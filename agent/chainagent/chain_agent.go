@@ -27,7 +27,6 @@ const defaultChannelBufferSize = 256
 type ChainAgent struct {
 	name              string
 	subAgents         []agent.Agent
-	tools             []tool.Tool
 	channelBufferSize int
 	agentCallbacks    *agent.Callbacks
 }
@@ -40,7 +39,6 @@ type Option func(*Options)
 // This struct is exported to allow external packages to inspect or modify options.
 type Options struct {
 	subAgents         []agent.Agent
-	tools             []tool.Tool
 	channelBufferSize int
 	agentCallbacks    *agent.Callbacks
 }
@@ -50,12 +48,6 @@ type Options struct {
 // influencing the next agent's execution.
 func WithSubAgents(subAgents []agent.Agent) Option {
 	return func(o *Options) { o.subAgents = subAgents }
-}
-
-// WithTools sets the tools available to the chain agent.
-// These tools can be used by any sub-agent in the chain during execution.
-func WithTools(tools []tool.Tool) Option {
-	return func(o *Options) { o.tools = tools }
 }
 
 // WithChannelBufferSize sets the buffer size for the event channel.
@@ -94,7 +86,6 @@ func New(name string, opts ...Option) *ChainAgent {
 	return &ChainAgent{
 		name:              name,
 		subAgents:         cfg.subAgents,
-		tools:             cfg.tools,
 		channelBufferSize: cfg.channelBufferSize,
 		agentCallbacks:    cfg.agentCallbacks,
 	}
@@ -153,9 +144,6 @@ func (a *ChainAgent) setupInvocation(invocation *agent.Invocation) {
 	// Set agent and agent name.
 	invocation.Agent = a
 	invocation.AgentName = a.name
-
-	// Set agent callbacks.
-	invocation.AgentCallbacks = a.agentCallbacks
 }
 
 // handleBeforeAgentCallbacks handles pre-execution callbacks.
@@ -164,11 +152,11 @@ func (a *ChainAgent) handleBeforeAgentCallbacks(
 	invocation *agent.Invocation,
 	eventChan chan<- *event.Event,
 ) bool {
-	if invocation.AgentCallbacks == nil {
+	if a.agentCallbacks == nil {
 		return false
 	}
 
-	customResponse, err := invocation.AgentCallbacks.RunBeforeAgent(ctx, invocation)
+	customResponse, err := a.agentCallbacks.RunBeforeAgent(ctx, invocation)
 	if err != nil {
 		// Send error event.
 		agent.EmitEvent(ctx, invocation, eventChan, event.NewErrorEvent(
@@ -237,11 +225,11 @@ func (a *ChainAgent) handleAfterAgentCallbacks(
 	invocation *agent.Invocation,
 	eventChan chan<- *event.Event,
 ) {
-	if invocation.AgentCallbacks == nil {
+	if a.agentCallbacks == nil {
 		return
 	}
 
-	customResponse, err := invocation.AgentCallbacks.RunAfterAgent(ctx, invocation, nil)
+	customResponse, err := a.agentCallbacks.RunAfterAgent(ctx, invocation, nil)
 	var evt *event.Event
 	if err != nil {
 		// Send error event.
@@ -265,7 +253,7 @@ func (a *ChainAgent) handleAfterAgentCallbacks(
 // Tools implements the agent.Agent interface.
 // It returns the tools available to this agent.
 func (a *ChainAgent) Tools() []tool.Tool {
-	return a.tools
+	return []tool.Tool{}
 }
 
 // Info implements the agent.Agent interface.

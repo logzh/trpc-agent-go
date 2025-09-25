@@ -555,6 +555,72 @@ func TestModel_Callbacks(t *testing.T) {
 		}
 	})
 
+	t.Run("chat stream complete callback", func(t *testing.T) {
+		var capturedRequest *openaigo.ChatCompletionNewParams
+		var capturedAccumulator *openaigo.ChatCompletionAccumulator
+		var capturedStreamErr error
+		var capturedCtx context.Context
+		callbackCalled := make(chan struct{})
+
+		streamCompleteCallback := func(ctx context.Context, req *openaigo.ChatCompletionNewParams, acc *openaigo.ChatCompletionAccumulator, streamErr error) {
+			capturedCtx = ctx
+			capturedRequest = req
+			capturedAccumulator = acc
+			capturedStreamErr = streamErr
+			close(callbackCalled)
+		}
+
+		m := New("gpt-3.5-turbo",
+			WithAPIKey(apiKey),
+			WithChatStreamCompleteCallback(streamCompleteCallback),
+		)
+
+		ctx := context.Background()
+		request := &model.Request{
+			Messages: []model.Message{
+				model.NewUserMessage("hello"),
+			},
+			GenerationConfig: model.GenerationConfig{
+				Stream: true, // Enable streaming for this test
+			},
+		}
+
+		responseChan, err := m.GenerateContent(ctx, request)
+		if err != nil {
+			t.Fatalf("failed to generate content: %v", err)
+		}
+
+		// Consume all responses
+		for response := range responseChan {
+			if response.Done {
+				break
+			}
+		}
+
+		// Wait for callback with timeout
+		select {
+		case <-callbackCalled:
+			// Success - callback was called
+		case <-time.After(30 * time.Second):
+			// Timeout - this is expected when API key is invalid
+			t.Skip("skipping stream complete callback test due to timeout - API might be slow or failing")
+		}
+
+		// Verify the callback was called with correct parameters (if it was called)
+		if capturedCtx != nil {
+			if capturedRequest == nil {
+				t.Fatal("expected request to be captured in callback")
+			}
+			if capturedRequest.Model != "gpt-3.5-turbo" {
+				t.Errorf("expected model %s, got %s", "gpt-3.5-turbo", capturedRequest.Model)
+			}
+			// Either accumulator should be non-nil (success) or streamErr should be non-nil (failure)
+			if capturedAccumulator == nil && capturedStreamErr == nil {
+				t.Fatal("expected either accumulator or streamErr to be set")
+			}
+		}
+	})
+
 	t.Run("multiple callbacks", func(t *testing.T) {
 		requestCalled := false
 		responseCalled := false
@@ -1483,6 +1549,17 @@ func TestModel_GenerateContent_StreamingBatchProcessing(t *testing.T) {
 			expectedCount: 1,
 		},
 		{
+			name: "ToolCall_NoID_Synthesized", // first tool call lacks id entirely; expect synthesized auto_call_0.
+			chunks: []string{
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"calc","arguments":"{\"a\":1}"}}]},"finish_reason":null}]}`,
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{"content":""},"finish_reason":"tool_calls"}]}`,
+			},
+			expectedTool:  "calc",
+			expectedArgs:  `{"a":1}`,
+			expectedCount: 1,
+		},
+		{
 			name: "ID_Index_Mapping_Verification", // Test ID -> Index mapping with multiple tool calls.
 			chunks: []string{
 				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,                                                                                       // Start boundary
@@ -1776,6 +1853,101 @@ func TestModel_GenerateContent_WithReasoningContent_NonStreaming(t *testing.T) {
 	// Check that content is also present
 	if responses[0].Choices[0].Message.Content != "Final answer" {
 		t.Errorf("Expected content 'Final answer', got '%s'", responses[0].Choices[0].Message.Content)
+	}
+}
+
+// TestModel_GenerateContent_NonStreaming_ToolCallNoID_Synthesized verifies that
+// when the provider omits tool_call.id in a non-streaming response, we synthesize
+// a stable ID (auto_call_<index>). This covers the non-streaming code path in
+// model/openai/openai.go around mapping ChatCompletion -> model.Response.
+func TestModel_GenerateContent_NonStreaming_ToolCallNoID_Synthesized(t *testing.T) {
+	// Mock server returning a non-streaming chat completion with tool_calls
+	// where the tool_call lacks an ID.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		response := `{
+            "id": "cmpl-ns-1",
+            "object": "chat.completion",
+            "created": 1699200001,
+            "model": "deepseek-chat",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Non-streaming with tool call",
+                        "tool_calls": [
+                            {
+                                "id": "",
+                                "type": "function",
+                                "function": {"name": "calc", "arguments": "{\"a\":1}"}
+                            }
+                        ]
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15}
+        }`
+
+		fmt.Fprint(w, response)
+	}))
+	defer server.Close()
+
+	// Create model instance
+	m := New("deepseek-chat", WithBaseURL(server.URL), WithAPIKey("test-key"))
+
+	// Create non-streaming request
+	req := &model.Request{
+		Messages:         []model.Message{{Role: model.RoleUser, Content: "Test non streaming tool call no id"}},
+		GenerationConfig: model.GenerationConfig{Stream: false},
+	}
+
+	// Send request
+	ctx := context.Background()
+	responseChan, err := m.GenerateContent(ctx, req)
+	if err != nil {
+		t.Fatalf("GenerateContent failed: %v", err)
+	}
+
+	// Collect single response
+	var responses []*model.Response
+	for response := range responseChan {
+		responses = append(responses, response)
+		if response.Done {
+			break
+		}
+	}
+
+	if len(responses) == 0 {
+		t.Fatalf("Expected at least 1 response, got %d", len(responses))
+	}
+	resp := responses[0]
+	if resp.Error != nil {
+		t.Fatalf("Unexpected model error: type=%s msg=%s", resp.Error.Type, resp.Error.Message)
+	}
+	if len(resp.Choices) == 0 {
+		t.Fatalf("Expected choices in response")
+	}
+
+	toolCalls := resp.Choices[0].Message.ToolCalls
+	if len(toolCalls) != 1 {
+		t.Fatalf("Expected 1 tool call, got %d", len(toolCalls))
+	}
+	// The adapter should synthesize an ID for the first tool call.
+	if toolCalls[0].ID != "auto_call_0" {
+		t.Errorf("Expected synthesized tool call ID 'auto_call_0', got '%s'", toolCalls[0].ID)
+	}
+	if toolCalls[0].Function.Name != "calc" {
+		t.Errorf("Expected function name 'calc', got '%s'", toolCalls[0].Function.Name)
+	}
+	if string(toolCalls[0].Function.Arguments) != `{"a":1}` {
+		t.Errorf("Expected function arguments '{\"a\":1}', got '%s'", string(toolCalls[0].Function.Arguments))
 	}
 }
 

@@ -12,6 +12,7 @@ package processor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -73,12 +74,14 @@ type subAgentCall struct {
 // FunctionCallResponseProcessor handles agent transfer operations after LLM responses.
 type FunctionCallResponseProcessor struct {
 	enableParallelTools bool
+	toolCallbacks       *tool.Callbacks
 }
 
 // NewFunctionCallResponseProcessor creates a new transfer response processor.
-func NewFunctionCallResponseProcessor(enableParallelTools bool) *FunctionCallResponseProcessor {
+func NewFunctionCallResponseProcessor(enableParallelTools bool, toolCallbacks *tool.Callbacks) *FunctionCallResponseProcessor {
 	return &FunctionCallResponseProcessor{
 		enableParallelTools: enableParallelTools,
+		toolCallbacks:       toolCallbacks,
 	}
 }
 
@@ -97,7 +100,18 @@ func (p *FunctionCallResponseProcessor) ProcessResponse(
 	}
 
 	functioncallResponseEvent, err := p.handleFunctionCallsAndSendEvent(ctx, invocation, rsp, req.Tools, ch)
+
+	// Option one: set invocation.EndInvocation is true, and stop next step.
+	// Option two: emit error event, maybe the LLM can correct this error and also need to wait for notice completion.
+	// maybe the Option two is better.
 	if err != nil || functioncallResponseEvent == nil {
+		return
+	}
+
+	// If the tool indicates skipping outer summarization, mark the invocation to end
+	// after this tool response so the flow does not perform an extra LLM call.
+	if functioncallResponseEvent.Actions != nil && functioncallResponseEvent.Actions.SkipSummarization {
+		invocation.EndInvocation = true
 		return
 	}
 
@@ -129,21 +143,19 @@ func (p *FunctionCallResponseProcessor) handleFunctionCallsAndSendEvent(
 	)
 	if err != nil {
 		log.Errorf("Function call handling failed for agent %s: %v", invocation.AgentName, err)
-		if emitErr := agent.EmitEvent(ctx, invocation, eventChan, event.NewErrorEvent(
+		agent.EmitEvent(ctx, invocation, eventChan, event.NewErrorEvent(
 			invocation.InvocationID,
 			invocation.AgentName,
 			model.ErrorTypeFlowError,
 			err.Error(),
-		)); emitErr != nil {
-			err = emitErr
-		}
+		))
 		return nil, err
 	}
-	err = agent.EmitEvent(ctx, invocation, eventChan, functionResponseEvent)
+	agent.EmitEvent(ctx, invocation, eventChan, functionResponseEvent)
 	return functionResponseEvent, nil
 }
 
-// handleFunctionCalls executes function calls and creates function response events.
+// handleFunctionCalls executes tool calls and returns a merged response event.
 func (p *FunctionCallResponseProcessor) handleFunctionCalls(
 	ctx context.Context,
 	invocation *agent.Invocation,
@@ -151,11 +163,6 @@ func (p *FunctionCallResponseProcessor) handleFunctionCalls(
 	tools map[string]tool.Tool,
 	eventChan chan<- *event.Event,
 ) (*event.Event, error) {
-	if llmResponse == nil || len(llmResponse.Choices) == 0 {
-		return nil, nil
-	}
-
-	var toolCallResponsesEvents []*event.Event
 	toolCalls := llmResponse.Choices[0].Message.ToolCalls
 
 	// If parallel tools are enabled AND multiple tool calls, execute concurrently
@@ -163,101 +170,64 @@ func (p *FunctionCallResponseProcessor) handleFunctionCalls(
 		return p.executeToolCallsInParallel(ctx, invocation, llmResponse, toolCalls, tools, eventChan)
 	}
 
-	// Execute each tool call.
-	for i, toolCall := range toolCalls {
-		if err := func(index int, toolCall model.ToolCall) error {
-			ctxWithInvocation, span := trace.Tracer.Start(ctx,
-				fmt.Sprintf("%s %s", itelemetry.SpanNamePrefixExecuteTool, toolCall.Function.Name))
-			defer span.End()
-			choice, err := p.executeToolCall(ctxWithInvocation, invocation, toolCall, tools, i, eventChan)
-			if err != nil {
-				return err
-			}
-			if choice == nil {
-				return nil
-			}
-			choice.Message.ToolName = toolCall.Function.Name
-			toolCallResponseEvent := newToolCallResponseEvent(invocation, llmResponse,
-				[]model.Choice{*choice})
-
-			if tl, ok := tools[toolCall.Function.Name]; ok {
-				if skipper, ok2 := tl.(summarizationSkipper); ok2 && skipper.SkipSummarization() {
-					if toolCallResponseEvent.Actions == nil {
-						toolCallResponseEvent.Actions = &event.EventActions{}
-					}
-					toolCallResponseEvent.Actions.SkipSummarization = true
-				}
-			}
-			toolCallResponsesEvents = append(toolCallResponsesEvents, toolCallResponseEvent)
-			tl, ok := tools[toolCall.Function.Name]
-			var declaration *tool.Declaration
-			if !ok {
-				declaration = &tool.Declaration{
-					Name:        "<not found>",
-					Description: "<not found>",
-				}
-			} else {
-				declaration = tl.Declaration()
-			}
-			itelemetry.TraceToolCall(span, declaration, toolCall.Function.Arguments, toolCallResponseEvent)
-			return nil
-		}(i, toolCall); err != nil {
+	var toolCallResponsesEvents []*event.Event
+	for i, tc := range toolCalls {
+		toolEvent, err := p.executeSingleToolCallSequential(
+			ctx, invocation, llmResponse, tools, eventChan, i, tc,
+		)
+		if err != nil {
 			return nil, err
 		}
-	}
-
-	var mergedEvent *event.Event
-	if len(toolCallResponsesEvents) == 0 {
-		// No explicit tool result events (likely forwarded inner events).
-		// Create minimal tool response messages so the next LLM call has
-		// required tool messages following tool_calls.
-		minimalChoices := make([]model.Choice, 0, len(toolCalls))
-		for _, tc := range toolCalls {
-			minimalChoices = append(minimalChoices, model.Choice{
-				Index: 0,
-				Message: model.Message{
-					Role:   model.RoleTool,
-					ToolID: tc.ID,
-					// Keep Content empty to avoid UI duplication; presence is enough for API.
-				},
-			})
+		if toolEvent != nil {
+			toolCallResponsesEvents = append(toolCallResponsesEvents, toolEvent)
 		}
-		mergedEvent = newToolCallResponseEvent(invocation, llmResponse, minimalChoices)
-		// If any tool prefers skipping summarization, propagate this hint even
-		// when we only forwarded inner events and didn't construct child events.
-		for _, tc := range toolCalls {
-			if tl, ok := tools[tc.Function.Name]; ok {
-				if skipper, ok2 := tl.(summarizationSkipper); ok2 && skipper.SkipSummarization() {
-					if mergedEvent.Actions == nil {
-						mergedEvent.Actions = &event.EventActions{}
-					}
-					mergedEvent.Actions.SkipSummarization = true
-					break
-				}
-			}
-		}
-	} else {
-		mergedEvent = mergeParallelToolCallResponseEvents(toolCallResponsesEvents)
 	}
 
-	// Signal that this event needs to be completed before proceeding.
-	mergedEvent.RequiresCompletion = true
-
-	// If the tool indicates skipping outer summarization, mark the invocation to end
-	// after this tool response so the flow does not perform an extra LLM call.
-	if mergedEvent.Actions != nil && mergedEvent.Actions.SkipSummarization {
-		invocation.EndInvocation = true
-	}
-	if len(toolCallResponsesEvents) > 1 {
-		_, span := trace.Tracer.Start(ctx, fmt.Sprintf("%s (merged)", itelemetry.SpanNamePrefixExecuteTool))
-		itelemetry.TraceMergedToolCalls(span, mergedEvent)
-		span.End()
-	}
-
+	mergedEvent := p.buildMergedParallelEvent(
+		ctx, invocation, llmResponse, tools, toolCalls, toolCallResponsesEvents,
+	)
 	return mergedEvent, nil
 }
 
-// executeToolCallsInParallel executes multiple tool calls concurrently using goroutines.
+// executeSingleToolCallSequential runs one tool call and returns its event.
+func (p *FunctionCallResponseProcessor) executeSingleToolCallSequential(
+	ctx context.Context,
+	invocation *agent.Invocation,
+	llmResponse *model.Response,
+	tools map[string]tool.Tool,
+	eventChan chan<- *event.Event,
+	index int,
+	toolCall model.ToolCall,
+) (*event.Event, error) {
+	ctxWithInvocation, span := trace.Tracer.Start(
+		ctx, fmt.Sprintf("%s %s", itelemetry.SpanNamePrefixExecuteTool, toolCall.Function.Name),
+	)
+	defer span.End()
+	choice, modifiedArgs, err := p.executeToolCall(
+		ctxWithInvocation, invocation, toolCall, tools, index, eventChan,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if choice == nil {
+		return nil, nil
+	}
+	choice.Message.ToolName = toolCall.Function.Name
+	toolEvent := newToolCallResponseEvent(
+		invocation, llmResponse, []model.Choice{*choice},
+	)
+	if tl, ok := tools[toolCall.Function.Name]; ok {
+		p.annotateSkipSummarization(toolEvent, tl)
+	}
+	decl := p.lookupDeclaration(tools, toolCall.Function.Name)
+	itelemetry.TraceToolCall(
+		span, decl, modifiedArgs, toolEvent,
+	)
+	return toolEvent, nil
+}
+
+// executeToolCallsInParallel runs multiple tool calls concurrently and merges
+// their results into a single event.
 func (p *FunctionCallResponseProcessor) executeToolCallsInParallel(
 	ctx context.Context,
 	invocation *agent.Invocation,
@@ -269,97 +239,13 @@ func (p *FunctionCallResponseProcessor) executeToolCallsInParallel(
 	resultChan := make(chan toolResult, len(toolCalls))
 	var wg sync.WaitGroup
 
-	// Start goroutines for concurrent execution.
-	for i, toolCall := range toolCalls {
+	for i, tc := range toolCalls {
 		wg.Add(1)
-		go func(index int, tc model.ToolCall) {
-			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					log.Errorf("Tool execution panic for %s (index: %d, ID: %s, agent: %s): %v",
-						tc.Function.Name, index, tc.ID, invocation.AgentName, r)
-					// Send error result to channel.
-					errorChoice := p.createErrorChoice(index, tc.ID, fmt.Sprintf("tool execution panic: %v", r))
-					errorChoice.Message.ToolName = tc.Function.Name
-					errorEvent := newToolCallResponseEvent(invocation, llmResponse, []model.Choice{*errorChoice})
-					select {
-					case resultChan <- toolResult{index: index, event: errorEvent}:
-					case <-ctx.Done():
-						// Context cancelled, don't block.
-					}
-				}
-			}()
-
-			ctxWithInvocation, span := trace.Tracer.Start(ctx,
-				fmt.Sprintf("%s %s", itelemetry.SpanNamePrefixExecuteTool, tc.Function.Name))
-			defer span.End()
-
-			choice, err := p.executeToolCall(ctxWithInvocation, invocation, tc, tools, index, eventChan)
-			if err != nil {
-				log.Errorf("Tool execution error for %s (index: %d, ID: %s, agent: %s): %v",
-					tc.Function.Name, index, tc.ID, invocation.AgentName, err)
-				// Send error result to channel.
-				errorChoice := p.createErrorChoice(index, tc.ID, fmt.Sprintf("tool execution error: %v", err))
-				errorChoice.Message.ToolName = tc.Function.Name
-				errorEvent := newToolCallResponseEvent(invocation, llmResponse,
-					[]model.Choice{*errorChoice})
-				select {
-				case resultChan <- toolResult{index: index, event: errorEvent}:
-				case <-ctx.Done():
-					// Context cancelled, don't block.
-				}
-				return
-			}
-			if choice == nil {
-				// For LongRunning tools that return nil, we still need to send a placeholder.
-				select {
-				case resultChan <- toolResult{index: index, event: nil}:
-				case <-ctx.Done():
-					// Context cancelled, don't block.
-				}
-				return
-			}
-
-			choice.Message.ToolName = tc.Function.Name
-			toolCallResponseEvent := newToolCallResponseEvent(invocation, llmResponse,
-				[]model.Choice{*choice})
-
-			// If the tool indicates we should skip outer summarization, mark it on the event
-			// so the flow/runner can respect it. This mirrors the sequential path handling.
-			if tl, ok := tools[tc.Function.Name]; ok {
-				if skipper, ok2 := tl.(summarizationSkipper); ok2 && skipper.SkipSummarization() {
-					if toolCallResponseEvent.Actions == nil {
-						toolCallResponseEvent.Actions = &event.EventActions{}
-					}
-					toolCallResponseEvent.Actions.SkipSummarization = true
-				}
-			}
-
-			tl, ok := tools[tc.Function.Name]
-			var declaration *tool.Declaration
-			if !ok {
-				declaration = &tool.Declaration{
-					Name:        "<not found>",
-					Description: "<not found>",
-				}
-			} else {
-				declaration = tl.Declaration()
-			}
-			itelemetry.TraceToolCall(span, declaration, tc.Function.Arguments, toolCallResponseEvent)
-
-			// Send result to channel with context cancellation support.
-			select {
-			case resultChan <- toolResult{
-				index: index,
-				event: toolCallResponseEvent,
-			}:
-			case <-ctx.Done():
-				// Context cancelled, don't block on channel send.
-			}
-		}(i, toolCall)
+		go p.runParallelToolCall(
+			ctx, &wg, invocation, llmResponse, tools, eventChan, resultChan, i, tc,
+		)
 	}
 
-	// Wait for all goroutines to complete with context cancellation support.
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -367,27 +253,145 @@ func (p *FunctionCallResponseProcessor) executeToolCallsInParallel(
 		close(done)
 	}()
 
-	// Collect results and maintain original order.
-	toolCallResponsesEvents := p.collectParallelToolResults(ctx, resultChan, len(toolCalls))
+	toolCallResponsesEvents := p.collectParallelToolResults(
+		ctx, resultChan, len(toolCalls),
+	)
+	mergedEvent := p.buildMergedParallelEvent(
+		ctx, invocation, llmResponse, tools, toolCalls, toolCallResponsesEvents,
+	)
+	return mergedEvent, nil
+}
 
+// runParallelToolCall executes one tool call and reports the result.
+func (p *FunctionCallResponseProcessor) runParallelToolCall(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	invocation *agent.Invocation,
+	llmResponse *model.Response,
+	tools map[string]tool.Tool,
+	eventChan chan<- *event.Event,
+	resultChan chan<- toolResult,
+	index int,
+	tc model.ToolCall,
+) {
+	defer wg.Done()
+	// Recover from panics to avoid breaking sibling goroutines.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf(
+				"Tool execution panic for %s (index: %d, ID: %s, agent: %s): %v",
+				tc.Function.Name, index, tc.ID, invocation.AgentName, r,
+			)
+			errorChoice := p.createErrorChoice(
+				index, tc.ID, fmt.Sprintf("tool execution panic: %v", r),
+			)
+			errorChoice.Message.ToolName = tc.Function.Name
+			errorEvent := newToolCallResponseEvent(
+				invocation, llmResponse, []model.Choice{*errorChoice},
+			)
+			p.sendToolResult(ctx, resultChan, toolResult{index: index, event: errorEvent})
+		}
+	}()
+
+	// Trace the tool execution for observability.
+	ctxWithInvocation, span := trace.Tracer.Start(
+		ctx, fmt.Sprintf("%s %s", itelemetry.SpanNamePrefixExecuteTool, tc.Function.Name),
+	)
+	defer span.End()
+
+	// Execute the tool (streamable or callable) with callbacks.
+	choice, modifiedArgs, err := p.executeToolCall(
+		ctxWithInvocation, invocation, tc, tools, index, eventChan,
+	)
+	if err != nil {
+		log.Errorf(
+			"Tool execution error for %s (index: %d, ID: %s, agent: %s): %v",
+			tc.Function.Name, index, tc.ID, invocation.AgentName, err,
+		)
+		errorChoice := p.createErrorChoice(
+			index, tc.ID, fmt.Sprintf("tool execution error: %v", err),
+		)
+		errorChoice.Message.ToolName = tc.Function.Name
+		errorEvent := newToolCallResponseEvent(
+			invocation, llmResponse, []model.Choice{*errorChoice},
+		)
+		p.sendToolResult(ctx, resultChan, toolResult{index: index, event: errorEvent})
+		return
+	}
+	// Long-running tools may return nil to indicate no immediate event.
+	if choice == nil {
+		p.sendToolResult(ctx, resultChan, toolResult{index: index, event: nil})
+		return
+	}
+
+	choice.Message.ToolName = tc.Function.Name
+	toolCallResponseEvent := newToolCallResponseEvent(
+		invocation, llmResponse, []model.Choice{*choice},
+	)
+	// Respect tool preference to skip outer summarization when present.
+	if tl, ok := tools[tc.Function.Name]; ok {
+		p.annotateSkipSummarization(toolCallResponseEvent, tl)
+	}
+	// Include declaration for telemetry even when tool is missing.
+	decl := p.lookupDeclaration(tools, tc.Function.Name)
+	itelemetry.TraceToolCall(span, decl, modifiedArgs, toolCallResponseEvent)
+	// Send result back to aggregator.
+	p.sendToolResult(
+		ctx, resultChan, toolResult{index: index, event: toolCallResponseEvent},
+	)
+}
+
+// annotateSkipSummarization marks an event to skip outer summarization.
+func (p *FunctionCallResponseProcessor) annotateSkipSummarization(
+	ev *event.Event, tl tool.Tool,
+) {
+	if skipper, ok := tl.(summarizationSkipper); ok && skipper.SkipSummarization() {
+		if ev.Actions == nil {
+			ev.Actions = &event.EventActions{}
+		}
+		ev.Actions.SkipSummarization = true
+	}
+}
+
+// lookupDeclaration returns a declaration or a safe placeholder.
+func (p *FunctionCallResponseProcessor) lookupDeclaration(
+	tools map[string]tool.Tool, name string,
+) *tool.Declaration {
+	if tl, ok := tools[name]; ok {
+		return tl.Declaration()
+	}
+	return &tool.Declaration{Name: "<not found>", Description: "<not found>"}
+}
+
+// sendToolResult sends without blocking when the context is cancelled.
+func (p *FunctionCallResponseProcessor) sendToolResult(
+	ctx context.Context, ch chan<- toolResult, res toolResult,
+) {
+	select {
+	case ch <- res:
+	case <-ctx.Done():
+	}
+}
+
+// buildMergedParallelEvent merges child tool events or builds minimal choices.
+func (p *FunctionCallResponseProcessor) buildMergedParallelEvent(
+	ctx context.Context,
+	invocation *agent.Invocation,
+	llmResponse *model.Response,
+	tools map[string]tool.Tool,
+	toolCalls []model.ToolCall,
+	toolCallEvents []*event.Event,
+) *event.Event {
 	var mergedEvent *event.Event
-	if len(toolCallResponsesEvents) == 0 {
-		// No explicit tool result events (likely forwarded inner events).
-		// Create minimal tool response messages so the next LLM call has
-		// required tool messages following tool_calls.
-		minimalChoices := make([]model.Choice, 0, len(toolCalls))
+	if len(toolCallEvents) == 0 {
+		minimal := make([]model.Choice, 0, len(toolCalls))
 		for _, tc := range toolCalls {
-			minimalChoices = append(minimalChoices, model.Choice{
-				Index: 0,
-				Message: model.Message{
-					Role:   model.RoleTool,
-					ToolID: tc.ID,
-				},
+			minimal = append(minimal, model.Choice{
+				Index:   0,
+				Message: model.Message{Role: model.RoleTool, ToolID: tc.ID},
 			})
 		}
-		mergedEvent = newToolCallResponseEvent(invocation, llmResponse, minimalChoices)
-		// If any tool prefers skipping summarization, propagate this hint even
-		// when we only forwarded inner events and didn't construct child events.
+		mergedEvent = newToolCallResponseEvent(invocation, llmResponse, minimal)
 		for _, tc := range toolCalls {
 			if tl, ok := tools[tc.Function.Name]; ok {
 				if skipper, ok2 := tl.(summarizationSkipper); ok2 && skipper.SkipSummarization() {
@@ -400,21 +404,32 @@ func (p *FunctionCallResponseProcessor) executeToolCallsInParallel(
 			}
 		}
 	} else {
-		mergedEvent = mergeParallelToolCallResponseEvents(toolCallResponsesEvents)
+		mergedEvent = mergeParallelToolCallResponseEvents(toolCallEvents)
 	}
-
-	// Signal that this event needs to be completed before proceeding.
 	mergedEvent.RequiresCompletion = true
-	if len(toolCallResponsesEvents) > 1 {
-		_, span := trace.Tracer.Start(ctx, fmt.Sprintf("%s (merged)", itelemetry.SpanNamePrefixExecuteTool))
+	if len(toolCallEvents) > 1 {
+		_, span := trace.Tracer.Start(
+			ctx, fmt.Sprintf("%s (merged)", itelemetry.SpanNamePrefixExecuteTool),
+		)
 		itelemetry.TraceMergedToolCalls(span, mergedEvent)
 		span.End()
 	}
-
-	return mergedEvent, nil
+	return mergedEvent
 }
 
 // executeToolCall executes a single tool call and returns the choice.
+// Parameters:
+//   - ctx: context for cancellation and tracing
+//   - invocation: agent invocation context containing agent name, model info, etc.
+//   - toolCall: the tool call to execute, including function name and arguments
+//   - tools: map of available tools by name
+//   - index: index of this tool call in the batch (for error reporting)
+//   - eventChan: channel for emitting events during execution
+//
+// Returns:
+//   - *model.Choice: the result choice containing tool response
+//   - []byte: the modified arguments after before-tool callbacks (for telemetry)
+//   - error: any error that occurred during execution
 func (p *FunctionCallResponseProcessor) executeToolCall(
 	ctx context.Context,
 	invocation *agent.Invocation,
@@ -422,7 +437,7 @@ func (p *FunctionCallResponseProcessor) executeToolCall(
 	tools map[string]tool.Tool,
 	index int,
 	eventChan chan<- *event.Event,
-) (*model.Choice, error) {
+) (*model.Choice, []byte, error) {
 	// Check if tool exists.
 	tl, exists := tools[toolCall.Function.Name]
 	if !exists {
@@ -439,24 +454,24 @@ func (p *FunctionCallResponseProcessor) executeToolCall(
 		} else {
 			log.Errorf("CallableTool %s not found (agent=%s, model=%s)",
 				toolCall.Function.Name, invocation.AgentName, invocation.Model.Info().Name)
-			return p.createErrorChoice(index, toolCall.ID, ErrorToolNotFound), nil
+			return p.createErrorChoice(index, toolCall.ID, ErrorToolNotFound), toolCall.Function.Arguments, nil
 		}
 	}
 
 	log.Debugf("Executing tool %s with args: %s", toolCall.Function.Name, string(toolCall.Function.Arguments))
 
 	// Execute the tool with callbacks.
-	result, err := p.executeToolWithCallbacks(ctx, invocation, toolCall, tl, eventChan)
+	result, modifiedArgs, err := p.executeToolWithCallbacks(ctx, invocation, toolCall, tl, eventChan)
 	if err != nil {
 		if _, ok := agent.AsStopError(err); ok {
-			return nil, err
+			return nil, modifiedArgs, err
 		}
-		return p.createErrorChoice(index, toolCall.ID, err.Error()), nil
+		return p.createErrorChoice(index, toolCall.ID, err.Error()), modifiedArgs, nil
 	}
 	//  allow to return nil not provide function response.
 	if r, ok := tl.(function.LongRunner); ok && r.LongRunning() {
 		if result == nil {
-			return nil, nil
+			return nil, modifiedArgs, nil
 		}
 	}
 
@@ -464,7 +479,7 @@ func (p *FunctionCallResponseProcessor) executeToolCall(
 	resultBytes, err := json.Marshal(result)
 	if err != nil {
 		log.Errorf("Failed to marshal tool result for %s: %v", toolCall.Function.Name, err)
-		return p.createErrorChoice(index, toolCall.ID, ErrorMarshalResult), nil
+		return p.createErrorChoice(index, toolCall.ID, ErrorMarshalResult), modifiedArgs, nil
 	}
 
 	log.Debugf("CallableTool %s executed successfully, result: %s", toolCall.Function.Name, string(resultBytes))
@@ -476,7 +491,7 @@ func (p *FunctionCallResponseProcessor) executeToolCall(
 			Content: string(resultBytes),
 			ToolID:  toolCall.ID,
 		},
-	}, nil
+	}, modifiedArgs, nil
 }
 
 // waitForCompletion waits for event completion if required.
@@ -486,12 +501,9 @@ func (p *FunctionCallResponseProcessor) waitForCompletion(ctx context.Context, i
 	}
 
 	completionID := agent.AppendEventNoticeKeyPrefix + lastEvent.ID
-	select {
-	case <-invocation.AddNoticeChannel(ctx, completionID):
-	case <-time.After(eventCompletionTimeout):
-		log.Warnf("Timeout waiting for completion of event %s", lastEvent.ID)
-	case <-ctx.Done():
-		return ctx.Err()
+	err := invocation.AddNoticeChannelAndWait(ctx, completionID, eventCompletionTimeout)
+	if errors.Is(err, context.Canceled) {
+		return err
 	}
 	return nil
 }
@@ -538,41 +550,42 @@ func (p *FunctionCallResponseProcessor) collectParallelToolResults(
 }
 
 // executeToolWithCallbacks executes a tool with before/after callbacks.
+// Returns (result, modifiedArguments, error).
 func (p *FunctionCallResponseProcessor) executeToolWithCallbacks(
 	ctx context.Context,
 	invocation *agent.Invocation,
 	toolCall model.ToolCall,
 	tl tool.Tool,
 	eventChan chan<- *event.Event,
-) (any, error) {
+) (any, []byte, error) {
 	toolDeclaration := tl.Declaration()
 	// Run before tool callbacks if they exist.
-	if invocation.ToolCallbacks != nil {
-		customResult, callbackErr := invocation.ToolCallbacks.RunBeforeTool(
+	if p.toolCallbacks != nil {
+		customResult, callbackErr := p.toolCallbacks.RunBeforeTool(
 			ctx,
 			toolCall.Function.Name,
 			toolDeclaration,
-			toolCall.Function.Arguments,
+			&toolCall.Function.Arguments,
 		)
 		if callbackErr != nil {
 			log.Errorf("Before tool callback failed for %s: %v", toolCall.Function.Name, callbackErr)
-			return nil, fmt.Errorf("tool callback error: %w", callbackErr)
+			return nil, toolCall.Function.Arguments, fmt.Errorf("tool callback error: %w", callbackErr)
 		}
 		if customResult != nil {
 			// Use custom result from callback.
-			return customResult, nil
+			return customResult, toolCall.Function.Arguments, nil
 		}
 	}
 
 	// Execute the actual tool.
 	result, err := p.executeTool(ctx, invocation, toolCall, tl, eventChan)
 	if err != nil {
-		return nil, err
+		return nil, toolCall.Function.Arguments, err
 	}
 
 	// Run after tool callbacks if they exist.
-	if invocation.ToolCallbacks != nil {
-		customResult, callbackErr := invocation.ToolCallbacks.RunAfterTool(
+	if p.toolCallbacks != nil {
+		customResult, callbackErr := p.toolCallbacks.RunAfterTool(
 			ctx,
 			toolCall.Function.Name,
 			toolDeclaration,
@@ -582,13 +595,13 @@ func (p *FunctionCallResponseProcessor) executeToolWithCallbacks(
 		)
 		if callbackErr != nil {
 			log.Errorf("After tool callback failed for %s: %v", toolCall.Function.Name, callbackErr)
-			return nil, fmt.Errorf("tool callback error: %w", callbackErr)
+			return nil, toolCall.Function.Arguments, fmt.Errorf("tool callback error: %w", callbackErr)
 		}
 		if customResult != nil {
 			result = customResult
 		}
 	}
-	return result, nil
+	return result, toolCall.Function.Arguments, nil
 }
 
 // isStreamable returns true if the tool supports streaming and its stream
@@ -693,29 +706,6 @@ func (f *FunctionCallResponseProcessor) consumeStream(
 		}
 	}
 	return contents, nil
-}
-
-// normalizeInnerEvent ensures invocation ID and branch are set for inner events.
-func (f *FunctionCallResponseProcessor) normalizeInnerEvent(ev *event.Event, inv *agent.Invocation) {
-	if ev.InvocationID == "" {
-		ev.InvocationID = inv.InvocationID
-	}
-	if ev.Branch == "" {
-		ev.Branch = inv.Branch
-	}
-}
-
-// shouldForwardInnerEvent suppresses forwarding of the inner agent's final full
-// content to avoid duplicate large blocks in the parent transcript. We still
-// aggregate its text from deltas for the final tool.response content.
-func (f *FunctionCallResponseProcessor) shouldForwardInnerEvent(ev *event.Event) bool {
-	if ev.Response != nil && len(ev.Response.Choices) > 0 {
-		ch := ev.Response.Choices[0]
-		if ch.Delta.Content == "" && ch.Message.Role == model.RoleAssistant && ch.Message.Content != "" && !ev.Response.IsPartial {
-			return false
-		}
-	}
-	return true
 }
 
 // appendInnerEventContent extracts textual content from an inner event and appends it.
@@ -937,18 +927,10 @@ func (f *FunctionCallResponseProcessor) processStreamChunk(
 ) error {
 	// Case 1: Raw sub-agent event passthrough.
 	if ev, ok := chunk.Content.(*event.Event); ok {
-		f.normalizeInnerEvent(ev, invocation)
-		// Default forwarding rule suppresses the final full assistant message to avoid
-		// duplication, but if we have not emitted any prior deltas/content from the
-		// inner stream, forward this final message so callers still see the sub-agent output.
-		shouldForward := f.shouldForwardInnerEvent(ev)
-		if !shouldForward && contents != nil && len(*contents) == 0 {
-			shouldForward = true
-		}
-		if shouldForward {
-			if err := agent.EmitEvent(ctx, invocation, eventChan, ev); err != nil {
-				return err
-			}
+		// With random FilterKey isolation, we can safely forward all inner events
+		// since they are properly isolated and won't pollute the parent session.
+		if err := event.EmitEvent(ctx, eventChan, ev); err != nil {
+			return err
 		}
 		f.appendInnerEventContent(ev, contents)
 		return nil

@@ -32,7 +32,6 @@ type EscalationFunc func(*event.Event) bool
 type CycleAgent struct {
 	name              string
 	subAgents         []agent.Agent
-	tools             []tool.Tool
 	maxIterations     *int // Optional maximum number of iterations
 	channelBufferSize int
 	agentCallbacks    *agent.Callbacks
@@ -47,7 +46,6 @@ type Option func(*Options)
 // This struct is exported to allow external packages to inspect or modify options.
 type Options struct {
 	subAgents         []agent.Agent
-	tools             []tool.Tool
 	maxIterations     *int
 	channelBufferSize int
 	agentCallbacks    *agent.Callbacks
@@ -59,12 +57,6 @@ type Options struct {
 // or the maximum number of iterations is reached.
 func WithSubAgents(sub []agent.Agent) Option {
 	return func(o *Options) { o.subAgents = sub }
-}
-
-// WithTools configures tools available to the cycle agent.
-// These tools can be used by any sub-agent during loop execution.
-func WithTools(tools []tool.Tool) Option {
-	return func(o *Options) { o.tools = tools }
 }
 
 // WithMaxIterations sets the maximum number of loop iterations.
@@ -111,7 +103,6 @@ func New(name string, opts ...Option) *CycleAgent {
 	return &CycleAgent{
 		name:              name,
 		subAgents:         cfg.subAgents,
-		tools:             cfg.tools,
 		maxIterations:     cfg.maxIterations,
 		channelBufferSize: cfg.channelBufferSize,
 		agentCallbacks:    cfg.agentCallbacks,
@@ -185,9 +176,6 @@ func (a *CycleAgent) setupInvocation(invocation *agent.Invocation) {
 	// Set agent and agent name
 	invocation.Agent = a
 	invocation.AgentName = a.name
-
-	// Set agent callbacks
-	invocation.AgentCallbacks = a.agentCallbacks
 }
 
 // handleBeforeAgentCallbacks handles pre-execution callbacks.
@@ -196,11 +184,11 @@ func (a *CycleAgent) handleBeforeAgentCallbacks(
 	invocation *agent.Invocation,
 	eventChan chan<- *event.Event,
 ) bool {
-	if invocation.AgentCallbacks == nil {
+	if a.agentCallbacks == nil {
 		return false
 	}
 
-	customResponse, err := invocation.AgentCallbacks.RunBeforeAgent(ctx, invocation)
+	customResponse, err := a.agentCallbacks.RunBeforeAgent(ctx, invocation)
 	if err != nil {
 		// Send error event.
 		agent.EmitEvent(ctx, invocation, eventChan, event.NewErrorEvent(
@@ -295,11 +283,11 @@ func (a *CycleAgent) handleAfterAgentCallbacks(
 	invocation *agent.Invocation,
 	eventChan chan<- *event.Event,
 ) {
-	if invocation.AgentCallbacks == nil {
+	if a.agentCallbacks == nil {
 		return
 	}
 
-	customResponse, err := invocation.AgentCallbacks.RunAfterAgent(ctx, invocation, nil)
+	customResponse, err := a.agentCallbacks.RunAfterAgent(ctx, invocation, nil)
 	var evt *event.Event
 	if err != nil {
 		// Send error event.
@@ -364,7 +352,7 @@ func (a *CycleAgent) Run(ctx context.Context, invocation *agent.Invocation) (<-c
 // Tools implements the agent.Agent interface.
 // It returns the tools available to this agent.
 func (a *CycleAgent) Tools() []tool.Tool {
-	return a.tools
+	return []tool.Tool{}
 }
 
 // Info implements the agent.Agent interface.

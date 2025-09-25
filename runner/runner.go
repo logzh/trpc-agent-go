@@ -12,6 +12,7 @@ package runner
 
 import (
 	"context"
+	"runtime/debug"
 	"time"
 
 	"github.com/google/uuid"
@@ -134,7 +135,7 @@ func (r *runner) Run(
 	}
 
 	// Create invocation.
-	var ro agent.RunOptions
+	ro := agent.RunOptions{RequestID: uuid.NewString()}
 	for _, opt := range runOpts {
 		opt(&ro)
 	}
@@ -148,8 +149,30 @@ func (r *runner) Run(
 		agent.WithInvocationEventFilterKey(r.appName),
 	)
 
+	// If caller provided a history via RunOptions and the session is empty,
+	// persist that history into the session exactly once, so subsequent turns
+	// and tool calls build on the same canonical transcript.
+	if len(ro.Messages) > 0 && (invocation.Session == nil || len(invocation.Session.Events) == 0) {
+		for _, msg := range ro.Messages {
+			author := r.agent.Info().Name
+			if msg.Role == model.RoleUser {
+				author = authorUser
+			}
+			m := msg
+			seedEvt := event.NewResponseEvent(
+				invocation.InvocationID,
+				author,
+				&model.Response{Done: false, Choices: []model.Choice{{Index: 0, Message: m}}},
+			)
+			agent.InjectIntoEvent(invocation, seedEvt)
+			if err := r.sessionService.AppendEvent(ctx, sess, seedEvt); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	// Append the incoming user message to the session if it has content.
-	if message.Content != "" {
+	if message.Content != "" && shouldAppendUserMessage(message, ro.Messages) {
 		evt := event.NewResponseEvent(
 			invocation.InvocationID,
 			authorUser,
@@ -181,14 +204,20 @@ func (r *runner) Run(
 	// Start a goroutine to process and append events to session.
 	go func() {
 		defer func() {
+			if r := recover(); r != nil {
+				log.Errorf("panic in runner event loop: %v\n%s", r, string(debug.Stack()))
+			}
 			close(processedEventCh)
 			invocation.CleanupNotice(ctx)
 		}()
 
 		for agentEvent := range agentEventCh {
+			if agentEvent == nil {
+				log.Debug("agentEvent is nil.")
+				continue
+			}
 			// Append event to session if it's complete (not partial).
-			if agentEvent != nil && (len(agentEvent.StateDelta) > 0 ||
-				(agentEvent.Response != nil && !agentEvent.IsPartial && agentEvent.IsValidContent())) {
+			if len(agentEvent.StateDelta) > 0 || (agentEvent.Response != nil && !agentEvent.IsPartial && agentEvent.IsValidContent()) {
 				if err := r.sessionService.AppendEvent(ctx, sess, agentEvent); err != nil {
 					log.Errorf("Failed to append event to session: %v", err)
 				}
@@ -231,11 +260,27 @@ func (r *runner) Run(
 	return processedEventCh, nil
 }
 
+func shouldAppendUserMessage(message model.Message, seed []model.Message) bool {
+	if len(seed) == 0 {
+		return true
+	}
+	if message.Role != model.RoleUser {
+		return true
+	}
+	for i := len(seed) - 1; i >= 0; i-- {
+		if seed[i].Role != model.RoleUser {
+			continue
+		}
+		return !model.MessagesEqual(seed[i], message)
+	}
+	return true
+}
+
 // RunWithMessages is a convenience helper that lets callers pass a full
-// conversation history ([]model.Message) directly, without relying on the
-// session service. It preserves backward compatibility by delegating to the
-// existing Runner.Run with an empty message and a RunOption that carries the
-// conversation history.
+// conversation history ([]model.Message) directly. The messages seed the LLM
+// request while the runner continues to merge in newer session events. It
+// preserves backward compatibility by delegating to Runner.Run with an empty
+// message and a RunOption that carries the conversation history.
 func RunWithMessages(
 	ctx context.Context,
 	r Runner,

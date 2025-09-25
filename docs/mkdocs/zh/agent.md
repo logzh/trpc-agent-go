@@ -72,6 +72,49 @@ llmAgent := llmagent.New(
 )
 ```
 
+### 占位符变量（会话状态注入）
+
+LLMAgent 会自动在 `Instruction` 和可选的 `SystemPrompt` 中注入会话状态。支持的占位符语法：
+
+- `{key}`：替换为 `session.State["key"]` 的字符串值
+- `{key?}`：可选；如果不存在，替换为空字符串
+- `{user:subkey}` / `{app:subkey}` / `{temp:subkey}`：访问用户/应用/临时命名空间（SessionService 会把 app/user 作用域的状态合并进 session，并带上前缀）
+
+注意：
+
+- 对于非可选的 `{key}`，若找不到则保留原样（便于 LLM 感知缺失上下文）
+- 值读取自 `invocation.Session.State`（Runner + SessionService 会自动设置/合并）
+
+示例：
+
+```go
+llm := llmagent.New(
+  "research-agent",
+  llmagent.WithModel(modelInstance),
+  llmagent.WithInstruction(
+    "You are a research assistant. Focus: {research_topics}. " +
+    "User interests: {user:topics?}. App banner: {app:banner?}.",
+  ),
+)
+
+// 通过 SessionService 初始化状态（用户态/应用态 + 会话本地键）
+_ = sessionService.UpdateUserState(ctx, session.UserKey{AppName: app, UserID: user}, session.StateMap{
+  "topics": []byte("quantum computing, cryptography"),
+})
+_ = sessionService.UpdateAppState(ctx, app, session.StateMap{
+  "banner": []byte("Research Mode"),
+})
+// 无前缀键直接存到 session.State
+_, _ = sessionService.CreateSession(ctx, session.Key{AppName: app, UserID: user, SessionID: sid}, session.StateMap{
+  "research_topics": []byte("AI, ML, DL"),
+})
+```
+
+进一步阅读：
+
+- 示例：`examples/placeholder`、`examples/outputkey`
+- Session API：`docs/mkdocs/zh/session.md`
+
 ### 使用 Runner 执行 Agent
 
 使用 Runner 来执行 Agent，这是推荐的使用方式：
@@ -172,14 +215,13 @@ Invocation 是 Agent 执行流程的上下文对象，包含了单次调用所�
 import "trpc.group/trpc-go/trpc-agent-go/agent"
 
 // 创建 Invocation 对象（高级用法）
-invocation := &agent.Invocation{
-    AgentName:     "demo-agent",                                                   // Agent 名称
-    InvocationID:  "demo-invocation-001",                                          // 调用 ID
-    EndInvocation: false,                                                          // 是否结束调用
-    Model:         modelInstance,                                                  // 使用的模型
-    Message:       model.NewUserMessage("Hello! Can you tell me about yourself?"), // 用户消息
-    Session:       &session.Session{ID: "session-001"},
-}
+invocation := agent.NewInvocation(
+    agent.WithInvocationAgent(r.agent),                               // Agent 实例
+    agent.WithInvocationSession(&session.Session{ID: "session-001"}), // Session
+    agent.WithInvocationEndInvocation(false),                         // 是否结束调用
+    agent.WithInvocationMessage(model.NewUserMessage("User input")),  // 用户消息
+    agent.WithInvocationModel(modelInstance),                         // 使用的模型
+)
 
 // 直接调用 Agent（高级用法）
 ctx := context.Background()
@@ -219,8 +261,6 @@ type Invocation struct {
 	RunOptions RunOptions
 	// TransferInfo 支持 Agent 之间的控制权转移
 	TransferInfo *TransferInfo
-	// AgentCallbacks 允许在 Agent 执行的不同阶段插入自定义逻辑
-	AgentCallbacks *AgentCallbacks
 	// ModelCallbacks 允许在模型调用的不同阶段插入自定义逻辑
 	ModelCallbacks *model.ModelCallbacks
 	// ToolCallbacks 允许在工具调用的不同阶段插入自定义逻辑
@@ -347,17 +387,8 @@ callbacks := &agent.AgentCallbacks{
     },
 }
 
-// 在 Invocation 中使用回调
-invocation := &agent.Invocation{
-    AgentName:     "demo-agent",
-    InvocationID:  "demo-001",
-    AgentCallbacks: callbacks,
-    Model:         modelInstance,
-    Message:       model.NewUserMessage("用户输入"),
-    Session: &session.Session{
-        ID: "session-001",
-    },
-}
+// 在 llmAgent中使用回掉
+llmagent := llmagent.New("llmagent", llmagent.WithAgentCallbacks(callbacks))
 ```
 
 回调机制让你能够精确控制 Agent 的执行过程，实现更复杂的业务逻辑。

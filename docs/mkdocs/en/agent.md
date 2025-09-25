@@ -72,6 +72,49 @@ llmAgent := llmagent.New(
 )
 ```
 
+### Placeholder Variables (Session State Injection)
+
+LLMAgent automatically injects session state into `Instruction` and the optional `SystemPrompt` via placeholder variables. Supported patterns:
+
+- `{key}`: Replace with the string value of `session.State["key"]`
+- `{key?}`: Optional; if missing, replaced with an empty string
+- `{user:subkey}` / `{app:subkey}` / `{temp:subkey}`: Use user/app/temp scoped keys (session services merge app/user state into session with these prefixes)
+
+Notes:
+
+- If a non-optional key is not found, the original `{key}` is preserved (helps the LLM notice missing context)
+- Values are read from `invocation.Session.State` (Runner + SessionService set/merge this automatically)
+
+Example:
+
+```go
+llm := llmagent.New(
+  "research-agent",
+  llmagent.WithModel(modelInstance),
+  llmagent.WithInstruction(
+    "You are a research assistant. Focus: {research_topics}. " +
+    "User interests: {user:topics?}. App banner: {app:banner?}.",
+  ),
+)
+
+// Initialize session state (Runner + SessionService)
+_ = sessionService.UpdateUserState(ctx, session.UserKey{AppName: app, UserID: user}, session.StateMap{
+  "topics": []byte("quantum computing, cryptography"),
+})
+_ = sessionService.UpdateAppState(ctx, app, session.StateMap{
+  "banner": []byte("Research Mode"),
+})
+// Unprefixed keys live directly in session.State
+_, _ = sessionService.CreateSession(ctx, session.Key{AppName: app, UserID: user, SessionID: sid}, session.StateMap{
+  "research_topics": []byte("AI, ML, DL"),
+})
+```
+
+See also:
+
+- Examples: `examples/placeholder`, `examples/outputkey`
+- Session API: `docs/mkdocs/en/session.md`
+
 ### Using Runner to Execute Agent
 
 Use Runner to execute the Agent, which is the recommended usage:
@@ -172,14 +215,13 @@ Invocation is the context object for Agent execution flow, containing all inform
 import "trpc.group/trpc-go/trpc-agent-go/agent"
 
 // Create Invocation object (advanced usage).
-invocation := &agent.Invocation{
-    AgentName:     "demo-agent",                                                   // Agent name.
-    InvocationID:  "demo-invocation-001",                                          // Invocation ID.
-    EndInvocation: false,                                                          // Whether to end invocation.
-    Model:         modelInstance,                                                  // Model to use.
-    Message:       model.NewUserMessage("Hello! Can you tell me about yourself?"), // User message.
-    Session:       &session.Session{ID: "session-001"},
-}
+invocation := agent.NewInvocation(
+    agent.WithAgentName(agent),                                                                  // Agent.
+    agent.WithInvocationMessage(model.NewUserMessage("Hello! Can you tell me about yourself?")), // User message.
+    agent.WithInvocationSession(&session.Session{ID: "session-001"}),                            // session object.
+    agent.WithInvocationEndInvocation(false),                                                    // Whether to end invocation.
+    agent.WithInvocationModel(modelInstance),                                                    // Model to use.
+)
 
 // Call Agent directly (advanced usage).
 ctx := context.Background()
@@ -219,12 +261,6 @@ type Invocation struct {
 	RunOptions RunOptions
 	// TransferInfo supports control transfer between Agents.
 	TransferInfo *TransferInfo
-	// AgentCallbacks allows inserting custom logic at different stages of Agent execution.
-	AgentCallbacks *AgentCallbacks
-	// ModelCallbacks allows inserting custom logic at different stages of model calls.
-	ModelCallbacks *model.ModelCallbacks
-	// ToolCallbacks allows inserting custom logic at different stages of tool calls.
-	ToolCallbacks *tool.ToolCallbacks
 
     // notice
 	noticeChanMap map[string]chan any
@@ -348,16 +384,7 @@ callbacks := &agent.AgentCallbacks{
 }
 
 // Use callbacks in Invocation.
-invocation := &agent.Invocation{
-    AgentName:     "demo-agent",
-    InvocationID:  "demo-001",
-    AgentCallbacks: callbacks,
-    Model:         modelInstance,
-    Message:       model.NewUserMessage("User input"),
-    Session: &session.Session{
-        ID: "session-001",
-    },
-}
+llmagent := llmagent.New("llmagent", llmagent.WithAgentCallbacks(callbacks))
 ```
 
 The callback mechanism allows you to precisely control the Agent's execution process and implement more complex business logic.

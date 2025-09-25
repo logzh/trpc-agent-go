@@ -61,8 +61,8 @@ func WithAddContextPrefix(addPrefix bool) ContentOption {
 // NewContentRequestProcessor creates a new content request processor.
 func NewContentRequestProcessor(opts ...ContentOption) *ContentRequestProcessor {
 	processor := &ContentRequestProcessor{
-		IncludeContents:  IncludeContentsAll, // Default to include all contents.
-		AddContextPrefix: true,               // Default to add context prefix.
+		IncludeContents:  IncludeContentsFiltered, // Default only to include filtered contents.
+		AddContextPrefix: true,                    // Default to add context prefix.
 	}
 
 	// Apply options.
@@ -90,21 +90,8 @@ func (p *ContentRequestProcessor) ProcessRequest(
 		return
 	}
 
-	// 0. If caller supplied explicit messages via RunOptions, prefer them
-	// and skip deriving from session or the single invocation message to
-	// avoid duplication. This supports use cases where the upstream
-	// system maintains the conversation history and passes it in each run.
-	if len(invocation.RunOptions.Messages) > 0 {
-		req.Messages = append(req.Messages, invocation.RunOptions.Messages...)
-
-		// Send a preprocessing event and return early.
-		evt := event.New(invocation.InvocationID, invocation.AgentName, event.WithObject(model.ObjectTypePreprocessingContent))
-		log.Debugf("Content request processor: used explicit messages (%d)", len(invocation.RunOptions.Messages))
-		agent.EmitEvent(ctx, invocation, ch, evt)
-		return
-	}
-
 	// Process session events if available and includeContents is not "none".
+	var addedFromSession int
 	if p.IncludeContents != IncludeContentsNone && invocation.Session != nil {
 		sessionMessages := p.getContents(
 			invocation.GetEventFilterKey(), // Current branch for filtering
@@ -112,6 +99,7 @@ func (p *ContentRequestProcessor) ProcessRequest(
 			invocation.AgentName, // Current agent name for filtering
 		)
 		req.Messages = append(req.Messages, sessionMessages...)
+		addedFromSession = len(sessionMessages)
 	}
 
 	// Include the current invocation message if:
@@ -119,8 +107,11 @@ func (p *ContentRequestProcessor) ProcessRequest(
 	// 2. There's no session OR the session has no events
 	// This prevents duplication when using Runner (which adds user message to session)
 	// while ensuring standalone usage works (where invocation.Message is the source)
+	// Additionally, when the session exists but has no messages for the
+	// current branch (e.g. sub agent first turn), include the invocation
+	// message so the sub agent receives the tool arguments as a user input.
 	if invocation.Message.Content != "" &&
-		(invocation.Session == nil || len(invocation.Session.Events) == 0) {
+		(invocation.Session == nil || len(invocation.Session.Events) == 0 || addedFromSession == 0) {
 		req.Messages = append(req.Messages, invocation.Message)
 		log.Debugf("Content request processor: added invocation message with role %s (no session or empty session)",
 			invocation.Message.Role)
@@ -152,12 +143,12 @@ func (p *ContentRequestProcessor) getContents(
 
 		// Skip events without content, or generated neither by user nor by model
 		// or has empty text. E.g. events purely for mutating session states.
-		if !evt.IsValidContent() {
+		if evt.Response == nil || evt.IsPartial || !evt.IsValidContent() {
 			continue
 		}
 
 		// Skip events not belong to current branch.
-		if !evt.Filter(filterKey) {
+		if p.IncludeContents == IncludeContentsFiltered && !evt.Filter(filterKey) {
 			continue
 		}
 

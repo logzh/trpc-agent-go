@@ -138,7 +138,7 @@ runner := runner.NewRunner("app", agent,
 
 ### 📋 前置条件
 
-- ✅ Go 1.24.1 或更高版本
+- ✅ Go 1.21 或更高版本
 - 🔑 LLM 提供商 API 密钥（OpenAI、DeepSeek 等）
 - 💡 5 分钟构建您的第一个智能 agent
 
@@ -328,7 +328,7 @@ type calculatorRsp struct {
 
 架构图
 
-![architecture](docs/assets/img/component_architecture.png)
+![architecture](docs/mkdocs/assets/img/component_architecture.png)
 
 ### 🔄 **执行流程**
 
@@ -354,7 +354,7 @@ type calculatorRsp struct {
 
 - 时序图
 
-![execution](docs/assets/img/timing_diagram.png)
+![execution](docs/mkdocs/assets/img/timing_diagram.png)
 
 ## 使用内置 Agents
 

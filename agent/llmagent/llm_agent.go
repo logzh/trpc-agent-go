@@ -356,8 +356,6 @@ type LLMAgent struct {
 	planner              planner.Planner
 	subAgents            []agent.Agent // Sub-agents that can be delegated to
 	agentCallbacks       *agent.Callbacks
-	modelCallbacks       *model.Callbacks
-	toolCallbacks        *tool.Callbacks
 	outputKey            string         // Key to store output in session state
 	outputSchema         map[string]any // JSON schema for output validation
 	inputSchema          map[string]any // JSON schema for input validation
@@ -394,7 +392,8 @@ func New(name string, opts ...Option) *LLMAgent {
 		responseProcessors = append(responseProcessors, orp)
 	}
 
-	responseProcessors = append(responseProcessors, processor.NewFunctionCallResponseProcessor(options.EnableParallelTools))
+	toolcallProcessor := processor.NewFunctionCallResponseProcessor(options.EnableParallelTools, options.ToolCallbacks)
+	responseProcessors = append(responseProcessors, toolcallProcessor)
 
 	// Add transfer response processor if sub-agents are configured.
 	if len(options.SubAgents) > 0 {
@@ -405,6 +404,7 @@ func New(name string, opts ...Option) *LLMAgent {
 	// Create flow with the provided processors and options.
 	flowOpts := llmflow.Options{
 		ChannelBufferSize: options.ChannelBufferSize,
+		ModelCallbacks:    options.ModelCallbacks,
 	}
 
 	llmFlow := llmflow.New(
@@ -441,8 +441,6 @@ func New(name string, opts ...Option) *LLMAgent {
 		planner:              options.Planner,
 		subAgents:            options.SubAgents,
 		agentCallbacks:       options.AgentCallbacks,
-		modelCallbacks:       options.ModelCallbacks,
-		toolCallbacks:        options.ToolCallbacks,
 		outputKey:            options.OutputKey,
 		outputSchema:         options.OutputSchema,
 		inputSchema:          options.InputSchema,
@@ -558,8 +556,8 @@ func (a *LLMAgent) Run(ctx context.Context, invocation *agent.Invocation) (<-cha
 	a.setupInvocation(invocation)
 
 	// Run before agent callbacks if they exist.
-	if invocation.AgentCallbacks != nil {
-		customResponse, err := invocation.AgentCallbacks.RunBeforeAgent(ctx, invocation)
+	if a.agentCallbacks != nil {
+		customResponse, err := a.agentCallbacks.RunBeforeAgent(ctx, invocation)
 		if err != nil {
 			return nil, fmt.Errorf("before agent callback failed: %w", err)
 		}
@@ -581,7 +579,7 @@ func (a *LLMAgent) Run(ctx context.Context, invocation *agent.Invocation) (<-cha
 	}
 
 	// If we have after agent callbacks, we need to wrap the event channel.
-	if invocation.AgentCallbacks != nil {
+	if a.agentCallbacks != nil {
 		return a.wrapEventChannel(ctx, invocation, flowEventChan), nil
 	}
 
@@ -602,11 +600,6 @@ func (a *LLMAgent) setupInvocation(invocation *agent.Invocation) {
 	// Propagate structured output configuration into invocation and request path.
 	invocation.StructuredOutputType = a.structuredOutputType
 	invocation.StructuredOutput = a.structuredOutput
-
-	// Set callbacks.
-	invocation.AgentCallbacks = a.agentCallbacks
-	invocation.ModelCallbacks = a.modelCallbacks
-	invocation.ToolCallbacks = a.toolCallbacks
 }
 
 // wrapEventChannel wraps the event channel to apply after agent callbacks.
@@ -628,8 +621,8 @@ func (a *LLMAgent) wrapEventChannel(
 		}
 
 		// After all events are processed, run after agent callbacks
-		if invocation.AgentCallbacks != nil {
-			customResponse, err := invocation.AgentCallbacks.RunAfterAgent(ctx, invocation, nil)
+		if a.agentCallbacks != nil {
+			customResponse, err := a.agentCallbacks.RunAfterAgent(ctx, invocation, nil)
 			var evt *event.Event
 			if err != nil {
 				// Send error event.
