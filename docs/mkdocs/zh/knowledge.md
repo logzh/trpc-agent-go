@@ -236,11 +236,17 @@ if err != nil {
     // 处理 error
 }
 
+docBuilder := func(tcDoc tcvectordb.Document) (*document.Document, []float64, error) {
+    return &document.Document{ID: tcDoc.Id}, nil, nil
+}
+
 // TcVector
 tcVS, err := vectortcvector.New(
     vectortcvector.WithURL("https://your-tcvector-endpoint"),
     vectortcvector.WithUsername("your-username"),
     vectortcvector.WithPassword("your-password"),
+    // 用于文档检索时的自定义文档构建方法。若不提供，则使用默认构建方法。
+    vectortcvector.WithDocBuilder(docBuilder),
 )
 if err != nil {
     // 处理 error
@@ -255,6 +261,36 @@ kb := knowledge.New(
 #### Elasticsearch
 
 ```go
+
+docBuilder := func(hitSource json.RawMessage) (*document.Document, []float64, error) {
+    var source struct {
+        ID        string    `json:"id"`
+        Title     string    `json:"title"`
+        Content   string    `json:"content"`
+        Page      int       `json:"page"`
+        Author    string    `json:"author"`
+        CreatedAt time.Time `json:"created_at"`
+        UpdatedAt time.Time `json:"updated_at"`
+        Embedding []float64 `json:"embedding"`
+    }
+    if err := json.Unmarshal(hitSource, &source); err != nil {
+        return nil, nil, err
+    }
+    // Create document.
+    doc := &document.Document{
+        ID:        source.ID,
+        Name:      source.Title,
+        Content:   source.Content,
+        CreatedAt: source.CreatedAt,
+        UpdatedAt: source.UpdatedAt,
+        Metadata: map[string]any{
+            "page":   source.Page,
+            "author": source.Author,
+        },
+    }
+    return doc, source.Embedding, nil
+}
+
 // 创建支持多版本 (v7, v8, v9) 的 Elasticsearch 向量存储
 esVS, err := vectorelasticsearch.New(
     vectorelasticsearch.WithAddresses([]string{"http://localhost:9200"}),
@@ -265,6 +301,8 @@ esVS, err := vectorelasticsearch.New(
     vectorelasticsearch.WithMaxRetries(3),
     // 版本可选："v7"、"v8"、"v9"（默认 "v9"）
     vectorelasticsearch.WithVersion("v9"),
+    // 用于文档检索时的自定义文档构建方法。若不提供，则使用默认构建方法。
+    vectorelasticsearch.WithDocBuilder(docBuilder),
 )
 if err != nil {
     // 处理 error
@@ -345,6 +383,17 @@ urlSrc := urlsource.New(
     urlsource.WithMaxContentLength(1024*1024),       // 最大内容长度 (1MB)
     urlsource.WithName("Web Content"),
 )
+
+// URL 源高级配置：分离内容获取和文档标识
+urlSrcAlias := urlsource.New(
+    []string{"https://trpc-go.com/docs/api.md"},     // 标识符 URL（用于文档 ID 和元数据）
+    urlsource.WithContentFetchingURL([]string{"https://github.com/trpc-group/trpc-go/raw/main/docs/api.md"}), // 实际内容获取 URL
+    urlsource.WithName("TRPC API Docs"),
+    urlsource.WithMetadataValue("source", "github"),
+)
+// 注意：使用 WithContentFetchingURL 时，标识符 URL 应保留获取内容的URL的文件信息，比如
+// 正确：标识符 URL 为 https://trpc-go.com/docs/api.md，获取 URL 为 https://github.com/.../docs/api.md
+// 错误：标识符 URL 为 https://trpc-go.com，会丢失文档路径信息
 
 // 自动源：智能识别类型，自动选择处理器
 autoSrc := autosource.New(

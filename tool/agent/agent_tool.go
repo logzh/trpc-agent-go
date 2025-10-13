@@ -18,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
+	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
@@ -65,10 +66,9 @@ func WithStreamInner(enabled bool) Option {
 
 // NewTool creates a new Tool that wraps the given agent.
 func NewTool(agent agent.Agent, opts ...Option) *Tool {
-	// Default to skipping summarization for AgentTool to avoid redundant
-	// outer-agent summaries after tool.response. This mirrors ADK-style
-	// behavior where the tool result is the end of the turn by default.
-	options := &agentToolOptions{skipSummarization: true}
+	// Default to allowing summarization so the parent agent can perform its
+	// normal post-tool reasoning unless opt-out is requested.
+	options := &agentToolOptions{skipSummarization: false}
 	for _, opt := range opts {
 		opt(options)
 	}
@@ -173,6 +173,22 @@ func (at *Tool) StreamableCall(ctx context.Context, jsonArgs []byte) (*tool.Stre
 				// not the parent agent. Use unique FilterKey to prevent cross-invocation event pollution.
 				agent.WithInvocationEventFilterKey(uniqueFilterKey),
 			)
+			// Store tool input as Event via sub-agent's event channel (safe concurrency).
+			// This ensures the tool input is available throughout all LLM calls within this AgentTool invocation.
+			if message.Content != "" {
+				evt := event.NewResponseEvent(
+					subInv.InvocationID,
+					"user", // Use "user" as author like Runner does for user messages.
+					&model.Response{Done: false, Choices: []model.Choice{{Index: 0, Message: message}}},
+				)
+				agent.InjectIntoEvent(subInv, evt) // This will set the uniqueFilterKey.
+
+				// Send the tool input event as the first event in the stream.
+				if stream.Writer.Send(tool.StreamChunk{Content: evt}, nil) {
+					return
+				}
+			}
+
 			subCtx := agent.NewInvocationContext(ctx, subInv)
 			evCh, err := at.agent.Run(subCtx, subInv)
 			if err != nil {
@@ -228,9 +244,9 @@ func (at *Tool) Declaration() *tool.Declaration {
 	}
 }
 
-// convertMapToToolSchema converts a map[string]interface{} schema to tool.Schema format.
+// convertMapToToolSchema converts a map[string]any schema to tool.Schema format.
 // This function handles the conversion from the agent's input schema format to the tool schema format.
-func convertMapToToolSchema(schema map[string]interface{}) *tool.Schema {
+func convertMapToToolSchema(schema map[string]any) *tool.Schema {
 	if schema == nil {
 		return nil
 	}

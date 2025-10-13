@@ -335,7 +335,7 @@ mathAgent := llmagent.New(
 // 2) 包装为 Agent 工具
 mathTool := agenttool.NewTool(
     mathAgent,
-    agenttool.WithSkipSummarization(true), // 默认 true：工具后不再让外层模型总结
+    agenttool.WithSkipSummarization(true), // 可选：工具响应后跳过外层模型总结
     agenttool.WithStreamInner(true),       // 开启：把子 Agent 的流式事件转发给父流程
 )
 
@@ -375,8 +375,8 @@ if ev.Author != parentName && len(ev.Choices) > 0 {
 ### 选项说明
 
 - WithSkipSummarization(bool)：
-  - true（默认）：外层 Flow 在 `tool.response` 后直接结束本轮（不再额外总结）
-  - false：允许在工具结果后继续一次 LLM 调用进行总结/回答
+  - false（默认）：允许在工具结果后继续一次 LLM 调用进行总结/回答
+  - true：外层 Flow 在 `tool.response` 后直接结束本轮（不再额外总结）
 
 - WithStreamInner(bool)：
   - true：把子 Agent 的事件直接转发到父流程（强烈建议父/子 Agent 都开启 `GenerationConfig{Stream: true}`）
@@ -571,16 +571,16 @@ func main() {
         }
         
         // 显示工具调用
-        if len(event.Choices) > 0 && len(event.Choices[0].Message.ToolCalls) > 0 {
-            for _, toolCall := range event.Choices[0].Message.ToolCalls {
+        if len(event.Response.Choices) > 0 && len(event.Response.Choices[0].Message.ToolCalls) > 0 {
+            for _, toolCall := range event.Response.Choices[0].Message.ToolCalls {
                 fmt.Printf("🔧 调用工具: %s\n", toolCall.Function.Name)
                 fmt.Printf("   参数: %s\n", string(toolCall.Function.Arguments))
             }
         }
         
         // 显示流式内容
-        if len(event.Choices) > 0 {
-            fmt.Print(event.Choices[0].Delta.Content)
+        if len(event.Response.Choices) > 0 {
+            fmt.Print(event.Response.Choices[0].Delta.Content)
         }
         
         if event.Done {

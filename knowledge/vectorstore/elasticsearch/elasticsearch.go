@@ -281,33 +281,17 @@ func (vs *VectorStore) Get(ctx context.Context, id string) (*document.Document, 
 	if !response.Found {
 		return nil, nil, fmt.Errorf("elasticsearch document not found: %s", id)
 	}
-
-	// Parse the _source field using our unified esDocument struct.
-	var source esDocument
-	if err := json.Unmarshal(response.Source_, &source); err != nil {
+	doc, embedding, err := vs.option.docBuilder(response.Source_)
+	if err != nil {
 		return nil, nil, fmt.Errorf("elasticsearch invalid document source: %w", err)
 	}
 
-	// Extract document fields.
-	doc := &document.Document{
-		ID:        source.ID,
-		Name:      source.Name,
-		Content:   source.Content,
-		CreatedAt: source.CreatedAt,
-		UpdatedAt: source.UpdatedAt,
-	}
-
-	// Extract metadata.
-	if source.Metadata != nil {
-		doc.Metadata = source.Metadata
-	}
-
 	// Extract embedding vector.
-	if len(source.Embedding) == 0 {
+	if len(embedding) == 0 {
 		return nil, nil, fmt.Errorf("elasticsearch embedding vector not found: %s", id)
 	}
 
-	return doc, source.Embedding, nil
+	return doc, embedding, nil
 }
 
 // getDocument retrieves a document by ID.
@@ -477,39 +461,23 @@ func (vs *VectorStore) parseSearchResults(data []byte) (*vectorstore.SearchResul
 		if hit.Score_ == nil {
 			continue
 		}
-
 		// Skip hits without _source payload.
 		if len(hit.Source_) == 0 {
 			continue
 		}
-
 		score := float64(*hit.Score_)
-
 		// Check score threshold.
 		if score < vs.option.scoreThreshold {
 			continue
 		}
-
-		// Parse the _source field using our unified esDocument struct.
-		var source esDocument
-		if err := json.Unmarshal(hit.Source_, &source); err != nil {
-			continue // Skip invalid documents
+		doc, _, err := vs.option.docBuilder(hit.Source_)
+		if err != nil {
+			log.Errorf("elasticsearch parse search result: %v", err)
+			continue
 		}
-
-		// Create document.
-		doc := &document.Document{
-			ID:        source.ID,
-			Name:      source.Name,
-			Content:   source.Content,
-			CreatedAt: source.CreatedAt,
-			UpdatedAt: source.UpdatedAt,
+		if doc == nil {
+			continue
 		}
-
-		// Extract metadata.
-		if source.Metadata != nil {
-			doc.Metadata = source.Metadata
-		}
-
 		scoredDoc := &vectorstore.ScoredDocument{
 			Document: doc,
 			Score:    score,
@@ -578,7 +546,7 @@ func (vs *VectorStore) GetMetadata(ctx context.Context, opts ...vectorstore.GetM
 }
 
 // buildCountQuery builds a count query with optional filters.
-func (vs *VectorStore) buildCountQuery(filter map[string]interface{}) *types.SearchRequestBody {
+func (vs *VectorStore) buildCountQuery(filter map[string]any) *types.SearchRequestBody {
 	query := types.NewSearchRequestBody()
 	query.Size = &[]int{0}[0] // Set size to 0 for count query
 
@@ -703,7 +671,7 @@ func (vs *VectorStore) queryMetadataBatch(
 	limit,
 	offset int,
 	docIDs []string,
-	filters map[string]interface{},
+	filters map[string]any,
 ) (map[string]vectorstore.DocumentMetadata, error) {
 	metadataQuery := types.NewSearchRequestBody()
 	metadataQuery.Size = &limit
@@ -763,7 +731,7 @@ func (vs *VectorStore) queryMetadataBatch(
 			continue // Skip invalid documents
 		}
 
-		metadata := make(map[string]interface{})
+		metadata := make(map[string]any)
 		if source.Metadata != nil {
 			metadata = source.Metadata
 		}

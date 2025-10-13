@@ -17,6 +17,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
@@ -396,8 +397,8 @@ func WithLLMToolSets(toolSets []tool.ToolSet) LLMNodeFuncOption {
 			runner.tools = make(map[string]tool.Tool)
 		}
 		for _, toolSet := range toolSets {
-			for _, tool := range toolSet.Tools(context.Background()) {
-				runner.tools[tool.Declaration().Name] = tool
+			for _, t := range toolSet.Tools(context.Background()) {
+				runner.tools[t.Declaration().Name] = t
 			}
 		}
 	}
@@ -769,8 +770,8 @@ func NewToolsNodeFunc(tools map[string]tool.Tool, opts ...Option) NodeFunc {
 		tools = make(map[string]tool.Tool)
 	}
 	for _, toolSet := range node.toolSets {
-		for _, tool := range toolSet.Tools(context.Background()) {
-			tools[tool.Declaration().Name] = tool
+		for _, t := range toolSet.Tools(context.Background()) {
+			tools[t.Declaration().Name] = t
 		}
 	}
 	return func(ctx context.Context, state State) (any, error) {
@@ -1280,6 +1281,7 @@ func emitToolCompleteEvent(ctx context.Context, config toolCompleteEventConfig) 
 		WithToolEventInput(string(config.Arguments)),
 		WithToolEventOutput(outputStr),
 		WithToolEventError(config.Error),
+		WithToolEventIncludeResponse(true),
 	)
 	invocation, _ := agent.InvocationFromContext(ctx)
 	agent.EmitEvent(ctx, invocation, config.EventChan, toolCompleteEvent)
@@ -1344,10 +1346,12 @@ func buildAgentInvocation(ctx context.Context, state State, targetAgent agent.Ag
 
 	// clone a new Invocation from parent.
 	if parentInvocation, ok := agent.InvocationFromContext(ctx); ok && parentInvocation != nil {
+		filterKey := parentInvocation.GetEventFilterKey() + agent.EventFilterKeyDelimiter + targetAgent.Info().Name + uuid.NewString()
 		invocation := parentInvocation.Clone(
 			agent.WithInvocationAgent(targetAgent),
 			agent.WithInvocationMessage(model.NewUserMessage(userInput)),
 			agent.WithInvocationRunOptions(agent.RunOptions{RuntimeState: state}),
+			agent.WithInvocationEventFilterKey(filterKey),
 		)
 		return invocation
 	}
@@ -1357,6 +1361,7 @@ func buildAgentInvocation(ctx context.Context, state State, targetAgent agent.Ag
 		agent.WithInvocationRunOptions(agent.RunOptions{RuntimeState: state}),
 		agent.WithInvocationMessage(model.NewUserMessage(userInput)),
 		agent.WithInvocationSession(sessionData),
+		agent.WithInvocationEventFilterKey(targetAgent.Info().Name+uuid.NewString()),
 	)
 	return invocation
 }
