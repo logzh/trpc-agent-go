@@ -225,8 +225,8 @@ appRunner := runner.NewRunner(
 
 ### Memory Service
 
-Configure the memory service in code. Two backends are supported: in-memory
-and Redis.
+Configure the memory service in code. Three backends are supported: in-memory,
+Redis, MySQL, and PostgreSQL.
 
 #### Configuration Example
 
@@ -234,6 +234,8 @@ and Redis.
 import (
     memoryinmemory "trpc.group/trpc-go/trpc-agent-go/memory/inmemory"
     memoryredis "trpc.group/trpc-go/trpc-agent-go/memory/redis"
+    memorymysql "trpc.group/trpc-go/trpc-agent-go/memory/mysql"
+    memorypostgres "trpc.group/trpc-go/trpc-agent-go/memory/postgres"
 )
 
 // In-memory implementation for development and testing.
@@ -248,17 +250,38 @@ if err != nil {
     // Handle error.
 }
 
+// MySQL implementation for production (relational database).
+// Table is automatically created on service initialization. Panics if creation fails.
+mysqlService, err := memorymysql.NewService(
+    memorymysql.WithMySQLClientDSN("user:password@tcp(localhost:3306)/dbname?parseTime=true"),
+    memorymysql.WithToolEnabled(memory.DeleteToolName, true), // Enable delete.
+)
+if err != nil {
+    // Handle error.
+}
+
+// PostgreSQL implementation for production (relational database).
+// Table is automatically created on service initialization. Panics if creation fails.
+postgresService, err := memorypostgres.NewService(
+    memorypostgres.WithPostgresConnString("postgres://user:password@localhost:5432/dbname"),
+    memorypostgres.WithSoftDelete(true), // Enable soft delete.
+    memorypostgres.WithToolEnabled(memory.DeleteToolName, true), // Enable delete.
+)
+if err != nil {
+    // Handle error.
+}
+
 // Register memory tools with the Agent.
 llmAgent := llmagent.New(
     "memory-assistant",
-    llmagent.WithTools(memService.Tools()), // Or use redisService.Tools().
+    llmagent.WithTools(memService.Tools()), // Or redisService.Tools(), mysqlService.Tools(), or postgresService.Tools().
 )
 
 // Set memory service in the Runner.
 runner := runner.NewRunner(
     "app",
     llmAgent,
-    runner.WithMemoryService(memService), // Or use redisService.
+    runner.WithMemoryService(memService), // Or redisService, mysqlService, or postgresService.
 )
 ```
 
@@ -476,7 +499,310 @@ go run main.go -memory inmemory
 go run main.go -memory redis -redis-addr localhost:6379
 
 # Flags:
-# -memory: memory service type (inmemory, redis), default is inmemory.
+# -memory: memory service type (inmemory, redis, mysql, postgres), default is inmemory.
 # -redis-addr: Redis server address, default is localhost:6379.
+# -mysql-dsn: MySQL Data Source Name (DSN), required when using MySQL.
+# -postgres-dsn: PostgreSQL connection string, required when using PostgreSQL.
+# -soft-delete: Enable soft delete for MySQL/PostgreSQL memory service (default false).
 # -model: model name, default is deepseek-chat.
 ```
+
+## Storage Backends
+
+### In-Memory Storage
+
+In-memory storage is suitable for development and testing:
+
+```go
+import memoryinmemory "trpc.group/trpc-go/trpc-agent-go/memory/inmemory"
+
+// Create in-memory service
+memoryService := memoryinmemory.NewMemoryService(
+    memoryinmemory.WithMemoryLimit(100), // Set memory limit
+    memoryinmemory.WithToolEnabled(memory.DeleteToolName, true), // Enable delete tool
+)
+```
+
+**Features:**
+
+- ✅ Zero configuration, ready to use
+- ✅ High performance, no network overhead
+- ❌ No data persistence, lost on restart
+- ❌ No distributed deployment support
+
+### Redis Storage
+
+Redis storage is suitable for production and distributed applications:
+
+```go
+import memoryredis "trpc.group/trpc-go/trpc-agent-go/memory/redis"
+
+// Create Redis memory service
+redisService, err := memoryredis.NewService(
+    memoryredis.WithRedisClientURL("redis://localhost:6379"),
+    memoryredis.WithMemoryLimit(1000), // Set memory limit
+    memoryredis.WithToolEnabled(memory.DeleteToolName, true), // Enable delete tool
+)
+if err != nil {
+    log.Fatalf("Failed to create redis memory service: %v", err)
+}
+```
+
+**Features:**
+
+- ✅ Data persistence, survives restarts
+- ✅ High performance for high concurrency
+- ✅ Distributed deployment support
+- ✅ Cluster and sentinel mode support
+- ⚙️ Requires Redis server
+
+**Redis Configuration Options:**
+
+- `WithRedisClientURL(url string)`: Set Redis connection URL
+- `WithRedisInstance(name string)`: Use pre-registered Redis instance
+- `WithMemoryLimit(limit int)`: Set maximum memories per user
+- `WithToolEnabled(toolName string, enabled bool)`: Enable or disable specific tools
+- `WithCustomTool(toolName string, creator ToolCreator)`: Use custom tool implementation
+
+### MySQL Storage
+
+MySQL storage is suitable for production environments requiring relational databases:
+
+```go
+import memorymysql "trpc.group/trpc-go/trpc-agent-go/memory/mysql"
+
+// Create MySQL memory service
+mysqlService, err := memorymysql.NewService(
+    memorymysql.WithMySQLClientDSN("user:password@tcp(localhost:3306)/dbname?parseTime=true"),
+    memorymysql.WithMemoryLimit(1000), // Set memory limit
+    memorymysql.WithTableName("memories"), // Custom table name (optional)
+    memorymysql.WithToolEnabled(memory.DeleteToolName, true), // Enable delete tool
+)
+if err != nil {
+    log.Fatalf("Failed to create mysql memory service: %v", err)
+}
+```
+
+**Features:**
+
+- ✅ Data persistence with ACID transaction guarantees
+- ✅ Relational database with complex query support
+- ✅ Master-slave replication and clustering support
+- ✅ Automatic table creation
+- ✅ Comprehensive monitoring and management tools
+- ⚙️ Requires MySQL server (5.7+ or 8.0+)
+
+**MySQL Configuration Options:**
+
+- `WithMySQLClientDSN(dsn string)`: Set MySQL Data Source Name (DSN)
+- `WithMySQLInstance(name string)`: Use pre-registered MySQL instance
+- `WithTableName(name string)`: Custom table name (default "memories"). Panics if invalid.
+- `WithMemoryLimit(limit int)`: Set maximum memories per user
+- `WithSoftDelete(enabled bool)`: Enable soft delete (default false). When enabled, delete operations set `deleted_at` and queries filter out soft-deleted rows.
+- `WithToolEnabled(toolName string, enabled bool)`: Enable or disable specific tools
+- `WithCustomTool(toolName string, creator ToolCreator)`: Use custom tool implementation
+
+**Note:** The table is automatically created when the service is initialized. If table creation fails, the service will panic.
+
+**DSN Format:**
+
+```
+[username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN]
+```
+
+**Common DSN Parameters:**
+
+- `parseTime=true`: Parse DATE and DATETIME to time.Time (required)
+- `charset=utf8mb4`: Character set
+- `loc=Local`: Location for time.Time values
+- `timeout=10s`: Connection timeout
+
+**Table Schema:**
+
+MySQL memory service automatically creates the following table structure on initialization:
+
+```sql
+CREATE TABLE IF NOT EXISTS memories (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    app_name VARCHAR(255) NOT NULL,
+    user_id VARCHAR(255) NOT NULL,
+    memory_id VARCHAR(64) NOT NULL,
+    memory_data JSON NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP NULL DEFAULT NULL,
+    INDEX idx_app_user (app_name, user_id),
+    UNIQUE INDEX idx_app_user_memory (app_name, user_id, memory_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+```
+
+**Start MySQL with Docker:**
+
+```bash
+# Start MySQL container
+docker run -d --name mysql-memory \
+  -e MYSQL_ROOT_PASSWORD=password \
+  -e MYSQL_DATABASE=memory_db \
+  -p 3306:3306 \
+  mysql:8.0
+
+# Wait for MySQL to be ready
+docker exec mysql-memory mysqladmin ping -h localhost -u root -ppassword
+
+# Use MySQL memory service
+go run main.go -memory mysql -mysql-dsn "root:password@tcp(localhost:3306)/memory_db?parseTime=true"
+```
+
+**Register MySQL Instance (Optional):**
+
+```go
+import (
+    storage "trpc.group/trpc-go/trpc-agent-go/storage/mysql"
+    memorymysql "trpc.group/trpc-go/trpc-agent-go/memory/mysql"
+)
+
+// Register MySQL instance
+storage.RegisterMySQLInstance("my-mysql",
+    storage.WithClientBuilderDSN("user:password@tcp(localhost:3306)/dbname?parseTime=true"),
+)
+
+// Use registered instance
+mysqlService, err := memorymysql.NewService(
+    memorymysql.WithMySQLInstance("my-mysql"),
+)
+```
+
+### PostgreSQL Storage
+
+PostgreSQL storage is suitable for production environments requiring relational databases with JSONB support:
+
+```go
+import memorypostgres "trpc.group/trpc-go/trpc-agent-go/memory/postgres"
+
+// Create PostgreSQL memory service
+postgresService, err := memorypostgres.NewService(
+    memorypostgres.WithPostgresConnString("postgres://user:password@localhost:5432/dbname"),
+    memorypostgres.WithMemoryLimit(1000), // Set memory limit
+    memorypostgres.WithTableName("memories"), // Custom table name (optional)
+    memorypostgres.WithSoftDelete(true), // Enable soft delete
+    memorypostgres.WithToolEnabled(memory.DeleteToolName, true), // Enable delete tool
+)
+if err != nil {
+    log.Fatalf("Failed to create postgres memory service: %v", err)
+}
+```
+
+**Features:**
+
+- ✅ Data persistence with ACID transaction guarantees
+- ✅ Relational database with complex query support
+- ✅ JSONB support for efficient JSON operations
+- ✅ Master-slave replication and clustering support
+- ✅ Automatic table creation
+- ✅ Comprehensive monitoring and management tools
+- ✅ Optional soft delete support
+- ⚙️ Requires PostgreSQL server (12+)
+
+**PostgreSQL Configuration Options:**
+
+- `WithPostgresConnString(connString string)`: Set PostgreSQL connection string
+- `WithPostgresInstance(name string)`: Use pre-registered PostgreSQL instance
+- `WithTableName(name string)`: Custom table name (default "memories"). Panics if invalid.
+- `WithMemoryLimit(limit int)`: Set maximum memories per user
+- `WithSoftDelete(enabled bool)`: Enable soft delete (default false). When enabled, delete operations set `deleted_at` and queries filter out soft-deleted rows.
+- `WithToolEnabled(toolName string, enabled bool)`: Enable or disable specific tools
+- `WithCustomTool(toolName string, creator ToolCreator)`: Use custom tool implementation
+
+**Note:** The table is automatically created when the service is initialized. If table creation fails, the service will panic.
+
+**Connection String Format:**
+
+```
+postgres://[user[:password]@][netloc][:port][/dbname][?param1=value1&...]
+```
+
+**Common Connection String Parameters:**
+
+- `sslmode=disable`: Disable SSL (for local development)
+- `sslmode=require`: Require SSL connection
+- `connect_timeout=10`: Connection timeout in seconds
+
+**Table Schema:**
+
+PostgreSQL memory service automatically creates the following table structure on initialization:
+
+```sql
+CREATE TABLE IF NOT EXISTS memories (
+    id BIGSERIAL PRIMARY KEY,
+    app_name VARCHAR(255) NOT NULL,
+    user_id VARCHAR(255) NOT NULL,
+    memory_id VARCHAR(64) NOT NULL,
+    memory_data JSONB NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP NULL DEFAULT NULL,
+    CONSTRAINT idx_app_user_memory UNIQUE (app_name, user_id, memory_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_app_user ON memories(app_name, user_id);
+CREATE INDEX IF NOT EXISTS idx_deleted_at ON memories(deleted_at);
+```
+
+**Start PostgreSQL with Docker:**
+
+```bash
+# Start PostgreSQL container
+docker run -d --name postgres-memory \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=password \
+  -e POSTGRES_DB=memory_db \
+  -p 5432:5432 \
+  postgres:15-alpine
+
+# Wait for PostgreSQL to be ready
+docker exec postgres-memory pg_isready -U postgres
+
+# Use PostgreSQL memory service
+go run main.go -memory postgres -postgres-dsn "postgres://postgres:password@localhost:5432/memory_db"
+```
+
+**Register PostgreSQL Instance (Optional):**
+
+```go
+import (
+    storage "trpc.group/trpc-go/trpc-agent-go/storage/postgres"
+    memorypostgres "trpc.group/trpc-go/trpc-agent-go/memory/postgres"
+)
+
+// Register PostgreSQL instance
+storage.RegisterPostgresInstance("my-postgres",
+    storage.WithClientConnString("postgres://user:password@localhost:5432/dbname"),
+)
+
+// Use registered instance
+postgresService, err := memorypostgres.NewService(
+    memorypostgres.WithPostgresInstance("my-postgres"),
+)
+```
+
+### Storage Backend Comparison
+
+| Feature                  | In-Memory | Redis      | MySQL          | PostgreSQL     |
+| ------------------------ | --------- | ---------- | -------------- | -------------- |
+| Data Persistence         | ❌        | ✅         | ✅             | ✅             |
+| Distributed Support      | ❌        | ✅         | ✅             | ✅             |
+| Transaction Support      | ❌        | Partial    | ✅ (ACID)      | ✅ (ACID)      |
+| Query Capability         | Simple    | Medium     | Powerful (SQL) | Powerful (SQL) |
+| JSON Support             | ❌        | Partial    | ✅ (JSON)      | ✅ (JSONB)     |
+| Performance              | Very High | High       | Medium-High    | Medium-High    |
+| Configuration Complexity | Low       | Medium     | Medium         | Medium         |
+| Use Case                 | Dev/Test  | Production | Production     | Production     |
+| Monitoring Tools         | None      | Rich       | Very Rich      | Very Rich      |
+
+**Selection Guide:**
+
+- **Development/Testing**: Use in-memory storage for fast iteration
+- **Production (High Performance)**: Use Redis storage for high concurrency scenarios
+- **Production (Data Integrity)**: Use MySQL storage when ACID guarantees and complex queries are needed
+- **Production (PostgreSQL)**: Use PostgreSQL storage when JSONB support and advanced PostgreSQL features are needed
+- **Hybrid Deployment**: Choose different storage backends based on different application scenarios

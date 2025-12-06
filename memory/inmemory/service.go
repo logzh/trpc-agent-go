@@ -39,16 +39,6 @@ func newAppMemories() *appMemories {
 	}
 }
 
-// serviceOpts contains options for memory service.
-type serviceOpts struct {
-	// memoryLimit is the limit of memories per user.
-	memoryLimit int
-	// toolCreators are functions to build tools after service creation.
-	toolCreators map[string]memory.ToolCreator
-	// enabledTools are the names of tools to enable.
-	enabledTools map[string]bool
-}
-
 // MemoryService is an in-memory implementation of memory.Service.
 type MemoryService struct {
 	// mu is the mutex for the service.
@@ -63,18 +53,7 @@ type MemoryService struct {
 
 // NewMemoryService creates a new in-memory memory service.
 func NewMemoryService(options ...ServiceOpt) *MemoryService {
-	opts := serviceOpts{
-		memoryLimit:  imemory.DefaultMemoryLimit,
-		toolCreators: make(map[string]memory.ToolCreator),
-		enabledTools: make(map[string]bool),
-	}
-
-	// Enable default tools first.
-	for toolName, creator := range imemory.DefaultEnabledTools {
-		opts.enabledTools[toolName] = true
-		opts.toolCreators[toolName] = creator
-	}
-
+	opts := defaultOptions.clone()
 	// Apply user options.
 	for _, option := range options {
 		option(&opts)
@@ -84,42 +63,6 @@ func NewMemoryService(options ...ServiceOpt) *MemoryService {
 		apps:        make(map[string]*appMemories),
 		opts:        opts,
 		cachedTools: make(map[string]tool.Tool),
-	}
-}
-
-// ServiceOpt is the option for the in-memory memory service.
-type ServiceOpt func(*serviceOpts)
-
-// WithMemoryLimit sets the limit of memories per user.
-func WithMemoryLimit(limit int) ServiceOpt {
-	return func(opts *serviceOpts) {
-		opts.memoryLimit = limit
-	}
-}
-
-// WithCustomTool sets a custom memory tool implementation.
-// The tool will be enabled by default.
-// If the tool name is invalid, this option will do nothing.
-func WithCustomTool(toolName string, creator memory.ToolCreator) ServiceOpt {
-	return func(opts *serviceOpts) {
-		// If the tool name is invalid, do nothing.
-		if !imemory.IsValidToolName(toolName) {
-			return
-		}
-		opts.toolCreators[toolName] = creator
-		opts.enabledTools[toolName] = true
-	}
-}
-
-// WithToolEnabled sets which tool is enabled.
-// If the tool name is invalid, this option will do nothing.
-func WithToolEnabled(toolName string, enabled bool) ServiceOpt {
-	return func(opts *serviceOpts) {
-		// If the tool name is invalid, do nothing.
-		if !imemory.IsValidToolName(toolName) {
-			return
-		}
-		opts.enabledTools[toolName] = enabled
 	}
 }
 

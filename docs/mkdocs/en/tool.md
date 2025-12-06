@@ -35,15 +35,22 @@ A ToolSet is a collection of related tools that implements the `tool.ToolSet` in
 
 ```go
 type ToolSet interface {
-    Tools(context.Context) []CallableTool  // Return the list of tools.
-    Close() error                          // Resource cleanup.
+    // Tools returns the current tools in this set.
+    Tools(context.Context) []tool.Tool
+
+    // Close releases any resources held by the ToolSet.
+    Close() error
+
+    // Name returns the identifier of the ToolSet, used for
+    // identification and conflict resolution.
+    Name() string
 }
 ```
 
 **Relationship between Tool and ToolSet:**
 
-- One **Tool** = one concrete capability (e.g., calculator).
-- One **ToolSet** = a group of related Tools (e.g., all tools provided by an MCP server).
+- One "Tool" = one concrete capability (e.g., calculator).
+- One "ToolSet" = a group of related Tools (e.g., all tools provided by an MCP server).
 - An Agent can use multiple Tools and multiple ToolSets simultaneously.
 
 #### 🌊 Streaming Tool Support
@@ -72,12 +79,12 @@ type StreamChunk struct {
 
 ### Tool Types
 
-| Tool Type | Definition | Integration Method |
-|----------|------------|--------------------|
-| **Function Tools** | Tools implemented by directly calling Go functions | `Tool` interface, in-process calls |
-| **Agent Tool (AgentTool)** | Wrap any Agent as a callable tool | `Tool` interface, supports streaming inner forwarding |
-| **DuckDuckGo Tool** | Search tool based on DuckDuckGo API | `Tool` interface, HTTP API |
-| **MCP ToolSet** | External toolset based on MCP protocol | `ToolSet` interface, multiple transports |
+| Tool Type                  | Definition                                         | Integration Method                                    |
+| -------------------------- | -------------------------------------------------- | ----------------------------------------------------- |
+| **Function Tools**         | Tools implemented by directly calling Go functions | `Tool` interface, in-process calls                    |
+| **Agent Tool (AgentTool)** | Wrap any Agent as a callable tool                  | `Tool` interface, supports streaming inner forwarding |
+| **DuckDuckGo Tool**        | Search tool based on DuckDuckGo API                | `Tool` interface, HTTP API                            |
+| **MCP ToolSet**            | External toolset based on MCP protocol             | `ToolSet` interface, multiple transports              |
 
 > **📖 Related docs**: For Agent Tool and Transfer Tool used in multi-Agent collaboration, see the Multi-Agent System document.
 
@@ -136,7 +143,7 @@ func getStreamableWeather(input weatherInput) *tool.StreamReader {
     stream := tool.NewStream(10)
     go func() {
         defer stream.Writer.Close()
-        
+
         // Simulate progressively returning weather data.
         result := "Sunny, 25°C in " + input.Location
         for i := 0; i < len(result); i++ {
@@ -146,14 +153,14 @@ func getStreamableWeather(input weatherInput) *tool.StreamReader {
                 },
                 Metadata: tool.Metadata{CreatedAt: time.Now()},
             }
-            
+
             if closed := stream.Writer.Send(chunk, nil); closed {
                 break
             }
             time.Sleep(10 * time.Millisecond) // Simulate latency.
         }
     }()
-    
+
     return stream.Reader
 }
 
@@ -179,7 +186,7 @@ for {
     if err != nil {
         return err
     }
-    
+
     // Process each chunk.
     fmt.Printf("Received: %v\n", chunk.Content)
 }
@@ -232,6 +239,7 @@ MCP (Model Context Protocol) is an open protocol that standardizes how applicati
 **MCP ToolSet Features:**
 
 - 🔗 Unified interface: All MCP tools are created via `mcp.NewMCPToolSet()`.
+- ✅ Explicit initialization: `(*mcp.ToolSet).Init(ctx)` lets you fail fast on MCP connection / tool loading errors during startup.
 - 🚀 Multiple transports: Supports STDIO, SSE, and Streamable HTTP.
 - 🔧 Tool filters: Supports including/excluding specific tools.
 
@@ -250,6 +258,11 @@ mcpToolSet := mcp.NewMCPToolSet(
     },
     mcp.WithToolFilter(mcp.NewIncludeFilter("echo", "add")), // Optional: tool filter.
 )
+
+// (Optional but recommended) Explicitly initialize MCP: connect + initialize + list tools.
+if err := mcpToolSet.Init(ctx); err != nil {
+    log.Fatalf("failed to initialize MCP toolset: %v", err)
+}
 
 // Integrate into an Agent.
 agent := llmagent.New("mcp-assistant",
@@ -329,6 +342,49 @@ sseToolSet := mcp.NewMCPToolSet(
 - 🎯 **Independent Retries**: Each tool call gets independent reconnection attempts
 - 🛡️ **Conservative Strategy**: Only triggers reconnection for clear connection/session errors to avoid infinite loops
 
+### Dynamic MCP Tool Discovery (LLMAgent Option)
+
+For MCP ToolSets, the list of tools on the server side can change over
+time (for example, when a new MCP tool is registered). To let an
+LLMAgent automatically see the **latest** tools from a ToolSet on each
+run, use `llmagent.WithRefreshToolSetsOnRun(true)` together with
+`WithToolSets`.
+
+#### LLMAgent configuration example
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+    "trpc.group/trpc-go/trpc-agent-go/tool"
+    "trpc.group/trpc-go/trpc-agent-go/tool/mcp"
+)
+
+// 1. Create an MCP ToolSet (can be STDIO, SSE, or Streamable HTTP).
+mcpToolSet := mcp.NewMCPToolSet(connectionConfig)
+
+// 2. Create an LLMAgent and enable dynamic ToolSets refresh.
+agent := llmagent.New(
+    "mcp-assistant",
+    llmagent.WithModel(openai.New("gpt-4o-mini")),
+    llmagent.WithToolSets([]tool.ToolSet{mcpToolSet}),
+    llmagent.WithRefreshToolSetsOnRun(true),
+)
+```
+
+When `WithRefreshToolSetsOnRun(true)` is enabled:
+
+- Each time the LLMAgent builds its tool list, it calls
+  `ToolSet.Tools(context.Background())` again.
+- If the MCP server adds or removes tools, the **next run** of this
+  LLMAgent will use the updated tool list automatically.
+
+This option focuses on **dynamic discovery** of tools. If you also need
+per-request HTTP headers (for example, authentication headers that come
+from `context.Context`), keep using the pattern shown in the
+`examples/mcptool/http_headers` example, where you manually call
+`toolSet.Tools(ctx)` and pass the tools via `WithTools`.
+
 ## Agent Tool (AgentTool)
 
 AgentTool lets you expose an existing Agent as a tool to be used by a parent Agent. Compared with a plain function tool, AgentTool provides:
@@ -358,8 +414,11 @@ mathAgent := llmagent.New(
 // 2) Wrap as an Agent tool
 mathTool := agenttool.NewTool(
     mathAgent,
-    agenttool.WithSkipSummarization(true), // opt-in: skip the outer summarization after tool.response
-    agenttool.WithStreamInner(true),       // forward child Agent streaming events to parent flow
+    // Optional, defaults to false. When set to true, the outer model summary will be skipped, 
+    // and the current round will end directly after tool.response.
+    agenttool.WithSkipSummarization(false),
+    // forward child Agent streaming events to parent flow.
+    agenttool.WithStreamInner(true),
 )
 
 // 3) Use in parent Agent
@@ -397,12 +456,29 @@ if ev.Author != parentName && len(ev.Choices) > 0 {
 ### Options
 
 - WithSkipSummarization(bool):
+
   - false (default): Allow an additional summarization/answer call after the tool result
   - true: Skip the outer summarization LLM call once the tool returns
 
 - WithStreamInner(bool):
+
   - true: Forward child Agent events to the parent flow (recommended: enable `GenerationConfig{Stream: true}` for both parent and child Agents)
   - false: Treat as a callable-only tool, without inner event forwarding
+
+- WithHistoryScope(HistoryScope):
+  - `HistoryScopeIsolated` (default): Keep the child Agent fully isolated; it only sees the current tool arguments (no inherited history).
+  - `HistoryScopeParentBranch`: Inherit parent conversation history by using a hierarchical filter key `parent/child-uuid`. This allows the content processor to include parent events via prefix matching while keeping child events isolated under a sub-branch. Typical use cases: “edit/optimize/continue previous output”.
+
+Example:
+
+```go
+child := agenttool.NewTool(
+    childAgent,
+    agenttool.WithSkipSummarization(false),
+    agenttool.WithStreamInner(true),
+    agenttool.WithHistoryScope(agenttool.HistoryScopeParentBranch),
+)
+```
 
 ### Notes
 
@@ -417,6 +493,7 @@ if ev.Author != parentName && len(ev.Choices) > 0 {
 ```go
 import (
     "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/tool"
     "trpc.group/trpc-go/trpc-agent-go/tool/function"
     "trpc.group/trpc-go/trpc-agent-go/tool/duckduckgo"
     "trpc.group/trpc-go/trpc-agent-go/tool/mcp"
@@ -428,7 +505,7 @@ calculatorTool := function.NewFunctionTool(calculator,
     function.WithDescription("Perform basic mathematical operations."))
 
 timeTool := function.NewFunctionTool(getCurrentTime,
-    function.WithName("current_time"), 
+    function.WithName("current_time"),
     function.WithDescription("Get the current time."))
 
 // Create a built-in tool.
@@ -443,6 +520,9 @@ stdioToolSet := mcp.NewMCPToolSet(
         Timeout:   10 * time.Second,
     },
 )
+if err := stdioToolSet.Init(ctx); err != nil {
+    return fmt.Errorf("failed to initialize stdio MCP toolset: %w", err)
+}
 
 sseToolSet := mcp.NewMCPToolSet(
     mcp.ConnectionConfig{
@@ -451,6 +531,9 @@ sseToolSet := mcp.NewMCPToolSet(
         Timeout:   10 * time.Second,
     },
 )
+if err := sseToolSet.Init(ctx); err != nil {
+    return fmt.Errorf("failed to initialize sse MCP toolset: %w", err)
+}
 
 streamableToolSet := mcp.NewMCPToolSet(
     mcp.ConnectionConfig{
@@ -459,6 +542,9 @@ streamableToolSet := mcp.NewMCPToolSet(
         Timeout:   10 * time.Second,
     },
 )
+if err := streamableToolSet.Init(ctx); err != nil {
+    return fmt.Errorf("failed to initialize streamable MCP toolset: %w", err)
+}
 
 // Create an Agent and integrate all tools.
 agent := llmagent.New("ai-assistant",
@@ -469,25 +555,223 @@ agent := llmagent.New("ai-assistant",
         calculatorTool, timeTool, searchTool,
     }),
     // Add ToolSets (ToolSet interface).
-    llmagent.WithToolSets([]tool.ToolSet{stdioToolSet, sseToolSet, streamableToolSet}),
+    llmagent.WithToolSets([]tool.ToolSet{
+        stdioToolSet, sseToolSet, streamableToolSet,
+    }),
 )
 ```
 
-### Tool Filters
+### MCP Tool Filters
+
+MCP ToolSets support filtering tools at creation time. It's recommended to use the unified `tool.FilterFunc` interface:
 
 ```go
-// Include filter: only allow specified tools.
-includeFilter := mcp.NewIncludeFilter("get_weather", "get_news", "calculator")
+import (
+    "trpc.group/trpc-go/trpc-agent-go/tool"
+    "trpc.group/trpc-go/trpc-agent-go/tool/mcp"
+)
 
-// Exclude filter: exclude specified tools.
-excludeFilter := mcp.NewExcludeFilter("deprecated_tool", "slow_tool")
+// ✅ Recommended: Use the unified filter interface
+includeFilter := tool.NewIncludeToolNamesFilter("get_weather", "get_news", "calculator")
+excludeFilter := tool.NewExcludeToolNamesFilter("deprecated_tool", "slow_tool")
 
-// Combined filters.
-combinedToolSet := mcp.NewMCPToolSet(
+// Apply filter
+toolSet := mcp.NewMCPToolSet(
     connectionConfig,
-    mcp.WithToolFilter(includeFilter),
+    mcp.WithToolFilterFunc(includeFilter),
+)
+
+// Optional: initialize once at startup to catch MCP connection / tool loading errors early.
+if err := toolSet.Init(ctx); err != nil {
+    return fmt.Errorf("failed to initialize MCP toolset: %w", err)
+}
+```
+
+### Per-Run Tool Filtering
+
+- Option one: Per-run tool filtering enables dynamic control of tool availability for each `runner.Run` invocation without modifying Agent configuration. This is a "soft constraint" mechanism for optimizing token consumption and implementing role-based tool access control.
+apply to all agents
+- Option two: Configure the runtime filtering function through 'llmagent. WhatToolFilter' to only apply to the current agent
+**Key Features:**
+
+- 🎯 **Per-Run Control**: Independent configuration per invocation, no Agent modification needed
+- 💰 **Cost Optimization**: Reduce tool descriptions sent to LLM, lowering token costs
+- 🛡️ **Smart Protection**: Framework tools (`transfer_to_agent`, `knowledge_search`) automatically preserved, never filtered
+- 🔧 **Flexible Customization**: Support for built-in filters and custom FilterFunc
+
+#### Basic Usage
+
+**1. Exclude Specific Tools (Exclude Filter)**
+
+Use blacklist approach to exclude unwanted tools:
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/tool"
+
+// Option 1:
+// Exclude text_tool and dangerous_tool, all other tools available
+filter := tool.NewExcludeToolNamesFilter("text_tool", "dangerous_tool")
+eventChan, err := runner.Run(ctx, userID, sessionID, message,
+    agent.WithToolFilter(filter),
+)
+
+// Option 2:
+agent := llmagent.New("ai-assistant",
+    llmagent.WithModel(model),
+    llmagent.WithInstruction("You are a helpful AI assistant that can use various tools to help users."),
+    llmagent.WithTools([]tool.Tool{
+        calculatorTool, timeTool, searchTool,
+    }),
+    llmagent.WithToolSets([]tool.ToolSet{
+        stdioToolSet, sseToolSet, streamableToolSet,
+    }),
+    llmagent.WithToolFilter(filter),
 )
 ```
+
+**2. Include Only Specific Tools (Include Filter)**
+
+Use whitelist approach to allow only specified tools:
+
+```go
+// Only allow calculator and time tool
+filter := tool.NewIncludeToolNamesFilter("calculator", "time_tool")
+eventChan, err := runner.Run(ctx, userID, sessionID, message,
+    agent.WithToolFilter(filter),
+)
+```
+
+**3. Custom Filtering Logic (Custom FilterFunc)**
+
+Implement custom filter function for complex filtering logic:
+
+```go
+// Option 1:
+// Custom filter: only allow tools with names starting with "safe_"
+filter := func(ctx context.Context, t tool.Tool) bool {
+    declaration := t.Declaration()
+    if declaration == nil {
+        return false
+    }
+    return strings.HasPrefix(declaration.Name, "safe_")
+}
+
+eventChan, err := runner.Run(ctx, userID, sessionID, message,
+    agent.WithToolFilter(filter),
+)
+
+// Option 2:
+agent := llmagent.New("ai-assistant",
+    llmagent.WithModel(model),
+    llmagent.WithInstruction("You are a helpful AI assistant that can use various tools to help users."),
+    llmagent.WithTools([]tool.Tool{
+        calculatorTool, timeTool, searchTool,
+    }),
+    llmagent.WithToolSets([]tool.ToolSet{
+        stdioToolSet, sseToolSet, streamableToolSet,
+    }),
+    llmagent.WithToolFilter(filter),
+```
+
+**4. Per-Agent Filtering**
+
+Use `agent.InvocationFromContext` to implement different tool sets for different Agents:
+
+```go
+// Define allowed tools for each Agent
+agentAllowedTools := map[string]map[string]bool{
+    "math-agent": {
+        "calculator": true,
+    },
+    "time-agent": {
+        "time_tool": true,
+    },
+}
+
+// Custom filter function: filter based on current Agent name
+filter := func(ctx context.Context, t tool.Tool) bool {
+    declaration := t.Declaration()
+    if declaration == nil {
+        return false
+    }
+    toolName := declaration.Name
+
+    // Get current Agent information from context
+    inv, ok := agent.InvocationFromContext(ctx)
+    if !ok || inv == nil {
+        return true // fallback: allow all tools
+    }
+
+    agentName := inv.AgentName
+
+    // Check if this tool is in the current Agent's allowed list
+    allowedTools, exists := agentAllowedTools[agentName]
+    if !exists {
+        return true // fallback: allow all tools
+    }
+
+    return allowedTools[toolName]
+}
+
+eventChan, err := runner.Run(ctx, userID, sessionID, message,
+    agent.WithToolFilter(filter),
+)
+```
+
+**Complete Example:** See `examples/toolfilter/` directory
+
+#### Smart Filtering Mechanism
+
+The framework automatically distinguishes **user tools** from **framework tools**, filtering only user tools:
+
+| Tool Category       | Includes                                                                                                                      | Filtered?                         |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| **User Tools**      | Tools registered via `WithTools`<br>Tools registered via `WithToolSets`                                                       | ✅ Subject to filtering           |
+| **Framework Tools** | `transfer_to_agent` (multi-Agent coordination)<br>`knowledge_search` (knowledge base retrieval)<br>`agentic_knowledge_search` | ❌ Never filtered, auto-preserved |
+
+**Example:**
+
+```go
+// Agent registers multiple tools
+agent := llmagent.New("assistant",
+    llmagent.WithTools([]tool.Tool{
+        calculatorTool,  // User tool
+        textTool,        // User tool
+    }),
+    llmagent.WithSubAgents([]agent.Agent{subAgent1, subAgent2}), // Auto-adds transfer_to_agent
+    llmagent.WithKnowledge(kb),                                   // Auto-adds knowledge_search
+)
+
+// Runtime filtering: only allow calculator
+filter := tool.NewIncludeToolNamesFilter("calculator")
+runner.Run(ctx, userID, sessionID, message,
+    agent.WithToolFilter(filter),
+)
+
+// Tools actually sent to LLM:
+// ✅ calculator        - User tool, in allowed list
+// ❌ textTool          - User tool, filtered out
+// ✅ transfer_to_agent - Framework tool, auto-preserved
+// ✅ knowledge_search  - Framework tool, auto-preserved
+```
+
+#### Important Notes
+
+⚠️ **Security Notice:** Per-run tool filtering is a "soft constraint" primarily for optimization and user experience. Tools must still implement their own authorization logic:
+
+```go
+func sensitiveOperation(ctx context.Context, req Request) (Result, error) {
+    // ✅ Required: internal tool authorization
+    if !hasPermission(ctx, req.UserID, "sensitive_operation") {
+        return nil, fmt.Errorf("permission denied")
+    }
+
+    // Execute operation
+    return performOperation(req)
+}
+```
+
+**Reason:** LLMs may know about tool existence and usage from context or memory and attempt to call them. Tool filtering reduces this possibility but cannot completely prevent it.
 
 ### Parallel Tool Execution
 
@@ -501,21 +785,74 @@ agent := llmagent.New("ai-assistant",
 )
 ```
 
+Graph workflows can also enable parallelism for a Tools node:
+
+```go
+stateGraph.AddToolsNode("tools", tools, graph.WithEnableParallelTools(true))
+```
+
 **Parallel execution effect:**
 
 ```bash
 # Parallel execution (enabled).
 Tool 1: get_weather     [====] 50ms
-Tool 2: get_population  [====] 50ms  
+Tool 2: get_population  [====] 50ms
 Tool 3: get_time       [====] 50ms
 Total time: ~50ms (executed simultaneously)
 
 # Serial execution (default).
 Tool 1: get_weather     [====] 50ms
 Tool 2: get_population       [====] 50ms
-Tool 3: get_time                  [====] 50ms  
+Tool 3: get_time                  [====] 50ms
 Total time: ~150ms (executed sequentially)
 ```
+
+### Dynamic ToolSet Management (Runtime)
+
+`WithToolSets` is a **static** configuration: it wires ToolSets when constructing the Agent. In many real‑world scenarios you also need to **add, remove, or replace ToolSets at runtime** without recreating the Agent.
+
+LLMAgent exposes three methods for this:
+
+- `AddToolSet(toolSet tool.ToolSet)` — add or replace a ToolSet by `ToolSet.Name()`.
+- `RemoveToolSet(name string) bool` — remove all ToolSets whose `Name()` matches `name`.
+- `SetToolSets(toolSets []tool.ToolSet)` — replace all ToolSets with the provided slice.
+
+These methods are concurrency‑safe and automatically recompute:
+
+- Aggregated tools (direct tools + ToolSets + knowledge tools + skill tools)
+- User tool tracking (used by the smart filtering logic above)
+
+**Typical usage pattern:**
+
+```go
+// 1. Create Agent with base tools only.
+agent := llmagent.New("dynamic-assistant",
+    llmagent.WithModel(model),
+    llmagent.WithTools([]tool.Tool{calculatorTool}),
+)
+
+// 2. Later, attach an MCP ToolSet at runtime.
+mcpToolSet := mcp.NewMCPToolSet(connectionConfig)
+if err := mcpToolSet.Init(ctx); err != nil {
+    return fmt.Errorf("failed to init MCP ToolSet: %w", err)
+}
+agent.AddToolSet(mcpToolSet)
+
+// 3. Replace all ToolSets from configuration (declarative control plane).
+toolSetsFromConfig := []tool.ToolSet{mcpToolSet, fileToolSet}
+agent.SetToolSets(toolSetsFromConfig)
+
+// 4. Remove a ToolSet by name (e.g., feature rollback).
+removed := agent.RemoveToolSet(mcpToolSet.Name())
+if !removed {
+    log.Printf("ToolSet %q not found", mcpToolSet.Name())
+}
+```
+
+Runtime ToolSet updates integrate seamlessly with the **tool filtering** logic described earlier:
+
+- Tools coming from `WithTools` or any ToolSet (including dynamically added ones) are treated as **user tools** and are subject to `WithToolFilter` and per‑run filters.
+- Framework tools such as `transfer_to_agent`, `knowledge_search`, and `agentic_knowledge_search` remain **never filtered** and are always available.
 
 ## Quick Start
 
@@ -534,7 +871,7 @@ package main
 import (
     "context"
     "fmt"
-    
+
     "trpc.group/trpc-go/trpc-agent-go/runner"
     "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
     "trpc.group/trpc-go/trpc-agent-go/model/openai"
@@ -564,7 +901,7 @@ func main() {
         function.WithName("calculator"),
         function.WithDescription("Simple calculator."),
     )
-    
+
     // 2. Create model and Agent.
     llmModel := openai.New("DeepSeek-V3-Online-64K")
     agent := llmagent.New("calculator-assistant",
@@ -573,25 +910,25 @@ func main() {
         llmagent.WithTools([]tool.Tool{calculatorTool}),
         llmagent.WithGenerationConfig(model.GenerationConfig{Stream: true}), // Enable streaming output.
     )
-    
+
     // 3. Create Runner and execute.
     r := runner.NewRunner("math-app", agent)
-    
+
     ctx := context.Background()
     userMessage := model.NewUserMessage("Please calculate 25 times 4.")
-    
+
     eventChan, err := r.Run(ctx, "user1", "session1", userMessage)
     if err != nil {
         panic(err)
     }
-    
+
     // 4. Handle responses.
     for event := range eventChan {
         if event.Error != nil {
             fmt.Printf("Error: %s\n", event.Error.Message)
             continue
         }
-        
+
         // Display tool calls.
         if len(event.Response.Choices) > 0 && len(event.Response.Choices[0].Message.ToolCalls) > 0 {
             for _, toolCall := range event.Response.Choices[0].Message.ToolCalls {
@@ -599,12 +936,12 @@ func main() {
                 fmt.Printf("   Params: %s\n", string(toolCall.Function.Arguments))
             }
         }
-        
+
         // Display streaming content.
         if len(event.Response.Choices) > 0 {
             fmt.Print(event.Response.Choices[0].Delta.Content)
         }
-        
+
         if event.Done {
             break
         }
@@ -619,7 +956,7 @@ func main() {
 cd examples/tool
 go run .
 
-# Enter the MCP tool example directory.  
+# Enter the MCP tool example directory.
 cd examples/mcp_tool
 
 # Start the external server.

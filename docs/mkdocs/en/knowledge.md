@@ -76,6 +76,9 @@ import (
     "trpc.group/trpc-go/trpc-agent-go/model/openai"
     "trpc.group/trpc-go/trpc-agent-go/runner"
     "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
+
+    // Import PDF reader to register it (optional - has separate go.mod to avoid unnecessary dependencies).
+    // _ "trpc.group/trpc-go/trpc-agent-go/knowledge/document/reader/pdf"
 )
 
 func main() {
@@ -358,58 +361,128 @@ llmAgent := llmagent.New(
 
 Vector storage can be configured through options in code. Configuration sources can be configuration files, command line parameters, or environment variables, which users can implement themselves.
 
+trpc-agent-go supports multiple vector store implementations:
+
+- **Memory**: In-memory vector store, suitable for testing and small-scale data
+- **PgVector**: PostgreSQL + pgvector extension based vector store, supports hybrid search
+- **TcVector**: Tencent Cloud Vector Database, supports remote embedding computation and hybrid search
+- **Elasticsearch**: Supports v7/v8/v9 multi-version Elasticsearch vector store
+
 #### Vector Store Configuration Examples
+
+##### Memory (In-memory Vector Store)
 
 ```go
 import (
     vectorinmemory "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/inmemory"
-    vectorpgvector "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/pgvector"
-    vectortcvector "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/tcvector"
-    vectorelasticsearch "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/elasticsearch"
 )
 
-// In-memory implementation, can be used for testing.
+// In-memory implementation, suitable for testing and small-scale data
 memVS := vectorinmemory.New()
 
-// PostgreSQL + pgvector.
+kb := knowledge.New(
+    knowledge.WithVectorStore(memVS),
+    knowledge.WithEmbedder(embedder), // Requires local embedder
+)
+```
+
+##### PgVector (PostgreSQL + pgvector)
+
+```go
+import (
+    vectorpgvector "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/pgvector"
+)
+
+// PostgreSQL + pgvector
 pgVS, err := vectorpgvector.New(
     vectorpgvector.WithHost("127.0.0.1"),
     vectorpgvector.WithPort(5432),
     vectorpgvector.WithUser("postgres"),
     vectorpgvector.WithPassword("your-password"),
     vectorpgvector.WithDatabase("your-database"),
-    // Set index dimension based on embedding model (text-embedding-3-small is 1536).
-    pgvector.WithIndexDimension(1536),
-    // Enable/disable text retrieval vector, used with hybrid search weights.
-    pgvector.WithEnableTSVector(true),
-    // Adjust hybrid search weights (vector similarity weight vs text relevance weight).
-    pgvector.WithHybridSearchWeights(0.7, 0.3),
-    // If Chinese word segmentation extension is installed (like zhparser/jieba), set language to improve text recall.
-    pgvector.WithLanguageExtension("english"),
+    // Set index dimension based on embedding model (text-embedding-3-small is 1536)
+    vectorpgvector.WithIndexDimension(1536),
+    // Enable/disable text retrieval vector, used with hybrid search weights
+    vectorpgvector.WithEnableTSVector(true),
+    // Adjust hybrid search weights (vector similarity weight vs text relevance weight)
+    vectorpgvector.WithHybridSearchWeights(0.7, 0.3),
+    // If Chinese word segmentation extension is installed (like zhparser/jieba), set language to improve text recall
+    vectorpgvector.WithLanguageExtension("english"),
 )
 if err != nil {
-    // Handle error.
+    // Handle error
 }
+
+kb := knowledge.New(
+    knowledge.WithVectorStore(pgVS),
+    knowledge.WithEmbedder(embedder), // Requires local embedder
+)
+```
+
+##### TcVector (Tencent Cloud Vector Database)
+
+TcVector supports two embedding modes:
+
+**1. Local Embedding Mode (Default)**
+
+Use local embedder to compute vectors, then store to TcVector:
+
+```go
+import (
+    vectortcvector "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/tcvector"
+)
 
 docBuilder := func(tcDoc tcvectordb.Document) (*document.Document, []float64, error) {
     return &document.Document{ID: tcDoc.Id}, nil, nil
 }
 
-// TcVector.
+// Local embedding mode
 tcVS, err := vectortcvector.New(
     vectortcvector.WithURL("https://your-tcvector-endpoint"),
     vectortcvector.WithUsername("your-username"),
     vectortcvector.WithPassword("your-password"),
-    // Optional custom method to build documents for retrieval. Falls back to the default if not provided.
+    // Optional custom method to build documents for retrieval. Falls back to the default if not provided
     vectortcvector.WithDocBuilder(docBuilder),
 )
 if err != nil {
-    // Handle error.
+    // Handle error
 }
 
-// Pass to Knowledge.
 kb := knowledge.New(
-    knowledge.WithVectorStore(memVS), // pgVS, tcVS.
+    knowledge.WithVectorStore(tcVS),
+    knowledge.WithEmbedder(embedder), // Requires local embedder
+)
+```
+
+**2. Remote Embedding Mode**
+
+Use TcVector cloud-side embedding computation, no local embedder needed, saves resources:
+
+```go
+import (
+    vectortcvector "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/tcvector"
+)
+
+// Remote embedding mode
+tcVS, err := vectortcvector.New(
+    vectortcvector.WithURL("https://your-tcvector-endpoint"),
+    vectortcvector.WithUsername("your-username"),
+    vectortcvector.WithPassword("your-password"),
+    // Enable remote embedding computation
+    vectortcvector.WithEnableRemoteEmbedding(true),
+    // Specify TcVector embedding model (e.g., bge-base-zh)
+    vectortcvector.WithRemoteEmbeddingModel("bge-base-zh"),
+    // If hybrid search is needed, enable TSVector
+    vectortcvector.WithEnableTSVector(true),
+)
+if err != nil {
+    // Handle error
+}
+
+kb := knowledge.New(
+    knowledge.WithVectorStore(tcVS),
+    // Note: When using remote embedding, no need to configure embedder
+    // knowledge.WithEmbedder(embedder), // Not needed
 )
 ```
 
@@ -512,6 +585,8 @@ kb := knowledge.New(
 - OpenAI embedding models (text-embedding-3-small, etc.)
 - Other OpenAI API compatible embedding services
 - Gemini embedding model (via `knowledge/embedder/gemini`)
+- Ollama embedding model (via `knowledge/embedder/ollama`)
+- huggingface text_embedding_interface model (via `knowledge/embedder/huggingface`）
 
 > **Note**:
 >
@@ -660,7 +735,7 @@ eventCh, err := runner.Run(
 )
 ```
 
-Runner-level filters have higher priority than Agent-level filters, and values with the same key will be overridden:
+**Important**: Agent-level filters have higher priority than Runner-level filters, and values with the same key will be overridden by Agent-level:
 
 ```go
 // Agent-level filter
@@ -673,19 +748,19 @@ llmAgent := llmagent.New(
     }),
 )
 
-// Runner-level filter will override the same keys
+// Runner-level filter's same keys will be overridden by Agent-level
 eventCh, err := runner.Run(
     ctx, userID, sessionID, message,
     agent.WithKnowledgeFilter(map[string]interface{}{
-        "source": "external",  // Override Agent-level "internal"
-        "topic":  "api",       // Add new filter condition
+        "source": "external",  // Will be overridden by Agent-level "internal"
+        "topic":  "api",       // Add new filter condition (not in Agent-level)
     }),
 )
 
 // Final effective filter:
 // {
 //     "category": "general",   // From Agent-level
-//     "source":   "external",  // From Runner-level (overridden)
+//     "source":   "internal",  // From Agent-level (overrode Runner-level "external")
 //     "topic":    "api",       // From Runner-level (added)
 // }
 ```
@@ -714,43 +789,140 @@ llmAgent := llmagent.New(
 )
 ```
 
-#### Filter Priority
+#### Filter Layers
 
-The system supports multi-layer filters, merged according to the following priority (later overrides earlier):
+The Knowledge system supports multi-layer filters, all implemented using FilterCondition and combined with **AND logic**. The system does not distinguish priority; all layer filters are merged equally.
 
-1. **Agent-level Filters**: Fixed filters set by `WithKnowledgeFilter()` (lowest priority)
-2. **Runner-level Filters**: Runtime filters passed at execution time (medium priority)
-3. **Intelligent Filters**: Filters dynamically generated by LLM (highest priority)
+**Filter Layers**:
+
+1. **Agent-level Filters**:
+   - Metadata filters set via `llmagent.WithKnowledgeFilter()`
+   - Complex condition filters set via `llmagent.WithKnowledgeConditionedFilter()`
+
+2. **Tool-level Filters**:
+   - Metadata filters set via `tool.WithFilter()`
+   - Complex condition filters set via `tool.WithConditionedFilter()`
+   - Note: Agent-level filters are actually implemented through Tool-level filters
+
+3. **Runner-level Filters**:
+   - Metadata filters passed via `agent.WithKnowledgeFilter()` in `runner.Run()`
+   - Complex condition filters passed via `agent.WithKnowledgeConditionedFilter()` in `runner.Run()`
+
+4. **LLM Intelligent Filters**:
+   - Filters dynamically generated by LLM based on user queries (complex condition filters only)
+
+> **Important Notes**:
+> - All filters are combined with **AND logic**, meaning documents must satisfy all filter conditions at all levels
+> - There is no priority override relationship; all filters are equal constraints
+> - Each level supports both metadata filters and complex condition filters (except LLM, which only supports complex conditions)
+
+##### Example: Filter Combination
 
 ```go
-// Filter merging logic (priority: Agent < Runner < Intelligent Filter)
-// If multiple levels set the same key, higher priority values override lower priority ones
+import "trpc.group/trpc-go/trpc-agent-go/knowledge/searchfilter"
 
-// Agent-level filter (basic filter)
-agentFilter := map[string]interface{}{
-    "category": "documentation",
-    "source":   "internal",
-}
+// 1. Agent-level filters
+llmAgent := llmagent.New(
+    "knowledge-assistant",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithKnowledge(kb),
+    // Agent-level metadata filter
+    llmagent.WithKnowledgeFilter(map[string]interface{}{
+        "source":   "official",      // Official source
+        "category": "documentation", // Documentation category
+    }),
+    // Agent-level complex condition filter
+    llmagent.WithKnowledgeConditionedFilter(
+        searchfilter.Equal("status", "published"), // Published status
+    ),
+)
 
-// Runner-level filter (runtime filter)
-runnerFilter := map[string]interface{}{
-    "source": "official",  // Override Agent-level "internal"
-    "topic":  "api",
-}
+// 2. Runner-level filters
+eventCh, err := runner.Run(
+    ctx, userID, sessionID, message,
+    // Runner-level metadata filter
+    agent.WithKnowledgeFilter(map[string]interface{}{
+        "region":   "china",  // China region
+        "language": "zh",     // Chinese language
+    }),
+    // Runner-level complex condition filter
+    agent.WithKnowledgeConditionedFilter(
+        searchfilter.GreaterThan("priority", 5), // Priority greater than 5
+    ),
+)
 
-// Intelligent filter (LLM dynamically generated)
-intelligentFilter := map[string]interface{}{
-    "topic": "programming",  // Override Runner-level "api"
-    "level": "advanced",
-}
+// 3. LLM intelligent filter (dynamically generated by LLM)
+// Example: User asks "find API related docs", LLM might generate {"topic": "api"}
 
-// Final merged result
-finalFilter := {
-    "category": "documentation",  // From Agent-level
-    "source":   "official",       // From Runner-level (overrode Agent-level)
-    "topic":    "programming",     // From intelligent filter (overrode Runner-level)
-    "level":    "advanced",       // From intelligent filter
-}
+// Final effective filter conditions (all combined with AND):
+// source = "official" AND 
+// category = "documentation" AND 
+// status = "published" AND
+// region = "china" AND 
+// language = "zh" AND 
+// priority > 5 AND
+// topic = "api"
+//
+// i.e., must satisfy all conditions at all levels
+```
+
+##### Complex Condition Filter Example
+
+```go
+// Manually create Tool with complex condition filters
+searchTool := tool.NewKnowledgeSearchTool(
+    kb,
+    // Agent-level metadata filter
+    tool.WithFilter(map[string]interface{}{
+        "source": "official",
+    }),
+    // Agent-level complex condition filter
+    tool.WithConditionedFilter(
+        searchfilter.Or(
+            searchfilter.Equal("topic", "programming"),
+            searchfilter.Equal("topic", "llm"),
+        ),
+    ),
+)
+
+llmAgent := llmagent.New(
+    "knowledge-assistant",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithTools(searchTool),  // Manually pass Tool
+)
+
+// Final filter conditions:
+// source = "official" AND (topic = "programming" OR topic = "llm")
+// i.e., must be official source AND topic is either programming or LLM
+```
+
+##### Common Filter Helper Functions
+
+```go
+// Comparison operators
+searchfilter.Equal(field, value)              // field = value
+searchfilter.NotEqual(field, value)           // field != value
+searchfilter.GreaterThan(field, value)        // field > value
+searchfilter.GreaterThanOrEqual(field, value) // field >= value
+searchfilter.LessThan(field, value)           // field < value
+searchfilter.LessThanOrEqual(field, value)    // field <= value
+searchfilter.In(field, values...)             // field IN (...)
+searchfilter.NotIn(field, values...)          // field NOT IN (...)
+searchfilter.Like(field, pattern)             // field LIKE pattern
+searchfilter.Between(field, min, max)         // field BETWEEN min AND max
+
+// Logical operators
+searchfilter.And(conditions...)               // AND combination
+searchfilter.Or(conditions...)                // OR combination
+
+// Nested example: (status = 'published') AND (category = 'doc' OR category = 'tutorial')
+searchfilter.And(
+    searchfilter.Equal("status", "published"),
+    searchfilter.Or(
+        searchfilter.Equal("category", "documentation"),
+        searchfilter.Equal("category", "tutorial"),
+    ),
+)
 ```
 
 ### Metadata Configuration
@@ -829,19 +1001,37 @@ vectorStore, err := vectorpgvector.New(
 
 #### TcVector
 
-- ✅ Supports predefined field filtering
-- ⚠️ Requires pre-establishing filter field indexes
+- ✅ Supports all metadata filtering
+- ✅ v0.4.0+ new collections automatically support JSON index (requires TCVector service support)
+- ⚡ Optional: Use `WithFilterIndexFields` to build additional indexes for frequently queried fields
 
 ```go
-// Get all metadata keys for establishing indexes
-metadataKeys := source.GetAllMetadataKeys(sources)
-
+// v0.4.0+ new collections (TCVector service supports JSON index)
 vectorStore, err := vectortcvector.New(
     vectortcvector.WithURL("https://your-endpoint"),
-    vectortcvector.WithFilterIndexFields(metadataKeys), // Establish filter field indexes
+    // ... other configurations
+)
+// All metadata fields are queryable via JSON index, no need to predefine
+
+// Optional: Build additional indexes for high-frequency fields to optimize performance
+metadataKeys := source.GetAllMetadataKeys(sources)
+vectorStore, err := vectortcvector.New(
+    vectortcvector.WithURL("https://your-endpoint"),
+    vectortcvector.WithFilterIndexFields(metadataKeys), // Optional: build additional indexes
+    // ... other configurations
+)
+
+// Collections before v0.4.0 or TCVector service without JSON index support
+vectorStore, err := vectortcvector.New(
+    vectortcvector.WithURL("https://your-endpoint"),
+    vectortcvector.WithFilterIndexFields(metadataKeys), // Required: predefine filter fields
     // ... other configurations
 )
 ```
+
+**Notes:**
+- **v0.4.0+ new collections**: Automatically create metadata JSON index, all fields queryable
+- **Legacy collections**: Only fields in `WithFilterIndexFields` are queryable
 
 #### In-memory Storage
 
@@ -1004,6 +1194,8 @@ import (
     "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder"
     geminiembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/gemini"
     openaiembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/openai"
+	ollamaembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/ollama"
+	huggingfaceembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/huggingface"
 
     // Source.
     "trpc.group/trpc-go/trpc-agent-go/knowledge/source"
@@ -1017,11 +1209,14 @@ import (
     vectorinmemory "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/inmemory"
     vectorpgvector "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/pgvector"
     vectortcvector "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/tcvector"
+
+    // Import PDF reader to register it (optional - has separate go.mod to avoid unnecessary dependencies).
+    // _ "trpc.group/trpc-go/trpc-agent-go/knowledge/document/reader/pdf"
 )
 
 func main() {
     var (
-        embedderType    = flag.String("embedder", "openai", "embedder type (openai, gemini)")
+        embedderType    = flag.String("embedder", "openai", "embedder type (openai, gemini, ollama, huggingface)")
         vectorStoreType = flag.String("vectorstore", "inmemory", "vector store type (inmemory, pgvector, tcvector)")
         modelName       = flag.String("model", "claude-4-sonnet-20250514", "Name of the model to use")
     )
@@ -1040,6 +1235,13 @@ func main() {
         if err != nil {
             log.Fatalf("Failed to create gemini embedder: %v", err)
         }
+	case "ollama":
+		embedder, err = ollamaembedder.New()
+		if err != nil {
+			log.Fatalf("Failed to create ollama embedder: %v", err)
+		}
+	case "huggingface":
+		embedder = huggingfaceembedder.New()
     default: // openai.
         embedder = openaiembedder.New(
             openaiembedder.WithModel(getEnvOrDefault("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")),
@@ -1263,7 +1465,7 @@ go run main.go -embedder openai -vectorstore tcvector
 go run main.go -embedder openai -vectorstore elasticsearch -es-version v9
 
 # Parameter description:
-# -embedder: Select embedder type (openai, gemini), default is openai.
+# -embedder: Select embedder type (openai, gemini, ollama, huggingface), default is openai.
 # -vectorstore: Select vector store type (inmemory, pgvector, tcvector, elasticsearch), default is inmemory.
 # -es-version: Elasticsearch version (v7, v8, v9), only when vectorstore=elasticsearch.
 ```
@@ -1346,3 +1548,15 @@ go run main.go -embedder openai -vectorstore elasticsearch -es-version v9
      - Confirm files exist and extensions are supported (.md/.txt/.pdf/.csv/.json/.docx, etc.);
      - Whether directory source needs `WithRecursive(true)`;
      - Use `WithFileExtensions` for whitelist filtering.
+
+7. **PDF file reading support**
+
+   - Note: The PDF reader depends on third-party libraries. To avoid introducing unnecessary dependencies into the main module, the PDF reader uses a separate `go.mod`.
+   - Usage: To support PDF file reading, manually import the PDF reader package for registration:
+     ```go
+     import (
+         // Import PDF reader to support .pdf file parsing.
+         _ "trpc.group/trpc-go/trpc-agent-go/knowledge/document/reader/pdf"
+     )
+     ```
+   - Note: Readers for other formats (.txt/.md/.csv/.json, etc.) are automatically registered and do not require manual import.

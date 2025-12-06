@@ -13,7 +13,6 @@ package graphagent
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
@@ -24,6 +23,25 @@ import (
 )
 
 var defaultChannelBufferSize = 256
+
+const (
+	// BranchFilterModePrefix Prefix matching pattern
+	BranchFilterModePrefix = processor.BranchFilterModePrefix
+	// BranchFilterModeAll include all
+	BranchFilterModeAll = processor.BranchFilterModeAll
+	// BranchFilterModeExact exact match
+	BranchFilterModeExact = processor.BranchFilterModeExact
+
+	// TimelineFilterAll includes all historical message records
+	// Suitable for scenarios requiring full conversation context
+	TimelineFilterAll = processor.TimelineFilterAll
+	// TimelineFilterCurrentRequest only includes messages within the current request cycle
+	// Filters out previous historical records, keeping only messages related to this request
+	TimelineFilterCurrentRequest = processor.TimelineFilterCurrentRequest
+	// TimelineFilterCurrentInvocation only includes messages within the current invocation session
+	// Suitable for scenarios requiring isolation between different invocation cycles in long-running sessions
+	TimelineFilterCurrentInvocation = processor.TimelineFilterCurrentInvocation
+)
 
 // Option is a function that configures a GraphAgent.
 type Option func(*Options)
@@ -52,6 +70,9 @@ func WithInitialState(state graph.State) Option {
 // WithChannelBufferSize sets the buffer size for event channels.
 func WithChannelBufferSize(size int) Option {
 	return func(opts *Options) {
+		if size < 0 {
+			size = defaultChannelBufferSize
+		}
 		opts.ChannelBufferSize = size
 	}
 }
@@ -70,6 +91,20 @@ func WithCheckpointSaver(saver graph.CheckpointSaver) Option {
 	}
 }
 
+// WithMessageTimelineFilterMode sets the message timeline filter mode.
+func WithMessageTimelineFilterMode(mode string) Option {
+	return func(opts *Options) {
+		opts.messageTimelineFilterMode = mode
+	}
+}
+
+// WithMessageBranchFilterMode sets the message branch filter mode.
+func WithMessageBranchFilterMode(mode string) Option {
+	return func(opts *Options) {
+		opts.messageBranchFilterMode = mode
+	}
+}
+
 // Options contains configuration options for creating a GraphAgent.
 type Options struct {
 	// Description is a description of the agent.
@@ -84,6 +119,11 @@ type Options struct {
 	ChannelBufferSize int
 	// CheckpointSaver is the checkpoint saver for the executor.
 	CheckpointSaver graph.CheckpointSaver
+
+	// MessageTimelineFilterMode is the message timeline filter mode.
+	messageTimelineFilterMode string
+	// MessageBranchFilterMode is the message branch filter mode.
+	messageBranchFilterMode string
 }
 
 // GraphAgent is an agent that executes a graph.
@@ -96,6 +136,7 @@ type GraphAgent struct {
 	agentCallbacks    *agent.Callbacks
 	initialState      graph.State
 	channelBufferSize int
+	options           Options
 }
 
 // New creates a new GraphAgent with the given graph and options.
@@ -131,6 +172,7 @@ func New(name string, g *graph.Graph, opts ...Option) (*GraphAgent, error) {
 		agentCallbacks:    options.AgentCallbacks,
 		initialState:      options.InitialState,
 		channelBufferSize: options.ChannelBufferSize,
+		options:           options,
 	}, nil
 }
 
@@ -144,15 +186,21 @@ func (ga *GraphAgent) Run(ctx context.Context, invocation *agent.Invocation) (<-
 
 	// Execute the graph.
 	if ga.agentCallbacks != nil {
-		customResponse, err := ga.agentCallbacks.RunBeforeAgent(ctx, invocation)
+		result, err := ga.agentCallbacks.RunBeforeAgent(ctx, &agent.BeforeAgentArgs{
+			Invocation: invocation,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("before agent callback failed: %w", err)
 		}
-		if customResponse != nil {
+		// Use the context from result if provided.
+		if result != nil && result.Context != nil {
+			ctx = result.Context
+		}
+		if result != nil && result.CustomResponse != nil {
 			// Create a channel that returns the custom response and then closes.
 			eventChan := make(chan *event.Event, 1)
 			// Create an event from the custom response.
-			customevent := event.NewResponseEvent(invocation.InvocationID, invocation.AgentName, customResponse)
+			customevent := event.NewResponseEvent(invocation.InvocationID, invocation.AgentName, result.CustomResponse)
 			agent.EmitEvent(ctx, invocation, eventChan, customevent)
 			close(eventChan)
 			return eventChan, nil
@@ -190,25 +238,12 @@ func (ga *GraphAgent) createInitialState(ctx context.Context, invocation *agent.
 	if invocation.Session != nil {
 		// Build a temporary request to reuse the processor logic.
 		req := &model.Request{}
-		// Default include mode is All for graphs unless overridden by runtime state.
-		// Docs note: If RuntimeState[CfgKeyIncludeContents] is not one of
-		// {none, filtered, all}, ignore it and fall back to the default (all)
-		// to avoid accidental context loss.
-		include := processor.IncludeContentsAll
-		if mode, ok := invocation.RunOptions.RuntimeState[graph.CfgKeyIncludeContents].(string); ok && mode != "" {
-			switch strings.ToLower(mode) {
-			case processor.IncludeContentsNone:
-				include = processor.IncludeContentsNone
-			case processor.IncludeContentsFiltered:
-				include = processor.IncludeContentsFiltered
-			case processor.IncludeContentsAll:
-				include = processor.IncludeContentsAll
-			}
-		}
+
 		// Default processor: include (possibly overridden) + preserve same branch.
 		p := processor.NewContentRequestProcessor(
-			processor.WithIncludeContents(include),
+			processor.WithBranchFilterMode(ga.options.messageBranchFilterMode),
 			processor.WithPreserveSameBranch(true),
+			processor.WithTimelineFilterMode(ga.options.messageTimelineFilterMode),
 		)
 		// We only need messages side effect; no output channel needed.
 		p.ProcessRequest(ctx, invocation, req, nil)
@@ -239,6 +274,10 @@ func (ga *GraphAgent) createInitialState(ctx context.Context, invocation *agent.
 	}
 	// Add parent agent to state so agent nodes can access sub-agents.
 	initialState[graph.StateKeyParentAgent] = ga
+	// Set checkpoint namespace if not already set.
+	if ns, ok := initialState[graph.CfgKeyCheckpointNS].(string); !ok || ns == "" {
+		initialState[graph.CfgKeyCheckpointNS] = ga.name
+	}
 
 	return initialState
 }
@@ -284,14 +323,26 @@ func (ga *GraphAgent) wrapEventChannel(
 	wrappedChan := make(chan *event.Event, ga.channelBufferSize)
 	go func() {
 		defer close(wrappedChan)
+		var fullRespEvent *event.Event
 		// Forward all events from the original channel
 		for evt := range originalChan {
+			if evt != nil && evt.Response != nil && !evt.Response.IsPartial {
+				fullRespEvent = evt
+			}
 			if err := event.EmitEvent(ctx, wrappedChan, evt); err != nil {
 				return
 			}
 		}
 		// After all events are processed, run after agent callbacks
-		customResponse, err := ga.agentCallbacks.RunAfterAgent(ctx, invocation, nil)
+		result, err := ga.agentCallbacks.RunAfterAgent(ctx, &agent.AfterAgentArgs{
+			Invocation:        invocation,
+			Error:             nil,
+			FullResponseEvent: fullRespEvent,
+		})
+		// Use the context from result if provided.
+		if result != nil && result.Context != nil {
+			ctx = result.Context
+		}
 		var evt *event.Event
 		if err != nil {
 			// Send error event.
@@ -301,12 +352,12 @@ func (ga *GraphAgent) wrapEventChannel(
 				agent.ErrorTypeAgentCallbackError,
 				err.Error(),
 			)
-		} else if customResponse != nil {
+		} else if result != nil && result.CustomResponse != nil {
 			// Create an event from the custom response.
 			evt = event.NewResponseEvent(
 				invocation.InvocationID,
 				invocation.AgentName,
-				customResponse,
+				result.CustomResponse,
 			)
 		}
 

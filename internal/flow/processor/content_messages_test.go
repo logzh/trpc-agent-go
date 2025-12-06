@@ -12,6 +12,7 @@ package processor
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
@@ -114,7 +115,9 @@ func TestProcessRequest_PreserveSameBranchKeepsRoles(t *testing.T) {
 	makeInvocation := func(sess *session.Session) *agent.Invocation {
 		inv := agent.NewInvocation(
 			agent.WithInvocationSession(sess),
-			agent.WithInvocationMessage(model.NewUserMessage("latest request")),
+			agent.WithInvocationMessage(
+				model.NewUserMessage("latest request"),
+			),
 			agent.WithInvocationEventFilterKey("graph-agent"),
 		)
 		inv.AgentName = "graph-agent"
@@ -129,23 +132,106 @@ func TestProcessRequest_PreserveSameBranchKeepsRoles(t *testing.T) {
 		newSessionEventWithBranch("graph-node", "graph-agent", "graph-agent/graph-node", assistantMsg),
 	)
 
-	// Default behavior rewrites same-branch assistant events as user context.
-	defaultReq := &model.Request{}
-	defaultProc := NewContentRequestProcessor()
-	defaultProc.ProcessRequest(context.Background(), makeInvocation(sess), defaultReq, nil)
-	require.Equal(t, 2, len(defaultReq.Messages))
-	require.Equal(t, model.RoleUser, defaultReq.Messages[0].Role)
-	require.Equal(t, model.RoleUser, defaultReq.Messages[1].Role)
-	require.Contains(t, defaultReq.Messages[1].Content, "For context")
-
-	// Enabling preserve option keeps assistant/tool roles intact for same-branch events.
+	// Default behavior now preserves same-branch assistant/tool roles.
+	// Explicitly enabling preserve keeps assistant role.
 	preserveReq := &model.Request{}
-	preserveProc := NewContentRequestProcessor(WithPreserveSameBranch(true))
-	preserveProc.ProcessRequest(context.Background(), makeInvocation(sess), preserveReq, nil)
+	preserveProc := NewContentRequestProcessor(
+		WithPreserveSameBranch(true),
+	)
+	preserveProc.ProcessRequest(
+		context.Background(), makeInvocation(sess), preserveReq, nil,
+	)
 	require.Equal(t, 2, len(preserveReq.Messages))
 	require.Equal(t, model.RoleUser, preserveReq.Messages[0].Role)
 	require.Equal(t, model.RoleAssistant, preserveReq.Messages[1].Role)
 	require.Equal(t, assistantMsg.Content, preserveReq.Messages[1].Content)
+
+	// Disabling preserve rewrites same-branch events as user context.
+	optOutReq := &model.Request{}
+	optOutProc := NewContentRequestProcessor(
+		WithPreserveSameBranch(false),
+	)
+	optOutProc.ProcessRequest(
+		context.Background(), makeInvocation(sess), optOutReq, nil,
+	)
+	require.Equal(t, 2, len(optOutReq.Messages))
+	require.Equal(t, model.RoleUser, optOutReq.Messages[0].Role)
+	require.Equal(t, model.RoleUser, optOutReq.Messages[1].Role)
+	require.Contains(t, optOutReq.Messages[1].Content, "For context")
+}
+
+// When the historical event branch is an ancestor or descendant of the current
+// branch, PreserveSameBranch=true should keep assistant roles.
+func TestProcessRequest_PreserveSameBranch_AncestorDescendant(t *testing.T) {
+	makeInvocation := func(sess *session.Session) *agent.Invocation {
+		inv := agent.NewInvocation(
+			agent.WithInvocationSession(sess),
+			agent.WithInvocationMessage(
+				model.NewUserMessage("latest request"),
+			),
+			agent.WithInvocationEventFilterKey("graph-agent"),
+		)
+		inv.AgentName = "graph-agent"
+		inv.Branch = "graph-agent/child"
+		return inv
+	}
+
+	// ancestor: graph-agent
+	// descendant: graph-agent/child/grandchild
+	msgAncestor := model.NewAssistantMessage("from ancestor")
+	msgDesc := model.NewAssistantMessage("from descendant")
+
+	sess := &session.Session{}
+	sess.Events = append(sess.Events,
+		newSessionEventWithBranch(
+			"graph-root", "graph-agent", "graph-agent", msgAncestor,
+		),
+		newSessionEventWithBranch(
+			"graph-leaf", "graph-agent",
+			"graph-agent/child/grandchild", msgDesc,
+		),
+	)
+
+	req := &model.Request{}
+	p := NewContentRequestProcessor(WithPreserveSameBranch(true))
+	p.ProcessRequest(context.Background(), makeInvocation(sess), req, nil)
+
+	require.Equal(t, 2, len(req.Messages))
+	require.Equal(t, model.RoleAssistant, req.Messages[0].Role)
+	require.Equal(t, msgAncestor.Content, req.Messages[0].Content)
+	require.Equal(t, model.RoleAssistant, req.Messages[1].Role)
+	require.Equal(t, msgDesc.Content, req.Messages[1].Content)
+}
+
+// When the historical event is on a different branch lineage, it should be
+// converted to user context even when preserve is true (default).
+func TestProcessRequest_CrossBranch_RewritesToUser(t *testing.T) {
+	inv := agent.NewInvocation(
+		agent.WithInvocationSession(&session.Session{}),
+		agent.WithInvocationMessage(model.NewUserMessage("ask")),
+		agent.WithInvocationEventFilterKey("graph-agent"),
+	)
+	inv.AgentName = "graph-agent"
+	inv.Branch = "graph-agent"
+
+	// Cross-branch event (not same lineage). Use the same filter key so it is
+	// included by IncludeContentsFiltered.
+	msg := model.NewAssistantMessage("foreign content")
+	evt := newSessionEventWithBranch(
+		"other-agent", "graph-agent", "other-root", msg,
+	)
+
+	sess := &session.Session{}
+	sess.Events = append(sess.Events, evt)
+	inv.Session = sess
+
+	req := &model.Request{}
+	p := NewContentRequestProcessor(WithPreserveSameBranch(true))
+	p.ProcessRequest(context.Background(), inv, req, nil)
+
+	require.Equal(t, 1, len(req.Messages))
+	require.Equal(t, model.RoleUser, req.Messages[0].Role)
+	require.Contains(t, req.Messages[0].Content, "For context")
 }
 
 func newSessionEvent(author string, msg model.Message) event.Event {
@@ -157,6 +243,182 @@ func newSessionEvent(author string, msg model.Message) event.Event {
 			},
 		},
 		Author: author,
+	}
+}
+
+// Test that session summary is merged into the last system message.
+func TestProcessRequest_SessionSummary_MergeWithSystemMessages(t *testing.T) {
+	// Create session with summary
+	sess := &session.Session{
+		Summaries: map[string]*session.Summary{
+			"test-agent": {
+				Summary:   "Session summary content",
+				UpdatedAt: time.Date(2023, 1, 1, 12, 0, 0, 0, time.UTC),
+			},
+		},
+	}
+
+	// Test case 1: Request has system message followed by user message
+	req1 := &model.Request{
+		Messages: []model.Message{
+			model.NewSystemMessage("existing system prompt"),
+			model.NewUserMessage("user question"),
+		},
+	}
+
+	inv1 := agent.NewInvocation(
+		agent.WithInvocationSession(sess),
+		agent.WithInvocationEventFilterKey("test-agent"),
+		agent.WithInvocationMessage(model.NewUserMessage("current request")),
+	)
+	inv1.AgentName = "test-agent"
+
+	p1 := NewContentRequestProcessor(WithAddSessionSummary(true))
+	p1.ProcessRequest(context.Background(), inv1, req1, nil)
+
+	// Should have 2 messages: merged system, user
+	require.Equal(t, 2, len(req1.Messages))
+	require.Equal(t, model.RoleSystem, req1.Messages[0].Role)
+	require.Equal(t, "existing system prompt\n\nSession summary content", req1.Messages[0].Content)
+	require.Equal(t, model.RoleUser, req1.Messages[1].Role)
+	require.Equal(t, "user question", req1.Messages[1].Content)
+
+	// Test case 2: Request has only user message (no system message)
+	req2 := &model.Request{
+		Messages: []model.Message{
+			model.NewUserMessage("user question"),
+		},
+	}
+
+	inv2 := agent.NewInvocation(
+		agent.WithInvocationSession(sess),
+		agent.WithInvocationEventFilterKey("test-agent"),
+		agent.WithInvocationMessage(model.NewUserMessage("current request")),
+	)
+	inv2.AgentName = "test-agent"
+
+	p2 := NewContentRequestProcessor(WithAddSessionSummary(true))
+	p2.ProcessRequest(context.Background(), inv2, req2, nil)
+
+	// Should have 2 messages: new system, user
+	require.Equal(t, 2, len(req2.Messages))
+	require.Equal(t, model.RoleSystem, req2.Messages[0].Role)
+	require.Equal(t, "Session summary content", req2.Messages[0].Content)
+	require.Equal(t, model.RoleUser, req2.Messages[1].Role)
+	require.Equal(t, "user question", req2.Messages[1].Content)
+
+	// Test case 3: Request has multiple system messages
+	req3 := &model.Request{
+		Messages: []model.Message{
+			model.NewSystemMessage("system 1"),
+			model.NewSystemMessage("system 2"),
+			model.NewUserMessage("user question"),
+		},
+	}
+
+	inv3 := agent.NewInvocation(
+		agent.WithInvocationSession(sess),
+		agent.WithInvocationEventFilterKey("test-agent"),
+		agent.WithInvocationMessage(model.NewUserMessage("current request")),
+	)
+	inv3.AgentName = "test-agent"
+
+	p3 := NewContentRequestProcessor(WithAddSessionSummary(true))
+	p3.ProcessRequest(context.Background(), inv3, req3, nil)
+
+	// Should have 2 messages: merged system (system1 + system2 + summary), user
+	require.Equal(t, 2, len(req3.Messages))
+	require.Equal(t, model.RoleSystem, req3.Messages[0].Role)
+	require.Equal(t, "system 1\n\nsystem 2\n\nSession summary content", req3.Messages[0].Content)
+	require.Equal(t, model.RoleUser, req3.Messages[1].Role)
+	require.Equal(t, "user question", req3.Messages[1].Content)
+}
+
+func TestContentRequestProcessor_mergeSystemMessages(t *testing.T) {
+	p := NewContentRequestProcessor()
+
+	tests := []struct {
+		name     string
+		input    []model.Message
+		expected []model.Message
+	}{
+		{
+			name:     "no messages",
+			input:    []model.Message{},
+			expected: []model.Message{},
+		},
+		{
+			name: "no system messages",
+			input: []model.Message{
+				model.NewUserMessage("hello"),
+				model.NewAssistantMessage("hi"),
+			},
+			expected: []model.Message{
+				model.NewUserMessage("hello"),
+				model.NewAssistantMessage("hi"),
+			},
+		},
+		{
+			name: "single system message",
+			input: []model.Message{
+				model.NewSystemMessage("system prompt"),
+				model.NewUserMessage("hello"),
+			},
+			expected: []model.Message{
+				model.NewSystemMessage("system prompt"),
+				model.NewUserMessage("hello"),
+			},
+		},
+		{
+			name: "multiple system messages",
+			input: []model.Message{
+				model.NewSystemMessage("system 1"),
+				model.NewSystemMessage("system 2"),
+				model.NewSystemMessage("system 3"),
+				model.NewUserMessage("hello"),
+			},
+			expected: []model.Message{
+				model.Message{Role: model.RoleSystem, Content: "system 1\n\nsystem 2\n\nsystem 3"},
+				model.NewUserMessage("hello"),
+			},
+		},
+		{
+			name: "system messages with empty content",
+			input: []model.Message{
+				model.NewSystemMessage(""),
+				model.NewSystemMessage("system 2"),
+				model.NewSystemMessage(""),
+				model.NewUserMessage("hello"),
+			},
+			expected: []model.Message{
+				model.Message{Role: model.RoleSystem, Content: "\n\nsystem 2\n\n"},
+				model.NewUserMessage("hello"),
+			},
+		},
+		{
+			name: "system messages not at beginning",
+			input: []model.Message{
+				model.NewSystemMessage("system 1"),
+				model.NewUserMessage("hello"),
+				model.NewSystemMessage("system 2"), // This should not be merged
+			},
+			expected: []model.Message{
+				model.NewSystemMessage("system 1"),
+				model.NewUserMessage("hello"),
+				model.NewSystemMessage("system 2"),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := p.mergeSystemMessages(tt.input)
+			require.Equal(t, len(tt.expected), len(result))
+			for i, expectedMsg := range tt.expected {
+				require.Equal(t, expectedMsg.Role, result[i].Role)
+				require.Equal(t, expectedMsg.Content, result[i].Content)
+			}
+		})
 	}
 }
 

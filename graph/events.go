@@ -79,6 +79,9 @@ const (
 	MetadataKeyModel = "_model_metadata"
 	// MetadataKeyCheckpoint is the key for checkpoint metadata.
 	MetadataKeyCheckpoint = "_checkpoint_metadata"
+	// MetadataKeyCacheHit is a synthetic key set on node completion events when
+	// a cache hit occurs for the node's output.
+	MetadataKeyCacheHit = "_cache_hit"
 )
 
 // NodeType represents the type of a graph node.
@@ -205,6 +208,8 @@ type ToolExecutionMetadata struct {
 	ToolName string `json:"toolName"`
 	// ToolID is the unique identifier of the tool call.
 	ToolID string `json:"toolId"`
+	// ResponseID is the response/message ID that issued this tool call.
+	ResponseID string `json:"responseId,omitempty"`
 	// Phase is the execution phase.
 	Phase ToolExecutionPhase `json:"phase"`
 	// StartTime is when the execution started.
@@ -229,6 +234,8 @@ type ModelExecutionMetadata struct {
 	ModelName string `json:"modelName"`
 	// NodeID is the unique identifier of the node.
 	NodeID string `json:"nodeId"`
+	// ResponseID is the response/message ID for this model output.
+	ResponseID string `json:"responseId,omitempty"`
 	// Phase is the execution phase.
 	Phase ModelExecutionPhase `json:"phase"`
 	// StartTime is when the execution started.
@@ -460,6 +467,7 @@ type ToolEventOptions struct {
 	InvocationID string
 	ToolName     string
 	ToolID       string
+	ResponseID   string
 	Phase        ToolExecutionPhase
 	StartTime    time.Time
 	EndTime      time.Time
@@ -488,6 +496,7 @@ type ModelEventOptions struct {
 	InvocationID string
 	ModelName    string
 	NodeID       string
+	ResponseID   string
 	Phase        ModelExecutionPhase
 	StartTime    time.Time
 	EndTime      time.Time
@@ -633,6 +642,13 @@ func WithToolEventToolID(toolID string) ToolEventOption {
 	}
 }
 
+// WithToolEventResponseID sets the parent response ID for tool events.
+func WithToolEventResponseID(responseID string) ToolEventOption {
+	return func(opts *ToolEventOptions) {
+		opts.ResponseID = responseID
+	}
+}
+
 // WithToolEventPhase sets the phase for tool events.
 func WithToolEventPhase(phase ToolExecutionPhase) ToolEventOption {
 	return func(opts *ToolEventOptions) {
@@ -682,6 +698,13 @@ func WithToolEventError(err error) ToolEventOption {
 func WithToolEventIncludeResponse(include bool) ToolEventOption {
 	return func(opts *ToolEventOptions) {
 		opts.IncludeResponse = include
+	}
+}
+
+// WithModelEventResponseID sets the response ID for model events.
+func WithModelEventResponseID(responseID string) ModelEventOption {
+	return func(opts *ModelEventOptions) {
+		opts.ResponseID = responseID
 	}
 }
 
@@ -1088,6 +1111,7 @@ func NewToolExecutionEvent(opts ...ToolEventOption) *event.Event {
 	metadata := ToolExecutionMetadata{
 		ToolName:     options.ToolName,
 		ToolID:       options.ToolID,
+		ResponseID:   options.ResponseID,
 		Phase:        options.Phase,
 		StartTime:    options.StartTime,
 		EndTime:      options.EndTime,
@@ -1142,6 +1166,7 @@ func NewModelExecutionEvent(opts ...ModelEventOption) *event.Event {
 	metadata := ModelExecutionMetadata{
 		ModelName:    options.ModelName,
 		NodeID:       options.NodeID,
+		ResponseID:   options.ResponseID,
 		Phase:        options.Phase,
 		StartTime:    options.StartTime,
 		EndTime:      options.EndTime,

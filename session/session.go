@@ -13,10 +13,13 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
+	"github.com/spaolacci/murmur3"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/log"
 )
 
 // StateMap is a map of state key-value pairs.
@@ -37,17 +40,148 @@ const SummaryFilterKeyAllContents = ""
 
 // Session is the interface that all sessions must implement.
 type Session struct {
-	ID      string        `json:"id"`      // ID is the session id.
-	AppName string        `json:"appName"` // AppName is the app name.
-	UserID  string        `json:"userID"`  // UserID is the user id.
-	State   StateMap      `json:"state"`   // State is the session state with delta support.
-	Events  []event.Event `json:"events"`  // Events is the session events.
-	EventMu sync.RWMutex  `json:"-"`
+	ID       string                 `json:"id"`      // ID is the session id.
+	AppName  string                 `json:"appName"` // AppName is the app name.
+	UserID   string                 `json:"userID"`  // UserID is the user id.
+	State    StateMap               `json:"state"`   // State is the session state with delta support.
+	Events   []event.Event          `json:"events"`  // Events is the session events.
+	EventMu  sync.RWMutex           `json:"-"`
+	Tracks   map[Track]*TrackEvents `json:"tracks,omitempty"` // Tracks stores track events.
+	TracksMu sync.RWMutex           `json:"-"`
 	// Summaries holds filter-aware summaries. The key is the event filter key.
 	SummariesMu sync.RWMutex        `json:"-"`                   // SummariesMu is the read-write mutex for Summaries.
 	Summaries   map[string]*Summary `json:"summaries,omitempty"` // Summaries is the filter-aware summaries.
 	UpdatedAt   time.Time           `json:"updatedAt"`           // UpdatedAt is the last update time.
 	CreatedAt   time.Time           `json:"createdAt"`           // CreatedAt is the creation time.
+
+	// Hash is the pre-computed slot hash value for asynchronous task dispatching.
+	// It is calculated once during session creation using murmur3 hash of
+	// "appName:userID:sessionID" and remains immutable throughout the session's lifecycle.
+	// This field is computed once during session creation and never modified.
+	Hash int `json:"-"`
+}
+
+// Clone returns a copy of the session.
+func (sess *Session) Clone() *Session {
+	sess.EventMu.RLock()
+	copiedSess := &Session{
+		ID:        sess.ID,
+		AppName:   sess.AppName,
+		UserID:    sess.UserID,
+		State:     make(StateMap), // Create new state to avoid reference sharing.
+		Events:    make([]event.Event, len(sess.Events)),
+		UpdatedAt: sess.UpdatedAt,
+		CreatedAt: sess.CreatedAt, // Add missing CreatedAt field.
+		Hash:      sess.Hash,
+	}
+	// Copy events.
+	copy(copiedSess.Events, sess.Events)
+	sess.EventMu.RUnlock()
+
+	// Copy track events.
+	sess.TracksMu.RLock()
+	if len(sess.Tracks) > 0 {
+		copiedSess.Tracks = make(map[Track]*TrackEvents, len(sess.Tracks))
+		for track, events := range sess.Tracks {
+			history := &TrackEvents{
+				Track: events.Track,
+			}
+			if len(events.Events) > 0 {
+				history.Events = make([]TrackEvent, len(events.Events))
+				copy(history.Events, events.Events)
+			}
+			copiedSess.Tracks[track] = history
+		}
+	}
+	sess.TracksMu.RUnlock()
+
+	// Copy state.
+	if sess.State != nil {
+		for k, v := range sess.State {
+			copiedValue := make([]byte, len(v))
+			copy(copiedValue, v)
+			copiedSess.State[k] = copiedValue
+		}
+	}
+
+	// Copy summaries.
+	sess.SummariesMu.RLock()
+	if sess.Summaries != nil {
+		copiedSess.Summaries = make(map[string]*Summary, len(sess.Summaries))
+		for b, sum := range sess.Summaries {
+			if sum == nil {
+				continue
+			}
+			// Shallow copy is fine since Summary is immutable after write.
+			copied := *sum
+			copiedSess.Summaries[b] = &copied
+		}
+	}
+	sess.SummariesMu.RUnlock()
+
+	return copiedSess
+}
+
+// SessionOptions is the options for a session.
+type SessionOptions func(*Session)
+
+// WithSessionEvents is the option for the session events.
+func WithSessionEvents(events []event.Event) SessionOptions {
+	return func(sess *Session) {
+		sess.Events = events
+	}
+}
+
+// WithSessionSummaries is the option for the session summaries.
+func WithSessionSummaries(summaries map[string]*Summary) SessionOptions {
+	return func(sess *Session) {
+		sess.Summaries = summaries
+	}
+}
+
+// WithSessionState is the option for the session state.
+func WithSessionState(state StateMap) SessionOptions {
+	return func(sess *Session) {
+		sess.State = state
+	}
+}
+
+// WithSessionCreatedAt is the option for the session createdAt.
+func WithSessionCreatedAt(createdAt time.Time) SessionOptions {
+	return func(sess *Session) {
+		sess.CreatedAt = createdAt
+	}
+}
+
+// WithSessionUpdatedAt is the option for the session updatedAt.
+func WithSessionUpdatedAt(updatedAt time.Time) SessionOptions {
+	return func(sess *Session) {
+		sess.UpdatedAt = updatedAt
+	}
+}
+
+// NewSession creates a new session.
+func NewSession(appName, userID, sessionID string, options ...SessionOptions) *Session {
+	hashKey := fmt.Sprintf("%s:%s:%s", appName, userID, sessionID)
+	hash := int(murmur3.Sum32([]byte(hashKey)))
+
+	sess := &Session{
+		ID:        sessionID,
+		AppName:   appName,
+		UserID:    userID,
+		Events:    []event.Event{},
+		UpdatedAt: time.Now(),
+		CreatedAt: time.Now(),
+		Summaries: make(map[string]*Summary),
+		State:     make(StateMap),
+
+		Hash: hash,
+	}
+	for _, o := range options {
+		o(sess)
+	}
+
+	return sess
 }
 
 // GetEvents returns the session events.
@@ -66,6 +200,189 @@ func (sess *Session) GetEventCount() int {
 	defer sess.EventMu.RUnlock()
 
 	return len(sess.Events)
+}
+
+// AppendTrackEvent appends a track event to the session.
+func (sess *Session) AppendTrackEvent(event *TrackEvent, opts ...Option) error {
+	if sess == nil {
+		return fmt.Errorf("session is nil")
+	}
+	if event == nil {
+		return fmt.Errorf("track event is nil")
+	}
+	if sess.State == nil {
+		sess.State = make(StateMap)
+	}
+	if err := ensureTrackExists(sess.State, event.Track); err != nil {
+		return fmt.Errorf("ensure track indexed: %w", err)
+	}
+	sess.TracksMu.Lock()
+	defer sess.TracksMu.Unlock()
+	if sess.Tracks == nil {
+		sess.Tracks = make(map[Track]*TrackEvents)
+	}
+	trackEvents, ok := sess.Tracks[event.Track]
+	if !ok || trackEvents == nil {
+		trackEvents = &TrackEvents{Track: event.Track}
+		sess.Tracks[event.Track] = trackEvents
+	}
+	trackEvents.Events = append(trackEvents.Events, *event)
+	sess.UpdatedAt = time.Now()
+	return nil
+}
+
+// GetTrackEvents returns the track events snapshot.
+func (sess *Session) GetTrackEvents(track Track) (*TrackEvents, error) {
+	sess.TracksMu.RLock()
+	defer sess.TracksMu.RUnlock()
+	if sess.Tracks == nil {
+		return nil, fmt.Errorf("tracks is empty")
+	}
+	trackEvents, ok := sess.Tracks[track]
+	if !ok || trackEvents == nil {
+		return nil, fmt.Errorf("track events not found: %s", track)
+	}
+	copied := &TrackEvents{Track: trackEvents.Track}
+	if len(trackEvents.Events) > 0 {
+		copied.Events = make([]TrackEvent, len(trackEvents.Events))
+		copy(copied.Events, trackEvents.Events)
+	}
+	return copied, nil
+}
+
+// EnsureEventStartWithUser filters events to ensure they start with RoleUser.
+// It removes events from the beginning until it finds the first event from RoleUser.
+func (sess *Session) EnsureEventStartWithUser() {
+	if sess == nil || len(sess.Events) == 0 {
+		log.Info("session is nil or has no events")
+		return
+	}
+	// Find the first event that starts with RoleUser
+	startIndex := -1
+	for i, event := range sess.Events {
+		if event.Response != nil && event.IsUserMessage() {
+			startIndex = i
+			break
+		}
+		// If event has no response or choices, continue to next event
+	}
+
+	// If no user event found, clear all events
+	if startIndex == -1 {
+		sess.Events = []event.Event{}
+		return
+	}
+
+	// Keep events starting from the first user event
+	if startIndex > 0 {
+		sess.Events = sess.Events[startIndex:]
+	}
+}
+
+// UpdateUserSession updates the user session with the given event and options.
+func (sess *Session) UpdateUserSession(event *event.Event, opts ...Option) {
+	if sess == nil || event == nil {
+		log.Info("session or event is nil")
+		return
+	}
+	if event.Response != nil && !event.IsPartial && event.IsValidContent() {
+		sess.EventMu.Lock()
+		sess.Events = append(sess.Events, *event)
+
+		// Apply filtering options
+		sess.ApplyEventFiltering(opts...)
+		sess.EventMu.Unlock()
+	}
+
+	sess.UpdatedAt = time.Now()
+	if sess.State == nil {
+		sess.State = make(StateMap)
+	}
+	sess.ApplyEventStateDelta(event)
+}
+
+// ApplyEventFiltering applies event number and time filtering to session events
+// It ensures that the filtered events still contain at least one user message.
+func (sess *Session) ApplyEventFiltering(opts ...Option) {
+	if sess == nil {
+		log.Info("session is nil")
+		return
+	}
+	originalEvents := sess.Events
+	opt := applyOptions(opts...)
+
+	// Apply event time filter - keep events after the specified time
+	if !opt.EventTime.IsZero() {
+		startIndex := -1
+		for i, e := range sess.Events {
+			if e.Timestamp.After(opt.EventTime) || e.Timestamp.Equal(opt.EventTime) {
+				startIndex = i
+				break
+			}
+		}
+		if startIndex >= 0 {
+			sess.Events = sess.Events[startIndex:]
+		} else {
+			// No events after the specified time, clear all events
+			sess.Events = []event.Event{}
+		}
+	}
+
+	// Apply event number limit
+	if opt.EventNum > 0 && len(sess.Events) > opt.EventNum {
+		sess.Events = sess.Events[len(sess.Events)-opt.EventNum:]
+	}
+
+	// check if has user message
+	for i := 0; i < len(sess.Events); i++ {
+		if sess.Events[i].IsUserMessage() {
+			sess.Events = sess.Events[i:]
+			return
+		}
+	}
+	// find the last user message from original events
+	for i := len(originalEvents) - 1; i >= 0; i-- {
+		if originalEvents[i].IsUserMessage() {
+			sess.Events = append([]event.Event{originalEvents[i]}, sess.Events...)
+			return
+		}
+	}
+
+	sess.Events = []event.Event{}
+}
+
+// ApplyEventStateDelta merges the state delta of the event into the session state.
+func (sess *Session) ApplyEventStateDelta(e *event.Event) {
+	if sess == nil || e == nil {
+		log.Info("session or event is nil")
+		return
+	}
+	if sess.State == nil {
+		sess.State = make(StateMap)
+	}
+	for key, value := range e.StateDelta {
+		sess.State[key] = value
+	}
+}
+
+// ApplyEventStateDeltaMap merges the state delta of the event into the session state.
+func ApplyEventStateDeltaMap(state StateMap, e *event.Event) {
+	if state == nil || e == nil {
+		log.Info("state or event is nil")
+		return
+	}
+
+	for key, value := range e.StateDelta {
+		state[key] = value
+	}
+}
+
+func applyOptions(opts ...Option) *Options {
+	opt := &Options{}
+	for _, o := range opts {
+		o(opt)
+	}
+	return opt
 }
 
 // Summary represents a concise, structured summary of a conversation branch.
@@ -130,6 +447,13 @@ type Service interface {
 
 	// DeleteUserState deletes the state by target scope and key.
 	DeleteUserState(ctx context.Context, userKey UserKey, key string) error
+
+	// UpdateSessionState updates the session-level state directly without appending an event.
+	// This is useful for state initialization, correction, or synchronization scenarios
+	// where event history is not needed.
+	// Keys with app: or user: prefixes are not allowed (use UpdateAppState/UpdateUserState instead).
+	// Keys with temp: prefix are allowed as they represent session-scoped ephemeral state.
+	UpdateSessionState(ctx context.Context, key Key, state StateMap) error
 
 	// AppendEvent appends an event to a session.
 	AppendEvent(ctx context.Context, session *Session, event *event.Event, options ...Option) error

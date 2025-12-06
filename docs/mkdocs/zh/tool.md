@@ -7,7 +7,7 @@ Tool 工具系统是 tRPC-Agent-Go 框架的核心组件，为 Agent 提供了�
 ### 🎯 核心特性
 
 - **🔧 多类型工具**：支持函数工具（Function Tools）和 MCP 标准工具
-- **🌊 流式响应**：支持实时流式响应和普通响应两种模式  
+- **🌊 流式响应**：支持实时流式响应和普通响应两种模式
 - **⚡ 并行执行**：工具调用支持并行执行以提升性能
 - **🔄 MCP 协议**：完整支持 STDIO、SSE、Streamable HTTP 三种传输方式
 - **🛠️ 配置支持**：提供配置选项和过滤器支持
@@ -35,15 +35,21 @@ ToolSet 是一组相关工具的集合，实现 `tool.ToolSet` 接口。ToolSet 
 
 ```go
 type ToolSet interface {
-    Tools(context.Context) []CallableTool  // 返回工具列表
-    Close() error                          // 资源清理
+    // 返回当前工具集内的工具
+    Tools(context.Context) []tool.Tool
+
+    // 释放工具集持有的资源
+    Close() error
+
+    // 返回该工具集的名称，用于标识与冲突处理
+    Name() string
 }
 ```
 
 **Tool 与 ToolSet 的关系：**
 
-- 一个 **Tool** = 一个具体功能（如计算器）
-- 一个 **ToolSet** = 一组相关的 Tool（如MCP服务器提供的所有工具）
+- 一个 "Tool" = 一个具体功能（如计算器）
+- 一个 "ToolSet" = 一组相关的 Tool（如 MCP 服务器提供的所有工具）
 - Agent 可以同时使用多个 Tool 和多个 ToolSet
 
 #### 🌊 流式工具支持
@@ -72,12 +78,12 @@ type StreamChunk struct {
 
 ### 工具类型说明
 
-| 工具类型 | 定义 | 集成方式 |
-|---------|------|---------|
-| **Function Tools** | 直接调用 Go 函数实现的工具 | `Tool` 接口，进程内调用 |
-| **Agent Tool (AgentTool)** | 将任意 Agent 包装为可调用工具 | `Tool` 接口，支持流式内部转发 |
-| **DuckDuckGo Tool** | 基于 DuckDuckGo API 的搜索工具 | `Tool` 接口，HTTP API |
-| **MCP ToolSet** | 基于 MCP 协议的外部工具集 | `ToolSet` 接口，支持多种传输方式 |
+| 工具类型                   | 定义                           | 集成方式                         |
+| -------------------------- | ------------------------------ | -------------------------------- |
+| **Function Tools**         | 直接调用 Go 函数实现的工具     | `Tool` 接口，进程内调用          |
+| **Agent Tool (AgentTool)** | 将任意 Agent 包装为可调用工具  | `Tool` 接口，支持流式内部转发    |
+| **DuckDuckGo Tool**        | 基于 DuckDuckGo API 的搜索工具 | `Tool` 接口，HTTP API            |
+| **MCP ToolSet**            | 基于 MCP 协议的外部工具集      | `ToolSet` 接口，支持多种传输方式 |
 
 > **📖 相关文档**：Agent 间协作相关的 Agent Tool 和 Transfer Tool 请参考 [多 Agent 系统文档](multiagent.md)。
 
@@ -136,7 +142,7 @@ func getStreamableWeather(input weatherInput) *tool.StreamReader {
     stream := tool.NewStream(10)
     go func() {
         defer stream.Writer.Close()
-        
+
         // 模拟逐步返回天气数据
         result := "Sunny, 25°C in " + input.Location
         for i := 0; i < len(result); i++ {
@@ -146,14 +152,14 @@ func getStreamableWeather(input weatherInput) *tool.StreamReader {
                 },
                 Metadata: tool.Metadata{CreatedAt: time.Now()},
             }
-            
+
             if closed := stream.Writer.Send(chunk, nil); closed {
                 break
             }
             time.Sleep(10 * time.Millisecond) // 模拟延迟
         }
     }()
-    
+
     return stream.Reader
 }
 
@@ -179,7 +185,7 @@ for {
     if err != nil {
         return err
     }
-    
+
     // 处理每个数据块
     fmt.Printf("收到数据: %v\n", chunk.Content)
 }
@@ -234,6 +240,7 @@ MCP（Model Context Protocol）是一个开放协议，标准化了应用程序�
 - 🔗 **统一接口**：所有 MCP 工具都通过 `mcp.NewMCPToolSet()` 创建
 - 🚀 **多种传输**：支持 STDIO、SSE、Streamable HTTP 三种传输方式
 - 🔧 **工具过滤**：支持包含/排除特定工具
+- ✅ **显式初始化**：通过 `(*mcp.ToolSet).Init(ctx)`，可以在应用启动阶段提前发现 MCP 连接/工具加载错误并快速失败
 
 ### 基本用法
 
@@ -250,6 +257,11 @@ mcpToolSet := mcp.NewMCPToolSet(
     },
     mcp.WithToolFilter(mcp.NewIncludeFilter("echo", "add")), // 可选：工具过滤
 )
+
+// （可选但推荐）显式初始化 MCP：建立连接 + 初始化会话 + 列工具
+if err := mcpToolSet.Init(ctx); err != nil {
+    log.Fatalf("初始化 MCP 工具集失败: %v", err)
+}
 
 // 集成到 Agent
 agent := llmagent.New("mcp-assistant",
@@ -274,6 +286,9 @@ mcpToolSet := mcp.NewMCPToolSet(
         Timeout:   10 * time.Second,
     },
 )
+if err := mcpToolSet.Init(ctx); err != nil {
+    return fmt.Errorf("初始化 STDIO MCP 工具集失败: %w", err)
+}
 ```
 
 #### 2. SSE 传输
@@ -291,10 +306,14 @@ mcpToolSet := mcp.NewMCPToolSet(
         },
     },
 )
+if err := mcpToolSet.Init(ctx); err != nil {
+    return fmt.Errorf("初始化 SSE MCP 工具集失败: %w", err)
+}
 ```
 
 #### 3. Streamable HTTP 传输
-使用标准 HTTP 协议进行通信，支持普通HTTP和流式响应。
+
+使用标准 HTTP 协议进行通信，支持普通 HTTP 和流式响应。
 
 ```go
 mcpToolSet := mcp.NewMCPToolSet(
@@ -304,6 +323,9 @@ mcpToolSet := mcp.NewMCPToolSet(
         Timeout:   10 * time.Second,
     },
 )
+if err := mcpToolSet.Init(ctx); err != nil {
+    return fmt.Errorf("初始化 Streamable MCP 工具集失败: %w", err)
+}
 ```
 
 ### 会话重连支持
@@ -327,6 +349,48 @@ sseToolSet := mcp.NewMCPToolSet(
 - 🔄 **自动重连**：检测到连接断开或会话过期时自动重建会话
 - 🎯 **独立重试**：每次工具调用独立计数，不会因早期失败影响后续调用
 - 🛡️ **保守策略**：仅针对明确的连接/会话错误触发重连，避免配置错误导致的无限循环
+
+### MCP 工具的动态发现与更新（LLMAgent 配置项）
+
+对于 MCP 工具集，服务器端的工具列表是可以变化的（例如在运行
+过程中新增了一个 MCP 工具）。如果希望 LLMAgent 在**每次调用**
+时自动看到最新的工具列表，可以在使用 `WithToolSets` 的同时，
+开启 `llmagent.WithRefreshToolSetsOnRun(true)`。
+
+#### LLMAgent 配置示例
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+    "trpc.group/trpc-go/trpc-agent-go/tool"
+    "trpc.group/trpc-go/trpc-agent-go/tool/mcp"
+)
+
+// 1. 创建 MCP 工具集（可以是 STDIO、SSE 或 Streamable HTTP）
+mcpToolSet := mcp.NewMCPToolSet(connectionConfig)
+
+// 2. 创建 LLMAgent，并开启 ToolSets 的自动刷新
+agent := llmagent.New(
+    "mcp-assistant",
+    llmagent.WithModel(openai.New("gpt-4o-mini")),
+    llmagent.WithToolSets([]tool.ToolSet{mcpToolSet}),
+    llmagent.WithRefreshToolSetsOnRun(true),
+)
+```
+
+当启用 `WithRefreshToolSetsOnRun(true)` 时：
+
+- LLMAgent 在构造工具列表时，会再次调用
+  `ToolSet.Tools(context.Background())`；
+- 如果 MCP 服务器新增或删除了工具，该 Agent **下一次执行** 时，
+  会自动使用更新后的工具列表。
+
+这个配置项的侧重点是**动态发现工具**。如果你还需要基于
+`context.Context` 的**每次请求动态 HTTP 请求头**（例如从上下文
+中提取认证信息），仍然可以参考 `examples/mcptool/http_headers`
+示例，手动调用 `toolSet.Tools(ctx)`，然后配合
+`WithTools` 使用。
 
 ## Agent 工具 (AgentTool)
 
@@ -357,8 +421,8 @@ mathAgent := llmagent.New(
 // 2) 包装为 Agent 工具
 mathTool := agenttool.NewTool(
     mathAgent,
-    agenttool.WithSkipSummarization(true), // 可选：工具响应后跳过外层模型总结
-    agenttool.WithStreamInner(true),       // 开启：把子 Agent 的流式事件转发给父流程
+    agenttool.WithSkipSummarization(false), // 可选，默认 false，当设置为 true 时会跳过外层模型总结，在 tool.response 后直接结束本轮
+    agenttool.WithStreamInner(true),        // 开启：把子 Agent 的流式事件转发给父流程
 )
 
 // 3) 在父 Agent 中使用该工具
@@ -397,12 +461,29 @@ if ev.Author != parentName && len(ev.Choices) > 0 {
 ### 选项说明
 
 - WithSkipSummarization(bool)：
+
   - false（默认）：允许在工具结果后继续一次 LLM 调用进行总结/回答
   - true：外层 Flow 在 `tool.response` 后直接结束本轮（不再额外总结）
 
 - WithStreamInner(bool)：
+
   - true：把子 Agent 的事件直接转发到父流程（强烈建议父/子 Agent 都开启 `GenerationConfig{Stream: true}`）
   - false：按“仅可调用工具”处理，不做内部事件转发
+
+- WithHistoryScope(HistoryScope)：
+  - `HistoryScopeIsolated`（默认）：保持子调用完全隔离，只读取本次工具参数（不继承父历史）。
+  - `HistoryScopeParentBranch`：通过分层过滤键 `父键/子名-UUID（Universally Unique Identifier，通用唯一识别码）` 继承父会话历史；内容处理器会基于前缀匹配纳入父事件，同时子事件仍写入独立子分支。典型场景：基于上一轮产出进行“编辑/优化/续写”。
+
+示例：
+
+```go
+child := agenttool.NewTool(
+    childAgent,
+    agenttool.WithSkipSummarization(false),
+    agenttool.WithStreamInner(true),
+    agenttool.WithHistoryScope(agenttool.HistoryScopeParentBranch),
+)
+```
 
 ### 注意事项
 
@@ -417,6 +498,7 @@ if ev.Author != parentName && len(ev.Choices) > 0 {
 ```go
 import (
     "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/tool"
     "trpc.group/trpc-go/trpc-agent-go/tool/function"
     "trpc.group/trpc-go/trpc-agent-go/tool/duckduckgo"
     "trpc.group/trpc-go/trpc-agent-go/tool/mcp"
@@ -428,7 +510,7 @@ calculatorTool := function.NewFunctionTool(calculator,
     function.WithDescription("执行基础数学运算"))
 
 timeTool := function.NewFunctionTool(getCurrentTime,
-    function.WithName("current_time"), 
+    function.WithName("current_time"),
     function.WithDescription("获取当前时间"))
 
 // 创建内置工具
@@ -469,25 +551,223 @@ agent := llmagent.New("ai-assistant",
         calculatorTool, timeTool, searchTool,
     }),
     // 添加工具集（ToolSet 接口）
-    llmagent.WithToolSets([]tool.ToolSet{stdioToolSet, sseToolSet, streamableToolSet}),
+    llmagent.WithToolSets([]tool.ToolSet{
+        stdioToolSet, sseToolSet, streamableToolSet,
+    }),
 )
 ```
 
-### 工具过滤器
+### MCP 工具过滤器
+
+MCP 工具集支持在创建时过滤工具。推荐使用统一的 `tool.FilterFunc` 接口：
 
 ```go
-// 包含过滤器：只使用指定工具
-includeFilter := mcp.NewIncludeFilter("get_weather", "get_news", "calculator")
+import (
+    "trpc.group/trpc-go/trpc-agent-go/tool"
+    "trpc.group/trpc-go/trpc-agent-go/tool/mcp"
+)
 
-// 排除过滤器：排除指定工具
-excludeFilter := mcp.NewExcludeFilter("deprecated_tool", "slow_tool")
+// ✅ 推荐：使用统一的过滤接口
+includeFilter := tool.NewIncludeToolNamesFilter("get_weather", "get_news", "calculator")
+excludeFilter := tool.NewExcludeToolNamesFilter("deprecated_tool", "slow_tool")
 
-// 组合过滤器
-combinedToolSet := mcp.NewMCPToolSet(
+// 应用过滤器
+toolSet := mcp.NewMCPToolSet(
     connectionConfig,
-    mcp.WithToolFilter(includeFilter),
+    mcp.WithToolFilterFunc(includeFilter),
 )
 ```
+
+### 运行时工具过滤
+
+- 方式一：运行时工具过滤允许在每次 `runner.Run` 调用时动态控制工具可用性，无需修改 Agent 配置。这是一个"软约束"机制，用于优化 token 消耗和实现基于角色的工具访问控制。针对所有agent生效
+- 方式二：通过`llmagent.WithToolFilter`配置运行时过滤function, 只对当前agent生效
+
+**核心特性：**
+
+- 🎯 **Per-Run 控制**：每次调用独立配置，不影响 Agent 定义
+- 💰 **成本优化**：减少发送给 LLM 的工具描述，降低 token 消耗
+- 🛡️ **智能保护**：框架工具（`transfer_to_agent`、`knowledge_search`）自动保留，永不被过滤
+- 🔧 **灵活定制**：支持内置过滤器和自定义 FilterFunc
+
+#### 基本用法
+
+**1. 排除特定工具（Exclude Filter）**
+
+使用黑名单方式排除不需要的工具：
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/tool"
+
+// 排除 text_tool，其他工具都可用
+filter := tool.NewExcludeToolNamesFilter("text_tool", "dangerous_tool")
+eventChan, err := runner.Run(ctx, userID, sessionID, message,
+    agent.WithToolFilter(filter),
+)
+```
+
+**2. 只允许特定工具（Include Filter）**
+
+使用白名单方式只允许指定的工具：
+
+```go
+// 方式一：
+// 只允许使用计算器和时间工具
+filter := tool.NewIncludeToolNamesFilter("calculator", "time_tool")
+eventChan, err := runner.Run(ctx, userID, sessionID, message,
+    agent.WithToolFilter(filter),
+)
+
+// 方式二：
+agent := llmagent.New("ai-assistant",
+    llmagent.WithModel(model),
+    llmagent.WithInstruction("你是一个有帮助的AI助手，可以使用多种工具协助用户"),
+    // 添加单个工具（Tool 接口）
+    llmagent.WithTools([]tool.Tool{
+        calculatorTool, timeTool, searchTool,
+    }),
+    // 添加工具集（ToolSet 接口）
+    llmagent.WithToolSets([]tool.ToolSet{
+        stdioToolSet, sseToolSet, streamableToolSet,
+    }),
+    llmagent.WithToolFilter(filter),
+)
+```
+
+**3. 自定义过滤逻辑（Custom FilterFunc）**
+
+实现自定义过滤函数以支持复杂的过滤逻辑：
+
+```go
+// 方式一：
+// 自定义过滤函数：只允许名称以 "safe_" 开头的工具
+filter := func(ctx context.Context, t tool.Tool) bool {
+    declaration := t.Declaration()
+    if declaration == nil {
+        return false
+    }
+    return strings.HasPrefix(declaration.Name, "safe_")
+}
+
+eventChan, err := runner.Run(ctx, userID, sessionID, message,
+    agent.WithToolFilter(filter),
+)
+
+// 方式二：
+agent := llmagent.New("ai-assistant",
+    llmagent.WithModel(model),
+    llmagent.WithInstruction("你是一个有帮助的AI助手，可以使用多种工具协助用户"),
+    // 添加单个工具（Tool 接口）
+    llmagent.WithTools([]tool.Tool{
+        calculatorTool, timeTool, searchTool,
+    }),
+    // 添加工具集（ToolSet 接口）
+    llmagent.WithToolSets([]tool.ToolSet{
+        stdioToolSet, sseToolSet, streamableToolSet,
+    }),
+    llmagent.WithToolFilter(filter),
+)
+```
+
+**4. Agent 粒度过滤（Per-Agent Filtering）**
+
+通过 `agent.InvocationFromContext` 实现不同 Agent 使用不同工具：
+
+```go
+// 为不同 Agent 定义允许的工具
+agentAllowedTools := map[string]map[string]bool{
+    "math-agent": {
+        "calculator": true,
+    },
+    "time-agent": {
+        "time_tool": true,
+    },
+}
+
+// 自定义过滤函数：根据当前 Agent 名称过滤
+filter := func(ctx context.Context, t tool.Tool) bool {
+    declaration := t.Declaration()
+    if declaration == nil {
+        return false
+    }
+    toolName := declaration.Name
+
+    // 从 context 获取当前 Agent 信息
+    inv, ok := agent.InvocationFromContext(ctx)
+    if !ok || inv == nil {
+        return true // fallback: 允许所有工具
+    }
+
+    agentName := inv.AgentName
+
+    // 检查该工具是否在当前 Agent 的允许列表中
+    allowedTools, exists := agentAllowedTools[agentName]
+    if !exists {
+        return true // fallback: 允许所有工具
+    }
+
+    return allowedTools[toolName]
+}
+
+eventChan, err := runner.Run(ctx, userID, sessionID, message,
+    agent.WithToolFilter(filter),
+)
+```
+
+**完整示例：** 参见 `examples/toolfilter/` 目录
+
+#### 智能过滤机制
+
+框架会自动区分**用户工具**和**框架工具**，只过滤用户工具：
+
+| 工具分类     | 包含的工具                                                                                             | 是否被过滤            |
+| ------------ | ------------------------------------------------------------------------------------------------------ | --------------------- |
+| **用户工具** | 通过 `WithTools` 注册的工具<br>通过 `WithToolSets` 注册的工具                                          | ✅ 受过滤控制         |
+| **框架工具** | `transfer_to_agent`（多 Agent 协调）<br>`knowledge_search`（知识库检索）<br>`agentic_knowledge_search` | ❌ 永不过滤，自动保留 |
+
+**示例：**
+
+```go
+// Agent 注册了多个工具
+agent := llmagent.New("assistant",
+    llmagent.WithTools([]tool.Tool{
+        calculatorTool,  // 用户工具
+        textTool,        // 用户工具
+    }),
+    llmagent.WithSubAgents([]agent.Agent{subAgent1, subAgent2}), // 自动添加 transfer_to_agent
+    llmagent.WithKnowledge(kb),                                   // 自动添加 knowledge_search
+)
+
+// 运行时过滤：只允许 calculator
+filter := tool.NewIncludeToolNamesFilter("calculator")
+runner.Run(ctx, userID, sessionID, message,
+    agent.WithToolFilter(filter),
+)
+
+// 实际发送给 LLM 的工具：
+// ✅ calculator        - 用户工具，在允许列表中
+// ❌ textTool          - 用户工具，被过滤
+// ✅ transfer_to_agent - 框架工具，自动保留
+// ✅ knowledge_search  - 框架工具，自动保留
+```
+
+#### 注意事项
+
+⚠️ **安全提示：** 运行时工具过滤是"软约束"，主要用于优化和用户体验。工具内部仍需实现自己的鉴权逻辑：
+
+```go
+func sensitiveOperation(ctx context.Context, req Request) (Result, error) {
+    // ✅ 必须：工具内部鉴权
+    if !hasPermission(ctx, req.UserID, "sensitive_operation") {
+        return nil, fmt.Errorf("permission denied")
+    }
+
+    // 执行操作
+    return performOperation(req)
+}
+```
+
+**原因：** LLM 可能从上下文或记忆中知道工具的存在和用法，并尝试调用。工具过滤减少了这种可能性，但不能完全防止。
 
 ### 并行工具执行
 
@@ -501,21 +781,74 @@ agent := llmagent.New("ai-assistant",
 )
 ```
 
+Graph 工作流下也可以在工具节点开启并行：
+
+```go
+stateGraph.AddToolsNode("tools", tools, graph.WithEnableParallelTools(true))
+```
+
 **并行执行效果：**
 
 ```bash
 # 并行执行（启用时）
 Tool 1: get_weather     [====] 50ms
-Tool 2: get_population  [====] 50ms  
+Tool 2: get_population  [====] 50ms
 Tool 3: get_time       [====] 50ms
 总时间: ~50ms（同时执行）
 
 # 串行执行（默认）
 Tool 1: get_weather     [====] 50ms
 Tool 2: get_population       [====] 50ms
-Tool 3: get_time                  [====] 50ms  
+Tool 3: get_time                  [====] 50ms
 总时间: ~150ms（依次执行）
 ```
+
+### 运行时 ToolSet 动态管理
+
+`WithToolSets` 是一种**静态配置方式**：在创建 Agent 时一次性注入 ToolSet。很多实际场景下，你希望在**运行时动态增删 ToolSet**，而不必重建 Agent。
+
+LLMAgent 提供了三个与 ToolSet 相关的运行时方法：
+
+- `AddToolSet(toolSet tool.ToolSet)` —— 按 `ToolSet.Name()` 添加或替换同名 ToolSet
+- `RemoveToolSet(name string) bool` —— 按名称移除所有同名 ToolSet，返回是否确实删除
+- `SetToolSets(toolSets []tool.ToolSet)` —— 以给定切片整体替换当前所有 ToolSet
+
+这些方法是并发安全的，并会自动重新计算：
+
+- 聚合后的工具列表（显式 `WithTools` 工具 + ToolSet 工具 + 知识检索工具 + Skills 工具）
+- “用户工具”跟踪信息（用于前文介绍的智能过滤机制）
+
+**典型使用方式：**
+
+```go
+// 1. 初始只挂基础工具
+agent := llmagent.New("dynamic-assistant",
+    llmagent.WithModel(model),
+    llmagent.WithTools([]tool.Tool{calculatorTool}),
+)
+
+// 2. 运行时挂载一个 MCP ToolSet
+mcpToolSet := mcp.NewMCPToolSet(connectionConfig)
+if err := mcpToolSet.Init(ctx); err != nil {
+    return fmt.Errorf("初始化 MCP ToolSet 失败: %w", err)
+}
+agent.AddToolSet(mcpToolSet)
+
+// 3. 从配置中心下发一整套 ToolSet（声明式控制）
+toolSetsFromConfig := []tool.ToolSet{mcpToolSet, fileToolSet}
+agent.SetToolSets(toolSetsFromConfig)
+
+// 4. 按名称下线某个 ToolSet（例如回滚某个集成）
+removed := agent.RemoveToolSet(mcpToolSet.Name())
+if !removed {
+    log.Printf("未找到 ToolSet %q", mcpToolSet.Name())
+}
+```
+
+运行时 ToolSet 更新会自动与前文的**工具过滤机制**协同工作：
+
+- 通过 `WithTools` 和所有 ToolSet（包括动态添加的 ToolSet）注册的工具都视为**用户工具**，会受到 `WithToolFilter` 以及每次调用的运行时过滤控制。
+- 框架工具（`transfer_to_agent`、`knowledge_search`、`agentic_knowledge_search`）仍然**永远不被过滤**，始终对 Agent 可用。
 
 ## 快速开始
 
@@ -534,7 +867,7 @@ package main
 import (
     "context"
     "fmt"
-    
+
     "trpc.group/trpc-go/trpc-agent-go/runner"
     "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
     "trpc.group/trpc-go/trpc-agent-go/model/openai"
@@ -564,7 +897,7 @@ func main() {
         function.WithName("calculator"),
         function.WithDescription("简单计算器"),
     )
-    
+
     // 2. 创建模型和 Agent
     llmModel := openai.New("DeepSeek-V3-Online-64K")
     agent := llmagent.New("calculator-assistant",
@@ -573,25 +906,25 @@ func main() {
         llmagent.WithTools([]tool.Tool{calculatorTool}),
         llmagent.WithGenerationConfig(model.GenerationConfig{Stream: true}), // 启用流式输出
     )
-    
+
     // 3. 创建 Runner 并执行
     r := runner.NewRunner("math-app", agent)
-    
+
     ctx := context.Background()
     userMessage := model.NewUserMessage("请计算 25 乘以 4")
-    
+
     eventChan, err := r.Run(ctx, "user1", "session1", userMessage)
     if err != nil {
         panic(err)
     }
-    
+
     // 4. 处理响应
     for event := range eventChan {
         if event.Error != nil {
             fmt.Printf("错误: %s\n", event.Error.Message)
             continue
         }
-        
+
         // 显示工具调用
         if len(event.Response.Choices) > 0 && len(event.Response.Choices[0].Message.ToolCalls) > 0 {
             for _, toolCall := range event.Response.Choices[0].Message.ToolCalls {
@@ -599,12 +932,12 @@ func main() {
                 fmt.Printf("   参数: %s\n", string(toolCall.Function.Arguments))
             }
         }
-        
+
         // 显示流式内容
         if len(event.Response.Choices) > 0 {
             fmt.Print(event.Response.Choices[0].Delta.Content)
         }
-        
+
         if event.Done {
             break
         }
@@ -619,7 +952,7 @@ func main() {
 cd examples/tool
 go run .
 
-# 进入 MCP 工具示例目录  
+# 进入 MCP 工具示例目录
 cd examples/mcp_tool
 
 # 启动外部服务器

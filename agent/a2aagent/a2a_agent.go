@@ -12,10 +12,7 @@ package a2aagent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
 	"time"
 
@@ -24,18 +21,16 @@ import (
 	"trpc.group/trpc-go/trpc-a2a-go/server"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	ia2a "trpc.group/trpc-go/trpc-agent-go/internal/a2a"
+	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
-var defaultStreamingChannelSize = 1024
-var defaultNonStreamingChannelSize = 10
-
 const (
-	// AgentCardWellKnownPath is the standard path for agent card discovery
-	AgentCardWellKnownPath = "/.well-known/agent.json"
-	// defaultFetchTimeout is the default timeout for fetching agent card
-	defaultFetchTimeout = 30 * time.Second
+	defaultStreamingChannelSize    = 1024
+	defaultNonStreamingChannelSize = 10
+	defaultUserIDHeader            = "X-User-ID"
 )
 
 // A2AAgent is an agent that communicates with a remote A2A agent via A2A protocol.
@@ -50,10 +45,11 @@ type A2AAgent struct {
 	extraA2AOptions      []client.Option        // Additional A2A client options
 	streamingBufSize     int                    // Buffer size for streaming responses
 	streamingRespHandler StreamingRespHandler   // Handler for streaming responses
-	transferStateKey     []string               // Keysa in session state to transfer to the A2A agent message by metadata
+	transferStateKey     []string               // Keys in session state to transfer to the A2A agent message by metadata
+	userIDHeader         string                 // HTTP header name to send UserID to A2A server
+	enableStreaming      *bool                  // Explicitly set streaming mode; nil means use agent card capability
 
-	httpClient *http.Client
-	a2aClient  *client.A2AClient
+	a2aClient *client.A2AClient
 }
 
 // New creates a new A2AAgent.
@@ -68,74 +64,60 @@ func New(opts ...Option) (*A2AAgent, error) {
 		opt(agent)
 	}
 
-	if agent.agentURL != "" && agent.agentCard == nil {
-		agentCard, err := agent.resolveAgentCardFromURL()
+	var agentURL string
+	if agent.agentCard != nil {
+		agentURL = agent.agentCard.URL
+	} else if agent.agentURL != "" {
+		agentURL = agent.agentURL
+	} else {
+		log.Info("agent card or agent card url not set")
+	}
+
+	// Normalize the URL to ensure it has a proper scheme
+	agentURL = ia2a.NormalizeURL(agentURL)
+
+	// Create A2A client first
+	a2aClient, err := client.NewA2AClient(agentURL, agent.extraA2AOptions...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create A2A client for %s: %w", agentURL, err)
+	}
+	agent.a2aClient = a2aClient
+
+	// If agent card is not set, fetch it using A2A client's GetAgentCard method
+	if agent.agentCard == nil {
+		agentCard, err := a2aClient.GetAgentCard(context.Background(), "")
 		if err != nil {
-			return nil, fmt.Errorf("failed to resolve agent card: %w", err)
+			return nil, fmt.Errorf("failed to fetch agent card from %s: %w", agentURL, err)
 		}
+
+		// Set name and description from agent card if not already set
+		if agent.name == "" {
+			agent.name = agentCard.Name
+		}
+		if agent.description == "" {
+			agent.description = agentCard.Description
+		}
+
+		if agentCard.URL == "" {
+			agentCard.URL = agentURL
+		} else {
+			// Normalize the agent card URL to ensure it has a proper scheme
+			agentCard.URL = ia2a.NormalizeURL(agentCard.URL)
+		}
+
+		// Rebuild a2a client if URL changed
+		if agentCard.URL != agentURL {
+			a2aClient, err := client.NewA2AClient(agentCard.URL, agent.extraA2AOptions...)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create A2A client for %s: %w", agentCard.URL, err)
+			}
+			agent.a2aClient = a2aClient
+		}
+
 		agent.agentCard = agentCard
 	}
 
-	if agent.agentCard == nil {
-		return nil, fmt.Errorf("agent card not set")
-	}
-
-	a2aClient, err := client.NewA2AClient(agent.agentCard.URL, agent.extraA2AOptions...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create A2A client for %s: %w", agent.agentCard.URL, err)
-	}
-	agent.a2aClient = a2aClient
 	return agent, nil
-}
-
-// resolveAgentCardFromURL fetches agent card from the well-known path
-func (r *A2AAgent) resolveAgentCardFromURL() (*server.AgentCard, error) {
-	agentURL := r.agentURL
-
-	// Construct the agent card discovery URL
-	agentCardURL := strings.TrimSuffix(agentURL, "/") + AgentCardWellKnownPath
-
-	// Create HTTP client if not set
-	httpClient := r.httpClient
-	if httpClient == nil {
-		httpClient = &http.Client{Timeout: defaultFetchTimeout}
-	}
-
-	// Fetch agent card from well-known path
-	resp, err := httpClient.Get(agentCardURL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch agent card from %s: %w", agentCardURL, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to fetch agent card from %s: HTTP %d", agentCardURL, resp.StatusCode)
-	}
-
-	// Read response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read agent card response: %w", err)
-	}
-
-	// Parse agent card JSON
-	var agentCard server.AgentCard
-	if err := json.Unmarshal(body, &agentCard); err != nil {
-		return nil, fmt.Errorf("failed to parse agent card JSON: %w", err)
-	}
-
-	if r.name == "" {
-		r.name = agentCard.Name
-	}
-
-	if r.description == "" {
-		r.description = agentCard.Description
-	}
-	// If URL is not set in the agent card, use the provided agent URL.
-	if agentCard.URL == "" {
-		agentCard.URL = agentURL
-	}
-	return &agentCard, nil
 }
 
 // sendErrorEvent sends an error event to the event channel
@@ -152,11 +134,31 @@ func (r *A2AAgent) sendErrorEvent(ctx context.Context, eventChan chan<- *event.E
 	))
 }
 
+// validateA2ARequestOptions validates that all A2A request options are of the correct type
+func (r *A2AAgent) validateA2ARequestOptions(invocation *agent.Invocation) error {
+	if invocation.RunOptions.A2ARequestOptions == nil {
+		return nil
+	}
+
+	for i, opt := range invocation.RunOptions.A2ARequestOptions {
+		if _, ok := opt.(client.RequestOption); !ok {
+			return fmt.Errorf("A2ARequestOptions[%d] is not a valid client.RequestOption, got type %T", i, opt)
+		}
+	}
+	return nil
+}
+
 // Run implements the Agent interface
 func (r *A2AAgent) Run(ctx context.Context, invocation *agent.Invocation) (<-chan *event.Event, error) {
 	if r.a2aClient == nil {
 		return nil, fmt.Errorf("A2A client not initialized")
 	}
+
+	// Validate A2A request options early
+	if err := r.validateA2ARequestOptions(invocation); err != nil {
+		return nil, err
+	}
+
 	useStreaming := r.shouldUseStreaming()
 	if useStreaming {
 		return r.runStreaming(ctx, invocation)
@@ -166,7 +168,12 @@ func (r *A2AAgent) Run(ctx context.Context, invocation *agent.Invocation) (<-cha
 
 // shouldUseStreaming determines whether to use streaming protocol
 func (r *A2AAgent) shouldUseStreaming() bool {
-	// Check if agent card supports streaming
+	// If explicitly set via option, use that value
+	if r.enableStreaming != nil {
+		return *r.enableStreaming
+	}
+
+	// Otherwise check if agent card supports streaming
 	if r.agentCard != nil && r.agentCard.Capabilities.Streaming != nil {
 		return *r.agentCard.Capabilities.Streaming
 	}
@@ -215,13 +222,31 @@ func (r *A2AAgent) runStreaming(ctx context.Context, invocation *agent.Invocatio
 		params := protocol.SendMessageParams{
 			Message: *a2aMessage,
 		}
-		streamChan, err := r.a2aClient.StreamMessage(ctx, params)
+		// Extract A2A request options from invocation
+		var requestOpts []client.RequestOption
+		if invocation.RunOptions.A2ARequestOptions != nil {
+			for _, opt := range invocation.RunOptions.A2ARequestOptions {
+				requestOpts = append(requestOpts, opt.(client.RequestOption))
+			}
+		}
+		// Add UserID header if session has UserID
+		if invocation.Session != nil && invocation.Session.UserID != "" {
+			userIDHeader := r.userIDHeader
+			if userIDHeader == "" {
+				userIDHeader = defaultUserIDHeader
+			}
+			requestOpts = append(requestOpts, client.WithRequestHeader(userIDHeader, invocation.Session.UserID))
+		}
+		streamChan, err := r.a2aClient.StreamMessage(ctx, params, requestOpts...)
 		if err != nil {
 			r.sendErrorEvent(ctx, eventChan, invocation, fmt.Sprintf("A2A streaming request failed to %s: %v", r.agentCard.URL, err))
 			return
 		}
 
-		var aggregatedContentBuilder strings.Builder
+		var (
+			responseID               string
+			aggregatedContentBuilder strings.Builder
+		)
 		for streamEvent := range streamChan {
 			if err := agent.CheckContextCancelled(ctx); err != nil {
 				return
@@ -235,6 +260,9 @@ func (r *A2AAgent) runStreaming(ctx context.Context, invocation *agent.Invocatio
 
 			// Aggregate content from delta
 			if evt.Response != nil && len(evt.Response.Choices) > 0 {
+				if evt.Response.ID != "" {
+					responseID = evt.Response.ID
+				}
 				if r.streamingRespHandler != nil {
 					content, err := r.streamingRespHandler(evt.Response)
 					if err != nil {
@@ -256,6 +284,8 @@ func (r *A2AAgent) runStreaming(ctx context.Context, invocation *agent.Invocatio
 			invocation.InvocationID,
 			r.name,
 			event.WithResponse(&model.Response{
+				ID:        responseID,
+				Object:    model.ObjectTypeChatCompletion,
 				Done:      true,
 				IsPartial: false,
 				Timestamp: time.Now(),
@@ -288,7 +318,22 @@ func (r *A2AAgent) runNonStreaming(ctx context.Context, invocation *agent.Invoca
 		params := protocol.SendMessageParams{
 			Message: *a2aMessage,
 		}
-		result, err := r.a2aClient.SendMessage(ctx, params)
+		// Extract A2A request options from invocation
+		var requestOpts []client.RequestOption
+		if invocation.RunOptions.A2ARequestOptions != nil {
+			for _, opt := range invocation.RunOptions.A2ARequestOptions {
+				requestOpts = append(requestOpts, opt.(client.RequestOption))
+			}
+		}
+		// Add UserID header if session has UserID
+		if invocation.Session != nil && invocation.Session.UserID != "" {
+			userIDHeader := r.userIDHeader
+			if userIDHeader == "" {
+				userIDHeader = defaultUserIDHeader
+			}
+			requestOpts = append(requestOpts, client.WithRequestHeader(userIDHeader, invocation.Session.UserID))
+		}
+		result, err := r.a2aClient.SendMessage(ctx, params, requestOpts...)
 		if err != nil {
 			r.sendErrorEvent(ctx, eventChan, invocation, fmt.Sprintf("A2A request failed to %s: %v", r.agentCard.URL, err))
 			return

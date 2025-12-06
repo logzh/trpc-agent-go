@@ -39,17 +39,6 @@ var (
 	errDocumentIDCannotBeEmpty = errors.New("elasticsearch document ID cannot be empty")
 )
 
-const (
-	// defaultIndexName is the default index name for documents.
-	defaultIndexName = "trpc_agent_documents"
-	// defaultScoreThreshold is the default minimum similarity score.
-	defaultScoreThreshold = 0.7
-	// defaultVectorDimension is the default dimension for embedding vectors.
-	defaultVectorDimension = 1536
-	// defaultMaxResults is the default maximum number of search results.
-	defaultMaxResults = 10
-)
-
 // indexCreateBody is a lightweight helper used to marshal typed mappings and settings.
 type indexCreateBody struct {
 	Mappings *types.TypeMapping   `json:"mappings,omitempty"`
@@ -68,14 +57,6 @@ func New(opts ...Option) (*VectorStore, error) {
 	option := defaultOptions
 	for _, opt := range opts {
 		opt(&option)
-	}
-
-	if option.indexName == "" {
-		option.indexName = defaultIndexName
-	}
-
-	if option.vectorDimension == 0 {
-		option.vectorDimension = defaultVectorDimension
 	}
 
 	// Create Elasticsearch client configuration.
@@ -376,6 +357,8 @@ func (vs *VectorStore) Search(ctx context.Context, query *vectorstore.SearchQuer
 		} else {
 			searchQuery, err = vs.buildHybridSearchQuery(query)
 		}
+	case vectorstore.SearchModeFilter:
+		searchQuery, err = vs.buildFilterSearchQuery(query)
 	default:
 		searchQuery, err = vs.buildVectorSearchQuery(query)
 	}

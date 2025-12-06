@@ -19,16 +19,7 @@ import (
 
 	"github.com/google/uuid"
 	"trpc.group/trpc-go/trpc-agent-go/event"
-	isession "trpc.group/trpc-go/trpc-agent-go/internal/session"
 	"trpc.group/trpc-go/trpc-agent-go/session"
-)
-
-const (
-	defaultSessionEventLimit     = 1000
-	defaultCleanupIntervalSecond = 300 // 5 min
-
-	defaultAsyncSummaryNum  = 3
-	defaultSummaryQueueSize = 256
 )
 
 // stateWithTTL wraps state data with expiration time.
@@ -43,7 +34,10 @@ type sessionWithTTL struct {
 	expiredAt time.Time
 }
 
-var _ session.Service = (*SessionService)(nil)
+var (
+	_ session.Service      = (*SessionService)(nil)
+	_ session.TrackService = (*SessionService)(nil)
+)
 
 // isExpired checks if the given time has passed.
 func isExpired(expiredAt time.Time) bool {
@@ -100,25 +94,20 @@ type SessionService struct {
 	cleanupDone     chan struct{}
 	cleanupOnce     sync.Once
 	summaryJobChans []chan *summaryJob // channel for summary jobs to processing
+	summaryWg       sync.WaitGroup     // wait group for summary workers
+	once            sync.Once          // ensure Close is called only once
 }
 
 // summaryJob represents a summary job to be processed asynchronously
 type summaryJob struct {
-	sessionKey session.Key
-	filterKey  string
-	force      bool
-	session    *session.Session
+	filterKey string
+	force     bool
+	session   *session.Session
 }
 
 // NewSessionService creates a new in-memory session service.
 func NewSessionService(options ...ServiceOpt) *SessionService {
-	opts := serviceOpts{
-		sessionEventLimit: defaultSessionEventLimit,
-		cleanupInterval:   0,
-		asyncSummaryNum:   defaultAsyncSummaryNum,
-		summaryQueueSize:  defaultSummaryQueueSize,
-		summaryJobTimeout: 30 * time.Second,
-	}
+	opts := defaultOptions
 	for _, option := range options {
 		option(&opts)
 	}
@@ -126,7 +115,7 @@ func NewSessionService(options ...ServiceOpt) *SessionService {
 	// Set default cleanup interval if any TTL is configured and auto cleanup is not disabled
 	if opts.cleanupInterval <= 0 {
 		if opts.sessionTTL > 0 || opts.appStateTTL > 0 || opts.userStateTTL > 0 {
-			opts.cleanupInterval = defaultCleanupIntervalSecond * time.Second
+			opts.cleanupInterval = defaultCleanupIntervalSecond
 		}
 	}
 
@@ -194,15 +183,7 @@ func (s *SessionService) CreateSession(
 	}
 
 	// Create the session with new State
-	sess := &session.Session{
-		ID:        key.SessionID,
-		AppName:   key.AppName,
-		UserID:    key.UserID,
-		State:     make(session.StateMap), // Initialize with provided state
-		Events:    []event.Event{},
-		UpdatedAt: time.Now(),
-		CreatedAt: time.Now(),
-	}
+	sess := session.NewSession(key.AppName, key.UserID, key.SessionID)
 
 	// Set initial state if provided
 	for k, v := range state {
@@ -230,7 +211,7 @@ func (s *SessionService) CreateSession(
 	}
 
 	// Create a copy and merge state for return
-	copiedSess := copySession(sess)
+	copiedSess := sess.Clone()
 	appState := getValidState(app.appState)
 	userState := getValidState(app.userState[key.UserID])
 	if appState == nil {
@@ -275,12 +256,10 @@ func (s *SessionService) GetSession(
 	// Refresh TTL on access
 	sessWithTTL.expiredAt = calculateExpiredAt(s.opts.sessionTTL)
 
-	copiedSess := copySession(sess)
+	copiedSess := sess.Clone()
 
 	// apply filtering options if provided
-	isession.ApplyEventFiltering(copiedSess, opts...)
-	// filter events to ensure they start with RoleUser
-	isession.EnsureEventStartWithUser(copiedSess)
+	copiedSess.ApplyEventFiltering(opts...)
 
 	appState := getValidState(app.appState)
 	userState := getValidState(app.userState[key.UserID])
@@ -321,10 +300,8 @@ func (s *SessionService) ListSessions(
 		if s == nil {
 			continue // Skip expired sessions
 		}
-		copiedSess := copySession(s)
-		isession.ApplyEventFiltering(copiedSess, opts...)
-		// filter events to ensure they start with RoleUser
-		isession.EnsureEventStartWithUser(copiedSess)
+		copiedSess := s.Clone()
+		copiedSess.ApplyEventFiltering(opts...)
 
 		appState := getValidState(app.appState)
 		userState := getValidState(app.userState[userKey.UserID])
@@ -487,6 +464,65 @@ func (s *SessionService) UpdateUserState(ctx context.Context, userKey session.Us
 	return nil
 }
 
+// UpdateSessionState updates the session-level state directly without appending an event.
+// This is useful for state initialization, correction, or synchronization scenarios
+// where event history is not needed.
+// Keys with app: or user: prefixes are not allowed (use UpdateAppState/UpdateUserState instead).
+// Keys with temp: prefix are allowed as they represent session-scoped ephemeral state.
+func (s *SessionService) UpdateSessionState(ctx context.Context, key session.Key, state session.StateMap) error {
+	if err := key.CheckSessionKey(); err != nil {
+		return err
+	}
+
+	app := s.getOrCreateAppSessions(key.AppName)
+
+	app.mu.Lock()
+	defer app.mu.Unlock()
+
+	// Find the session
+	userSessions, userExists := app.sessions[key.UserID]
+	if !userExists {
+		return fmt.Errorf("memory session service update session state failed: user not found")
+	}
+
+	sessWithTTL, sessExists := userSessions[key.SessionID]
+	if !sessExists {
+		return fmt.Errorf("memory session service update session state failed: session not found")
+	}
+
+	// Check if session is expired
+	if isExpired(sessWithTTL.expiredAt) {
+		return fmt.Errorf("memory session service update session state failed: session expired")
+	}
+
+	// Validate: disallow app: and user: prefixes
+	for k := range state {
+		if strings.HasPrefix(k, session.StateAppPrefix) {
+			return fmt.Errorf("memory session service update session state failed: %s is not allowed, use UpdateAppState instead", k)
+		}
+		if strings.HasPrefix(k, session.StateUserPrefix) {
+			return fmt.Errorf("memory session service update session state failed: %s is not allowed, use UpdateUserState instead", k)
+		}
+	}
+
+	// Update session state (allow temp: prefix and unprefixed keys)
+	for k, v := range state {
+		copiedValue := make([]byte, len(v))
+		copy(copiedValue, v)
+		sessWithTTL.session.State[k] = copiedValue
+	}
+
+	// Update timestamp
+	sessWithTTL.session.UpdatedAt = time.Now()
+
+	// Refresh TTL if configured
+	if s.opts.sessionTTL > 0 {
+		sessWithTTL.expiredAt = calculateExpiredAt(s.opts.sessionTTL)
+	}
+
+	return nil
+}
+
 // DeleteUserState deletes the user state.
 func (s *SessionService) DeleteUserState(ctx context.Context, userKey session.UserKey, key string) error {
 	if err := userKey.CheckUserKey(); err != nil {
@@ -555,7 +591,7 @@ func (s *SessionService) AppendEvent(
 	event *event.Event,
 	opts ...session.Option,
 ) error {
-	isession.UpdateUserSession(sess, event, opts...)
+	sess.UpdateUserSession(event, opts...)
 	key := session.Key{
 		AppName:   sess.AppName,
 		UserID:    sess.UserID,
@@ -593,7 +629,62 @@ func (s *SessionService) AppendEvent(
 	// update stored session with the given event
 	s.updateStoredSession(storedSession, event)
 
-	// Update the session in the wrapper and refresh TTL
+	// Update the session in the wrapper and refresh TTL.
+	storedSessionWithTTL.session = storedSession
+	storedSessionWithTTL.expiredAt = calculateExpiredAt(s.opts.sessionTTL)
+	return nil
+}
+
+// AppendTrackEvent appends a track event to a session transcript.
+func (s *SessionService) AppendTrackEvent(
+	ctx context.Context,
+	sess *session.Session,
+	trackEvent *session.TrackEvent,
+	opts ...session.Option,
+) error {
+	if err := sess.AppendTrackEvent(trackEvent, opts...); err != nil {
+		return fmt.Errorf("append track event: %w", err)
+	}
+	key := session.Key{
+		AppName:   sess.AppName,
+		UserID:    sess.UserID,
+		SessionID: sess.ID,
+	}
+	if err := key.CheckSessionKey(); err != nil {
+		return err
+	}
+
+	app, ok := s.getAppSessions(key.AppName)
+	if !ok {
+		return fmt.Errorf("app not found: %s", key.AppName)
+	}
+
+	app.mu.Lock()
+	defer app.mu.Unlock()
+
+	// Check if user exists first to prevent panic.
+	userSessions, ok := app.sessions[key.UserID]
+	if !ok {
+		return fmt.Errorf("user not found: %s", key.UserID)
+	}
+
+	storedSessionWithTTL, ok := userSessions[key.SessionID]
+	if !ok {
+		return fmt.Errorf("session not found: %s", key.SessionID)
+	}
+
+	// Check if session is expired.
+	storedSession := getValidSession(storedSessionWithTTL)
+	if storedSession == nil {
+		return fmt.Errorf("session expired: %s", key.SessionID)
+	}
+
+	// Append track event to the session.
+	if err := storedSession.AppendTrackEvent(trackEvent, opts...); err != nil {
+		return fmt.Errorf("append track event: %w", err)
+	}
+
+	// Update the session in the wrapper and refresh TTL.
 	storedSessionWithTTL.session = storedSession
 	storedSessionWithTTL.expiredAt = calculateExpiredAt(s.opts.sessionTTL)
 	return nil
@@ -664,67 +755,27 @@ func (s *SessionService) stopCleanupRoutine() {
 
 // Close closes the service.
 func (s *SessionService) Close() error {
-	s.stopCleanupRoutine()
-	s.stopAsyncSummaryWorker()
+	s.once.Do(func() {
+		s.stopCleanupRoutine()
+		s.stopAsyncSummaryWorker()
+	})
 	return nil
 }
 
 // updateStoredSession updates the stored session with the given event.
 func (s *SessionService) updateStoredSession(sess *session.Session, e *event.Event) {
-	sess.EventMu.Lock()
 	if e.Response != nil && !e.IsPartial && e.IsValidContent() {
+		sess.EventMu.Lock()
 		sess.Events = append(sess.Events, *e)
 		if s.opts.sessionEventLimit > 0 && len(sess.Events) > s.opts.sessionEventLimit {
-			sess.Events = sess.Events[len(sess.Events)-s.opts.sessionEventLimit:]
+			sess.ApplyEventFiltering(session.WithEventNum(s.opts.sessionEventLimit))
 		}
+		sess.EventMu.Unlock()
 	}
-	sess.EventMu.Unlock()
+
 	sess.UpdatedAt = time.Now()
 	// Merge event state delta to session state.
-	isession.ApplyEventStateDelta(sess, e)
-}
-
-// copySession creates a  copy of a session.
-func copySession(sess *session.Session) *session.Session {
-	sess.EventMu.RLock()
-	copiedSess := &session.Session{
-		ID:        sess.ID,
-		AppName:   sess.AppName,
-		UserID:    sess.UserID,
-		State:     make(session.StateMap), // Create new state to avoid reference sharing.
-		Events:    make([]event.Event, len(sess.Events)),
-		UpdatedAt: sess.UpdatedAt,
-		CreatedAt: sess.CreatedAt, // Add missing CreatedAt field.
-	}
-
-	// Copy events.
-	copy(copiedSess.Events, sess.Events)
-	sess.EventMu.RUnlock()
-
-	// Copy state.
-	if sess.State != nil {
-		for k, v := range sess.State {
-			copiedValue := make([]byte, len(v))
-			copy(copiedValue, v)
-			copiedSess.State[k] = copiedValue
-		}
-	}
-
-	// Copy summaries.
-	sess.SummariesMu.RLock()
-	if sess.Summaries != nil {
-		copiedSess.Summaries = make(map[string]*session.Summary, len(sess.Summaries))
-		for b, sum := range sess.Summaries {
-			if sum == nil {
-				continue
-			}
-			// Shallow copy is fine since Summary is immutable after write.
-			copied := *sum
-			copiedSess.Summaries[b] = &copied
-		}
-	}
-	sess.SummariesMu.RUnlock()
-	return copiedSess
+	sess.ApplyEventStateDelta(e)
 }
 
 // mergeState merges app-level and user-level state into the session state.

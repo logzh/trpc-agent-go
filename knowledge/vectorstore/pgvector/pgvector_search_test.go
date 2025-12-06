@@ -11,1231 +11,526 @@ package pgvector
 
 import (
 	"context"
-	"fmt"
-	"reflect"
-	"strings"
+	"errors"
 	"testing"
-	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/suite"
-	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
-	"trpc.group/trpc-go/trpc-agent-go/knowledge/searchfilter"
+	"github.com/stretchr/testify/require"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore"
 )
 
-// PgVectorSearchTestSuite contains the search test suite for pgvector.
-type PgVectorSearchTestSuite struct {
-	suite.Suite
-	vs       *VectorStore
-	testDocs map[string]*document.Document // Store test documents for validation
-}
-
-// Run the search test suite.
-func TestPgVectorSearchSuite(t *testing.T) {
-	suite.Run(t, new(PgVectorSearchTestSuite))
-}
-
-// SetupSuite runs once before all tests.
-func (suite *PgVectorSearchTestSuite) SetupSuite() {
-	if host == "" {
-		suite.T().Skip("Skipping PgVector tests: PGVECTOR_HOST not set")
-		return
-	}
-	fmt.Println("host", host)
-	fmt.Println("port", port)
-	fmt.Println("user", user)
-	fmt.Println("password", password)
-	fmt.Println("database", database)
-	fmt.Println("table", table)
-
-	vs, err := New(
-		WithHost(host),
-		WithPort(port),
-		WithUser(user),
-		WithPassword(password),
-		WithDatabase(database),
-		WithTable(table),
-		WithIndexDimension(3),             // Small dimension for testing
-		WithHybridSearchWeights(0.7, 0.3), // Test custom weights
-	)
-	if err != nil {
-		suite.T().Skipf("Skipping PgVector tests: failed to connect to database: %v", err)
-		return
-	}
-	suite.vs = vs
-	suite.testDocs = make(map[string]*document.Document)
-}
-
-// TearDownSuite runs once after all search tests.
-func (suite *PgVectorSearchTestSuite) TearDownSuite() {
-	if suite.vs != nil {
-		// Clean up test table
-		_, err := suite.vs.pool.Exec(context.Background(), "DROP TABLE IF EXISTS "+table)
-		suite.NoError(err)
-		suite.vs.Close()
-	}
-}
-
-// SetupTest runs before each search test.
-func (suite *PgVectorSearchTestSuite) SetupTest() {
-	// Clean up table data before each test
-	_, err := suite.vs.pool.Exec(context.Background(), "DELETE FROM "+table)
-	suite.NoError(err)
-}
-
-// validateSearchResult validates a single search result.
-func (suite *PgVectorSearchTestSuite) validateSearchResult(result *vectorstore.ScoredDocument) {
-	// Validate document structure
-	suite.NotNil(result.Document, "Document should not be nil")
-	suite.NotEmpty(result.Document.ID, "Document ID should not be empty")
-	suite.NotEmpty(result.Document.Name, "Document Name should not be empty")
-	suite.NotEmpty(result.Document.Content, "Document Content should not be empty")
-
-	// Validate score
-	suite.GreaterOrEqual(result.Score, 0.0, "Score should be non-negative")
-	suite.LessOrEqual(result.Score, 1.0, "Score should not exceed 1.0")
-
-	// Compare with original test document if available
-	if originalDoc, exists := suite.testDocs[result.Document.ID]; exists {
-		suite.validateDocumentContent(originalDoc, result.Document)
-	}
-}
-
-// validateDocumentContent compares returned document with original.
-func (suite *PgVectorSearchTestSuite) validateDocumentContent(expected, actual *document.Document) {
-	suite.Equal(expected.ID, actual.ID, "Document ID should match")
-	suite.Equal(expected.Name, actual.Name, "Document Name should match")
-	suite.Equal(expected.Content, actual.Content, "Document Content should match")
-
-	// Validate metadata
-	suite.NotNil(actual.Metadata, "Document metadata should not be nil")
-	for key, expectedValue := range expected.Metadata {
-		actualValue, exists := actual.Metadata[key]
-		suite.True(exists, "Metadata key '%s' should exist", key)
-
-		// Flexible type comparison for metadata
-		suite.True(suite.compareMetadataValues(expectedValue, actualValue),
-			"Metadata '%s' should match: expected %v (%T), got %v (%T)",
-			key, expectedValue, expectedValue, actualValue, actualValue)
-	}
-}
-
-// compareMetadataValues provides flexible comparison for metadata values.
-func (suite *PgVectorSearchTestSuite) compareMetadataValues(expected, actual any) bool {
-	// Direct equality check
-	if expected == actual {
-		return true
-	}
-
-	// Handle numeric type conversions (JSON unmarshaling often converts to float64)
-	switch e := expected.(type) {
-	case int:
-		if a, ok := actual.(float64); ok {
-			return float64(e) == a
-		}
-	case float64:
-		if a, ok := actual.(int); ok {
-			return e == float64(a)
-		}
-	case []string:
-		if a, ok := actual.([]any); ok {
-			if len(e) != len(a) {
-				return false
-			}
-			for i, v := range e {
-				if str, ok := a[i].(string); !ok || str != v {
-					return false
-				}
-			}
-			return true
-		}
-	}
-	return false
-}
-
-// validateSearchResults validates the complete search result set.
-func (suite *PgVectorSearchTestSuite) validateSearchResults(results []*vectorstore.ScoredDocument, expectedMinCount int) {
-	suite.GreaterOrEqual(len(results), expectedMinCount,
-		"Should return at least %d results", expectedMinCount)
-
-	// Validate individual results
-	for i, result := range results {
-		suite.validateSearchResult(result)
-		suite.T().Logf("Result %d: ID=%s, Name=%s, Score=%.4f",
-			i+1, result.Document.ID, result.Document.Name, result.Score)
-	}
-
-	// Validate score ordering (descending)
-	for i := 1; i < len(results); i++ {
-		suite.GreaterOrEqual(results[i-1].Score, results[i].Score,
-			"Results should be ordered by score (descending): result[%d].Score=%.4f >= result[%d].Score=%.4f",
-			i-1, results[i-1].Score, i, results[i].Score)
-	}
-}
-
-// validateKeywordRelevance checks if results are relevant to the keyword query.
-func (suite *PgVectorSearchTestSuite) validateKeywordRelevance(results []*vectorstore.ScoredDocument, keywords []string) {
-	for _, result := range results {
-		hasRelevantContent := false
-		content := strings.ToLower(result.Document.Name + " " + result.Document.Content)
-
-		for _, keyword := range keywords {
-			if strings.Contains(content, strings.ToLower(keyword)) {
-				hasRelevantContent = true
-				break
-			}
-		}
-
-		// Log for debugging - keyword relevance might not be strict
-		if !hasRelevantContent {
-			suite.T().Logf("Note: Document %s may not contain keywords %v",
-				result.Document.ID, keywords)
-		}
-	}
-}
-
-// TestSearchModes tests different search modes.
-func (suite *PgVectorSearchTestSuite) TestSearchModes() {
-	ctx := context.Background()
-
-	// Setup test data.
-	testDocs := []struct {
-		doc       *document.Document
-		embedding []float64
-	}{
-		{
-			doc: &document.Document{
-				ID:      "doc1",
-				Name:    "Python Programming",
-				Content: "Python is a powerful programming language for data science and machine learning",
-				Metadata: map[string]any{
-					"category": "programming",
-					"language": "python",
-					"level":    "beginner",
-				},
-			},
-			embedding: []float64{0.1, 0.2, 0.3},
-		},
-		{
-			doc: &document.Document{
-				ID:      "doc2",
-				Name:    "Go Development",
-				Content: "Go is a fast and efficient language for system programming and web development",
-				Metadata: map[string]any{
-					"category": "programming",
-					"language": "go",
-					"level":    "intermediate",
-				},
-			},
-			embedding: []float64{0.2, 0.3, 0.4},
-		},
-		{
-			doc: &document.Document{
-				ID:      "doc3",
-				Name:    "Data Science Tutorial",
-				Content: "Learn data science fundamentals with Python and machine learning algorithms",
-				Metadata: map[string]any{
-					"category": "tutorial",
-					"language": "python",
-					"level":    "advanced",
-				},
-			},
-			embedding: []float64{0.15, 0.25, 0.35},
-		},
-	}
-
-	// Add test documents
-	for _, td := range testDocs {
-		err := suite.vs.Add(ctx, td.doc, td.embedding)
-		suite.NoError(err)
-		// Store for validation
-		suite.testDocs[td.doc.ID] = td.doc
-	}
-
-	testCases := []struct {
-		name        string
-		query       *vectorstore.SearchQuery
-		expectError bool
-		minResults  int
-		validator   func(results []*vectorstore.ScoredDocument)
-	}{
-		{
-			name: "vector search",
-			query: &vectorstore.SearchQuery{
-				Vector:     []float64{0.1, 0.2, 0.3}, // Similar to doc1
-				Limit:      10,
-				SearchMode: vectorstore.SearchModeVector,
-			},
-			expectError: false,
-			minResults:  1,
-			validator: func(results []*vectorstore.ScoredDocument) {
-				// Vector search should prioritize similarity
-				if len(results) > 0 {
-					suite.Greater(results[0].Score, 0.0, "Vector search should return similarity scores")
-				}
-			},
-		},
-		{
-			name: "keyword search",
-			query: &vectorstore.SearchQuery{
-				Query:      "Python programming",
-				Limit:      10,
-				SearchMode: vectorstore.SearchModeKeyword,
-			},
-			expectError: false,
-			minResults:  1,
-			validator: func(results []*vectorstore.ScoredDocument) {
-				// Validate keyword relevance
-				suite.validateKeywordRelevance(results, []string{"Python", "programming"})
-			},
-		},
-		{
-			name: "hybrid search",
-			query: &vectorstore.SearchQuery{
-				Vector:     []float64{0.1, 0.2, 0.3},
-				Query:      "machine learning",
-				Limit:      10,
-				SearchMode: vectorstore.SearchModeHybrid,
-			},
-			expectError: false,
-			minResults:  1,
-			validator: func(results []*vectorstore.ScoredDocument) {
-				// Hybrid search should combine both signals
-				suite.validateKeywordRelevance(results, []string{"machine", "learning"})
-				if len(results) > 0 {
-					suite.Greater(results[0].Score, 0.0, "Hybrid search should return meaningful scores")
-				}
-			},
-		},
-		{
-			name: "filter search",
-			query: &vectorstore.SearchQuery{
-				Filter: &vectorstore.SearchFilter{
-					Metadata: map[string]any{
-						"category": "programming",
-					},
-				},
-				Limit:      10,
-				SearchMode: vectorstore.SearchModeFilter,
-			},
-			expectError: false,
-			minResults:  2, // doc1 and doc2 have category=programming
-			validator: func(results []*vectorstore.ScoredDocument) {
-				// All results should match the filter
-				for _, r := range results {
-					if category, ok := r.Document.Metadata["category"]; ok {
-						suite.Equal("programming", category,
-							"All filtered results should have category='programming'")
-					} else {
-						suite.Fail("Result should have category metadata")
-					}
-				}
-			},
-		},
-		{
-			name: "search with ID filter",
-			query: &vectorstore.SearchQuery{
-				Vector: []float64{0.1, 0.2, 0.3},
-				Filter: &vectorstore.SearchFilter{
-					IDs: []string{"doc1", "doc3"},
-				},
-				Limit:      10,
-				SearchMode: vectorstore.SearchModeVector,
-			},
-			expectError: false,
-			minResults:  2,
-			validator: func(results []*vectorstore.ScoredDocument) {
-				// All results should match the ID filter
-				allowedIDs := map[string]bool{"doc1": true, "doc3": true}
-				for _, r := range results {
-					suite.True(allowedIDs[r.Document.ID],
-						"Result ID %s should be in allowed list", r.Document.ID)
-				}
-			},
-		},
-	}
-
-	for _, tc := range testCases {
-		suite.Run(tc.name, func() {
-			result, err := suite.vs.Search(ctx, tc.query)
-			if tc.expectError {
-				suite.Error(err)
-				return
-			}
-
-			suite.NoError(err, "Search should not error")
-			suite.NotNil(result, "Search result should not be nil")
-
-			// Validate search results
-			suite.validateSearchResults(result.Results, tc.minResults)
-
-			// Run custom validator
-			if tc.validator != nil {
-				tc.validator(result.Results)
-			}
-		})
-	}
-}
-
-// TestHybridSearchWeights tests hybrid search weight configuration.
-func (suite *PgVectorSearchTestSuite) TestHybridSearchWeights() {
-	ctx := context.Background()
-
-	// Add test document.
-	doc := &document.Document{
-		ID:      "weight_test",
-		Name:    "Weight Test Document",
-		Content: "This document tests hybrid search weight configuration with machine learning",
-		Metadata: map[string]any{
-			"category": "test",
-		},
-	}
-	embedding := []float64{0.1, 0.2, 0.3}
-	err := suite.vs.Add(ctx, doc, embedding)
-	suite.NoError(err)
-	// Store for validation.
-	suite.testDocs[doc.ID] = doc
-
-	testCases := []struct {
-		name         string
-		vectorWeight float64
-		textWeight   float64
-		expectNorm   bool // Whether weights should be normalized.
-	}{
-		{
-			name:         "default weights",
-			vectorWeight: 0.7,
-			textWeight:   0.3,
-			expectNorm:   false,
-		},
-		{
-			name:         "equal weights",
-			vectorWeight: 0.5,
-			textWeight:   0.5,
-			expectNorm:   false,
-		},
-		{
-			name:         "unnormalized weights",
-			vectorWeight: 3.0,
-			textWeight:   1.0,
-			expectNorm:   true, // Should be normalized to 0.75 and 0.25
-		},
-		{
-			name:         "vector priority",
-			vectorWeight: 0.8,
-			textWeight:   0.2,
-			expectNorm:   false,
-		},
-		{
-			name:         "text priority",
-			vectorWeight: 0.2,
-			textWeight:   0.8,
-			expectNorm:   false,
-		},
-	}
-
-	for _, tc := range testCases {
-		suite.Run(tc.name, func() {
-			// Create a new vector store with specific weights.
-			table := "test_weights_" + time.Now().Format("150405")
-			vs, err := New(
-				WithHost(host),
-				WithPort(port),
-				WithUser(user),
-				WithPassword(password),
-				WithDatabase(database),
-				WithTable(table),
-				WithIndexDimension(3),
-				WithHybridSearchWeights(tc.vectorWeight, tc.textWeight),
-			)
-			suite.NoError(err)
-			defer func() {
-				vs.pool.Exec(context.Background(), "DROP TABLE IF EXISTS "+table)
-				vs.Close()
-			}()
-
-			// Add the same test document.
-			err = vs.Add(ctx, doc, embedding)
-			suite.NoError(err)
-
-			// Perform hybrid search.
-			query := &vectorstore.SearchQuery{
-				Vector:     []float64{0.1, 0.2, 0.3},
-				Query:      "machine learning",
-				Limit:      1,
-				SearchMode: vectorstore.SearchModeHybrid,
-			}
-
-			result, err := vs.Search(ctx, query)
-			suite.NoError(err, "Hybrid search should not error")
-			suite.NotNil(result, "Search result should not be nil")
-			suite.Len(result.Results, 1, "Should return exactly 1 result")
-
-			// Validate search results content.
-			if len(result.Results) > 0 {
-				resultDoc := result.Results[0]
-
-				// Validate document structure.
-				suite.NotNil(resultDoc.Document, "Document should not be nil")
-				suite.Equal(doc.ID, resultDoc.Document.ID, "Document ID should match")
-				suite.Equal(doc.Name, resultDoc.Document.Name, "Document name should match")
-				suite.Equal(doc.Content, resultDoc.Document.Content, "Document content should match")
-
-				// Validate score.
-				suite.Greater(resultDoc.Score, 0.0, "Score should be positive")
-				suite.LessOrEqual(resultDoc.Score, 1.0, "Score should not exceed 1.0")
-
-				// Validate keyword relevance.
-				content := strings.ToLower(resultDoc.Document.Name + " " + resultDoc.Document.Content)
-				suite.True(strings.Contains(content, "machine") || strings.Contains(content, "learning"),
-					"Result should be relevant to search keywords")
-			}
-
-			// Verify weights are correctly applied.
-			if tc.expectNorm {
-				// For normalized weights, just ensure search works
-				suite.Greater(result.Results[0].Score, 0.0, "Normalized weights should produce valid scores")
-			} else {
-				// Verify the actual weights are used
-				expectedVector := tc.vectorWeight / (tc.vectorWeight + tc.textWeight)
-				expectedText := tc.textWeight / (tc.vectorWeight + tc.textWeight)
-				suite.InDelta(expectedVector, vs.option.vectorWeight, 0.001,
-					"Vector weight should be normalized correctly")
-				suite.InDelta(expectedText, vs.option.textWeight, 0.001,
-					"Text weight should be normalized correctly")
-			}
-		})
-	}
-}
-
-// TestMetadataFiltering tests different metadata filtering approaches.
-func (suite *PgVectorSearchTestSuite) TestMetadataFiltering() {
-	ctx := context.Background()
-
-	// Setup test data with various metadata types.
-	testDocs := []struct {
-		doc       *document.Document
-		embedding []float64
-	}{
-		{
-			doc: &document.Document{
-				ID:      "meta1",
-				Name:    "Document 1",
-				Content: "Content with integer metadata",
-				Metadata: map[string]any{
-					"priority": 1,
-					"active":   true,
-					"score":    95.5,
-					"category": "urgent",
-				},
-			},
-			embedding: []float64{0.1, 0.2, 0.3},
-		},
-		{
-			doc: &document.Document{
-				ID:      "meta2",
-				Name:    "Document 2",
-				Content: "Content with different metadata",
-				Metadata: map[string]any{
-					"priority": 2,
-					"active":   false,
-					"score":    87.2,
-					"category": "normal",
-				},
-			},
-			embedding: []float64{0.2, 0.3, 0.4},
-		},
-		{
-			doc: &document.Document{
-				ID:      "meta3",
-				Name:    "Document 3",
-				Content: "Content with mixed metadata",
-				Metadata: map[string]any{
-					"priority": 1,
-					"active":   true,
-					"score":    92.8,
-					"category": "urgent",
-				},
-			},
-			embedding: []float64{0.15, 0.25, 0.35},
-		},
-	}
-
-	// Add test documents.
-	for _, td := range testDocs {
-		err := suite.vs.Add(ctx, td.doc, td.embedding)
-		suite.NoError(err)
-		// Store for validation.
-		suite.testDocs[td.doc.ID] = td.doc
-	}
-
-	testCases := []struct {
-		name          string
-		filter        map[string]any
-		expectedCount int
-		expectedIDs   []string
-	}{
-		{
-			name: "integer filter",
-			filter: map[string]any{
-				"priority": 1,
-			},
-			expectedCount: 2,
-			expectedIDs:   []string{"meta1", "meta3"},
-		},
-		{
-			name: "boolean filter",
-			filter: map[string]any{
-				"active": true,
-			},
-			expectedCount: 2,
-			expectedIDs:   []string{"meta1", "meta3"},
-		},
-		{
-			name: "string filter",
-			filter: map[string]any{
-				"category": "urgent",
-			},
-			expectedCount: 2,
-			expectedIDs:   []string{"meta1", "meta3"},
-		},
-		{
-			name: "float filter",
-			filter: map[string]any{
-				"score": 95.5,
-			},
-			expectedCount: 1,
-			expectedIDs:   []string{"meta1"},
-		},
-		{
-			name: "multiple filters",
-			filter: map[string]any{
-				"priority": 1,
-				"active":   true,
-			},
-			expectedCount: 2,
-			expectedIDs:   []string{"meta1", "meta3"},
-		},
-		{
-			name: "no match filter",
-			filter: map[string]any{
-				"priority": 999,
-			},
-			expectedCount: 0,
-			expectedIDs:   []string{},
-		},
-	}
-
-	for _, tc := range testCases {
-		suite.Run(tc.name, func() {
-			query := &vectorstore.SearchQuery{
-				Vector: []float64{0.1, 0.2, 0.3},
-				Filter: &vectorstore.SearchFilter{
-					Metadata: tc.filter,
-				},
-				Limit:      10,
-				SearchMode: vectorstore.SearchModeVector,
-			}
-
-			result, err := suite.vs.Search(ctx, query)
-			suite.NoError(err, "Metadata filtering search should not error")
-			suite.NotNil(result, "Search result should not be nil")
-			suite.Len(result.Results, tc.expectedCount,
-				"Should return exactly %d results", tc.expectedCount)
-
-			// Validate search results.
-			if len(result.Results) > 0 {
-				suite.validateSearchResults(result.Results, tc.expectedCount)
-			}
-
-			// Verify the correct documents are returned.
-			actualIDs := make([]string, len(result.Results))
-			for i, scored := range result.Results {
-				actualIDs[i] = scored.Document.ID
-			}
-			suite.ElementsMatch(tc.expectedIDs, actualIDs,
-				"Should return expected document IDs")
-
-			// Validate that all results match the filter criteria.
-			for _, result := range result.Results {
-				for filterKey, filterValue := range tc.filter {
-					actualValue, exists := result.Document.Metadata[filterKey]
-					suite.True(exists, "Filter key '%s' should exist in result", filterKey)
-					suite.True(suite.compareMetadataValues(filterValue, actualValue),
-						"Filter value should match: expected %v, got %v", filterValue, actualValue)
-				}
-			}
-		})
-	}
-}
-
-// TestSearchErrorHandling tests search-related error conditions.
-func (suite *PgVectorSearchTestSuite) TestSearchErrorHandling() {
-	ctx := context.Background()
-
-	testCases := []struct {
-		name      string
-		operation func() error
-		wantError bool
-	}{
-		{
-			name: "search with nil query",
-			operation: func() error {
-				_, err := suite.vs.Search(ctx, nil)
-				return err
-			},
-			wantError: true,
-		},
-		{
-			name: "hybrid search without vector",
-			operation: func() error {
-				query := &vectorstore.SearchQuery{
-					Query:      "test",
-					SearchMode: vectorstore.SearchModeHybrid,
-				}
-				_, err := suite.vs.searchByHybrid(ctx, query)
-				return err
-			},
-			wantError: true,
-		},
-		{
-			name: "hybrid search without keyword",
-			operation: func() error {
-				query := &vectorstore.SearchQuery{
-					Vector:     []float64{0.1, 0.2, 0.3},
-					SearchMode: vectorstore.SearchModeHybrid,
-				}
-				_, err := suite.vs.searchByHybrid(ctx, query)
-				return err
-			},
-			wantError: true,
-		},
-		{
-			name: "search with invalid vector dimension",
-			operation: func() error {
-				query := &vectorstore.SearchQuery{
-					Vector:     []float64{0.1, 0.2}, // Wrong dimension (should be 3)
-					Limit:      10,
-					SearchMode: vectorstore.SearchModeVector,
-				}
-				_, err := suite.vs.Search(ctx, query)
-				return err
-			},
-			wantError: true,
-		},
-		{
-			name: "search with empty vector",
-			operation: func() error {
-				query := &vectorstore.SearchQuery{
-					Vector:     []float64{},
-					Limit:      10,
-					SearchMode: vectorstore.SearchModeVector,
-				}
-				_, err := suite.vs.Search(ctx, query)
-				return err
-			},
-			wantError: true,
-		},
-	}
-
-	for _, tc := range testCases {
-		suite.Run(tc.name, func() {
-			err := tc.operation()
-			if tc.wantError {
-				suite.Error(err)
-			} else {
-				suite.NoError(err)
-			}
-		})
-	}
-}
-
-// TestAdvancedSearchScenarios tests more complex search scenarios.
-func (suite *PgVectorSearchTestSuite) TestAdvancedSearchScenarios() {
-	ctx := context.Background()
-
-	// Setup test data for advanced scenarios.
-	testDocs := []struct {
-		doc       *document.Document
-		embedding []float64
-	}{
-		{
-			doc: &document.Document{
-				ID:      "advanced1",
-				Name:    "Machine Learning Fundamentals",
-				Content: "Introduction to machine learning algorithms and neural networks",
-				Metadata: map[string]any{
-					"category":   "education",
-					"difficulty": "beginner",
-					"rating":     4.5,
-					"topics":     []string{"ml", "ai", "algorithms"},
-				},
-			},
-			embedding: []float64{0.1, 0.8, 0.2},
-		},
-		{
-			doc: &document.Document{
-				ID:      "advanced2",
-				Name:    "Deep Learning Applications",
-				Content: "Advanced neural network architectures and their applications",
-				Metadata: map[string]any{
-					"category":   "education",
-					"difficulty": "advanced",
-					"rating":     4.8,
-					"topics":     []string{"deep learning", "neural networks", "applications"},
-				},
-			},
-			embedding: []float64{0.2, 0.9, 0.1},
-		},
-		{
-			doc: &document.Document{
-				ID:      "advanced3",
-				Name:    "Python for Data Science",
-				Content: "Using Python libraries for data analysis and machine learning",
-				Metadata: map[string]any{
-					"category":   "programming",
-					"difficulty": "intermediate",
-					"rating":     4.2,
-					"topics":     []string{"python", "data science", "pandas"},
-				},
-			},
-			embedding: []float64{0.3, 0.1, 0.9},
-		},
-	}
-
-	// Add test documents.
-	for _, td := range testDocs {
-		err := suite.vs.Add(ctx, td.doc, td.embedding)
-		suite.NoError(err)
-		// Store for validation.
-		suite.testDocs[td.doc.ID] = td.doc
-	}
-
-	suite.Run("complex metadata filtering", func() {
-		query := &vectorstore.SearchQuery{
-			Vector: []float64{0.2, 0.5, 0.3},
-			Filter: &vectorstore.SearchFilter{
-				Metadata: map[string]any{
-					"category":   "education",
-					"difficulty": "beginner",
-				},
-			},
-			Limit:      10,
-			SearchMode: vectorstore.SearchModeVector,
-		}
-
-		result, err := suite.vs.Search(ctx, query)
-		suite.NoError(err, "Complex metadata filtering should not error")
-		suite.NotNil(result, "Search result should not be nil")
-		suite.Len(result.Results, 1, "Should return exactly 1 result")
-
-		if len(result.Results) > 0 {
-			suite.validateSearchResults(result.Results, 1)
-			suite.Equal("advanced1", result.Results[0].Document.ID,
-				"Should return the beginner education document")
-		}
-	})
-
-	suite.Run("high similarity threshold", func() {
-		query := &vectorstore.SearchQuery{
-			Vector:     []float64{0.1, 0.8, 0.2}, // Very similar to advanced1
-			MinScore:   0.95,                     // High threshold
-			Limit:      10,
-			SearchMode: vectorstore.SearchModeVector,
-		}
-
-		result, err := suite.vs.Search(ctx, query)
-		suite.NoError(err, "High similarity threshold search should not error")
-		suite.NotNil(result, "Search result should not be nil")
-
-		// Should find at least the exact match.
-		suite.GreaterOrEqual(len(result.Results), 1,
-			"Should find at least 1 high similarity result")
-
-		if len(result.Results) > 0 {
-			suite.validateSearchResults(result.Results, 1)
-			suite.GreaterOrEqual(result.Results[0].Score, 0.95,
-				"Top result should meet high similarity threshold")
-		}
-	})
-
-	suite.Run("hybrid search with complex query", func() {
-		query := &vectorstore.SearchQuery{
-			Vector: []float64{0.2, 0.7, 0.3},
-			Query:  "machine learning neural networks",
-			Filter: &vectorstore.SearchFilter{
-				Metadata: map[string]any{
-					"category": "education",
-				},
-			},
-			Limit:      10,
-			SearchMode: vectorstore.SearchModeHybrid,
-		}
-
-		result, err := suite.vs.Search(ctx, query)
-		suite.NoError(err, "Hybrid search with complex query should not error")
-		suite.NotNil(result, "Search result should not be nil")
-		suite.GreaterOrEqual(len(result.Results), 1,
-			"Should find at least 1 result")
-
-		if len(result.Results) > 0 {
-			suite.validateSearchResults(result.Results, 1)
-
-			// Validate keyword relevance.
-			suite.validateKeywordRelevance(result.Results,
-				[]string{"machine", "learning", "neural", "networks"})
-
-			// Verify all results match the filter.
-			for _, scored := range result.Results {
-				category, exists := scored.Document.Metadata["category"]
-				suite.True(exists, "Category metadata should exist")
-				suite.Equal("education", category,
-					"All results should have category='education'")
-			}
-		}
-	})
-
-}
-
-func (suite *PgVectorSearchTestSuite) TestMinScoreFiltering() {
-	ctx := context.Background()
-
-	// Setup test data specifically for MinScore testing.
-	testDocs := []struct {
-		doc       *document.Document
-		embedding []float64
-	}{
-		{
-			doc: &document.Document{
-				ID:      "minscore1",
-				Name:    "Artificial Intelligence Guide",
-				Content: "Comprehensive guide to artificial intelligence and machine learning concepts",
-				Metadata: map[string]any{
-					"category": "education",
-					"type":     "guide",
-					"rating":   4.8,
-				},
-			},
-			embedding: []float64{0.1, 0.9, 0.1}, // High similarity target
-		},
-		{
-			doc: &document.Document{
-				ID:      "minscore2",
-				Name:    "Programming Best Practices",
-				Content: "Essential programming practices for software development and code quality",
-				Metadata: map[string]any{
-					"category": "programming",
-					"type":     "tutorial",
-					"rating":   4.5,
-				},
-			},
-			embedding: []float64{0.5, 0.3, 0.2}, // Medium similarity
-		},
-		{
-			doc: &document.Document{
-				ID:      "minscore3",
-				Name:    "Database Design Principles",
-				Content: "Database design fundamentals and normalization techniques for efficient data storage",
-				Metadata: map[string]any{
-					"category": "database",
-					"type":     "reference",
-					"rating":   4.2,
-				},
-			},
-			embedding: []float64{0.8, 0.1, 0.1}, // Low similarity to AI content
-		},
-	}
-
-	// Add test documents.
-	for _, td := range testDocs {
-		err := suite.vs.Add(ctx, td.doc, td.embedding)
-		suite.NoError(err)
-		// Store for validation.
-		suite.testDocs[td.doc.ID] = td.doc
-	}
-
-	suite.Run("vector search with medium MinScore", func() {
-		query := &vectorstore.SearchQuery{
-			Vector:     []float64{0.1, 0.9, 0.1}, // Very similar to minscore1
-			MinScore:   0.6,                      // Medium threshold
-			Limit:      10,
-			SearchMode: vectorstore.SearchModeVector,
-		}
-
-		result, err := suite.vs.Search(ctx, query)
-		suite.NoError(err, "Vector search with MinScore should not error")
-		suite.NotNil(result, "Search result should not be nil")
-
-		// All results should meet the minimum score requirement.
-		for _, scored := range result.Results {
-			suite.GreaterOrEqual(scored.Score, 0.6,
-				"All results should meet MinScore threshold of 0.6, got %.4f", scored.Score)
-		}
-
-		// Should find at least the highly similar document.
-		suite.GreaterOrEqual(len(result.Results), 1,
-			"Should find at least 1 result with score >= 0.6")
-
-		suite.T().Logf("Vector search with MinScore 0.6 returned %d results", len(result.Results))
-	})
-
-	suite.Run("keyword search with MinScore", func() {
-		query := &vectorstore.SearchQuery{
-			Query:      "artificial intelligence machine learning",
-			MinScore:   0.01, // Low threshold for keyword search (ts_rank scores are typically low)
-			Limit:      10,
-			SearchMode: vectorstore.SearchModeKeyword,
-		}
-
-		result, err := suite.vs.Search(ctx, query)
-		suite.NoError(err, "Keyword search with MinScore should not error")
-		suite.NotNil(result, "Search result should not be nil")
-
-		// All results should meet the minimum score requirement.
-		for _, scored := range result.Results {
-			suite.GreaterOrEqual(scored.Score, 0.01,
-				"All results should meet MinScore threshold of 0.01, got %.4f", scored.Score)
-		}
-
-		// Should find relevant documents.
-		if len(result.Results) > 0 {
-			suite.validateKeywordRelevance(result.Results,
-				[]string{"artificial", "intelligence", "machine", "learning"})
-		}
-
-		suite.T().Logf("Keyword search with MinScore 0.01 returned %d results", len(result.Results))
-	})
-
-	suite.Run("hybrid search with MinScore", func() {
-		query := &vectorstore.SearchQuery{
-			Vector:     []float64{0.2, 0.8, 0.2},
-			Query:      "artificial intelligence programming",
-			MinScore:   0.3, // Medium threshold for hybrid search
-			Limit:      10,
-			SearchMode: vectorstore.SearchModeHybrid,
-		}
-
-		result, err := suite.vs.Search(ctx, query)
-		suite.NoError(err, "Hybrid search with MinScore should not error")
-		suite.NotNil(result, "Search result should not be nil")
-
-		// All results should meet the minimum score requirement.
-		for _, scored := range result.Results {
-			suite.GreaterOrEqual(scored.Score, 0.3,
-				"All results should meet MinScore threshold of 0.3, got %.4f", scored.Score)
-		}
-
-		// Should combine semantic and keyword relevance.
-		if len(result.Results) > 0 {
-			suite.validateKeywordRelevance(result.Results,
-				[]string{"artificial", "intelligence", "programming"})
-		}
-
-		suite.T().Logf("Hybrid search with MinScore 0.3 returned %d results", len(result.Results))
-	})
-
-	suite.Run("very high MinScore returns no results", func() {
-		query := &vectorstore.SearchQuery{
-			Vector:     []float64{-1.0, -1.0, -1.0}, // Vector very dissimilar to all test data
-			MinScore:   0.95,                        // High threshold that should filter out all results
-			Limit:      10,
-			SearchMode: vectorstore.SearchModeVector,
-		}
-
-		result, err := suite.vs.Search(ctx, query)
-		suite.NoError(err, "Search with very high MinScore should not error")
-		suite.NotNil(result, "Search result should not be nil")
-
-		// Should return no results due to high threshold.
-		suite.Equal(0, len(result.Results),
-			"Search with very high MinScore should return no results")
-
-		suite.T().Logf("Search with MinScore 0.95 correctly returned 0 results")
-	})
-
-	suite.Run("MinScore combined with metadata filtering", func() {
-		query := &vectorstore.SearchQuery{
-			Vector: []float64{0.2, 0.8, 0.2},
-			Filter: &vectorstore.SearchFilter{
-				Metadata: map[string]any{
-					"category": "education",
-				},
-			},
-			MinScore:   0.5,
-			Limit:      10,
-			SearchMode: vectorstore.SearchModeVector,
-		}
-
-		result, err := suite.vs.Search(ctx, query)
-		suite.NoError(err, "Search with MinScore and metadata filter should not error")
-		suite.NotNil(result, "Search result should not be nil")
-
-		// All results should meet both criteria.
-		for _, scored := range result.Results {
-			suite.GreaterOrEqual(scored.Score, 0.5,
-				"All results should meet MinScore threshold of 0.5, got %.4f", scored.Score)
-
-			category, exists := scored.Document.Metadata["category"]
-			suite.True(exists, "Category metadata should exist")
-			suite.Equal("education", category,
-				"All results should have category='education'")
-		}
-
-		suite.T().Logf("Search with MinScore 0.5 and metadata filter returned %d results", len(result.Results))
-	})
-
-	suite.Run("MinScore edge cases", func() {
-		// Test with MinScore = 0 (should return all results).
-		query1 := &vectorstore.SearchQuery{
-			Vector:     []float64{0.5, 0.5, 0.5},
-			MinScore:   0.0,
-			Limit:      10,
-			SearchMode: vectorstore.SearchModeVector,
-		}
-
-		result1, err := suite.vs.Search(ctx, query1)
-		suite.NoError(err, "Search with MinScore 0.0 should not error")
-		suite.NotNil(result1, "Search result should not be nil")
-
-		// Should return documents (scores can be 0 or higher).
-		for _, scored := range result1.Results {
-			suite.GreaterOrEqual(scored.Score, 0.0,
-				"All results should have score >= 0.0, got %.4f", scored.Score)
-		}
-
-		// Test with MinScore = 1.0 (perfect match only).
-		query2 := &vectorstore.SearchQuery{
-			Vector:     []float64{0.1, 0.9, 0.1}, // Exact match to minscore1
-			MinScore:   1.0,
-			Limit:      10,
-			SearchMode: vectorstore.SearchModeVector,
-		}
-
-		result2, err := suite.vs.Search(ctx, query2)
-		suite.NoError(err, "Search with MinScore 1.0 should not error")
-		suite.NotNil(result2, "Search result should not be nil")
-
-		// Should only return perfect or near-perfect matches.
-		for _, scored := range result2.Results {
-			suite.GreaterOrEqual(scored.Score, 1.0,
-				"All results should meet MinScore threshold of 1.0, got %.4f", scored.Score)
-		}
-
-		suite.T().Logf("MinScore edge cases: 0.0 returned %d results, 1.0 returned %d results",
-			len(result1.Results), len(result2.Results))
-	})
-}
-
-func Test_Vector_buildQueryFilter(t *testing.T) {
+// TestVectorStore_Search tests the Search method with various scenarios
+func TestVectorStore_Search(t *testing.T) {
 	tests := []struct {
 		name      string
-		condition *vectorstore.SearchFilter
+		query     *vectorstore.SearchQuery
+		setupMock func(sqlmock.Sqlmock)
 		wantErr   bool
-		wantSql   string
-		wantArgs  []any
+		errMsg    string
+		validate  func(*testing.T, *vectorstore.SearchResult)
 	}{
 		{
-			name:     "Empty condition",
-			wantErr:  false,
-			wantSql:  "WHERE 1=1\n",
-			wantArgs: []any{},
-		},
-		{
-			name: "ids condition",
-			condition: &vectorstore.SearchFilter{
-				IDs: []string{"1", "2"},
+			name: "success_simple_search",
+			query: &vectorstore.SearchQuery{
+				Vector:     []float64{1.0, 0.5, 0.2},
+				Limit:      5,
+				SearchMode: vectorstore.SearchModeVector,
 			},
-			wantErr:  false,
-			wantSql:  "WHERE 1=1 AND id IN ($1, $2)\n",
-			wantArgs: []any{"1", "2"},
-		},
-		{
-			name: "metadata condition",
-			condition: &vectorstore.SearchFilter{
-				Metadata: map[string]any{
-					"category": "test",
-				},
-			},
-			wantErr:  false,
-			wantSql:  "WHERE 1=1 AND metadata @> $1::jsonb\n",
-			wantArgs: []any{"{\"category\":\"test\"}"},
-		},
-		{
-			name: "filter condition",
-			condition: &vectorstore.SearchFilter{
-				FilterCondition: &searchfilter.UniversalFilterCondition{
-					Operator: searchfilter.OperatorAnd,
-					Value: []*searchfilter.UniversalFilterCondition{
-						{
-							Field:    "name",
-							Operator: searchfilter.OperatorEqual,
-							Value:    "test",
-						},
-						{
-							Field:    "age",
-							Operator: searchfilter.OperatorGreaterThan,
-							Value:    30,
-						},
-					},
-				},
-			},
-			wantErr:  false,
-			wantSql:  "WHERE 1=1 AND ((name = $1) AND (age > $2))\n",
-			wantArgs: []any{"test", 30},
-		},
-		{
-			name: "ids and filter condition",
-			condition: &vectorstore.SearchFilter{
-				IDs: []string{"1", "2"},
-				FilterCondition: &searchfilter.UniversalFilterCondition{
-					Operator: searchfilter.OperatorAnd,
-					Value: []*searchfilter.UniversalFilterCondition{
-						{
-							Field:    "name",
-							Operator: searchfilter.OperatorEqual,
-							Value:    "test",
-						},
-						{
-							Field:    "age",
-							Operator: searchfilter.OperatorGreaterThan,
-							Value:    30,
-						},
-					},
-				},
-			},
-			wantErr:  false,
-			wantSql:  "WHERE 1=1 AND id IN ($1, $2) AND ((name = $3) AND (age > $4))\n",
-			wantArgs: []any{"1", "2", "test", 30},
-		},
-	}
+			setupMock: func(mock sqlmock.Sqlmock) {
+				rows := mockSearchResultRow("doc_1", "First Doc", "First content",
+					[]float64{0.9, 0.5, 0.2}, map[string]any{"rank": 1}, 0.95)
+				rows.AddRow("doc_2", "Second Doc", "Second content", "[0.8,0.4,0.3]",
+					mapToJSON(map[string]any{"rank": 2}), 1000000, 2000000, 0.85)
+				rows.AddRow("doc_3", "Third Doc", "Third content", "[0.7,0.6,0.1]",
+					mapToJSON(map[string]any{"rank": 3}), 1000000, 2000000, 0.75)
 
-	vs := &VectorStore{
-		option:          defaultOptions,
-		filterConverter: &pgVectorConverter{},
+				// Match any SELECT query with LIMIT
+				mock.ExpectQuery("SELECT .+ FROM documents .+ LIMIT").
+					WillReturnRows(rows)
+			},
+			wantErr: false,
+			validate: func(t *testing.T, result *vectorstore.SearchResult) {
+				require.Len(t, result.Results, 3)
+				assert.Equal(t, "doc_1", result.Results[0].Document.ID)
+				assert.Equal(t, 0.95, result.Results[0].Score)
+				assert.Equal(t, "doc_2", result.Results[1].Document.ID)
+				assert.Equal(t, 0.85, result.Results[1].Score)
+			},
+		},
+		{
+			name:      "nil_query",
+			query:     nil,
+			setupMock: func(mock sqlmock.Sqlmock) {},
+			wantErr:   true,
+			errMsg:    "query is required",
+		},
+		{
+			name: "empty_query_vector",
+			query: &vectorstore.SearchQuery{
+				Vector:     []float64{},
+				Limit:      5,
+				SearchMode: vectorstore.SearchModeVector,
+			},
+			setupMock: func(mock sqlmock.Sqlmock) {},
+			wantErr:   true,
+			errMsg:    "vector is not supported",
+		},
+		{
+			name: "dimension_mismatch",
+			query: &vectorstore.SearchQuery{
+				Vector:     []float64{1.0, 0.5}, // Only 2 dimensions
+				Limit:      5,
+				SearchMode: vectorstore.SearchModeVector,
+			},
+			setupMock: func(mock sqlmock.Sqlmock) {},
+			wantErr:   true,
+			errMsg:    "dimension mismatch",
+		},
+		{
+			name: "no_results",
+			query: &vectorstore.SearchQuery{
+				Vector:     []float64{1.0, 0.5, 0.2},
+				Limit:      5,
+				SearchMode: vectorstore.SearchModeVector,
+			},
+			setupMock: func(mock sqlmock.Sqlmock) {
+				rows := sqlmock.NewRows([]string{"id", "name", "content", "embedding", "metadata", "created_at", "updated_at", "score"})
+				mock.ExpectQuery("SELECT .+ FROM documents .+ LIMIT").
+					WillReturnRows(rows)
+			},
+			wantErr: false,
+			validate: func(t *testing.T, result *vectorstore.SearchResult) {
+				assert.Len(t, result.Results, 0)
+			},
+		},
+		{
+			name: "database_error",
+			query: &vectorstore.SearchQuery{
+				Vector:     []float64{1.0, 0.5, 0.2},
+				Limit:      5,
+				SearchMode: vectorstore.SearchModeVector,
+			},
+			setupMock: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery("SELECT .+ FROM documents").
+					WillReturnError(errors.New("connection timeout"))
+			},
+			wantErr: true,
+			errMsg:  "connection timeout",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			qb := newVectorQueryBuilder(vs.option)
-			err := vs.buildQueryFilter(qb, tt.condition)
+			vs, tc := newTestVectorStore(t, WithIndexDimension(3))
+			defer tc.Close()
+
+			tt.setupMock(tc.mock)
+
+			result, err := vs.Search(context.Background(), tt.query)
+
 			if tt.wantErr {
-				if err == nil {
-					t.Errorf("buildQueryFilter() expected error, but got nil")
+				require.Error(t, err)
+				if tt.errMsg != "" {
+					assert.Contains(t, err.Error(), tt.errMsg)
 				}
-				return
+			} else {
+				require.NoError(t, err)
+				if tt.validate != nil {
+					tt.validate(t, result)
+				}
 			}
 
-			if err != nil {
-				t.Errorf("buildQueryFilter() unexpected error = %v", err)
-				return
-			}
-			sql, args := qb.build(10)
-
-			assert.Contains(t, sql, tt.wantSql)
-			if !reflect.DeepEqual(args, tt.wantArgs) {
-				t.Errorf("buildQueryFilter() args = %v, want %v", args, tt.wantArgs)
-			}
+			tc.AssertExpectations(t)
 		})
 	}
+}
+
+// TestVectorStore_SearchWithMinScore tests MinScore filtering
+func TestVectorStore_SearchWithMinScore(t *testing.T) {
+	t.Run("vector_search_with_min_score", func(t *testing.T) {
+		vs, tc := newTestVectorStore(t, WithIndexDimension(3))
+		defer tc.Close()
+
+		query := &vectorstore.SearchQuery{
+			Vector:     []float64{1.0, 0.5, 0.2},
+			Limit:      5,
+			MinScore:   0.8, // MinScore > 0 should add score filter
+			SearchMode: vectorstore.SearchModeVector,
+		}
+
+		// Mock result with high score
+		rows := mockSearchResultRow("doc_1", "High Score Doc", "Highly relevant content",
+			[]float64{1.0, 0.5, 0.2}, map[string]any{"quality": "high"}, 0.95)
+		tc.mock.ExpectQuery("SELECT .+ FROM documents .+ LIMIT").
+			WillReturnRows(rows)
+
+		result, err := vs.Search(context.Background(), query)
+		require.NoError(t, err)
+		require.Len(t, result.Results, 1)
+		assert.Equal(t, "doc_1", result.Results[0].Document.ID)
+		assert.GreaterOrEqual(t, result.Results[0].Score, 0.8)
+		tc.AssertExpectations(t)
+	})
+
+	t.Run("hybrid_search_with_min_score", func(t *testing.T) {
+		vs, tc := newTestVectorStoreWithTSVector(t, WithIndexDimension(3))
+		defer tc.Close()
+
+		query := &vectorstore.SearchQuery{
+			Vector:     []float64{1.0, 0.5, 0.2},
+			Query:      "test",
+			Limit:      5,
+			MinScore:   0.75, // MinScore > 0 should add score filter
+			SearchMode: vectorstore.SearchModeHybrid,
+		}
+
+		rows := mockSearchResultRow("doc_1", "Relevant Doc", "Test content",
+			[]float64{1.0, 0.5, 0.2}, map[string]any{}, 0.85)
+		tc.mock.ExpectQuery("SELECT .+ FROM documents .+ LIMIT").
+			WillReturnRows(rows)
+
+		result, err := vs.Search(context.Background(), query)
+		require.NoError(t, err)
+		require.Len(t, result.Results, 1)
+		assert.GreaterOrEqual(t, result.Results[0].Score, 0.75)
+		tc.AssertExpectations(t)
+	})
+}
+
+// TestVectorStore_SearchEmptyResults tests handling of queries that return no results
+func TestVectorStore_SearchEmptyResults(t *testing.T) {
+	tests := []struct {
+		name  string
+		query *vectorstore.SearchQuery
+	}{
+		{
+			name: "no_matching_documents",
+			query: &vectorstore.SearchQuery{
+				Vector:     []float64{1.0, 0.5, 0.2},
+				Limit:      5,
+				SearchMode: vectorstore.SearchModeVector,
+			},
+		},
+		{
+			name: "high_score_threshold",
+			query: &vectorstore.SearchQuery{
+				Vector:     []float64{1.0, 0.5, 0.2},
+				Limit:      5,
+				MinScore:   0.99,
+				SearchMode: vectorstore.SearchModeVector,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vs, tc := newTestVectorStore(t, WithIndexDimension(3))
+			defer tc.Close()
+
+			// Mock empty result set
+			emptyRows := sqlmock.NewRows([]string{"id", "name", "content", "embedding", "metadata", "created_at", "updated_at", "score"})
+			tc.mock.ExpectQuery("SELECT .+ FROM documents").
+				WillReturnRows(emptyRows)
+
+			result, err := vs.Search(context.Background(), tt.query)
+
+			require.NoError(t, err)
+			assert.Empty(t, result.Results)
+
+			tc.AssertExpectations(t)
+		})
+	}
+}
+
+// TestVectorStore_SearchByKeyword tests keyword search
+func TestVectorStore_SearchByKeyword(t *testing.T) {
+	t.Run("keyword_search_without_tsvector", func(t *testing.T) {
+		vs, tc := newTestVectorStore(t, WithEnableTSVector(false))
+		defer tc.Close()
+
+		query := &vectorstore.SearchQuery{
+			Query:      "test query",
+			SearchMode: vectorstore.SearchModeKeyword,
+			Limit:      10,
+		}
+
+		// Should fall back to filter search
+		rows := sqlmock.NewRows([]string{"id", "name", "content", "embedding", "metadata", "created_at", "updated_at", "score"})
+		tc.mock.ExpectQuery("SELECT .+ FROM documents").WillReturnRows(rows)
+
+		result, err := vs.Search(context.Background(), query)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		tc.AssertExpectations(t)
+	})
+
+	t.Run("keyword_search_with_tsvector", func(t *testing.T) {
+		vs, tc := newTestVectorStoreWithTSVector(t)
+		defer tc.Close()
+
+		query := &vectorstore.SearchQuery{
+			Query:      "artificial intelligence",
+			SearchMode: vectorstore.SearchModeKeyword,
+			Limit:      5,
+		}
+
+		rows := mockSearchResultRow("doc_1", "AI Doc", "Artificial intelligence content",
+			[]float64{1.0, 0.5, 0.2}, map[string]any{"category": "AI"}, 0.95)
+		tc.mock.ExpectQuery("SELECT .+ FROM documents .+ LIMIT").WillReturnRows(rows)
+
+		result, err := vs.Search(context.Background(), query)
+		require.NoError(t, err)
+		require.Len(t, result.Results, 1)
+		assert.Equal(t, "doc_1", result.Results[0].Document.ID)
+		tc.AssertExpectations(t)
+	})
+
+	t.Run("keyword_search_empty_query", func(t *testing.T) {
+		vs, tc := newTestVectorStoreWithTSVector(t)
+		defer tc.Close()
+
+		query := &vectorstore.SearchQuery{
+			Query:      "",
+			SearchMode: vectorstore.SearchModeKeyword,
+			Limit:      5,
+		}
+
+		result, err := vs.Search(context.Background(), query)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "keyword is required")
+		require.Nil(t, result)
+		tc.AssertExpectations(t)
+	})
+}
+
+// TestVectorStore_SearchByHybrid tests hybrid search
+func TestVectorStore_SearchByHybrid(t *testing.T) {
+	t.Run("hybrid_search_with_vector_and_text", func(t *testing.T) {
+		vs, tc := newTestVectorStoreWithTSVector(t, WithIndexDimension(3))
+		defer tc.Close()
+
+		query := &vectorstore.SearchQuery{
+			Vector:     []float64{1.0, 0.5, 0.2},
+			Query:      "artificial intelligence",
+			SearchMode: vectorstore.SearchModeHybrid,
+			Limit:      5,
+		}
+
+		rows := mockSearchResultRow("doc_1", "AI Doc", "Artificial intelligence content",
+			[]float64{1.0, 0.5, 0.2}, map[string]any{"category": "AI"}, 0.92)
+		tc.mock.ExpectQuery("SELECT .+ FROM documents .+ LIMIT").WillReturnRows(rows)
+
+		result, err := vs.Search(context.Background(), query)
+		require.NoError(t, err)
+		require.Len(t, result.Results, 1)
+		assert.Equal(t, "doc_1", result.Results[0].Document.ID)
+		tc.AssertExpectations(t)
+	})
+
+	t.Run("hybrid_search_without_tsvector", func(t *testing.T) {
+		vs, tc := newTestVectorStore(t, WithEnableTSVector(false), WithIndexDimension(3))
+		defer tc.Close()
+
+		query := &vectorstore.SearchQuery{
+			Vector:     []float64{1.0, 0.5, 0.2},
+			Query:      "test",
+			SearchMode: vectorstore.SearchModeHybrid,
+			Limit:      5,
+		}
+
+		// Should fall back to vector search
+		rows := sqlmock.NewRows([]string{"id", "name", "content", "embedding", "metadata", "created_at", "updated_at", "score"})
+		tc.mock.ExpectQuery("SELECT .+ FROM documents").WillReturnRows(rows)
+
+		result, err := vs.Search(context.Background(), query)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		tc.AssertExpectations(t)
+	})
+
+	t.Run("hybrid_search_empty_vector", func(t *testing.T) {
+		vs, tc := newTestVectorStoreWithTSVector(t)
+		defer tc.Close()
+
+		query := &vectorstore.SearchQuery{
+			Vector:     []float64{},
+			Query:      "test",
+			SearchMode: vectorstore.SearchModeHybrid,
+			Limit:      5,
+		}
+
+		result, err := vs.Search(context.Background(), query)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "vector is required")
+		require.Nil(t, result)
+		tc.AssertExpectations(t)
+	})
+
+	t.Run("hybrid_search_dimension_mismatch", func(t *testing.T) {
+		vs, tc := newTestVectorStoreWithTSVector(t, WithIndexDimension(3))
+		defer tc.Close()
+
+		query := &vectorstore.SearchQuery{
+			Vector:     []float64{1.0, 0.5}, // Wrong dimension: 2 instead of 3
+			Query:      "test",
+			SearchMode: vectorstore.SearchModeHybrid,
+			Limit:      5,
+		}
+
+		result, err := vs.Search(context.Background(), query)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "dimension mismatch")
+		assert.Contains(t, err.Error(), "expected 3, got 2")
+		require.Nil(t, result)
+		tc.AssertExpectations(t)
+	})
+
+	t.Run("hybrid_search_vector_only_no_text", func(t *testing.T) {
+		vs, tc := newTestVectorStoreWithTSVector(t, WithIndexDimension(3))
+		defer tc.Close()
+
+		query := &vectorstore.SearchQuery{
+			Vector:     []float64{1.0, 0.5, 0.2},
+			Query:      "", // No text query
+			SearchMode: vectorstore.SearchModeHybrid,
+			Limit:      5,
+		}
+
+		rows := mockSearchResultRow("doc_1", "Test Doc", "Test content",
+			[]float64{1.0, 0.5, 0.2}, map[string]any{}, 0.98)
+		tc.mock.ExpectQuery("SELECT .+ FROM documents .+ LIMIT").WillReturnRows(rows)
+
+		result, err := vs.Search(context.Background(), query)
+		require.NoError(t, err)
+		require.Len(t, result.Results, 1)
+		tc.AssertExpectations(t)
+	})
+}
+
+// TestVectorStore_SearchByFilter tests filter-only search
+func TestVectorStore_SearchByFilter(t *testing.T) {
+	t.Run("filter_search_success", func(t *testing.T) {
+		vs, tc := newTestVectorStore(t)
+		defer tc.Close()
+
+		query := &vectorstore.SearchQuery{
+			SearchMode: vectorstore.SearchModeFilter,
+			Filter: &vectorstore.SearchFilter{
+				IDs: []string{"doc_1", "doc_2"},
+			},
+			Limit: 10,
+		}
+
+		rows := mockSearchResultRow("doc_1", "Test Doc", "Test content",
+			[]float64{1.0, 0.5, 0.2}, map[string]any{"category": "test"}, 1.0)
+		tc.mock.ExpectQuery("SELECT .+ FROM documents .+ LIMIT").WillReturnRows(rows)
+
+		result, err := vs.Search(context.Background(), query)
+		require.NoError(t, err)
+		require.Len(t, result.Results, 1)
+		assert.Equal(t, "doc_1", result.Results[0].Document.ID)
+		tc.AssertExpectations(t)
+	})
+
+	t.Run("filter_search_with_metadata", func(t *testing.T) {
+		vs, tc := newTestVectorStore(t)
+		defer tc.Close()
+
+		query := &vectorstore.SearchQuery{
+			SearchMode: vectorstore.SearchModeFilter,
+			Filter: &vectorstore.SearchFilter{
+				Metadata: map[string]any{"category": "AI"},
+			},
+			Limit: 5,
+		}
+
+		rows := sqlmock.NewRows([]string{"id", "name", "content", "embedding", "metadata", "created_at", "updated_at", "score"})
+		tc.mock.ExpectQuery("SELECT .+ FROM documents .+ LIMIT").WillReturnRows(rows)
+
+		result, err := vs.Search(context.Background(), query)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		tc.AssertExpectations(t)
+	})
+}
+
+// TestVectorStore_DeleteByFilter tests delete by filter
+func TestVectorStore_DeleteByFilter(t *testing.T) {
+	t.Run("delete_all_documents", func(t *testing.T) {
+		vs, tc := newTestVectorStore(t)
+		defer tc.Close()
+
+		tc.mock.ExpectExec("TRUNCATE TABLE documents").
+			WillReturnResult(sqlmock.NewResult(0, 0))
+
+		err := vs.DeleteByFilter(context.Background(), vectorstore.WithDeleteAll(true))
+		require.NoError(t, err)
+		tc.AssertExpectations(t)
+	})
+
+	t.Run("delete_by_ids", func(t *testing.T) {
+		vs, tc := newTestVectorStore(t)
+		defer tc.Close()
+
+		tc.mock.ExpectExec("DELETE FROM documents WHERE .+ IN").
+			WillReturnResult(sqlmock.NewResult(0, 2))
+
+		err := vs.DeleteByFilter(context.Background(),
+			vectorstore.WithDeleteDocumentIDs([]string{"doc_1", "doc_2"}))
+		require.NoError(t, err)
+		tc.AssertExpectations(t)
+	})
+
+	t.Run("delete_by_metadata_filter", func(t *testing.T) {
+		vs, tc := newTestVectorStore(t)
+		defer tc.Close()
+
+		tc.mock.ExpectExec("DELETE FROM documents WHERE").
+			WillReturnResult(sqlmock.NewResult(0, 3))
+
+		err := vs.DeleteByFilter(context.Background(),
+			vectorstore.WithDeleteFilter(map[string]any{"category": "deprecated"}))
+		require.NoError(t, err)
+		tc.AssertExpectations(t)
+	})
+
+	t.Run("delete_all_with_conflicting_params", func(t *testing.T) {
+		vs, tc := newTestVectorStore(t)
+		defer tc.Close()
+
+		err := vs.DeleteByFilter(context.Background(),
+			vectorstore.WithDeleteAll(true),
+			vectorstore.WithDeleteDocumentIDs([]string{"doc_1"}))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "delete all documents, but document ids")
+		tc.AssertExpectations(t)
+	})
+
+	t.Run("delete_without_conditions", func(t *testing.T) {
+		vs, tc := newTestVectorStore(t)
+		defer tc.Close()
+
+		err := vs.DeleteByFilter(context.Background())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no filter conditions")
+		tc.AssertExpectations(t)
+	})
+}
+
+// TestVectorStore_Search_InvalidMode tests invalid search mode
+func TestVectorStore_Search_InvalidMode(t *testing.T) {
+	vs, tc := newTestVectorStore(t)
+	defer tc.Close()
+
+	query := &vectorstore.SearchQuery{
+		SearchMode: 999, // Invalid mode
+		Limit:      5,
+	}
+
+	result, err := vs.Search(context.Background(), query)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid search mode")
+	require.Nil(t, result)
+	tc.AssertExpectations(t)
 }

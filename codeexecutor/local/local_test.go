@@ -11,6 +11,7 @@ package local_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -238,7 +239,8 @@ func TestLocalCodeExecutor_ExecuteCode_WithRelativeWorkDir(t *testing.T) {
 
 	executor := local.New(
 		local.WithWorkDir(workDirArg),
-		local.WithCleanTempFiles(false), // keep artifacts to verify path correctness
+		local.WithCleanTempFiles(false), // keep output files to verify
+		// path correctness
 	)
 
 	input := codeexecutor.CodeExecutionInput{
@@ -315,6 +317,65 @@ func TestLocalCodeExecutor_CodeBlockDelimiter(t *testing.T) {
 	assert.Equal(t, "```", delimiter.End)
 }
 
+func TestLocalCodeExecutor_WithCodeBlockDelimiter(t *testing.T) {
+	tests := []struct {
+		name          string
+		delimiter     codeexecutor.CodeBlockDelimiter
+		expectedStart string
+		expectedEnd   string
+	}{
+		{
+			name: "custom delimiter with go markers",
+			delimiter: codeexecutor.CodeBlockDelimiter{
+				Start: "```go",
+				End:   "```go",
+			},
+			expectedStart: "```go",
+			expectedEnd:   "```go",
+		},
+		{
+			name: "custom delimiter with xml-style tags",
+			delimiter: codeexecutor.CodeBlockDelimiter{
+				Start: "<code>",
+				End:   "</code>",
+			},
+			expectedStart: "<code>",
+			expectedEnd:   "</code>",
+		},
+		{
+			name: "custom delimiter with triple backticks and language",
+			delimiter: codeexecutor.CodeBlockDelimiter{
+				Start: "```python",
+				End:   "```",
+			},
+			expectedStart: "```python",
+			expectedEnd:   "```",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := local.New(
+				local.WithCodeBlockDelimiter(tt.delimiter),
+			)
+
+			delimiter := executor.CodeBlockDelimiter()
+
+			assert.Equal(t, tt.expectedStart, delimiter.Start)
+			assert.Equal(t, tt.expectedEnd, delimiter.End)
+		})
+	}
+}
+
+func TestLocalCodeExecutor_DefaultCodeBlockDelimiter(t *testing.T) {
+	// Test that default delimiter is used when WithCodeBlockDelimiter is not called
+	executor := local.New()
+	delimiter := executor.CodeBlockDelimiter()
+
+	assert.Equal(t, "```", delimiter.Start)
+	assert.Equal(t, "```", delimiter.End)
+}
+
 func TestLocalCodeExecutor_ExecuteCode_InvalidWorkDir(t *testing.T) {
 	// Use a path that cannot be created (e.g., under a file instead of directory)
 	tempFile, err := os.CreateTemp("", "test-file-")
@@ -383,6 +444,72 @@ func TestLocalCodeExecutor_WithTimeout(t *testing.T) {
 
 	assert.NoError(t, err) // ExecuteCode itself doesn't return error for block execution failures
 	assert.Contains(t, result.Output, "Error executing code block")
+}
+
+// Cover wrapper methods on CodeExecutor to raise file coverage.
+func TestLocalCodeExecutor_WrapperMethods(t *testing.T) {
+	exec := local.New(
+		local.WithTimeout(2 * time.Second),
+	)
+	ctx := context.Background()
+	ws, err := exec.CreateWorkspace(
+		ctx, "wrap", codeexecutor.WorkspacePolicy{},
+	)
+	require.NoError(t, err)
+	defer exec.Cleanup(ctx, ws)
+
+	// PutFiles via wrapper and collect them back.
+	err = exec.PutFiles(ctx, ws, []codeexecutor.PutFile{{
+		Path:    filepath.Join(codeexecutor.DirWork, "w.txt"),
+		Content: []byte("w"),
+		Mode:    0o644,
+	}})
+	require.NoError(t, err)
+
+	// PutDirectory wrapper copies a temp dir.
+	src := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(src, "a.txt"), []byte("a"), 0o644,
+	))
+	err = exec.PutDirectory(ctx, ws, src, "dst")
+	require.NoError(t, err)
+
+	// RunProgram wrapper echoes a value.
+	res, err := exec.RunProgram(ctx, ws, codeexecutor.RunProgramSpec{
+		Cmd: "bash", Args: []string{"-lc", "echo ok"},
+		Timeout: 2 * time.Second,
+	})
+	require.NoError(t, err)
+	require.Contains(t, res.Stdout, "ok")
+
+	// Collect via wrapper.
+	files, err := exec.Collect(ctx, ws, []string{
+		filepath.Join(codeexecutor.DirWork, "*.txt"),
+		filepath.Join("dst", "*.txt"),
+	})
+	require.NoError(t, err)
+	if len(files) > 0 {
+		// Ensure names are workspace-relative.
+		for _, f := range files {
+			require.False(t, strings.HasPrefix(f.Name, ws.Path))
+		}
+	}
+
+	// ExecuteInline via wrapper.
+	out, err := exec.ExecuteInline(ctx, "inline",
+		[]codeexecutor.CodeBlock{{
+			Language: "bash", Code: "echo inline",
+		}}, 2*time.Second,
+	)
+	require.NoError(t, err)
+	require.Contains(t, out.Stdout, "inline")
+
+	// Engine should be non-nil and usable.
+	eng := exec.Engine()
+	require.NotNil(t, eng)
+	// Describe returns something.
+	require.NotEqual(t, "", eng.Describe())
+	_ = fmt.Sprintf("%T", eng)
 }
 
 func TestLocalCodeExecutor_IntegrationTest(t *testing.T) {
@@ -716,4 +843,221 @@ cat temp_file.txt
 		// Code files should be cleaned up (though this is timing-dependent, so we might not catch it reliably)
 		// The important thing is that execution succeeded
 	})
+}
+
+func TestLocal_PythonNoPrintAddsNewline(t *testing.T) {
+	const (
+		langPy   = "python"
+		execID   = "py-no-print"
+		filename = "code_0.py"
+	)
+	tempDir, err := os.MkdirTemp("", "py-no-print-")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	e := local.New(
+		local.WithWorkDir(tempDir),
+		local.WithCleanTempFiles(false),
+	)
+	in := codeexecutor.CodeExecutionInput{
+		CodeBlocks: []codeexecutor.CodeBlock{{
+			Language: langPy,
+			Code:     "x = 1",
+		}},
+		ExecutionID: execID,
+	}
+	_, err = e.ExecuteCode(context.Background(), in)
+	require.NoError(t, err)
+
+	// The created python file should end with a newline.
+	p := filepath.Join(tempDir, filename)
+	data, rerr := os.ReadFile(p)
+	require.NoError(t, rerr)
+	require.Greater(t, len(data), 0)
+	require.Equal(t, byte('\n'), data[len(data)-1])
+}
+
+func TestLocal_PythonPrintNoAutoNewline(t *testing.T) {
+	const (
+		langPy   = "python"
+		execID   = "py-print"
+		filename = "code_0.py"
+	)
+	tempDir, err := os.MkdirTemp("", "py-print-")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	e := local.New(
+		local.WithWorkDir(tempDir),
+		local.WithCleanTempFiles(false),
+	)
+	// No trailing newline in source on purpose.
+	src := "print('ok')"
+	in := codeexecutor.CodeExecutionInput{
+		CodeBlocks: []codeexecutor.CodeBlock{{
+			Language: langPy,
+			Code:     src,
+		}},
+		ExecutionID: execID,
+	}
+	_, err = e.ExecuteCode(context.Background(), in)
+	require.NoError(t, err)
+
+	p := filepath.Join(tempDir, filename)
+	data, rerr := os.ReadFile(p)
+	require.NoError(t, rerr)
+	// File content should be exactly the source, no auto newline.
+	require.Equal(t, src, string(data))
+}
+
+func TestLocal_BashFileModeExec(t *testing.T) {
+	const (
+		langBash = "bash"
+		execID   = "bash-mode"
+		fname    = "code_0.sh"
+	)
+	tempDir, err := os.MkdirTemp("", "bash-mode-")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	e := local.New(
+		local.WithWorkDir(tempDir),
+		local.WithCleanTempFiles(false),
+	)
+	in := codeexecutor.CodeExecutionInput{
+		CodeBlocks: []codeexecutor.CodeBlock{{
+			Language: langBash,
+			Code:     "echo ok",
+		}},
+		ExecutionID: execID,
+	}
+	_, err = e.ExecuteCode(context.Background(), in)
+	require.NoError(t, err)
+
+	p := filepath.Join(tempDir, fname)
+	st, serr := os.Stat(p)
+	require.NoError(t, serr)
+	// Executable bit should be present for bash scripts (0755).
+	require.NotZero(t, st.Mode()&0o111)
+}
+
+func TestLocal_CommandErrorFormat(t *testing.T) {
+	const (
+		langBash = "bash"
+		execID   = "bash-err"
+	)
+	tempDir, err := os.MkdirTemp("", "bash-err-")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	e := local.New(
+		local.WithWorkDir(tempDir),
+		local.WithCleanTempFiles(false),
+	)
+	// Use an invalid command to trigger error formatting path.
+	in := codeexecutor.CodeExecutionInput{
+		CodeBlocks: []codeexecutor.CodeBlock{{
+			Language: langBash,
+			Code:     "this-does-not-exist",
+		}},
+		ExecutionID: execID,
+	}
+	res, err := e.ExecuteCode(context.Background(), in)
+	require.NoError(t, err)
+	// The output should include our standard error prefix and hint at
+	// the command failure details produced by executeCommand.
+	require.Contains(t, res.Output, "Error executing code block")
+	require.Contains(t, res.Output, "cmd=bash")
+}
+
+func TestLocal_DelegatesWorkspaceMethods(t *testing.T) {
+	const (
+		execID = "ws-delegate"
+	)
+	e := local.New()
+	ctx := context.Background()
+
+	ws, err := e.CreateWorkspace(
+		ctx, execID, codeexecutor.WorkspacePolicy{},
+	)
+	require.NoError(t, err)
+	defer e.Cleanup(ctx, ws)
+
+	// Put files and collect them back.
+	err = e.PutFiles(ctx, ws, []codeexecutor.PutFile{{
+		Path:    "work/hello.txt",
+		Content: []byte("hi"),
+		Mode:    0o644,
+	}})
+	require.NoError(t, err)
+
+	files, err := e.Collect(ctx, ws, []string{"work/*.txt"})
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(files), 1)
+
+	// Run a simple program in workspace.
+	rr, err := e.RunProgram(ctx, ws, codeexecutor.RunProgramSpec{
+		Cmd:  "bash",
+		Args: []string{"-lc", "echo ok"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 0, rr.ExitCode)
+
+	// ExecuteInline via wrapper.
+	rin, err := e.ExecuteInline(ctx, execID,
+		[]codeexecutor.CodeBlock{{
+			Language: "bash", Code: "echo inline",
+		}}, 2*time.Second,
+	)
+	require.NoError(t, err)
+	require.Contains(t, rin.Stdout, "inline")
+}
+
+func TestLocal_EngineExposed(t *testing.T) {
+	e := local.New()
+	eng := e.Engine()
+	require.NotNil(t, eng)
+	require.NotNil(t, eng.Manager())
+	require.NotNil(t, eng.FS())
+	require.NotNil(t, eng.Runner())
+}
+
+func TestLocalCodeExecutor_WorkspaceAutoInputsToggle(t *testing.T) {
+	ctx := context.Background()
+	host := t.TempDir()
+	const seedName = "seed.txt"
+	hfile := filepath.Join(host, seedName)
+	require.NoError(t, os.WriteFile(hfile, []byte("seed"), 0o644))
+
+	execOn := local.New(
+		local.WithWorkspaceInputsHostBase(host),
+	)
+	engOn := execOn.Engine()
+	ws1, err := engOn.Manager().CreateWorkspace(
+		ctx, "auto-on", codeexecutor.WorkspacePolicy{},
+	)
+	require.NoError(t, err)
+	defer engOn.Manager().Cleanup(ctx, ws1)
+
+	data, err := os.ReadFile(filepath.Join(
+		ws1.Path, codeexecutor.DirWork, "inputs", seedName,
+	))
+	require.NoError(t, err)
+	require.Equal(t, "seed", string(data))
+
+	execOff := local.New(
+		local.WithWorkspaceInputsHostBase(host),
+		local.WithWorkspaceAutoInputs(false),
+	)
+	engOff := execOff.Engine()
+	ws2, err := engOff.Manager().CreateWorkspace(
+		ctx, "auto-off", codeexecutor.WorkspacePolicy{},
+	)
+	require.NoError(t, err)
+	defer engOff.Manager().Cleanup(ctx, ws2)
+
+	_, err = os.Stat(filepath.Join(
+		ws2.Path, codeexecutor.DirWork, "inputs", seedName,
+	))
+	require.Error(t, err)
 }

@@ -70,6 +70,9 @@ func (c *multiTurnChat) run() error {
 		return fmt.Errorf("setup failed: %w", err)
 	}
 
+	// Ensure runner resources are cleaned up (trpc-agent-go >= v0.5.0)
+	defer c.runner.Close()
+
 	// Start interactive chat.
 	return c.startChat(ctx)
 }
@@ -99,9 +102,12 @@ func (c *multiTurnChat) setup(ctx context.Context) error {
 			Args:      []string{"run", "./stdioserver/main.go"},
 			Timeout:   10 * time.Second,
 		},
-		mcp.WithToolFilter(mcp.NewIncludeFilter("echo", "add")),
+		mcp.WithToolFilterFunc(tool.NewIncludeToolNamesFilter("echo", "add")),
 	)
-	fmt.Println("STDIO MCP Toolset created successfully")
+	if err := stdioToolSet.Init(ctx); err != nil {
+		return fmt.Errorf("failed to initialize STDIO MCP toolset: %w", err)
+	}
+	fmt.Println("STDIO MCP Toolset initialized successfully")
 
 	// Create Streamable MCP tools.
 	streamableToolSet := mcp.NewMCPToolSet(
@@ -110,7 +116,7 @@ func (c *multiTurnChat) setup(ctx context.Context) error {
 			ServerURL: "http://localhost:3000/mcp", // Use ServerURL instead of URL
 			Timeout:   10 * time.Second,
 		},
-		mcp.WithToolFilter(mcp.NewIncludeFilter("get_weather", "get_news")),
+		mcp.WithToolFilterFunc(tool.NewIncludeToolNamesFilter("get_weather", "get_news")),
 		mcp.WithMCPOptions(
 			// WithSimpleRetry(3): Uses default settings with 3 retry attempts
 			// - MaxRetries: 3 (range: 0-10)
@@ -125,7 +131,10 @@ func (c *multiTurnChat) setup(ctx context.Context) error {
 			// }),
 		),
 	)
-	fmt.Println("Streamable MCP Toolset created successfully")
+	if err := streamableToolSet.Init(ctx); err != nil {
+		return fmt.Errorf("failed to initialize Streamable MCP toolset: %w", err)
+	}
+	fmt.Println("Streamable MCP Toolset initialized successfully")
 
 	// Create SSE MCP tools with session reconnection.
 	sseToolSet := mcp.NewMCPToolSet(
@@ -137,7 +146,7 @@ func (c *multiTurnChat) setup(ctx context.Context) error {
 				"User-Agent": "trpc-agent-go/1.0.0",
 			},
 		},
-		mcp.WithToolFilter(mcp.NewIncludeFilter("sse_recipe", "sse_health_tip")),
+		mcp.WithToolFilterFunc(tool.NewIncludeToolNamesFilter("sse_recipe", "sse_health_tip")),
 		// Enable session reconnection for automatic recovery when server restarts (max 3 attempts)
 		mcp.WithSessionReconnect(3),
 		mcp.WithMCPOptions(
@@ -151,6 +160,9 @@ func (c *multiTurnChat) setup(ctx context.Context) error {
 			}),
 		),
 	)
+	if err := sseToolSet.Init(ctx); err != nil {
+		return fmt.Errorf("failed to initialize SSE MCP toolset: %w", err)
+	}
 
 	// Create LLM agent with tools.
 	genConfig := model.GenerationConfig{
@@ -388,7 +400,7 @@ func (c *multiTurnChat) getCurrentTime(_ context.Context, args timeArgs) (timeRe
 
 // calculatorArgs represents arguments for the calculator tool.
 type calculatorArgs struct {
-	Operation string  `json:"operation" description:"The operation: add, subtract, multiply, divide"`
+	Operation string  `json:"operation" description:"The operation to perform"`
 	A         float64 `json:"a" description:"First number"`
 	B         float64 `json:"b" description:"Second number"`
 }
@@ -403,7 +415,7 @@ type calculatorResult struct {
 
 // timeArgs represents arguments for the time tool.
 type timeArgs struct {
-	Timezone string `json:"timezone" description:"Timezone (UTC, EST, PST, CST) or leave empty for local"`
+	Timezone string `json:"timezone" description:"Timezone or leave empty for local"`
 }
 
 // timeResult represents the current time information.

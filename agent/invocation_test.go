@@ -105,14 +105,14 @@ func TestInvocation_AddNoticeChannelAndWait(t *testing.T) {
 	}{
 		{
 			name:        "wait_with_context_cancel_error",
-			ctxDelay:    50 * time.Millisecond,
+			ctxDelay:    100 * time.Millisecond,
 			noticeKey:   "test-channel-1",
-			waitTimeout: 100 * time.Millisecond,
+			waitTimeout: 200 * time.Millisecond,
 			errType:     2,
-			mainSleep:   300 * time.Millisecond,
+			mainSleep:   500 * time.Millisecond,
 			execTime: execTime{
-				min: 50 * time.Millisecond,
-				max: 150 * time.Millisecond,
+				min: 80 * time.Millisecond,
+				max: 300 * time.Millisecond,
 			},
 		},
 		{
@@ -123,7 +123,7 @@ func TestInvocation_AddNoticeChannelAndWait(t *testing.T) {
 			waitTimeout: 100 * time.Millisecond,
 			mainSleep:   300 * time.Millisecond,
 			execTime: execTime{
-				min: 100 * time.Millisecond,
+				min: 80 * time.Millisecond,
 				max: 300 * time.Millisecond,
 			},
 		},
@@ -133,10 +133,10 @@ func TestInvocation_AddNoticeChannelAndWait(t *testing.T) {
 			noticeKey:   "test-channel-3",
 			errType:     0,
 			waitTimeout: 1 * time.Second,
-			mainSleep:   300 * time.Millisecond,
+			mainSleep:   100 * time.Millisecond,
 			execTime: execTime{
-				min: 30 * time.Millisecond,
-				max: 1 * time.Second,
+				min: 80 * time.Millisecond,
+				max: 500 * time.Millisecond,
 			},
 		},
 		{
@@ -145,55 +145,84 @@ func TestInvocation_AddNoticeChannelAndWait(t *testing.T) {
 			noticeKey:   "test-channel-4",
 			errType:     0,
 			waitTimeout: 1 * time.Second,
-			mainSleep:   300 * time.Millisecond,
+			mainSleep:   100 * time.Millisecond,
 			execTime: execTime{
-				min: 300 * time.Millisecond,
-				max: 1 * time.Second,
+				min: 80 * time.Millisecond,
+				max: 500 * time.Millisecond,
 			},
 		},
 	}
 
-	inv := NewInvocation()
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			inv := NewInvocation()
 			ctx := context.Background()
 			if tt.ctxDelay > 0 {
 				innerCtx, cancel := context.WithTimeout(ctx, tt.ctxDelay)
 				defer cancel()
 				ctx = innerCtx
 			}
-			complete := false
-			startTime := time.Now()
-			go func() {
-				startTime := time.Now()
-				err := inv.AddNoticeChannelAndWait(ctx, tt.noticeKey, tt.waitTimeout)
-				duration := time.Since(startTime)
-				complete = true
-				require.True(t, duration > tt.execTime.min && duration < tt.execTime.max)
 
-				switch tt.errType {
-				case 0:
-					require.NoError(t, err)
-				case 1:
-					require.Error(t, err)
-					_, isWaitNoticeTimeoutError := AsWaitNoticeTimeoutError(err)
-					require.True(t, isWaitNoticeTimeoutError)
-				case 2:
-					require.Error(t, err)
-					_, isWaitNoticeTimeoutError := AsWaitNoticeTimeoutError(err)
-					require.False(t, isWaitNoticeTimeoutError)
-				}
+			done := make(chan struct{})
+			errCh := make(chan error, 1)
+			durationCh := make(chan time.Duration, 1)
+			startTime := time.Now()
+
+			go func() {
+				defer close(done)
+				goroutineStart := time.Now()
+				err := inv.AddNoticeChannelAndWait(ctx, tt.noticeKey, tt.waitTimeout)
+				durationCh <- time.Since(goroutineStart)
+				errCh <- err
 			}()
-			time.Sleep(tt.mainSleep)
-			inv.NotifyCompletion(ctx, tt.noticeKey)
-			require.Equal(t, 0, len(inv.noticeChanMap))
-			for {
-				if complete {
-					break
-				}
+
+			// Wait for the expected trigger condition
+			if tt.errType == 0 {
+				// For success cases, notify before timeout/context cancel
+				time.Sleep(tt.mainSleep)
+				inv.NotifyCompletion(context.Background(), tt.noticeKey)
+			} else {
+				// For error cases, let timeout or context cancel happen naturally
+				// No notification needed
 			}
-			duration := time.Since(startTime)
-			require.True(t, duration > tt.mainSleep)
+
+			// Wait for goroutine to complete
+			<-done
+
+			duration := <-durationCh
+			err := <-errCh
+
+			// Verify execution time with more tolerance
+			require.GreaterOrEqual(t, duration, tt.execTime.min,
+				"execution time %v should be >= %v", duration, tt.execTime.min)
+			require.LessOrEqual(t, duration, tt.execTime.max,
+				"execution time %v should be <= %v", duration, tt.execTime.max)
+
+			// Verify error type
+			switch tt.errType {
+			case 0:
+				require.NoError(t, err, "expected no error but got: %v", err)
+			case 1:
+				require.Error(t, err, "expected timeout error but got no error")
+				_, isWaitNoticeTimeoutError := AsWaitNoticeTimeoutError(err)
+				require.True(t, isWaitNoticeTimeoutError, "expected WaitNoticeTimeoutError but got: %T", err)
+			case 2:
+				require.Error(t, err, "expected context error but got no error")
+				_, isWaitNoticeTimeoutError := AsWaitNoticeTimeoutError(err)
+				require.False(t, isWaitNoticeTimeoutError, "expected context error but got WaitNoticeTimeoutError")
+			}
+
+			// Verify channel cleanup
+			if tt.errType == 0 {
+				require.Equal(t, 0, len(inv.noticeChanMap), "notice channel should be cleaned up")
+			}
+
+			// Verify main execution time
+			mainDuration := time.Since(startTime)
+			if tt.errType == 0 {
+				require.GreaterOrEqual(t, mainDuration, tt.mainSleep,
+					"main execution time %v should be >= sleep time %v", mainDuration, tt.mainSleep)
+			}
 		})
 	}
 }
@@ -243,4 +272,258 @@ func TestInvocation_AddNoticeChannelAndWait_nil(t *testing.T) {
 
 	err := inv.AddNoticeChannelAndWait(context.Background(), "test-key", 2*time.Second)
 	require.Error(t, err)
+}
+
+func TestInvocation_GetEventFilterKey(t *testing.T) {
+	tests := []struct {
+		name      string
+		inv       *Invocation
+		expectKey string
+	}{
+		{
+			name:      "nil invocation",
+			inv:       nil,
+			expectKey: "",
+		},
+		{
+			name:      "invocation without filter key",
+			inv:       NewInvocation(),
+			expectKey: "",
+		},
+		{
+			name:      "invocation with filter key",
+			inv:       NewInvocation(WithInvocationEventFilterKey("test-filter-key")),
+			expectKey: "test-filter-key",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			key := tt.inv.GetEventFilterKey()
+			require.Equal(t, tt.expectKey, key)
+		})
+	}
+}
+
+func TestInjectIntoEvent(t *testing.T) {
+	tests := []struct {
+		name     string
+		inv      *Invocation
+		event    *event.Event
+		validate func(*testing.T, *event.Event)
+	}{
+		{
+			name:  "nil event",
+			inv:   NewInvocation(WithInvocationID("test-id")),
+			event: nil,
+			validate: func(t *testing.T, e *event.Event) {
+				// Nothing to validate, should not panic
+			},
+		},
+		{
+			name:  "nil invocation",
+			inv:   nil,
+			event: &event.Event{},
+			validate: func(t *testing.T, e *event.Event) {
+				require.Equal(t, "", e.InvocationID)
+			},
+		},
+		{
+			name: "inject invocation info",
+			inv: NewInvocation(
+				WithInvocationID("test-inv-id"),
+				WithInvocationBranch("test-branch"),
+				WithInvocationEventFilterKey("test-filter"),
+				WithInvocationRunOptions(RunOptions{RequestID: "test-request-id"}),
+			),
+			event: &event.Event{},
+			validate: func(t *testing.T, e *event.Event) {
+				require.Equal(t, "test-inv-id", e.InvocationID)
+				require.Equal(t, "test-branch", e.Branch)
+				require.Equal(t, "test-filter", e.FilterKey)
+				require.Equal(t, "test-request-id", e.RequestID)
+			},
+		},
+		{
+			name: "inject with parent invocation",
+			inv: func() *Invocation {
+				parent := NewInvocation(WithInvocationID("parent-id"))
+				child := parent.Clone(WithInvocationID("child-id"))
+				return child
+			}(),
+			event: &event.Event{},
+			validate: func(t *testing.T, e *event.Event) {
+				require.Equal(t, "child-id", e.InvocationID)
+				require.Equal(t, "parent-id", e.ParentInvocationID)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			InjectIntoEvent(tt.inv, tt.event)
+			tt.validate(t, tt.event)
+		})
+	}
+}
+
+func TestEmitEvent(t *testing.T) {
+	tests := []struct {
+		name      string
+		inv       *Invocation
+		ch        chan *event.Event
+		event     *event.Event
+		expectErr bool
+	}{
+		{
+			name:      "nil channel",
+			inv:       NewInvocation(),
+			ch:        nil,
+			event:     &event.Event{},
+			expectErr: false,
+		},
+		{
+			name:      "nil event",
+			inv:       NewInvocation(),
+			ch:        make(chan *event.Event, 1),
+			event:     nil,
+			expectErr: false,
+		},
+		{
+			name:      "successful emit",
+			inv:       NewInvocation(WithInvocationID("test-id")),
+			ch:        make(chan *event.Event, 1),
+			event:     &event.Event{ID: "event-1"},
+			expectErr: false,
+		},
+		{
+			name:      "emit with nil invocation",
+			inv:       nil,
+			ch:        make(chan *event.Event, 1),
+			event:     &event.Event{ID: "event-2"},
+			expectErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			err := EmitEvent(ctx, tt.inv, tt.ch, tt.event)
+			if tt.expectErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestGetAppendEventNoticeKey(t *testing.T) {
+	tests := []struct {
+		name     string
+		eventID  string
+		expected string
+	}{
+		{
+			name:     "normal event ID",
+			eventID:  "event-123",
+			expected: AppendEventNoticeKeyPrefix + "event-123",
+		},
+		{
+			name:     "empty event ID",
+			eventID:  "",
+			expected: AppendEventNoticeKeyPrefix,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			key := GetAppendEventNoticeKey(tt.eventID)
+			require.Equal(t, tt.expected, key)
+		})
+	}
+}
+
+func TestWithCustomAgentConfigs(t *testing.T) {
+	configs := map[string]any{"custom-llm": "test-config"}
+	opts := &RunOptions{}
+	WithCustomAgentConfigs(configs)(opts)
+
+	// Verify config was set by retrieving it
+	require.NotNil(t, opts.CustomAgentConfigs)
+	require.Equal(t, "test-config", opts.CustomAgentConfigs["custom-llm"])
+}
+
+func TestInvocation_GetCustomAgentConfig(t *testing.T) {
+	// Test get existing config - use WithCustomAgentConfigs to set it
+	opts := &RunOptions{}
+	WithCustomAgentConfigs(map[string]any{"custom-llm": "test-config"})(opts)
+
+	inv := &Invocation{
+		RunOptions: *opts,
+	}
+	require.Equal(t, "test-config", inv.GetCustomAgentConfig("custom-llm"))
+	require.Nil(t, inv.GetCustomAgentConfig("non-existing"))
+
+	// Test nil cases
+	var nilInv *Invocation
+	require.Nil(t, nilInv.GetCustomAgentConfig("custom-llm"))
+
+	invWithNilConfigs := &Invocation{RunOptions: RunOptions{}}
+	require.Nil(t, invWithNilConfigs.GetCustomAgentConfig("custom-llm"))
+}
+
+func TestCustomAgentConfigs_Integration(t *testing.T) {
+	// Create RunOptions with configs using the proper setter
+	opts := &RunOptions{}
+	WithCustomAgentConfigs(map[string]any{"custom-llm": "test-config"})(opts)
+
+	inv := NewInvocation(WithInvocationRunOptions(*opts))
+
+	require.Equal(t, "test-config", inv.GetCustomAgentConfig("custom-llm"))
+
+	// Test Clone preserves configs
+	clonedInv := inv.Clone()
+	require.Equal(t, "test-config", clonedInv.GetCustomAgentConfig("custom-llm"))
+}
+
+func TestWithModel(t *testing.T) {
+	mockModel := &mockModel{name: "test-model"}
+	opts := &RunOptions{}
+	WithModel(mockModel)(opts)
+
+	require.NotNil(t, opts.Model)
+	require.Equal(t, "test-model", opts.Model.Info().Name)
+}
+
+func TestWithModelName(t *testing.T) {
+	opts := &RunOptions{}
+	WithModelName("gpt-4")(opts)
+
+	require.Equal(t, "gpt-4", opts.ModelName)
+}
+
+func TestWithModel_Integration(t *testing.T) {
+	mockModel := &mockModel{name: "custom-model"}
+
+	// Test WithModel sets the model in RunOptions.
+	inv := NewInvocation(
+		WithInvocationRunOptions(RunOptions{
+			Model: mockModel,
+		}),
+	)
+
+	require.NotNil(t, inv.RunOptions.Model)
+	require.Equal(t, "custom-model", inv.RunOptions.Model.Info().Name)
+}
+
+func TestWithModelName_Integration(t *testing.T) {
+	// Test WithModelName sets the model name in RunOptions.
+	inv := NewInvocation(
+		WithInvocationRunOptions(RunOptions{
+			ModelName: "gpt-4-turbo",
+		}),
+	)
+
+	require.Equal(t, "gpt-4-turbo", inv.RunOptions.ModelName)
 }

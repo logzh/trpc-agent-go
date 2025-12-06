@@ -90,7 +90,7 @@ func (dr *DefaultRetriever) Retrieve(ctx context.Context, q *Query) (*Result, er
 
 	// Step 2: Generate embedding.
 	var embedding []float64
-	if dr.embedder != nil {
+	if dr.embedder != nil && finalQuery != "" {
 		var err error
 		embedding, err = dr.embedder.GetEmbedding(ctx, finalQuery)
 		if err != nil {
@@ -100,6 +100,7 @@ func (dr *DefaultRetriever) Retrieve(ctx context.Context, q *Query) (*Result, er
 
 	// Step 3: Search vector store.
 	searchResults, err := dr.vectorStore.Search(ctx, &vectorstore.SearchQuery{
+		Query:      finalQuery,
 		Vector:     embedding,
 		Limit:      q.Limit,
 		MinScore:   q.MinScore,
@@ -121,7 +122,13 @@ func (dr *DefaultRetriever) Retrieve(ctx context.Context, q *Query) (*Result, er
 
 	// Step 5: Rerank results (if reranker is available).
 	if dr.reranker != nil {
-		rerankerResults, err = dr.reranker.Rerank(ctx, rerankerResults)
+		rerankerResults, err = dr.reranker.Rerank(ctx, &reranker.Query{
+			Text:       q.Text,
+			FinalQuery: finalQuery,
+			History:    q.History,
+			UserID:     q.UserID,
+			SessionID:  q.SessionID,
+		}, rerankerResults)
 		if err != nil {
 			return nil, err
 		}

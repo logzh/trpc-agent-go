@@ -24,6 +24,7 @@ import (
 	itool "trpc.group/trpc-go/trpc-agent-go/internal/tool"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/telemetry/trace"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 	"trpc.group/trpc-go/trpc-agent-go/tool/function"
@@ -60,6 +61,17 @@ type streamInnerPreference interface {
 type toolResult struct {
 	index int
 	event *event.Event
+	err   error
+}
+
+// Default message used when transferring to a sub-agent without an explicit message.
+// Users can override or disable it via SetDefaultTransferMessage.
+var defaultTransferMessage = "Task delegated from coordinator"
+
+// SetDefaultTransferMessage configures the message to inject when a sub-agent is
+// called without an explicit message (model directly calls the sub-agent name).
+func SetDefaultTransferMessage(message string) {
+	defaultTransferMessage = message
 }
 
 // subAgentCall defines the input format for direct sub-agent tool calls.
@@ -92,7 +104,7 @@ func (p *FunctionCallResponseProcessor) ProcessResponse(
 	rsp *model.Response,
 	ch chan<- *event.Event,
 ) {
-	if invocation == nil || !rsp.IsToolCallResponse() {
+	if invocation == nil || rsp == nil || rsp.IsPartial || !rsp.IsToolCallResponse() {
 		return
 	}
 
@@ -101,6 +113,12 @@ func (p *FunctionCallResponseProcessor) ProcessResponse(
 	// Option one: set invocation.EndInvocation is true, and stop next step.
 	// Option two: emit error event, maybe the LLM can correct this error and also need to wait for notice completion.
 	// maybe the Option two is better.
+	// Allow users to intervene in error handling through callbacks.
+	if _, ok := agent.AsStopError(err); ok {
+		invocation.EndInvocation = true
+		return
+	}
+
 	if err != nil || functioncallResponseEvent == nil {
 		return
 	}
@@ -187,11 +205,18 @@ func (p *FunctionCallResponseProcessor) executeSingleToolCallSequential(
 ) (*event.Event, error) {
 	_, span := trace.Tracer.Start(ctx, itelemetry.NewExecuteToolSpanName(toolCall.Function.Name))
 	defer span.End()
-	choice, modifiedArgs, err := p.executeToolCall(
+	startTime := time.Now()
+	ctx, choice, modifiedArgs, shouldIgnoreError, err := p.executeToolCall(
 		ctx, invocation, toolCall, tools, index, eventChan,
 	)
 	if err != nil {
-		return nil, err
+		if shouldIgnoreError {
+			// Create error choice for ignorable errors
+			choice = p.createErrorChoice(index, toolCall.ID, err.Error())
+		} else {
+			// Return critical errors (e.g., stop errors) immediately
+			return nil, err
+		}
 	}
 	if choice == nil {
 		return nil, nil
@@ -200,13 +225,46 @@ func (p *FunctionCallResponseProcessor) executeSingleToolCallSequential(
 	toolEvent := newToolCallResponseEvent(
 		invocation, llmResponse, []model.Choice{*choice},
 	)
+	if toolCall.Function.Name == transfer.TransferToolName {
+		toolEvent.Tag = TransferTag
+	}
 	if tl, ok := tools[toolCall.Function.Name]; ok {
 		p.annotateSkipSummarization(toolEvent, tl)
 	}
 	decl := p.lookupDeclaration(tools, toolCall.Function.Name)
-	itelemetry.TraceToolCall(
-		span, decl, modifiedArgs, toolEvent,
+
+	var (
+		sess      = &session.Session{}
+		modelName string
+		agentName string
 	)
+	// Attach state delta if the tool provides it.
+	if tl, ok := tools[toolCall.Function.Name]; ok {
+		p.attachStateDelta(tl, modifiedArgs, choice, toolEvent)
+	}
+
+	if invocation != nil {
+		if invocation.Session != nil {
+			sess = invocation.Session
+		}
+		if invocation.Model != nil {
+			modelName = invocation.Model.Info().Name
+		}
+		if invocation.AgentName != "" {
+			agentName = invocation.AgentName
+		}
+	}
+
+	itelemetry.TraceToolCall(span, sess, decl, modifiedArgs, toolEvent, err)
+	itelemetry.ReportExecuteToolMetrics(ctx, itelemetry.ExecuteToolAttributes{
+		RequestModelName: modelName,
+		ToolName:         toolCall.Function.Name,
+		AppName:          sess.AppName,
+		UserID:           sess.UserID,
+		SessionID:        sess.ID,
+		AgentName:        agentName,
+		Error:            err,
+	}, time.Since(startTime))
 	return toolEvent, nil
 }
 
@@ -237,13 +295,13 @@ func (p *FunctionCallResponseProcessor) executeToolCallsInParallel(
 		close(done)
 	}()
 
-	toolCallResponsesEvents := p.collectParallelToolResults(
+	toolCallResponsesEvents, err := p.collectParallelToolResults(
 		ctx, resultChan, len(toolCalls),
 	)
 	mergedEvent := p.buildMergedParallelEvent(
 		ctx, invocation, llmResponse, tools, toolCalls, toolCallResponsesEvents,
 	)
-	return mergedEvent, nil
+	return mergedEvent, err
 }
 
 // runParallelToolCall executes one tool call and reports the result.
@@ -273,6 +331,9 @@ func (p *FunctionCallResponseProcessor) runParallelToolCall(
 			errorEvent := newToolCallResponseEvent(
 				invocation, llmResponse, []model.Choice{*errorChoice},
 			)
+			if tc.Function.Name == transfer.TransferToolName {
+				errorEvent.Tag = TransferTag
+			}
 			p.sendToolResult(ctx, resultChan, toolResult{index: index, event: errorEvent})
 		}
 	}()
@@ -280,11 +341,12 @@ func (p *FunctionCallResponseProcessor) runParallelToolCall(
 	// Trace the tool execution for observability.
 	_, span := trace.Tracer.Start(ctx, itelemetry.NewExecuteToolSpanName(tc.Function.Name))
 	defer span.End()
-
+	startTime := time.Now()
 	// Execute the tool (streamable or callable) with callbacks.
-	choice, modifiedArgs, err := p.executeToolCall(
+	ctx, choice, modifiedArgs, shouldIgnoreError, err := p.executeToolCall(
 		ctx, invocation, tc, tools, index, eventChan,
 	)
+	// Handle errors based on whether they are ignorable or critical.
 	if err != nil {
 		log.Errorf(
 			"Tool execution error for %s (index: %d, ID: %s, agent: %s): %v",
@@ -297,12 +359,20 @@ func (p *FunctionCallResponseProcessor) runParallelToolCall(
 		errorEvent := newToolCallResponseEvent(
 			invocation, llmResponse, []model.Choice{*errorChoice},
 		)
-		p.sendToolResult(ctx, resultChan, toolResult{index: index, event: errorEvent})
+		if tc.Function.Name == transfer.TransferToolName {
+			errorEvent.Tag = TransferTag
+		}
+		// Only propagate the error if it's not ignorable (e.g., stop errors)
+		var returnErr error
+		if !shouldIgnoreError {
+			returnErr = err
+		}
+		p.sendToolResult(ctx, resultChan, toolResult{index: index, event: errorEvent, err: returnErr})
 		return
 	}
 	// Long-running tools may return nil to indicate no immediate event.
 	if choice == nil {
-		p.sendToolResult(ctx, resultChan, toolResult{index: index, event: nil})
+		p.sendToolResult(ctx, resultChan, toolResult{index: index})
 		return
 	}
 
@@ -310,24 +380,94 @@ func (p *FunctionCallResponseProcessor) runParallelToolCall(
 	toolCallResponseEvent := newToolCallResponseEvent(
 		invocation, llmResponse, []model.Choice{*choice},
 	)
+	if tc.Function.Name == transfer.TransferToolName {
+		toolCallResponseEvent.Tag = TransferTag
+	}
 	// Respect tool preference to skip outer summarization when present.
 	if tl, ok := tools[tc.Function.Name]; ok {
 		p.annotateSkipSummarization(toolCallResponseEvent, tl)
 	}
 	// Include declaration for telemetry even when tool is missing.
 	decl := p.lookupDeclaration(tools, tc.Function.Name)
-	itelemetry.TraceToolCall(span, decl, modifiedArgs, toolCallResponseEvent)
+
+	var (
+		sess      = &session.Session{}
+		modelName string
+		agentName string
+	)
+	if invocation != nil {
+		if invocation.Session != nil {
+			sess = invocation.Session
+		}
+		if invocation.Model != nil {
+			modelName = invocation.Model.Info().Name
+		}
+		if invocation.AgentName != "" {
+			agentName = invocation.AgentName
+		}
+	}
+	// Attach state delta if the tool provides it.
+	if tl, ok := tools[tc.Function.Name]; ok {
+		p.attachStateDelta(tl, modifiedArgs, choice, toolCallResponseEvent)
+	}
+	itelemetry.TraceToolCall(span, sess, decl, modifiedArgs, toolCallResponseEvent, err)
+	itelemetry.ReportExecuteToolMetrics(ctx, itelemetry.ExecuteToolAttributes{
+		RequestModelName: modelName,
+		ToolName:         tc.Function.Name,
+		AppName:          sess.AppName,
+		UserID:           sess.UserID,
+		SessionID:        sess.ID,
+		AgentName:        agentName,
+		Error:            err,
+	}, time.Since(startTime))
 	// Send result back to aggregator.
 	p.sendToolResult(
 		ctx, resultChan, toolResult{index: index, event: toolCallResponseEvent},
 	)
 }
 
+// attachStateDelta copies tool-provided state delta to the event.
+func (p *FunctionCallResponseProcessor) attachStateDelta(
+	tl tool.Tool, args []byte, choice *model.Choice, ev *event.Event,
+) {
+	if tl == nil || choice == nil || ev == nil {
+		return
+	}
+	original := tl
+	if nameTool, ok := tl.(*itool.NamedTool); ok {
+		original = nameTool.Original()
+	}
+	type stateDeltaProvider interface {
+		StateDelta([]byte, []byte) map[string][]byte
+	}
+	sdp, ok := original.(stateDeltaProvider)
+	if !ok {
+		return
+	}
+	b := []byte(choice.Message.Content)
+	delta := sdp.StateDelta(args, b)
+	if len(delta) == 0 {
+		return
+	}
+	if ev.StateDelta == nil {
+		ev.StateDelta = map[string][]byte{}
+	}
+	for k, v := range delta {
+		ev.StateDelta[k] = v
+	}
+}
+
 // annotateSkipSummarization marks an event to skip outer summarization.
 func (p *FunctionCallResponseProcessor) annotateSkipSummarization(
 	ev *event.Event, tl tool.Tool,
 ) {
-	if skipper, ok := tl.(summarizationSkipper); ok && skipper.SkipSummarization() {
+	// Unwrap NamedTool to inspect the original for preferences.
+	original := tl
+	if nameTool, ok := tl.(*itool.NamedTool); ok {
+		original = nameTool.Original()
+	}
+	if skipper, ok := original.(summarizationSkipper); ok &&
+		skipper.SkipSummarization() {
 		if ev.Actions == nil {
 			ev.Actions = &event.EventActions{}
 		}
@@ -376,7 +516,13 @@ func (p *FunctionCallResponseProcessor) buildMergedParallelEvent(
 		mergedEvent = newToolCallResponseEvent(invocation, llmResponse, minimal)
 		for _, tc := range toolCalls {
 			if tl, ok := tools[tc.Function.Name]; ok {
-				if skipper, ok2 := tl.(summarizationSkipper); ok2 && skipper.SkipSummarization() {
+				// Unwrap NamedTool then check for preference.
+				original := tl
+				if nameTool, ok2 := tl.(*itool.NamedTool); ok2 {
+					original = nameTool.Original()
+				}
+				if skipper, ok2 := original.(summarizationSkipper); ok2 &&
+					skipper.SkipSummarization() {
 					if mergedEvent.Actions == nil {
 						mergedEvent.Actions = &event.EventActions{}
 					}
@@ -406,9 +552,11 @@ func (p *FunctionCallResponseProcessor) buildMergedParallelEvent(
 //   - eventChan: channel for emitting events during execution
 //
 // Returns:
-//   - *model.Choice: the result choice containing tool response
+//   - context.Context: updated context from callbacks (if any)
+//   - *model.Choice: the result choice containing tool response (nil if error occurred)
 //   - []byte: the modified arguments after before-tool callbacks (for telemetry)
-//   - error: any error that occurred during execution
+//   - bool: shouldIgnoreError - true if the error is ignorable (e.g., tool not found, marshal error), false for critical errors (e.g., stop errors)
+//   - error: any error that occurred during execution (no longer swallowed)
 func (p *FunctionCallResponseProcessor) executeToolCall(
 	ctx context.Context,
 	invocation *agent.Invocation,
@@ -416,7 +564,7 @@ func (p *FunctionCallResponseProcessor) executeToolCall(
 	tools map[string]tool.Tool,
 	index int,
 	eventChan chan<- *event.Event,
-) (*model.Choice, []byte, error) {
+) (context.Context, *model.Choice, []byte, bool, error) {
 	// Check if tool exists.
 	tl, exists := tools[toolCall.Function.Name]
 	if !exists {
@@ -433,44 +581,50 @@ func (p *FunctionCallResponseProcessor) executeToolCall(
 		} else {
 			log.Errorf("CallableTool %s not found (agent=%s, model=%s)",
 				toolCall.Function.Name, invocation.AgentName, invocation.Model.Info().Name)
-			return p.createErrorChoice(index, toolCall.ID, ErrorToolNotFound), toolCall.Function.Arguments, nil
+			return ctx, nil, toolCall.Function.Arguments, true, fmt.Errorf("executeToolCall: %s", ErrorToolNotFound)
 		}
 	}
 
 	log.Debugf("Executing tool %s with args: %s", toolCall.Function.Name, string(toolCall.Function.Arguments))
 
 	// Execute the tool with callbacks.
-	result, modifiedArgs, err := p.executeToolWithCallbacks(ctx, invocation, toolCall, tl, eventChan)
+	ctx, result, modifiedArgs, err := p.executeToolWithCallbacks(ctx, invocation, toolCall, tl, eventChan)
+	// Only return error when it's a stop error
 	if err != nil {
 		if _, ok := agent.AsStopError(err); ok {
-			return nil, modifiedArgs, err
+			return ctx, nil, modifiedArgs, false, err
 		}
-		return p.createErrorChoice(index, toolCall.ID, err.Error()), modifiedArgs, nil
+		return ctx, nil, modifiedArgs, true, err
 	}
 	//  allow to return nil not provide function response.
 	if r, ok := tl.(function.LongRunner); ok && r.LongRunning() {
 		if result == nil {
-			return nil, modifiedArgs, nil
+			return ctx, nil, modifiedArgs, true, nil
 		}
 	}
 
 	// Marshal the result to JSON.
 	resultBytes, err := json.Marshal(result)
 	if err != nil {
-		log.Errorf("Failed to marshal tool result for %s: %v", toolCall.Function.Name, err)
-		return p.createErrorChoice(index, toolCall.ID, ErrorMarshalResult), modifiedArgs, nil
+		// Marshal failures (for example, NaN in floats) do not
+		// affect the overall flow. Downgrade to warning to avoid
+		// noisy alerts while still surfacing the issue.
+		log.Warnf("Failed to marshal tool result for %s: %v",
+			toolCall.Function.Name, err)
+		return ctx, nil, modifiedArgs, true,
+			fmt.Errorf("%s: %w", ErrorMarshalResult, err)
 	}
 
 	log.Debugf("CallableTool %s executed successfully, result: %s", toolCall.Function.Name, string(resultBytes))
 
-	return &model.Choice{
+	return ctx, &model.Choice{
 		Index: index,
 		Message: model.Message{
 			Role:    model.RoleTool,
 			Content: string(resultBytes),
 			ToolID:  toolCall.ID,
 		},
-	}, modifiedArgs, nil
+	}, modifiedArgs, true, nil
 }
 
 // createErrorChoice creates an error choice for tool execution failures.
@@ -492,81 +646,100 @@ func (p *FunctionCallResponseProcessor) collectParallelToolResults(
 	ctx context.Context,
 	resultChan <-chan toolResult,
 	toolCallsCount int,
-) []*event.Event {
+) ([]*event.Event, error) {
 	results := make([]*event.Event, toolCallsCount)
+	var err error
 	for {
 		select {
 		case result, ok := <-resultChan:
 			if !ok {
 				// Channel closed, all results received.
-				return p.filterNilEvents(results)
+				return p.filterNilEvents(results), err
 			}
 			if result.index >= 0 && result.index < len(results) {
 				results[result.index] = result.event
+				if err == nil && result.err != nil {
+					err = result.err
+				}
 			} else {
 				log.Errorf("Tool result index %d out of range [0, %d)", result.index, len(results))
 			}
 		case <-ctx.Done():
 			// Context cancelled, return what we have.
 			log.Warnf("Context cancelled while waiting for tool results")
-			return p.filterNilEvents(results)
+			return p.filterNilEvents(results), nil
 		}
 	}
 }
 
 // executeToolWithCallbacks executes a tool with before/after callbacks.
-// Returns (result, modifiedArguments, error).
+// Returns (context, result, modifiedArguments, error).
 func (p *FunctionCallResponseProcessor) executeToolWithCallbacks(
 	ctx context.Context,
 	invocation *agent.Invocation,
 	toolCall model.ToolCall,
 	tl tool.Tool,
 	eventChan chan<- *event.Event,
-) (any, []byte, error) {
+) (context.Context, any, []byte, error) {
+	// Inject tool call ID into context for callbacks to use.
+	ctx = context.WithValue(ctx, tool.ContextKeyToolCallID{}, toolCall.ID)
+
 	toolDeclaration := tl.Declaration()
 	// Run before tool callbacks if they exist.
 	if p.toolCallbacks != nil {
-		customResult, callbackErr := p.toolCallbacks.RunBeforeTool(
-			ctx,
-			toolCall.Function.Name,
-			toolDeclaration,
-			&toolCall.Function.Arguments,
-		)
+		result, callbackErr := p.toolCallbacks.RunBeforeTool(ctx, &tool.BeforeToolArgs{
+			ToolName:    toolCall.Function.Name,
+			Declaration: toolDeclaration,
+			Arguments:   toolCall.Function.Arguments,
+		})
 		if callbackErr != nil {
 			log.Errorf("Before tool callback failed for %s: %v", toolCall.Function.Name, callbackErr)
-			return nil, toolCall.Function.Arguments, fmt.Errorf("tool callback error: %w", callbackErr)
+			return ctx, nil, toolCall.Function.Arguments, fmt.Errorf("tool callback error: %w", callbackErr)
 		}
-		if customResult != nil {
+		// Use the context from result if provided for subsequent operations.
+		if result != nil && result.Context != nil {
+			ctx = result.Context
+		}
+		if result != nil && result.CustomResult != nil {
 			// Use custom result from callback.
-			return customResult, toolCall.Function.Arguments, nil
+			return ctx, result.CustomResult, toolCall.Function.Arguments, nil
+		}
+		if result != nil && result.ModifiedArguments != nil {
+			// Use modified arguments from callback.
+			toolCall.Function.Arguments = result.ModifiedArguments
 		}
 	}
 
 	// Execute the actual tool.
-	result, err := p.executeTool(ctx, invocation, toolCall, tl, eventChan)
+	toolResult, err := p.executeTool(ctx, invocation, toolCall, tl, eventChan)
 	if err != nil {
-		return nil, toolCall.Function.Arguments, err
+		log.Warnf("tool execute failed, function name: %v, arguments: %s, result: %v, err: %v",
+			toolCall.Function.Name, string(toolCall.Function.Arguments), toolResult, err)
 	}
 
 	// Run after tool callbacks if they exist.
+	// If the tool returns an error, the callback function will still execute to allow the user to handle the error.
 	if p.toolCallbacks != nil {
-		customResult, callbackErr := p.toolCallbacks.RunAfterTool(
-			ctx,
-			toolCall.Function.Name,
-			toolDeclaration,
-			toolCall.Function.Arguments,
-			result,
-			err,
-		)
+		afterResult, callbackErr := p.toolCallbacks.RunAfterTool(ctx, &tool.AfterToolArgs{
+			ToolName:    toolCall.Function.Name,
+			Declaration: toolDeclaration,
+			Arguments:   toolCall.Function.Arguments,
+			Result:      toolResult,
+			Error:       err,
+		})
 		if callbackErr != nil {
 			log.Errorf("After tool callback failed for %s: %v", toolCall.Function.Name, callbackErr)
-			return nil, toolCall.Function.Arguments, fmt.Errorf("tool callback error: %w", callbackErr)
+			return ctx, toolResult, toolCall.Function.Arguments, fmt.Errorf("tool callback error: %w", callbackErr)
 		}
-		if customResult != nil {
-			result = customResult
+		// Use the context from result if provided for subsequent operations.
+		if afterResult != nil && afterResult.Context != nil {
+			ctx = afterResult.Context
+		}
+		if afterResult != nil && afterResult.CustomResult != nil {
+			toolResult = afterResult.CustomResult
 		}
 	}
-	return result, toolCall.Function.Arguments, nil
+	return ctx, toolResult, toolCall.Function.Arguments, err
 }
 
 // isStreamable returns true if the tool supports streaming and its stream
@@ -766,14 +939,34 @@ func newToolCallResponseEvent(
 }
 
 func mergeParallelToolCallResponseEvents(es []*event.Event) *event.Event {
-	if len(es) == 0 {
+	switch len(es) {
+	case 0:
 		return nil
-	}
-	if len(es) == 1 {
+	case 1:
 		return es[0]
+	default:
 	}
 
-	// Pre-calculate capacity to avoid multiple slice reallocations
+	mergedChoices := collectMergedChoices(es)
+	mergedDelta := collectStateDelta(es)
+	baseEvent := findBaseEvent(es)
+	resp := buildMergedToolResponse(baseEvent, mergedChoices)
+	mergedEvent := buildMergedEvent(baseEvent, resp)
+
+	if len(mergedDelta) > 0 {
+		mergedEvent.StateDelta = mergedDelta
+	}
+	if shouldSkipSummarization(es) {
+		if mergedEvent.Actions == nil {
+			mergedEvent.Actions = &event.EventActions{}
+		}
+		mergedEvent.Actions.SkipSummarization = true
+	}
+	return mergedEvent
+}
+
+// collectMergedChoices collects the choices from all events.
+func collectMergedChoices(es []*event.Event) []model.Choice {
 	totalChoices := 0
 	for _, e := range es {
 		if e != nil && e.Response != nil {
@@ -788,55 +981,67 @@ func mergeParallelToolCallResponseEvents(es []*event.Event) *event.Event {
 			mergedChoices = append(mergedChoices, e.Response.Choices...)
 		}
 	}
-	eventID := uuid.New().String()
+	return mergedChoices
+}
 
-	// Find a valid base event for metadata.
-	var baseEvent *event.Event
+// collectStateDelta collects the state delta from all events.
+func collectStateDelta(es []*event.Event) map[string][]byte {
+	mergedDelta := map[string][]byte{}
 	for _, e := range es {
-		if e != nil {
-			baseEvent = e
-			break
+		if e == nil || len(e.StateDelta) == 0 {
+			continue
+		}
+		for k, v := range e.StateDelta {
+			mergedDelta[k] = v
 		}
 	}
+	return mergedDelta
+}
 
-	// Build response payload with appropriate metadata.
+// findBaseEvent finds a valid base event for metadata.
+func findBaseEvent(es []*event.Event) *event.Event {
+	for _, e := range es {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
+// buildMergedToolResponse builds the merged tool response.
+func buildMergedToolResponse(baseEvent *event.Event, mergedChoices []model.Choice) *model.Response {
 	modelName := "unknown"
 	if baseEvent != nil && baseEvent.Response != nil {
 		modelName = baseEvent.Response.Model
 	}
-
-	resp := &model.Response{
-		ID:        eventID,
+	return &model.Response{
+		ID:        uuid.New().String(),
 		Object:    model.ObjectTypeToolResponse,
 		Created:   time.Now().Unix(),
 		Model:     modelName,
 		Choices:   mergedChoices,
 		Timestamp: time.Now(),
 	}
+}
 
+// buildMergedEvent builds the merged event.
+func buildMergedEvent(baseEvent *event.Event, resp *model.Response) *event.Event {
 	// If we have a base event, carry over invocation, author and branch.
-	var merged *event.Event
 	if baseEvent != nil {
-		merged = event.New(
-			baseEvent.InvocationID,
-			baseEvent.Author,
-			event.WithResponse(resp),
-		)
-	} else {
-		// Fallback: construct without base metadata.
-		merged = event.New("", "", event.WithResponse(resp))
+		return event.New(baseEvent.InvocationID, baseEvent.Author, event.WithResponse(resp))
 	}
-	// If any child event prefers skipping summarization, propagate it.
+	// Fallback: construct without base metadata.
+	return event.New("", "", event.WithResponse(resp))
+}
+
+// shouldSkipSummarization checks if any event prefers skipping summarization.
+func shouldSkipSummarization(es []*event.Event) bool {
 	for _, e := range es {
 		if e != nil && e.Actions != nil && e.Actions.SkipSummarization {
-			if merged.Actions == nil {
-				merged.Actions = &event.EventActions{}
-			}
-			merged.Actions.SkipSummarization = true
-			break
+			return true
 		}
 	}
-	return merged
+	return false
 }
 
 // findCompatibleTool attempts to map a requested (missing) tool name to a compatible tool.
@@ -871,7 +1076,7 @@ func convertToolArguments(originalName string, originalArgs []byte, targetName s
 
 	message := input.Message
 	if message == "" {
-		message = "Task delegated from coordinator"
+		message = defaultTransferMessage
 	}
 
 	req := &transfer.Request{

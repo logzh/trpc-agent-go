@@ -69,6 +69,7 @@ func main() {
 
 	// 3. Create Runner.
 	r := runner.NewRunner("my-app", a)
+	defer r.Close()  // Ensure cleanup (trpc-agent-go >= v0.5.0)
 
 	// 4. Run conversation.
 	ctx := context.Background()
@@ -88,6 +89,11 @@ func main() {
 
 		if len(event.Response.Choices) > 0 {
 			fmt.Print(event.Response.Choices[0].Delta.Content)
+		}
+
+		// Recommended: stop when Runner emits its completion event.
+		if event.IsRunnerCompletion() {
+			break
 		}
 	}
 }
@@ -153,10 +159,39 @@ r := runner.NewRunner("my-app", agent,
 ```go
 // Execute a single conversation.
 eventChan, err := r.Run(ctx, userID, sessionID, message, options...)
-
-// With run options (currently RunOptions is an empty struct, reserved for future use).
-eventChan, err := r.Run(ctx, userID, sessionID, message)
 ```
+
+#### Resume Interrupted Runs (tools-first resume)
+
+In long-running conversations, users may interrupt the agent while it is still
+in a tool-calling phase (for example, the last message in the session is an
+assistant message with `tool_calls`, but no tool result has been written yet).
+When you later reuse the same `sessionID`, you can ask the Runner to *resume*
+from that point instead of asking the model to repeat the tool calls:
+
+```go
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    model.Message{},                // no new user message
+    agent.WithResume(true),         // enable resume mode
+)
+```
+
+When `WithResume(true)` is set:
+
+- Runner inspects the latest persisted session event.
+- If the last event is an assistant response that contains `tool_calls` and
+  there is no later tool result, Runner will execute those pending tools first
+  (using the same tool set and callbacks as a normal step) and persist the
+  tool results into the session.
+- After tools finish, the normal LLM cycle continues using the updated session
+  history, so the model sees both the original tool calls and their results.
+
+If the last event is a user or tool message (or a plain assistant reply
+without `tool_calls`), `WithResume(true)` is a no-op and the flow behaves like
+today’s `Run` call.
 
 #### Provide Conversation History (auto-seed + session reuse)
 
@@ -194,6 +229,43 @@ option; it only derives messages from session events (or falls back to the
 single `invocation.Message` if the session has no events). `RunWithMessages`
 still sets `invocation.Message` to the latest user turn so graph/flow agents
 that inspect it continue to work.
+
+### ✅ Detecting End-of-Run and Reading Final Output (Graph-friendly)
+
+When driving a GraphAgent workflow, the LLM’s “final response” is not the end of
+the workflow—nodes like `output` may still be pending. Instead of checking
+`Response.IsFinalResponse()`, always stop on the Runner’s terminal completion
+event:
+
+```go
+for e := range eventChan {
+    // ... print streaming chunks, etc.
+    if e.IsRunnerCompletion() {
+        break
+    }
+}
+```
+
+For convenience, Runner now propagates the graph’s final snapshot into this last
+event. You can extract the final textual output via `graph.StateKeyLastResponse`:
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/graph"
+
+for e := range eventChan {
+    if e.IsRunnerCompletion() {
+        if b, ok := e.StateDelta[graph.StateKeyLastResponse]; ok {
+            var final string
+            _ = json.Unmarshal(b, &final)
+            fmt.Println("\nFINAL:", final)
+        }
+        break
+    }
+}
+```
+
+This keeps application code simple and consistent across Agent types while still
+preserving detailed graph events for advanced use.
 
 ## 💾 Session Management
 
@@ -442,22 +514,112 @@ for event := range eventChan {
 
 ### Resource Management
 
-```go
-// Use context to control lifecycle.
-ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
+#### 🔒 Closing Runner (Important)
 
-// Ensure all events are consumed.
+**You MUST call `Close()` when the Runner is no longer needed to prevent goroutine leaks(`trpc-agent-go >= v0.5.0`).**
+
+**Runner Only Closes Resources It Created**
+
+When a Runner is created without providing a Session Service, it automatically creates a default inmemory Session Service. This service starts background goroutines internally (for asynchronous summary processing, TTL-based session cleanup, etc.). **Runner only manages the lifecycle of this self-created inmemory Session Service.** If you provide your own Session Service via `WithSessionService()`, you are responsible for managing its lifecycle—Runner won't close it.
+
+If you don't call `Close()` on a Runner that owns an inmemory Session Service, the background goroutines will run forever, causing resource leaks.
+
+**Recommended Practice**:
+
+```go
+// ✅ Recommended: Use defer to ensure cleanup
+r := runner.NewRunner("my-app", agent)
+defer r.Close()  // Ensure cleanup on function exit (trpc-agent-go >= v0.5.0)
+
+// Use the runner
 eventChan, err := r.Run(ctx, userID, sessionID, message)
 if err != nil {
-    return err
+	return err
 }
 
 for event := range eventChan {
-    // Process events.
-    if event.Done {
-        break
-    }
+	// Process events
+	if event.IsRunnerCompletion() {
+		break
+	}
+}
+```
+
+**When You Provide Your Own Session Service**:
+
+```go
+// You create and manage the session service lifecycle
+sessionService := redis.NewService(redis.WithRedisClientURL("redis://localhost:6379"))
+defer sessionService.Close()  // YOU are responsible for closing it
+
+// Runner uses but doesn't own this session service
+r := runner.NewRunner("my-app", agent, 
+	runner.WithSessionService(sessionService))
+defer r.Close()  // This will NOT close sessionService (you provided it) (trpc-agent-go >= v0.5.0)
+
+// ... use the runner
+```
+
+**Long-Running Services**:
+
+```go
+type Service struct {
+	runner runner.Runner
+	sessionService session.Service  // If you manage it yourself
+}
+
+func NewService() *Service {
+	r := runner.NewRunner("my-app", agent)
+	return &Service{runner: r}
+}
+
+func (s *Service) Start() error {
+	// Service startup logic
+	return nil
+}
+
+// Call Close when shutting down the service
+func (s *Service) Stop() error {
+	// Close runner (which closes its owned inmemory session service)
+    // trpc-agent-go >= v0.5.0
+	if err := s.runner.Close(); err != nil {
+		return err
+	}
+	
+	// If you provided your own session service, close it here
+	if s.sessionService != nil {
+		return s.sessionService.Close()
+	}
+	
+	return nil
+}
+```
+
+**Important Notes**:
+
+- ✅ `Close()` is idempotent; calling it multiple times is safe
+- ✅ **Runner only closes the inmemory Session Service it creates by default**
+- ✅ If you provide your own Session Service via `WithSessionService()`, Runner won't close it (you manage it yourself)
+- ❌ Not calling `Close()` when Runner owns an inmemory Session Service will cause goroutine leaks
+
+#### Context Lifecycle Control
+
+```go
+// Use context to control the lifecycle of a single run
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+// Ensure all events are consumed
+eventChan, err := r.Run(ctx, userID, sessionID, message)
+if err != nil {
+	return err
+}
+
+for event := range eventChan {
+	// Process events
+	if event.Done {
+		break
+	}
 }
 ```
 

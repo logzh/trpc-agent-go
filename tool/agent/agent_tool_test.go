@@ -265,6 +265,121 @@ func TestTool_StreamInner_And_StreamableCall(t *testing.T) {
 	}
 }
 
+func TestTool_HistoryScope_ParentBranch_Streamable_FilterKeyPrefix(t *testing.T) {
+	sa := &streamingMockAgent{name: "stream-agent"}
+	at := NewTool(sa, WithStreamInner(true), WithHistoryScope(HistoryScopeParentBranch))
+
+	// Parent invocation with base filter key.
+	sess := &session.Session{}
+	parent := agent.NewInvocation(
+		agent.WithInvocationSession(sess),
+		agent.WithInvocationEventFilterKey("parent-agent"),
+	)
+	ctx := agent.NewInvocationContext(context.Background(), parent)
+
+	r, err := at.StreamableCall(ctx, []byte(`{"request":"hi"}`))
+	if err != nil {
+		t.Fatalf("StreamableCall error: %v", err)
+	}
+	defer r.Close()
+	// Drain stream
+	for i := 0; i < 4; i++ {
+		if _, err := r.Recv(); err != nil {
+			t.Fatalf("unexpected stream error: %v", err)
+		}
+	}
+
+	// Expect child filter key prefixed by parent key.
+	if !strings.HasPrefix(sa.seenFilterKey, "parent-agent/"+sa.name+"-") {
+		t.Fatalf("expected child filter key to start with %q, got %q", "parent-agent/"+sa.name+"-", sa.seenFilterKey)
+	}
+}
+
+// inspectAgent collects matched contents from session using the invocation's filter key
+// and returns them joined by '|'.
+type inspectAgent struct{ name string }
+
+func (m *inspectAgent) Run(ctx context.Context, inv *agent.Invocation) (<-chan *event.Event, error) {
+	fk := inv.GetEventFilterKey()
+	var matched []string
+	if inv.Session != nil {
+		for i := range inv.Session.Events {
+			evt := inv.Session.Events[i]
+			if evt.Filter(fk) && evt.Response != nil && len(evt.Response.Choices) > 0 {
+				msg := evt.Response.Choices[0].Message
+				if msg.Content != "" {
+					matched = append(matched, msg.Content)
+				}
+			}
+		}
+	}
+	ch := make(chan *event.Event, 1)
+	ch <- &event.Event{Response: &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage(strings.Join(matched, "|"))}}}}
+	close(ch)
+	return ch, nil
+}
+
+func (m *inspectAgent) Tools() []tool.Tool              { return nil }
+func (m *inspectAgent) Info() agent.Info                { return agent.Info{Name: m.name, Description: "inspect"} }
+func (m *inspectAgent) SubAgents() []agent.Agent        { return nil }
+func (m *inspectAgent) FindSubAgent(string) agent.Agent { return nil }
+
+func TestTool_HistoryScope_ParentBranch_Call_InheritsParentHistory(t *testing.T) {
+	ia := &inspectAgent{name: "child"}
+	at := NewTool(ia, WithHistoryScope(HistoryScopeParentBranch))
+
+	// Build parent session with a prior assistant event under parent branch.
+	sess := &session.Session{}
+	parent := agent.NewInvocation(
+		agent.WithInvocationSession(sess),
+		agent.WithInvocationEventFilterKey("parent-branch"),
+	)
+	ctx := agent.NewInvocationContext(context.Background(), parent)
+
+	// Append a parent assistant event (author parent, content "PARENT").
+	parentEvt := event.NewResponseEvent(parent.InvocationID, "parent", &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("PARENT")}}})
+	agent.InjectIntoEvent(parent, parentEvt)
+	sess.Events = append(sess.Events, *parentEvt)
+
+	// Call the tool with child input.
+	out, err := at.Call(ctx, []byte(`{"request":"CHILD"}`))
+	if err != nil {
+		t.Fatalf("call error: %v", err)
+	}
+	s, _ := out.(string)
+	// Expect both parent content and tool input to be visible via filter inheritance.
+	if !strings.Contains(s, "PARENT") || !strings.Contains(s, `{"request":"CHILD"}`) {
+		t.Fatalf("expected output to contain both parent and child contents, got: %q", s)
+	}
+}
+
+func TestTool_HistoryScope_Isolated_Streamable_NoParentPrefix(t *testing.T) {
+	sa := &streamingMockAgent{name: "stream-agent"}
+	at := NewTool(sa, WithStreamInner(true), WithHistoryScope(HistoryScopeIsolated))
+
+	sess := &session.Session{}
+	parent := agent.NewInvocation(
+		agent.WithInvocationSession(sess),
+		agent.WithInvocationEventFilterKey("parent-agent"),
+	)
+	ctx := agent.NewInvocationContext(context.Background(), parent)
+
+	r, err := at.StreamableCall(ctx, []byte(`{"request":"hi"}`))
+	if err != nil {
+		t.Fatalf("StreamableCall error: %v", err)
+	}
+	defer r.Close()
+	for i := 0; i < 4; i++ { // drain
+		if _, err := r.Recv(); err != nil {
+			t.Fatalf("stream read error: %v", err)
+		}
+	}
+	// Expect isolated (no parent prefix)
+	if !strings.HasPrefix(sa.seenFilterKey, sa.name+"-") || strings.HasPrefix(sa.seenFilterKey, "parent-agent/") {
+		t.Fatalf("expected isolated child key starting with %q, got %q", sa.name+"-", sa.seenFilterKey)
+	}
+}
+
 func TestTool_StreamInner_FlagFalse(t *testing.T) {
 	a := &mockAgent{name: "agent-x", description: "d"}
 	at := NewTool(a, WithStreamInner(false))
@@ -343,5 +458,243 @@ func TestNewTool_UsesAgentSchemas(t *testing.T) {
 	}
 	if decl.OutputSchema == nil || decl.OutputSchema.Type != "string" {
 		t.Fatalf("expected converted output schema, got: %#v", decl.OutputSchema)
+	}
+}
+
+func TestTool_SkipSummarization(t *testing.T) {
+	a := &mockAgent{name: "test", description: "test"}
+
+	// Test default (false)
+	at1 := NewTool(a)
+	if at1.SkipSummarization() {
+		t.Errorf("Expected SkipSummarization to be false by default")
+	}
+
+	// Test with true
+	at2 := NewTool(a, WithSkipSummarization(true))
+	if !at2.SkipSummarization() {
+		t.Errorf("Expected SkipSummarization to be true")
+	}
+
+	// Test with false explicitly
+	at3 := NewTool(a, WithSkipSummarization(false))
+	if at3.SkipSummarization() {
+		t.Errorf("Expected SkipSummarization to be false")
+	}
+}
+
+// eventErrorMockAgent returns an event with error
+type eventErrorMockAgent struct{ name string }
+
+func (m *eventErrorMockAgent) Run(ctx context.Context, invocation *agent.Invocation) (<-chan *event.Event, error) {
+	ch := make(chan *event.Event, 1)
+	ch <- &event.Event{
+		Response: &model.Response{
+			Error: &model.ResponseError{Message: "event error occurred"},
+		},
+	}
+	close(ch)
+	return ch, nil
+}
+func (m *eventErrorMockAgent) Tools() []tool.Tool              { return nil }
+func (m *eventErrorMockAgent) Info() agent.Info                { return agent.Info{Name: m.name, Description: "err"} }
+func (m *eventErrorMockAgent) SubAgents() []agent.Agent        { return nil }
+func (m *eventErrorMockAgent) FindSubAgent(string) agent.Agent { return nil }
+
+func TestTool_Call_EventError(t *testing.T) {
+	at := NewTool(&eventErrorMockAgent{name: "err-event-agent"})
+	_, err := at.Call(context.Background(), []byte(`{"request":"x"}`))
+	if err == nil {
+		t.Fatalf("expected error from Call when event contains error")
+	}
+	if !strings.Contains(err.Error(), "event error occurred") {
+		t.Fatalf("expected error message to contain 'event error occurred', got: %v", err)
+	}
+}
+
+func TestTool_Call_WithParentInvocation_EventError(t *testing.T) {
+	at := NewTool(&eventErrorMockAgent{name: "err-event-agent"})
+
+	sess := &session.Session{}
+	parent := agent.NewInvocation(
+		agent.WithInvocationSession(sess),
+		agent.WithInvocationEventFilterKey("parent"),
+	)
+	ctx := agent.NewInvocationContext(context.Background(), parent)
+
+	_, err := at.Call(ctx, []byte(`{"request":"x"}`))
+	if err == nil {
+		t.Fatalf("expected error from Call when event contains error")
+	}
+	if !strings.Contains(err.Error(), "event error occurred") {
+		t.Fatalf("expected error message to contain 'event error occurred', got: %v", err)
+	}
+}
+
+func TestTool_StreamableCall_WithParentInvocation_RunError(t *testing.T) {
+	at := NewTool(&errorMockAgent{name: "err-agent"}, WithStreamInner(true))
+
+	sess := &session.Session{}
+	parent := agent.NewInvocation(
+		agent.WithInvocationSession(sess),
+		agent.WithInvocationEventFilterKey("parent"),
+	)
+	ctx := agent.NewInvocationContext(context.Background(), parent)
+
+	r, err := at.StreamableCall(ctx, []byte(`{}`))
+	if err != nil {
+		t.Fatalf("unexpected StreamableCall error: %v", err)
+	}
+	defer r.Close()
+
+	// First chunk might be the tool input event, second should be error
+	var foundError bool
+	for i := 0; i < 2; i++ {
+		ch, err := r.Recv()
+		if err != nil {
+			break
+		}
+		if s, ok := ch.Content.(string); ok && strings.Contains(s, "agent tool run error") {
+			foundError = true
+			break
+		}
+	}
+	if !foundError {
+		t.Fatalf("expected to find error chunk in stream")
+	}
+}
+
+func TestTool_StreamableCall_EmptyMessage(t *testing.T) {
+	sa := &streamingMockAgent{name: "stream-agent"}
+	at := NewTool(sa, WithStreamInner(true))
+
+	sess := &session.Session{}
+	parent := agent.NewInvocation(
+		agent.WithInvocationSession(sess),
+		agent.WithInvocationEventFilterKey("parent"),
+	)
+	ctx := agent.NewInvocationContext(context.Background(), parent)
+
+	// Call with empty message content
+	r, err := at.StreamableCall(ctx, []byte(``))
+	if err != nil {
+		t.Fatalf("StreamableCall error: %v", err)
+	}
+	defer r.Close()
+
+	// Should still receive events (3 from streaming mock)
+	for i := 0; i < 3; i++ {
+		if _, err := r.Recv(); err != nil {
+			t.Fatalf("unexpected stream error: %v", err)
+		}
+	}
+}
+
+func TestConvertMapToToolSchema(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    map[string]any
+		expected *tool.Schema
+	}{
+		{
+			name:     "nil input",
+			input:    nil,
+			expected: nil,
+		},
+		{
+			name: "invalid JSON - channel type",
+			input: map[string]any{
+				"invalid": make(chan int), // channels cannot be marshaled to JSON
+			},
+			expected: nil,
+		},
+		{
+			name: "valid schema",
+			input: map[string]any{
+				"type":        "object",
+				"description": "test schema",
+				"properties": map[string]any{
+					"field1": map[string]any{"type": "string"},
+				},
+			},
+			expected: &tool.Schema{
+				Type:        "object",
+				Description: "test schema",
+				Properties: map[string]*tool.Schema{
+					"field1": {Type: "string"},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := convertMapToToolSchema(tt.input)
+			if tt.expected == nil {
+				if result != nil {
+					t.Errorf("Expected nil result, got: %#v", result)
+				}
+			} else {
+				if result == nil {
+					t.Errorf("Expected non-nil result, got nil")
+				} else if result.Type != tt.expected.Type || result.Description != tt.expected.Description {
+					t.Errorf("Expected %+v, got %+v", tt.expected, result)
+				}
+			}
+		})
+	}
+}
+
+func TestTool_Call_WithParentInvocation_NoSession(t *testing.T) {
+	a := &mockAgent{name: "test", description: "test"}
+	at := NewTool(a)
+
+	// Create parent invocation without session
+	parent := agent.NewInvocation()
+	ctx := agent.NewInvocationContext(context.Background(), parent)
+
+	// Should fall back to isolated runner
+	result, err := at.Call(ctx, []byte(`{"request":"test"}`))
+	if err != nil {
+		t.Fatalf("Call error: %v", err)
+	}
+	if result == nil {
+		t.Fatalf("Expected non-nil result")
+	}
+}
+
+// nilEventMockAgent sends nil event in stream
+type nilEventMockAgent struct{ name string }
+
+func (m *nilEventMockAgent) Run(ctx context.Context, invocation *agent.Invocation) (<-chan *event.Event, error) {
+	ch := make(chan *event.Event, 2)
+	go func() {
+		ch <- nil // Send nil event
+		ch <- &event.Event{Response: &model.Response{Choices: []model.Choice{{Message: model.NewAssistantMessage("ok")}}}}
+		close(ch)
+	}()
+	return ch, nil
+}
+func (m *nilEventMockAgent) Tools() []tool.Tool              { return nil }
+func (m *nilEventMockAgent) Info() agent.Info                { return agent.Info{Name: m.name, Description: "nil"} }
+func (m *nilEventMockAgent) SubAgents() []agent.Agent        { return nil }
+func (m *nilEventMockAgent) FindSubAgent(string) agent.Agent { return nil }
+
+func TestTool_StreamableCall_NilEvent(t *testing.T) {
+	at := NewTool(&nilEventMockAgent{name: "nil-agent"}, WithStreamInner(true))
+
+	r, err := at.StreamableCall(context.Background(), []byte(`{}`))
+	if err != nil {
+		t.Fatalf("StreamableCall error: %v", err)
+	}
+	defer r.Close()
+
+	// Should receive the non-nil event (nil event is skipped in fallback path)
+	ch, err := r.Recv()
+	if err != nil {
+		t.Fatalf("unexpected stream read error: %v", err)
+	}
+	if ch.Content == nil {
+		t.Fatalf("expected non-nil content")
 	}
 }

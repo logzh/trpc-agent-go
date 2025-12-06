@@ -190,25 +190,6 @@ func (m *putMockSaver) PutFull(ctx context.Context, req PutFullRequest) (map[str
 func (m *putMockSaver) DeleteLineage(ctx context.Context, lineageID string) error { return nil }
 func (m *putMockSaver) Close() error                                              { return nil }
 
-func TestExecutor_CreateCheckpoint_SuccessAndError(t *testing.T) {
-	g := New(NewStateSchema())
-	exec := &Executor{graph: g}
-	// nil saver no-op
-	err := exec.createCheckpoint(context.Background(), CreateCheckpointConfig("ln", "", "ns"), State{"a": 1}, CheckpointSourceUpdate, 0)
-	require.NoError(t, err)
-	// success path
-	pm := &putMockSaver{}
-	exec.checkpointSaver = pm
-	err = exec.createCheckpoint(context.Background(), CreateCheckpointConfig("ln", "", "ns"), State{"a": 1}, CheckpointSourceUpdate, 0)
-	require.NoError(t, err)
-	require.True(t, pm.called)
-	// error path
-	pm2 := &putMockSaver{retErr: fmt.Errorf("err")}
-	exec.checkpointSaver = pm2
-	err = exec.createCheckpoint(context.Background(), CreateCheckpointConfig("ln", "", "ns"), State{"a": 1}, CheckpointSourceUpdate, 0)
-	require.Error(t, err)
-}
-
 // resumeFromCheckpoint paths
 type resumeMockSaver struct {
 	tuple *CheckpointTuple
@@ -273,6 +254,70 @@ func TestExecutor_ResumeFromCheckpoint_Paths(t *testing.T) {
 	require.Len(t, writes, 0)
 }
 
+// Ensure NextChannels fallback in resumeFromCheckpoint updates channels
+// when there are no pending writes and no NextNodes.
+func TestExecutor_ResumeFromCheckpoint_NextChannelsFallback(t *testing.T) {
+	g := New(NewStateSchema())
+	// Pre-create the branch channel so resumeFromCheckpoint can update it.
+	g.addChannel(ChannelBranchPrefix+"A", ichannel.BehaviorLastValue)
+
+	exec := &Executor{graph: g}
+	tuple := &CheckpointTuple{Checkpoint: &Checkpoint{
+		ID:            "c3",
+		ChannelValues: map[string]any{},
+		NextChannels:  []string{ChannelBranchPrefix + "A"},
+	}}
+	exec.checkpointSaver = &resumeMockSaver{tuple: tuple}
+
+	st, ckpt, writes, err := exec.resumeFromCheckpoint(
+		context.Background(), nil,
+		CreateCheckpointConfig("ln", "id", "ns"),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, ckpt)
+	require.Empty(t, writes)
+	// State should not contain next nodes key in this fallback path.
+	require.NotContains(t, st, StateKeyNextNodes)
+
+	// The channel should have been updated once by the fallback.
+	ch, _ := g.getChannel(ChannelBranchPrefix + "A")
+	require.NotNil(t, ch)
+	require.Equal(t, int64(1), ch.Version)
+}
+
+// Verify restoreStateFromCheckpoint fills schema defaults and zero values
+// for fields missing from the checkpoint.
+func TestExecutor_RestoreStateFromCheckpoint_DefaultsAndZero(t *testing.T) {
+	schema := NewStateSchema().
+		AddField("opt", StateField{
+			Type:    reflect.TypeOf(0),
+			Default: func() any { return 42 },
+			Reducer: DefaultReducer,
+		}).
+		AddField("names", StateField{
+			Type:    reflect.TypeOf([]string{}),
+			Reducer: StringSliceReducer,
+		})
+	g := New(schema)
+	exec := &Executor{graph: g}
+
+	tuple := &CheckpointTuple{Checkpoint: &Checkpoint{
+		ID:            "ck",
+		ChannelValues: map[string]any{"x": 1},
+	}}
+
+	st := exec.restoreStateFromCheckpoint(tuple)
+	// Existing non-schema key remains.
+	require.Equal(t, 1, st["x"])
+	// Missing schema field with Default gets populated.
+	require.Equal(t, 42, st["opt"])
+	// Missing slice field present with zero (typed nil) value.
+	v, ok := st["names"]
+	require.True(t, ok)
+	_, isSlice := v.([]string)
+	require.True(t, isSlice)
+}
+
 func TestExecutor_HelperMethods(t *testing.T) {
 	exec := &Executor{graph: New(NewStateSchema())}
 	// getConfigKeys
@@ -305,6 +350,76 @@ func TestExecutor_ProcessResumeCommand_And_ApplyExecutableNextNodes(t *testing.T
 	restored := make(State)
 	exec.applyExecutableNextNodes(restored, tuple)
 	require.NotNil(t, restored[StateKeyNextNodes])
+}
+
+func TestExecutor_SyncResumeState_RemovesKeysWhenMissing(t *testing.T) {
+	exec := &Executor{graph: New(NewStateSchema())}
+	execCtx := &ExecutionContext{
+		State: State{
+			ResumeChannel:          "pending",
+			StateKeyResumeMap:      map[string]any{"node": "old"},
+			StateKeyUsedInterrupts: map[string]any{"node": "value"},
+		},
+	}
+	exec.syncResumeState(execCtx, State{})
+	if _, exists := execCtx.State[ResumeChannel]; exists {
+		t.Fatalf("resume channel should be cleared")
+	}
+	if _, exists := execCtx.State[StateKeyResumeMap]; exists {
+		t.Fatalf("resume map should be cleared")
+	}
+	if _, exists := execCtx.State[StateKeyUsedInterrupts]; exists {
+		t.Fatalf("used interrupts should be cleared")
+	}
+}
+
+func TestExecutor_SyncResumeState_CopiesMapMutations(t *testing.T) {
+	exec := &Executor{graph: New(NewStateSchema())}
+	execCtx := &ExecutionContext{State: make(State)}
+	nodeState := State{
+		ResumeChannel:     "answer",
+		StateKeyResumeMap: map[string]any{"node": "new"},
+		StateKeyUsedInterrupts: map[string]any{
+			"node": "new",
+		},
+	}
+	exec.syncResumeState(execCtx, nodeState)
+	// Mutate node state after sync to verify executor state holds a copy.
+	nodeState[StateKeyResumeMap].(map[string]any)["node"] = "mutated"
+	require.Equal(t, "answer", execCtx.State[ResumeChannel])
+	require.Equal(t, "new", execCtx.State[StateKeyResumeMap].(map[string]any)["node"])
+	require.Equal(t, "new", execCtx.State[StateKeyUsedInterrupts].(map[string]any)["node"])
+}
+
+func TestExecutor_SyncResumeState_NilInputs(t *testing.T) {
+	exec := &Executor{graph: New(NewStateSchema())}
+	require.NotPanics(t, func() {
+		exec.syncResumeState(nil, State{ResumeChannel: "value"})
+	})
+	execCtx := &ExecutionContext{State: State{ResumeChannel: "existing"}}
+	require.NotPanics(t, func() {
+		exec.syncResumeState(execCtx, nil)
+	})
+	require.Equal(t, "existing", execCtx.State[ResumeChannel])
+}
+
+func TestExecutor_SyncResumeState_InitializesNilState(t *testing.T) {
+	exec := &Executor{graph: New(NewStateSchema())}
+	execCtx := &ExecutionContext{}
+	nodeState := State{
+		ResumeChannel: "value",
+	}
+	exec.syncResumeState(execCtx, nodeState)
+	require.NotNil(t, execCtx.State)
+	require.Equal(t, "value", execCtx.State[ResumeChannel])
+}
+
+func TestSyncResumeKey_NilValueDeletesKey(t *testing.T) {
+	target := State{ResumeChannel: "to-delete"}
+	source := State{ResumeChannel: nil}
+	syncResumeKey(target, source, ResumeChannel)
+	_, exists := target[ResumeChannel]
+	require.False(t, exists)
 }
 
 func TestExecutor_BuildExecutionContext_ResumedVersionsSeen(t *testing.T) {
@@ -418,6 +533,6 @@ func TestRunModel_BeforeModelError(t *testing.T) {
 	cbs := model.NewCallbacks().RegisterBeforeModel(func(ctx context.Context, req *model.Request) (*model.Response, error) {
 		return nil, fmt.Errorf("boom")
 	})
-	_, err := runModel(context.Background(), cbs, &dummyModel{}, &model.Request{Messages: []model.Message{model.NewUserMessage("hi")}})
+	_, _, err := runModel(context.Background(), cbs, &dummyModel{}, &model.Request{Messages: []model.Message{model.NewUserMessage("hi")}})
 	require.Error(t, err)
 }

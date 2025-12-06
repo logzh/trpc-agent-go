@@ -12,7 +12,9 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,11 +22,13 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/artifact"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/graph"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/session/inmemory"
+	"trpc.group/trpc-go/trpc-agent-go/telemetry/appid"
 )
 
 // Author types for events.
@@ -65,6 +69,11 @@ type Runner interface {
 		message model.Message,
 		runOpts ...agent.RunOption,
 	) (<-chan *event.Event, error)
+
+	// Close closes the runner and releases owned resources.
+	// It's safe to call Close multiple times.
+	// Only resources created by the runner (not provided by user) will be closed.
+	Close() error
 }
 
 // runner runs agents.
@@ -74,6 +83,10 @@ type runner struct {
 	sessionService  session.Service
 	memoryService   memory.Service
 	artifactService artifact.Service
+
+	// Resource management fields.
+	ownedSessionService bool      // Indicates if sessionService was created by this runner.
+	closeOnce           sync.Once // Ensures Close is called only once.
 }
 
 // Options is the options for the Runner.
@@ -92,16 +105,40 @@ func NewRunner(appName string, agent agent.Agent, opts ...Option) Runner {
 		opt(&options)
 	}
 
+	// Track if we created the session service.
+	var ownedSessionService bool
 	if options.sessionService == nil {
 		options.sessionService = inmemory.NewSessionService()
+		ownedSessionService = true
 	}
+	// Register this runner's identity for observability fallback.
+	appid.RegisterRunner(appName, agent.Info().Name)
+
 	return &runner{
-		appName:         appName,
-		agent:           agent,
-		sessionService:  options.sessionService,
-		memoryService:   options.memoryService,
-		artifactService: options.artifactService,
+		appName:             appName,
+		agent:               agent,
+		sessionService:      options.sessionService,
+		memoryService:       options.memoryService,
+		artifactService:     options.artifactService,
+		ownedSessionService: ownedSessionService,
 	}
+}
+
+// Close closes the runner and cleans up owned resources.
+// It's safe to call Close multiple times.
+// Only resources created by this runner will be closed.
+func (r *runner) Close() error {
+	var closeErr error
+	r.closeOnce.Do(func() {
+		// Only close resources that we own (created by this runner).
+		if r.ownedSessionService && r.sessionService != nil {
+			if err := r.sessionService.Close(); err != nil {
+				closeErr = err
+				log.Errorf("close session service failed: %v", err)
+			}
+		}
+	})
+	return closeErr
 }
 
 // Run runs the agent.
@@ -212,6 +249,12 @@ func (r *runner) processAgentEvents(
 	agentEventCh <-chan *event.Event,
 ) chan *event.Event {
 	processedEventCh := make(chan *event.Event, cap(agentEventCh))
+	// Capture the graph-level final snapshot if present so we can propagate it
+	// to the terminal runner-completion event. This makes “final output”
+	// discoverable from the very last event without requiring graph-specific
+	// branching in user code.
+	var finalStateDelta map[string][]byte
+	var finalChoices []model.Choice
 	// Start a goroutine to process and append events to session.
 	go func() {
 		defer func() {
@@ -222,61 +265,170 @@ func (r *runner) processAgentEvents(
 			invocation.CleanupNotice(ctx)
 		}()
 
+		// Process all agent events.
 		for agentEvent := range agentEventCh {
 			if agentEvent == nil {
 				log.Debug("agentEvent is nil.")
 				continue
 			}
-			// Append event to session if it's complete (not partial).
-			if len(agentEvent.StateDelta) > 0 ||
-				(agentEvent.Response != nil && !agentEvent.IsPartial && agentEvent.IsValidContent()) {
-				if err := r.sessionService.AppendEvent(ctx, sess, agentEvent); err != nil {
-					log.Errorf("Failed to append event to session: %v", err)
-				}
 
-				// Trigger summarization immediately after appending a qualifying event.
-				// Use EnqueueSummaryJob for true asynchronous processing.
-				// Prefer filter-specific summarization to avoid scanning all filters.
-				if err := r.sessionService.EnqueueSummaryJob(
-					context.Background(), sess, agentEvent.FilterKey, false,
-				); err != nil {
-					log.Debugf("Auto summarize after append skipped or failed: %v.", err)
-				}
-				// Do not enqueue full-session summary here. The worker will cascade
-				// a full-session summarization after a branch update when appropriate.
+			// Append qualifying events to session and trigger summarization.
+			r.handleEventPersistence(ctx, sess, agentEvent)
+
+			// Capture graph-level completion snapshot for final event.
+			if agentEvent.Done && agentEvent.Object == graph.ObjectTypeGraphExecution {
+				finalStateDelta, finalChoices = r.captureGraphCompletion(agentEvent)
 			}
 
+			// Notify completion if required.
 			if agentEvent.RequiresCompletion {
 				completionID := agent.GetAppendEventNoticeKey(agentEvent.ID)
 				invocation.NotifyCompletion(ctx, completionID)
 			}
+
+			// Emit event to output channel.
 			if err := event.EmitEvent(ctx, processedEventCh, agentEvent); err != nil {
 				return
 			}
 		}
 
-		// Emit final runner completion event after all agent events are processed.
-		runnerCompletionEvent := event.NewResponseEvent(
-			invocation.InvocationID,
-			r.appName,
-			&model.Response{
-				ID:        "runner-completion-" + uuid.New().String(),
-				Object:    model.ObjectTypeRunnerCompletion,
-				Created:   time.Now().Unix(),
-				Done:      true,
-				IsPartial: false,
-			},
-		)
-
-		// Append runner completion event to session.
-		if err := r.sessionService.AppendEvent(ctx, sess, runnerCompletionEvent); err != nil {
-			log.Errorf("Failed to append runner completion event to session: %v", err)
-		}
-
-		// Send the runner completion event to output channel.
-		agent.EmitEvent(ctx, invocation, processedEventCh, runnerCompletionEvent)
+		// Emit final runner completion event.
+		r.emitRunnerCompletion(ctx, invocation, sess, processedEventCh,
+			finalStateDelta, finalChoices)
 	}()
 	return processedEventCh
+}
+
+// handleEventPersistence appends qualifying events to the session and triggers
+// asynchronous summarization.
+func (r *runner) handleEventPersistence(
+	ctx context.Context,
+	sess *session.Session,
+	agentEvent *event.Event,
+) {
+	// Append event to session if it's complete (not partial).
+	if !r.shouldPersistEvent(agentEvent) {
+		return
+	}
+
+	if err := r.sessionService.AppendEvent(ctx, sess, agentEvent); err != nil {
+		log.Errorf("Failed to append event to session: %v", err)
+		return
+	}
+
+	// Trigger summarization immediately after appending a qualifying event.
+	// Use EnqueueSummaryJob for true asynchronous processing.
+	// Prefer filter-specific summarization to avoid scanning all filters.
+	if err := r.sessionService.EnqueueSummaryJob(
+		context.Background(), sess, agentEvent.FilterKey, false,
+	); err != nil {
+		log.Debugf("Auto summarize after append skipped or failed: %v.", err)
+	}
+	// Do not enqueue full-session summary here. The worker will cascade
+	// a full-session summarization after a branch update when appropriate.
+}
+
+// shouldPersistEvent determines if an event should be persisted to the session.
+// Events are persisted if they contain state deltas or are complete, valid
+// responses.
+func (r *runner) shouldPersistEvent(agentEvent *event.Event) bool {
+	return len(agentEvent.StateDelta) > 0 ||
+		(agentEvent.Response != nil && !agentEvent.IsPartial && agentEvent.IsValidContent())
+}
+
+// captureGraphCompletion captures the final state delta and choices from a
+// graph execution completion event.
+func (r *runner) captureGraphCompletion(
+	agentEvent *event.Event,
+) (map[string][]byte, []model.Choice) {
+	// Shallow copy map (values are immutable []byte owned by event stream).
+	finalStateDelta := make(map[string][]byte, len(agentEvent.StateDelta))
+	for k, v := range agentEvent.StateDelta {
+		// Copy bytes to avoid accidental mutation downstream.
+		if v != nil {
+			vv := make([]byte, len(v))
+			copy(vv, v)
+			finalStateDelta[k] = vv
+		}
+	}
+
+	var finalChoices []model.Choice
+	if agentEvent.Response != nil && len(agentEvent.Response.Choices) > 0 {
+		finalChoices = agentEvent.Response.Choices
+	}
+	return finalStateDelta, finalChoices
+}
+
+// emitRunnerCompletion creates and emits the final runner completion event,
+// optionally propagating graph-level completion data.
+func (r *runner) emitRunnerCompletion(
+	ctx context.Context,
+	invocation *agent.Invocation,
+	sess *session.Session,
+	processedEventCh chan *event.Event,
+	finalStateDelta map[string][]byte,
+	finalChoices []model.Choice,
+) {
+	// Create runner completion event.
+	runnerCompletionEvent := event.NewResponseEvent(
+		invocation.InvocationID,
+		r.appName,
+		&model.Response{
+			ID:        "runner-completion-" + uuid.New().String(),
+			Object:    model.ObjectTypeRunnerCompletion,
+			Created:   time.Now().Unix(),
+			Done:      true,
+			IsPartial: false,
+		},
+	)
+
+	// Propagate graph-level completion data if available.
+	if len(finalStateDelta) > 0 {
+		r.propagateGraphCompletion(runnerCompletionEvent, finalStateDelta, finalChoices)
+	}
+
+	// Append runner completion event to session.
+	if err := r.sessionService.AppendEvent(ctx, sess, runnerCompletionEvent); err != nil {
+		log.Errorf("Failed to append runner completion event to session: %v", err)
+	}
+
+	// Send the runner completion event to output channel.
+	agent.EmitEvent(ctx, invocation, processedEventCh, runnerCompletionEvent)
+}
+
+// propagateGraphCompletion propagates graph-level completion data (state delta
+// and final choices) to the runner completion event.
+func (r *runner) propagateGraphCompletion(
+	runnerCompletionEvent *event.Event,
+	finalStateDelta map[string][]byte,
+	finalChoices []model.Choice,
+) {
+	// Initialize state delta map if needed.
+	if runnerCompletionEvent.StateDelta == nil {
+		runnerCompletionEvent.StateDelta = make(map[string][]byte, len(finalStateDelta))
+	}
+
+	// Copy state delta with byte ownership.
+	for k, v := range finalStateDelta {
+		if v != nil {
+			vv := make([]byte, len(v))
+			copy(vv, v)
+			runnerCompletionEvent.StateDelta[k] = vv
+		} else {
+			runnerCompletionEvent.StateDelta[k] = nil
+		}
+	}
+
+	// Optionally echo the final text as a non-streaming assistant message
+	// if graph provided it in its completion.
+	if runnerCompletionEvent.Response != nil &&
+		len(runnerCompletionEvent.Response.Choices) == 0 &&
+		len(finalChoices) > 0 {
+		// Keep only content to avoid carrying tool deltas etc.
+		// Use JSON marshal/unmarshal to deep-copy minimal fields safely.
+		b, _ := json.Marshal(finalChoices)
+		_ = json.Unmarshal(b, &runnerCompletionEvent.Response.Choices)
+	}
 }
 
 // shouldAppendUserMessage checks if the incoming user message should be appended to the session.

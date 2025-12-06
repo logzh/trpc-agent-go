@@ -19,11 +19,84 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/internal/flow"
+	"trpc.group/trpc-go/trpc-agent-go/internal/flow/processor"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
+	"trpc.group/trpc-go/trpc-agent-go/tool/function"
 )
+
+// Additional unit tests for long-running tool tracking and preprocess
+
+// mockLongRunnerTool implements tool.Tool and a LongRunning() flag.
+type mockLongRunnerTool struct {
+	name string
+	long bool
+}
+
+func (m *mockLongRunnerTool) Declaration() *tool.Declaration { return &tool.Declaration{Name: m.name} }
+func (m *mockLongRunnerTool) LongRunning() bool              { return m.long }
+
+func TestCollectLongRunningToolIDs(t *testing.T) {
+	calls := []model.ToolCall{
+		{ID: "1", Function: model.FunctionDefinitionParam{Name: "fast"}},
+		{ID: "2", Function: model.FunctionDefinitionParam{Name: "slow"}},
+		{ID: "3", Function: model.FunctionDefinitionParam{Name: "unknown"}},
+		{ID: "4", Function: model.FunctionDefinitionParam{Name: "nolong"}},
+	}
+	tools := map[string]tool.Tool{
+		"fast":   &mockLongRunnerTool{name: "fast", long: false},
+		"slow":   &mockLongRunnerTool{name: "slow", long: true},
+		"nolong": &mockLongRunnerTool{name: "nolong", long: false},
+		// unknown not present
+	}
+	got := collectLongRunningToolIDs(calls, tools)
+	if _, ok := got["2"]; !ok {
+		t.Fatalf("expected long-running id '2' present, got %#v", got)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 id, got %d", len(got))
+	}
+}
+
+// minimalAgent exposes tools for preprocess test.
+type minimalAgent struct{ tools []tool.Tool }
+
+func (m *minimalAgent) Run(context.Context, *agent.Invocation) (<-chan *event.Event, error) {
+	ch := make(chan *event.Event)
+	close(ch)
+	return ch, nil
+}
+func (m *minimalAgent) Tools() []tool.Tool              { return m.tools }
+func (m *minimalAgent) Info() agent.Info                { return agent.Info{Name: "a"} }
+func (m *minimalAgent) SubAgents() []agent.Agent        { return nil }
+func (m *minimalAgent) FindSubAgent(string) agent.Agent { return nil }
+
+func TestPreprocess_AddsAgentToolsWhenPresent(t *testing.T) {
+	f := New(nil, nil, Options{})
+	req := &model.Request{Tools: map[string]tool.Tool{}}
+	inv := agent.NewInvocation()
+	inv.Agent = &minimalAgent{tools: []tool.Tool{&mockLongRunnerTool{name: "t1"}}}
+	ch := make(chan *event.Event, 4)
+	f.preprocess(context.Background(), inv, req, ch)
+	if _, ok := req.Tools["t1"]; !ok {
+		t.Fatalf("expected tool 't1' added to request")
+	}
+}
+
+func TestCreateLLMResponseEvent_LongRunningIDs(t *testing.T) {
+	f := New(nil, nil, Options{})
+	inv := agent.NewInvocation()
+	req := &model.Request{Tools: map[string]tool.Tool{
+		"slow": &mockLongRunnerTool{name: "slow", long: true},
+	}}
+	rsp := &model.Response{Choices: []model.Choice{{Message: model.Message{ToolCalls: []model.ToolCall{{ID: "x", Function: model.FunctionDefinitionParam{Name: "slow"}}}}}}}
+	evt := f.createLLMResponseEvent(inv, rsp, req)
+	if _, ok := evt.LongRunningToolIDs["x"]; !ok {
+		t.Fatalf("expected long-running tool id tracked")
+	}
+}
 
 // mockAgent implements agent.Agent for testing
 type mockAgent struct {
@@ -382,4 +455,166 @@ func TestRun_NoPanicWhenModelReturnsNoResponses(t *testing.T) {
 		count++
 	}
 	require.Equal(t, 1, count)
+}
+
+// TestRunAfterModelCallbacks_ErrorPassing tests that modelErr is correctly passed to callbacks
+// when response.Error is not nil.
+func TestRunAfterModelCallbacks_ErrorPassing(t *testing.T) {
+	tests := []struct {
+		name       string
+		response   *model.Response
+		wantErr    bool
+		wantErrMsg string
+	}{
+		{
+			name: "response with error",
+			response: &model.Response{
+				Error: &model.ResponseError{
+					Type:    model.ErrorTypeAPIError,
+					Message: "rate limit exceeded",
+				},
+			},
+			wantErr:    true,
+			wantErrMsg: "api_error: rate limit exceeded",
+		},
+		{
+			name: "response without error",
+			response: &model.Response{
+				Choices: []model.Choice{{Index: 0, Message: model.NewAssistantMessage("ok")}},
+			},
+			wantErr:    false,
+			wantErrMsg: "",
+		},
+		{
+			name:       "nil response",
+			response:   nil,
+			wantErr:    false,
+			wantErrMsg: "",
+		},
+		{
+			name: "response with nil error field",
+			response: &model.Response{
+				Error: nil,
+			},
+			wantErr:    false,
+			wantErrMsg: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var receivedErr error
+			callbacks := model.NewCallbacks().RegisterAfterModel(
+				func(ctx context.Context, req *model.Request, rsp *model.Response, modelErr error) (*model.Response, error) {
+					receivedErr = modelErr
+					return nil, nil
+				},
+			)
+
+			flow := &Flow{
+				modelCallbacks: callbacks,
+			}
+
+			_, _, err := flow.runAfterModelCallbacks(context.Background(), &model.Request{}, tt.response)
+			require.NoError(t, err)
+
+			if tt.wantErr {
+				require.NotNil(t, receivedErr, "expected callback to receive error, but got nil")
+				require.Equal(t, tt.wantErrMsg, receivedErr.Error(), "error message mismatch")
+			} else {
+				require.Nil(t, receivedErr, "expected callback to receive nil error, but got: %v", receivedErr)
+			}
+		})
+	}
+}
+
+// Test that when RunOptions.Resume is enabled and the latest session event
+// is an assistant tool_call response, the flow executes the pending tool
+// before issuing a new LLM request.
+func TestRun_WithResumeExecutesPendingToolCalls(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	// Record invocations of the test tool.
+	var toolCalls []string
+	testTool := function.NewFunctionTool(
+		func(_ context.Context, req *struct {
+			Value string `json:"value"`
+		}) (*struct {
+			Value string `json:"value"`
+		}, error) {
+			toolCalls = append(toolCalls, req.Value)
+			return &struct {
+				Value string `json:"value"`
+			}{Value: "ok:" + req.Value}, nil
+		},
+		function.WithName("resume_tool"),
+		function.WithDescription("resume test tool"),
+	)
+
+	// Session contains a single assistant tool_call response.
+	sess := &session.Session{}
+	resp := &model.Response{
+		Done: true,
+		Choices: []model.Choice{
+			{
+				Message: model.Message{
+					Role: model.RoleAssistant,
+					ToolCalls: []model.ToolCall{
+						{
+							ID: "call-1",
+							Function: model.FunctionDefinitionParam{
+								Name:      "resume_tool",
+								Arguments: []byte(`{"value":"resume"}`),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	toolCallEvent := event.NewResponseEvent("inv-1", "agent-resume", resp)
+	sess.Events = append(sess.Events, *toolCallEvent)
+
+	// Agent with the test tool and a model that returns no responses.
+	agentWithTool := &mockAgentWithTools{
+		name:  "agent-resume",
+		tools: []tool.Tool{testTool},
+	}
+
+	inv := agent.NewInvocation(
+		agent.WithInvocationID("inv-1"),
+		agent.WithInvocationAgent(agentWithTool),
+		agent.WithInvocationSession(sess),
+		agent.WithInvocationModel(&noResponseModel{}),
+		agent.WithInvocationRunOptions(agent.RunOptions{
+			Resume: true,
+		}),
+	)
+
+	llmFlow := New(
+		nil,
+		[]flow.ResponseProcessor{
+			processor.NewFunctionCallResponseProcessor(false, nil),
+		},
+		Options{},
+	)
+
+	eventCh, err := llmFlow.Run(ctx, inv)
+	require.NoError(t, err)
+
+	var sawToolResult bool
+	for evt := range eventCh {
+		if evt.RequiresCompletion {
+			key := agent.AppendEventNoticeKeyPrefix + evt.ID
+			_ = inv.NotifyCompletion(ctx, key)
+		}
+		if evt.Response != nil && evt.Response.IsToolResultResponse() {
+			sawToolResult = true
+		}
+	}
+
+	require.True(t, sawToolResult, "expected tool result event when resuming")
+	require.Len(t, toolCalls, 1)
+	require.Equal(t, "resume", toolCalls[0])
 }

@@ -126,6 +126,7 @@ func TestNewToolAndModelEvents(t *testing.T) {
 		WithToolEventToolName("fetch"),
 		WithToolEventToolID("t-1"),
 		WithToolEventNodeID("node-1"),
+		WithToolEventResponseID("rsp-1"),
 		WithToolEventPhase(ToolExecutionPhaseComplete),
 		WithToolEventStartTime(start),
 		WithToolEventEndTime(end),
@@ -155,11 +156,13 @@ func TestNewToolAndModelEvents(t *testing.T) {
 	require.Equal(t, "tool failed", te.Response.Error.Message)
 	require.Equal(t, model.ErrorTypeFlowError, te.Response.Error.Type)
 	require.GreaterOrEqual(t, tmeta.Duration, time.Duration(0))
+	require.Equal(t, "rsp-1", tmeta.ResponseID)
 
 	me := NewModelExecutionEvent(
 		WithModelEventInvocationID("inv"),
 		WithModelEventModelName("gpt"),
 		WithModelEventNodeID("node-1"),
+		WithModelEventResponseID("resp-1"),
 		WithModelEventPhase(ModelExecutionPhaseError),
 		WithModelEventStartTime(start),
 		WithModelEventEndTime(end),
@@ -174,6 +177,7 @@ func TestNewToolAndModelEvents(t *testing.T) {
 	require.Equal(t, ModelExecutionPhaseError, mmeta.Phase)
 	require.Equal(t, 9, mmeta.StepNumber)
 	require.Equal(t, "oops", mmeta.Error)
+	require.Equal(t, "resp-1", mmeta.ResponseID)
 }
 
 func TestNewPregelAndChannelStateEvents(t *testing.T) {
@@ -295,6 +299,7 @@ func TestNewGraphCompletionEvent_SerializeFinalStateSkipsInternalAndUnserializab
 		MetadataKeyCompletion:  []byte("v"),
 		StateKeyExecContext:    "ctx",
 		StateKeyParentAgent:    "agent",
+		StateKeyNodeCallbacks:  NewNodeCallbacks(),
 		StateKeyToolCallbacks:  "tc",
 		StateKeyModelCallbacks: "mc",
 		StateKeyAgentCallbacks: "ac",
@@ -318,6 +323,7 @@ func TestNewGraphCompletionEvent_SerializeFinalStateSkipsInternalAndUnserializab
 	require.NotContains(t, e.StateDelta, MetadataKeyState)
 	require.NotContains(t, e.StateDelta, StateKeyExecContext)
 	require.NotContains(t, e.StateDelta, StateKeyParentAgent)
+	require.NotContains(t, e.StateDelta, StateKeyNodeCallbacks)
 	require.NotContains(t, e.StateDelta, StateKeyToolCallbacks)
 	require.NotContains(t, e.StateDelta, StateKeyModelCallbacks)
 	require.NotContains(t, e.StateDelta, StateKeyAgentCallbacks)

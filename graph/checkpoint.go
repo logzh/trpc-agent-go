@@ -549,10 +549,7 @@ func (cm *CheckpointManager) CreateCheckpoint(
 
 	// Convert state to channel values with deep copy to prevent races when
 	// the saver serializes the checkpoint concurrently with node execution.
-	channelValues := make(map[string]any)
-	for k, v := range state {
-		channelValues[k] = deepCopyAny(v)
-	}
+	channelValues := state.deepCopy(false, nil)
 
 	// Create channel versions (simple incrementing integers for now).
 	channelVersions := make(map[string]int64)

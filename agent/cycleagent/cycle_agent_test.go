@@ -667,4 +667,115 @@ func TestCycleAgent_MaxIterations(t *testing.T) {
 	require.Equal(t, max, cnt)
 }
 
+func TestCycleAgent_AfterCallbackError(t *testing.T) {
+	cb := agent.NewCallbacks()
+	cb.RegisterAfterAgent(func(ctx context.Context, inv *agent.Invocation, err error) (*model.Response, error) {
+		return nil, errors.New("after failed")
+	})
+
+	one := 1
+	ca := newFromLegacy(legacyOptions{
+		Name:           "loop",
+		SubAgents:      []agent.Agent{&noopAgent{"a"}},
+		AgentCallbacks: cb,
+		MaxIterations:  &one,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	events, err := ca.Run(ctx, &agent.Invocation{InvocationID: "id", AgentName: "loop"})
+	require.NoError(t, err)
+
+	var last *event.Event
+	for e := range events {
+		last = e
+	}
+	require.NotNil(t, last)
+	require.NotNil(t, last.Error)
+	require.Equal(t, agent.ErrorTypeAgentCallbackError, last.Error.Type)
+}
+
+func TestCycleAgent_SubAgentsAndInfo(t *testing.T) {
+	sub1 := &noopAgent{name: "sub1"}
+	sub2 := &noopAgent{name: "sub2"}
+
+	ca := newFromLegacy(legacyOptions{
+		Name:      "loop",
+		SubAgents: []agent.Agent{sub1, sub2},
+	})
+
+	// Test SubAgents.
+	subs := ca.SubAgents()
+	require.Len(t, subs, 2)
+
+	// Test FindSubAgent.
+	found := ca.FindSubAgent("sub1")
+	require.NotNil(t, found)
+	require.Equal(t, "sub1", found.Info().Name)
+
+	notFound := ca.FindSubAgent("missing")
+	require.Nil(t, notFound)
+
+	// Test Info.
+	info := ca.Info()
+	require.Equal(t, "loop", info.Name)
+
+	// Test Tools.
+	tools := ca.Tools()
+	require.Empty(t, tools)
+}
+
+// TestCycleAgent_CallbackContextPropagation tests that context values set in
+// BeforeAgent callback can be retrieved in AfterAgent callback.
+func TestCycleAgent_CallbackContextPropagation(t *testing.T) {
+	type contextKey string
+	const testKey contextKey = "test-key"
+	const testValue = "test-value-from-before"
+
+	// Create callbacks that set and read context values.
+	callbacks := agent.NewCallbacks()
+	var capturedValue any
+
+	// BeforeAgent callback sets a context value.
+	callbacks.RegisterBeforeAgent(func(ctx context.Context, args *agent.BeforeAgentArgs) (*agent.BeforeAgentResult, error) {
+		ctxWithValue := context.WithValue(ctx, testKey, testValue)
+		return &agent.BeforeAgentResult{
+			Context: ctxWithValue,
+		}, nil
+	})
+
+	// AfterAgent callback reads the context value.
+	callbacks.RegisterAfterAgent(func(ctx context.Context, args *agent.AfterAgentArgs) (*agent.AfterAgentResult, error) {
+		capturedValue = ctx.Value(testKey)
+		return nil, nil
+	})
+
+	// Create cycle agent with callbacks.
+	subAgent := &noopAgent{name: "child"}
+	cycleAgent := newFromLegacy(legacyOptions{
+		Name:           "test-cycle",
+		SubAgents:      []agent.Agent{subAgent},
+		AgentCallbacks: callbacks,
+		MaxIterations:  ptrInt(1), // Run only one iteration.
+	})
+
+	// Run the agent.
+	ctx := context.Background()
+	invocation := &agent.Invocation{
+		InvocationID: "test-invocation",
+		AgentName:    "test-cycle",
+	}
+
+	events, err := cycleAgent.Run(ctx, invocation)
+	require.NoError(t, err)
+
+	// Consume all events to ensure callbacks are executed.
+	for range events {
+	}
+
+	// Verify that the context value was captured in AfterAgent callback.
+	require.Equal(t, testValue, capturedValue, "context value should be propagated from BeforeAgent to AfterAgent")
+}
+
 func ptrInt(i int) *int { return &i }

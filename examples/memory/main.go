@@ -25,6 +25,8 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
 	memoryinmemory "trpc.group/trpc-go/trpc-agent-go/memory/inmemory"
+	memorymysql "trpc.group/trpc-go/trpc-agent-go/memory/mysql"
+	memorypostgres "trpc.group/trpc-go/trpc-agent-go/memory/postgres"
 	memoryredis "trpc.group/trpc-go/trpc-agent-go/memory/redis"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/model/openai"
@@ -34,9 +36,29 @@ import (
 
 var (
 	modelName      = flag.String("model", "deepseek-chat", "Name of the model to use")
-	memServiceName = flag.String("memory", "inmemory", "Name of the memory service to use, inmemory / redis")
-	redisAddr      = flag.String("redis-addr", "localhost:6379", "Redis address")
+	memServiceName = flag.String("memory", "inmemory", "Name of the memory service to use, inmemory / redis / mysql / postgres")
 	streaming      = flag.Bool("streaming", true, "Enable streaming mode for responses")
+	softDelete     = flag.Bool("soft-delete", false, "Enable soft delete for MySQL/PostgreSQL memory service")
+)
+
+// Environment variables for memory services.
+var (
+	// Redis.
+	redisAddr = getEnvOrDefault("REDIS_ADDR", "localhost:6379")
+
+	// PostgreSQL.
+	pgHost     = getEnvOrDefault("PG_HOST", "localhost")
+	pgPort     = getEnvOrDefault("PG_PORT", "5432")
+	pgUser     = getEnvOrDefault("PG_USER", "postgres")
+	pgPassword = getEnvOrDefault("PG_PASSWORD", "")
+	pgDatabase = getEnvOrDefault("PG_DATABASE", "trpc-agent-go-pgmemory")
+
+	// MySQL.
+	mysqlHost     = getEnvOrDefault("MYSQL_HOST", "localhost")
+	mysqlPort     = getEnvOrDefault("MYSQL_PORT", "3306")
+	mysqlUser     = getEnvOrDefault("MYSQL_USER", "root")
+	mysqlPassword = getEnvOrDefault("MYSQL_PASSWORD", "")
+	mysqlDatabase = getEnvOrDefault("MYSQL_DATABASE", "trpc_agent_go")
 )
 
 func main() {
@@ -46,8 +68,17 @@ func main() {
 	fmt.Printf("🧠 Multi Turn Chat with Memory\n")
 	fmt.Printf("Model: %s\n", *modelName)
 	fmt.Printf("Memory Service: %s\n", *memServiceName)
-	if *memServiceName == "redis" {
-		fmt.Printf("Redis: %s\n", *redisAddr)
+	switch *memServiceName {
+	case "redis":
+		fmt.Printf("Redis: %s\n", redisAddr)
+	case "postgres":
+		fmt.Printf("PostgreSQL: %s:%s/%s\n", pgHost, pgPort, pgDatabase)
+		fmt.Printf("Soft delete: %t\n", *softDelete)
+	case "mysql":
+		fmt.Printf("MySQL: %s:%s/%s\n", mysqlHost, mysqlPort, mysqlDatabase)
+		fmt.Printf("Soft delete: %t\n", *softDelete)
+	default:
+		fmt.Printf("In-memory\n")
 	}
 	fmt.Printf("Streaming: %t\n", *streaming)
 	fmt.Printf("Available tools: memory_add, memory_update, memory_search, memory_load\n")
@@ -58,7 +89,6 @@ func main() {
 	chat := &memoryChat{
 		modelName:      *modelName,
 		memServiceName: *memServiceName,
-		redisAddr:      *redisAddr,
 		streaming:      *streaming,
 	}
 
@@ -71,7 +101,6 @@ func main() {
 type memoryChat struct {
 	modelName      string
 	memServiceName string
-	redisAddr      string
 	streaming      bool
 	runner         runner.Runner
 	userID         string
@@ -86,6 +115,9 @@ func (c *memoryChat) run() error {
 	if err := c.setup(ctx); err != nil {
 		return fmt.Errorf("setup failed: %w", err)
 	}
+
+	// Ensure runner resources are cleaned up (trpc-agent-go >= v0.5.0)
+	defer c.runner.Close()
 
 	// Start interactive chat.
 	return c.startChat(ctx)
@@ -104,7 +136,7 @@ func (c *memoryChat) setup(_ context.Context) error {
 
 	switch c.memServiceName {
 	case "redis":
-		redisURL := fmt.Sprintf("redis://%s", c.redisAddr)
+		redisURL := fmt.Sprintf("redis://%s", redisAddr)
 		memoryService, err = memoryredis.NewService(
 			memoryredis.WithRedisClientURL(redisURL),
 			// You can enable or disable tools and create custom tools here.
@@ -113,6 +145,42 @@ func (c *memoryChat) setup(_ context.Context) error {
 		)
 		if err != nil {
 			return fmt.Errorf("failed to create redis memory service: %w", err)
+		}
+	case "mysql":
+		// Build MySQL DSN.
+		mysqlDSN := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4",
+			mysqlUser, mysqlPassword, mysqlHost, mysqlPort, mysqlDatabase)
+		memoryService, err = memorymysql.NewService(
+			memorymysql.WithMySQLClientDSN(mysqlDSN),
+			memorymysql.WithSoftDelete(*softDelete),
+			// You can enable or disable tools and create custom tools here.
+			memorymysql.WithToolEnabled(memory.DeleteToolName, false),               // delete tool is disabled by default
+			memorymysql.WithCustomTool(memory.ClearToolName, customClearMemoryTool), // custom clear tool
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create mysql memory service: %w", err)
+		}
+	case "postgres":
+		// Convert pgPort from string to int.
+		port := 5432
+		if pgPort != "" {
+			if p, parseErr := fmt.Sscanf(pgPort, "%d", &port); parseErr != nil || p != 1 {
+				return fmt.Errorf("invalid PG_PORT value: %s", pgPort)
+			}
+		}
+		memoryService, err = memorypostgres.NewService(
+			memorypostgres.WithHost(pgHost),
+			memorypostgres.WithPort(port),
+			memorypostgres.WithUser(pgUser),
+			memorypostgres.WithPassword(pgPassword),
+			memorypostgres.WithDatabase(pgDatabase),
+			memorypostgres.WithSoftDelete(*softDelete),
+			// You can enable or disable tools and create custom tools here.
+			memorypostgres.WithToolEnabled(memory.DeleteToolName, false),               // delete tool is disabled by default
+			memorypostgres.WithCustomTool(memory.ClearToolName, customClearMemoryTool), // custom clear tool
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create postgres memory service: %w", err)
 		}
 	default: // inmemory
 		memoryService = memoryinmemory.NewMemoryService(
@@ -348,4 +416,12 @@ func intPtr(i int) *int {
 
 func floatPtr(f float64) *float64 {
 	return &f
+}
+
+// getEnvOrDefault returns the environment variable value or a default value if not set.
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
 }

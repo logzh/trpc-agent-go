@@ -7,6 +7,7 @@
 //
 //
 
+// Package main demonstrates the I/O conventions of a graph.
 package main
 
 import (
@@ -82,6 +83,8 @@ func run() error {
 	// Runner + memory session
 	sessionSvc := inmemory.NewSessionService()
 	r := runner.NewRunner("io-conventions-app", ga, runner.WithSessionService(sessionSvc))
+	// Ensure runner resources are cleaned up (trpc-agent-go >= v0.5.0)
+	defer r.Close()
 
 	// Interactive
 	user := "user"
@@ -218,14 +221,14 @@ func collect(ctx context.Context, state graph.State) (any, error) {
 // buildSubAgent creates a simple assistant that reads parsed_time from runtime state
 func buildSubAgent(name, baseURL, apiKey string) agent.Agent {
 	mdl := openai.New(name, openai.WithBaseURL(baseURL), openai.WithAPIKey(apiKey))
-	mcb := model.NewCallbacks().RegisterBeforeModel(func(ctx context.Context, req *model.Request) (*model.Response, error) {
+	mcb := model.NewCallbacks().RegisterBeforeModel(func(ctx context.Context, args *model.BeforeModelArgs) (*model.BeforeModelResult, error) {
 		inv, _ := agent.InvocationFromContext(ctx)
 		if inv == nil || inv.RunOptions.RuntimeState == nil {
 			return nil, nil
 		}
 		pt, _ := inv.RunOptions.RuntimeState["parsed_time"].(string)
 		if pt != "" {
-			req.Messages = append([]model.Message{model.NewSystemMessage("Use parsed_time=" + pt + " if relevant.")}, req.Messages...)
+			args.Request.Messages = append([]model.Message{model.NewSystemMessage("Use parsed_time=" + pt + " if relevant.")}, args.Request.Messages...)
 		}
 		return nil, nil
 	})

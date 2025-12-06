@@ -12,6 +12,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -49,6 +50,9 @@ type ToolSet struct {
 }
 
 // NewMCPToolSet creates a new MCP tool set with the given configuration.
+// Use WithName option to set a custom name for the toolset to avoid name conflicts
+// for tools with the same name under different tool sets when using multiple MCP toolsets.
+// Example: NewMCPToolSet(config, WithName("your-mcp-toolset"))
 func NewMCPToolSet(config ConnectionConfig, opts ...ToolSetOption) *ToolSet {
 	// Apply default configuration.
 	cfg := toolSetConfig{
@@ -80,6 +84,16 @@ func NewMCPToolSet(config ConnectionConfig, opts ...ToolSetOption) *ToolSet {
 	return toolSet
 }
 
+// Init establishes the MCP session and preloads tools by calling
+// Initialize and ListTools once. It returns any initialization error so
+// callers can fail fast during startup.
+func (ts *ToolSet) Init(ctx context.Context) error {
+	if err := ts.listTools(ctx); err != nil {
+		return fmt.Errorf("failed to initialize MCP tool set %q: %w", ts.name, err)
+	}
+	return nil
+}
+
 // Tools implements the ToolSet interface.
 func (ts *ToolSet) Tools(ctx context.Context) []tool.Tool {
 	if err := ts.listTools(ctx); err != nil {
@@ -95,7 +109,7 @@ func (ts *ToolSet) Tools(ctx context.Context) []tool.Tool {
 	result := make([]tool.Tool, 0, len(ts.tools))
 	for _, t := range ts.tools {
 		// All tools created by newMCPTool implement CallableTool, so this should always succeed
-		result = append(result, t.(tool.Tool))
+		result = append(result, t)
 	}
 	return result
 }
@@ -149,33 +163,8 @@ func (ts *ToolSet) listTools(ctx context.Context) error {
 	}
 
 	// Apply tool filter if configured.
-	if ts.config.toolFilter != nil {
-		toolInfos := make([]ToolInfo, len(tools))
-		for i, tool := range tools {
-			decl := tool.Declaration()
-			toolInfos[i] = ToolInfo{
-				Name:        decl.Name,
-				Description: decl.Description,
-			}
-		}
-
-		filteredInfos := ts.config.toolFilter.Filter(ctx, toolInfos)
-		filteredTools := make([]tool.Tool, 0, len(filteredInfos))
-
-		// Build a map for quick lookup.
-		filteredNames := make(map[string]bool)
-		for _, info := range filteredInfos {
-			filteredNames[info.Name] = true
-		}
-
-		// Keep only filtered tools.
-		for _, tool := range tools {
-			if filteredNames[tool.Declaration().Name] {
-				filteredTools = append(filteredTools, tool)
-			}
-		}
-
-		tools = filteredTools
+	if ts.config.toolFilterFunc != nil {
+		tools = tool.FilterTools(ctx, tools, ts.config.toolFilterFunc)
 	}
 
 	// Update tools atomically.
@@ -407,35 +396,17 @@ func (m *mcpSessionManager) callTool(ctx context.Context, name string, arguments
 
 		log.Debug("Tool call completed", "name", name, "content_count", len(callResp.Content))
 		result = callResp.Content
+		if callResp.StructuredContent != nil {
+			structuredBytes, err := json.Marshal(callResp.StructuredContent)
+			if err != nil {
+				return fmt.Errorf("marshal structured content: %w", err)
+			}
+			result = append(result, mcp.NewTextContent(string(structuredBytes)))
+		}
 		return nil
 	})
 
 	return result, operationErr
-}
-
-// extractErrorFromContent extracts error information from MCP content.
-func (m *mcpSessionManager) extractErrorFromContent(contents []mcp.Content) string {
-	if len(contents) == 0 {
-		return "unknown error"
-	}
-
-	var errorMessages []string
-	for _, content := range contents {
-		if textContent, ok := content.(mcp.TextContent); ok {
-			errorMessages = append(errorMessages, textContent.Text)
-		}
-	}
-
-	if len(errorMessages) == 0 {
-		return "error content not readable"
-	}
-
-	if len(errorMessages) == 1 {
-		return errorMessages[0]
-	}
-
-	// Join multiple error messages.
-	return fmt.Sprintf("%s", errorMessages)
 }
 
 // close closes the MCP session and client connection.
@@ -573,7 +544,7 @@ func (m *mcpSessionManager) recreateSession(ctx context.Context) error {
 	// Use singleflight to ensure only one reconnection happens at a time
 	// If multiple goroutines call this simultaneously, only one will execute,
 	// and others will wait for the result
-	_, err, _ := m.reconnectGroup.Do("reconnect", func() (interface{}, error) {
+	_, err, _ := m.reconnectGroup.Do("reconnect", func() (any, error) {
 		return nil, m.doRecreateSession(ctx)
 	})
 	return err

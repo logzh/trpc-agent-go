@@ -17,6 +17,7 @@ import (
 	"reflect"
 
 	itool "trpc.group/trpc-go/trpc-agent-go/internal/tool"
+	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
@@ -31,6 +32,9 @@ type FunctionTool[I, O any] struct {
 	fn           func(context.Context, I) (O, error)
 	longRunning  bool
 	unmarshaler  unmarshaler
+	// skipSummarization indicates whether the outer flow should skip
+	// the post-tool summarization step after this tool returns.
+	skipSummarization bool
 }
 
 // Option is a function that configures a FunctionTool.
@@ -38,10 +42,13 @@ type Option func(*functionToolOptions)
 
 // functionToolOptions holds the configuration options for FunctionTool.
 type functionToolOptions struct {
-	name        string
-	description string
-	unmarshaler unmarshaler
-	longRunning bool
+	name              string
+	description       string
+	unmarshaler       unmarshaler
+	longRunning       bool
+	skipSummarization bool
+	inputSchema       *tool.Schema
+	outputSchema      *tool.Schema
 }
 
 // WithName sets the name of the function tool.
@@ -74,6 +81,31 @@ func WithLongRunning(longRunning bool) Option {
 	}
 }
 
+// WithSkipSummarization sets whether the outer flow should skip the
+// summarization step after this tool returns a result. When true, the
+// tool.response event will be annotated and the current turn ends.
+func WithSkipSummarization(skip bool) Option {
+	return func(opts *functionToolOptions) {
+		opts.skipSummarization = skip
+	}
+}
+
+// WithInputSchema sets a custom input schema for the function tool.
+// When provided, the automatic schema generation will be skipped.
+func WithInputSchema(schema *tool.Schema) Option {
+	return func(opts *functionToolOptions) {
+		opts.inputSchema = schema
+	}
+}
+
+// WithOutputSchema sets a custom output schema for the function tool.
+// When provided, the automatic schema generation will be skipped.
+func WithOutputSchema(schema *tool.Schema) Option {
+	return func(opts *functionToolOptions) {
+		opts.outputSchema = schema
+	}
+}
+
 // NewFunctionTool creates and returns a new instance of FunctionTool with the specified
 // function implementation and optional configuration.
 // Parameters:
@@ -92,22 +124,41 @@ func NewFunctionTool[I, O any](fn func(context.Context, I) (O, error), opts ...O
 	for _, opt := range opts {
 		opt(options)
 	}
+	if options.name == "" {
+		log.Warnf("FunctionTool: name is empty")
+	}
+	if options.description == "" {
+		log.Warnf("FunctionTool: description is empty")
+	}
 
 	var (
 		emptyI I
 		emptyO O
 	)
-	iSchema := itool.GenerateJSONSchema(reflect.TypeOf(emptyI))
-	oSchema := itool.GenerateJSONSchema(reflect.TypeOf(emptyO))
+
+	var iSchema *tool.Schema
+	if options.inputSchema != nil {
+		iSchema = options.inputSchema
+	} else {
+		iSchema = itool.GenerateJSONSchema(reflect.TypeOf(emptyI))
+	}
+
+	var oSchema *tool.Schema
+	if options.outputSchema != nil {
+		oSchema = options.outputSchema
+	} else {
+		oSchema = itool.GenerateJSONSchema(reflect.TypeOf(emptyO))
+	}
 
 	return &FunctionTool[I, O]{
-		name:         options.name,
-		description:  options.description,
-		longRunning:  options.longRunning,
-		fn:           fn,
-		unmarshaler:  options.unmarshaler,
-		inputSchema:  iSchema,
-		outputSchema: oSchema,
+		name:              options.name,
+		description:       options.description,
+		longRunning:       options.longRunning,
+		fn:                fn,
+		unmarshaler:       options.unmarshaler,
+		inputSchema:       iSchema,
+		outputSchema:      oSchema,
+		skipSummarization: options.skipSummarization,
 	}
 }
 
@@ -132,6 +183,12 @@ func (ft *FunctionTool[I, O]) Call(ctx context.Context, jsonArgs []byte) (any, e
 // LongRunning indicates whether the function tool is expected to run for a long time.
 func (ft *FunctionTool[I, O]) LongRunning() bool {
 	return ft.longRunning
+}
+
+// SkipSummarization reports whether this tool prefers skipping the
+// outer-agent summarization after tool.response.
+func (ft *FunctionTool[I, O]) SkipSummarization() bool {
+	return ft.skipSummarization
 }
 
 // Declaration returns the tool's declaration information.
@@ -167,6 +224,8 @@ type StreamableFunctionTool[I, O any] struct {
 	fn           func(context.Context, I) (*tool.StreamReader, error)
 	longRunning  bool
 	unmarshaler  unmarshaler
+	// skipSummarization has the same meaning as in FunctionTool.
+	skipSummarization bool
 }
 
 // NewStreamableFunctionTool creates a new StreamableFunctionTool instance.
@@ -193,17 +252,30 @@ func NewStreamableFunctionTool[I, O any](fn func(context.Context, I) (*tool.Stre
 		emptyI I
 		emptyO O
 	)
-	iSchema := itool.GenerateJSONSchema(reflect.TypeOf(emptyI))
-	oSchema := itool.GenerateJSONSchema(reflect.TypeOf(emptyO))
+
+	var iSchema *tool.Schema
+	if options.inputSchema != nil {
+		iSchema = options.inputSchema
+	} else {
+		iSchema = itool.GenerateJSONSchema(reflect.TypeOf(emptyI))
+	}
+
+	var oSchema *tool.Schema
+	if options.outputSchema != nil {
+		oSchema = options.outputSchema
+	} else {
+		oSchema = itool.GenerateJSONSchema(reflect.TypeOf(emptyO))
+	}
 
 	return &StreamableFunctionTool[I, O]{
-		name:         options.name,
-		description:  options.description,
-		longRunning:  options.longRunning,
-		fn:           fn,
-		unmarshaler:  options.unmarshaler,
-		inputSchema:  iSchema,
-		outputSchema: oSchema,
+		name:              options.name,
+		description:       options.description,
+		longRunning:       options.longRunning,
+		fn:                fn,
+		unmarshaler:       options.unmarshaler,
+		inputSchema:       iSchema,
+		outputSchema:      oSchema,
+		skipSummarization: options.skipSummarization,
 	}
 }
 
@@ -254,6 +326,12 @@ func (t *StreamableFunctionTool[I, O]) Declaration() *tool.Declaration {
 // LongRunning indicates whether the streamable function tool is expected to run for a long time.
 func (t *StreamableFunctionTool[I, O]) LongRunning() bool {
 	return t.longRunning
+}
+
+// SkipSummarization reports whether this tool prefers skipping the
+// outer-agent summarization after tool.response.
+func (t *StreamableFunctionTool[I, O]) SkipSummarization() bool {
+	return t.skipSummarization
 }
 
 type unmarshaler interface {

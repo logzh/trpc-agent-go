@@ -1,6 +1,6 @@
-# Multi-turn Chat with Runner + Tools
+# Runner Quickstart: Multi-turn Chat with Tools
 
-This example demonstrates a clean multi-turn chat interface using the `Runner` orchestration component with streaming output, session management, and actual tool calling functionality.
+This example demonstrates a minimal multi-turn chat interface using the `Runner` orchestration component. It focuses on core functionality with an in-memory session backend, making it easy to understand and run.
 
 ## What is Multi-turn Chat?
 
@@ -28,18 +28,19 @@ This implementation showcases the essential features for building conversational
 
 ## Environment Variables
 
-| Variable          | Description                              | Default Value               |
-| ----------------- | ---------------------------------------- | --------------------------- |
-| `OPENAI_API_KEY`  | API key for the model service (required) | ``                          |
-| `OPENAI_BASE_URL` | Base URL for the model API endpoint      | `https://api.openai.com/v1` |
+| Variable                | Description                                    | Default Value               |
+| ----------------------- | ---------------------------------------------- | --------------------------- |
+| `OPENAI_API_KEY`        | API key for the openai model                   | ``                          |
+| `OPENAI_BASE_URL`       | Base URL for the openai model API endpoint     | `https://api.openai.com/v1` |
+| `ANTHROPIC_AUTH_TOKEN`  | API key for the anthropic model                | ``                          |
+| `ANTHROPIC_BASE_URL`    | Base URL for the anthropic model API endpoint  | `https://api.anthropic.com` |
 
 ## Command Line Arguments
 
 | Argument           | Description                                         | Default Value    |
 | ------------------ | --------------------------------------------------- | ---------------- |
 | `-model`           | Name of the model to use                            | `deepseek-chat`  |
-| `-session`         | Session service: `inmemory` or `redis`              | `inmemory`       |
-| `-redis-addr`      | Redis server address (when using redis session)     | `localhost:6379` |
+| `-variant`         | Variant to use when calling the OpenAI provider     | `openai`         |
 | `-streaming`       | Enable streaming mode for responses                 | `true`           |
 | `-enable-parallel` | Enable parallel tool execution (faster performance) | `false`          |
 
@@ -60,19 +61,11 @@ export OPENAI_API_KEY="your-api-key"
 go run . -model gpt-4o
 ```
 
-### With Redis Session
+### Custom Variant
 
 ```bash
 export OPENAI_API_KEY="your-api-key"
-go run . -session redis -redis-addr localhost:6379
-```
-
-### Using Environment Variable
-
-If you have `MODEL_NAME` set in your environment:
-
-```bash
-source ~/.bashrc && go run . -model "$MODEL_NAME"
+go run . -variant deepseek
 ```
 
 ### Response Modes
@@ -85,9 +78,6 @@ go run .
 
 # Non-streaming mode (complete response at once)
 go run . -streaming=false
-
-# Combined with other options
-go run . -model gpt-4o -streaming=false -session redis
 ```
 
 **When to use each mode:**
@@ -131,13 +121,11 @@ Output:
 ```
 Usage of ./runner:
   -enable-parallel
-        Enable parallel tool execution (faster performance) (default false)
+        Enable parallel tool execution (default: false, serial execution)
   -model string
         Name of the model to use (default "deepseek-chat")
-  -redis-addr string
-        Redis address (default "localhost:6379")
-  -session string
-        Name of the session service to use, inmemory / redis (default "inmemory")
+  -variant string
+        Name of the variant to use when calling the OpenAI provider (default "openai")
   -streaming
         Enable streaming mode for responses (default true)
 ```
@@ -180,14 +168,15 @@ When you ask for calculations or time information, you'll see:
 The interface is simple and intuitive:
 
 ```
-🚀 Multi-turn Chat with Runner + Tools
-Model: gpt-4o-mini
+🚀 Runner quickstart: multi-turn chat with tools
+Model: deepseek-chat
 Streaming: true
-Parallel Tools: disabled (serial execution)
-Type 'exit' to end the conversation
+Parallel tools: false
+Session backend: in-memory (simple demo)
+Type '/exit' to end the conversation
 Available tools: calculator, current_time
 ==================================================
-✅ Chat ready! Session: chat-session-1703123456
+✅ Chat ready! Session: demo-session-1703123456
 
 👤 You: Hello! How are you today?
 🤖 Assistant: Hello! I'm doing well, thank you for asking. I'm here and ready to help you with whatever you need. How are you doing today?
@@ -199,8 +188,15 @@ Available tools: calculator, current_time
 👋 Goodbye!
 ```
 
-### Session Commands
+## Session Storage
 
-- `/history` - Ask the agent to show conversation history
-- `/new` - Start a new session (resets conversation context)
-- `/exit` - End the conversation
+This example uses **in-memory session storage** for simplicity. This means:
+- ✅ Fast and no external dependencies
+- ✅ Perfect for development and testing
+- ⚠️ Session data is lost when the program exits
+
+**For production use with persistent session storage** (Redis, PostgreSQL, MySQL), see the `examples/session/` directory which demonstrates advanced session management features including:
+- Multiple session backends (Redis, PostgreSQL, MySQL)
+- Session switching with `/use <id>` command
+- Session listing with `/sessions` command
+- Creating new sessions with `/new` command

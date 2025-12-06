@@ -18,6 +18,17 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/storage/elasticsearch"
 )
 
+const (
+	// defaultIndexName is the default index name for documents.
+	defaultIndexName = "trpc_agent_documents"
+	// defaultScoreThreshold is the default minimum similarity score.
+	defaultScoreThreshold = 0.7
+	// defaultVectorDimension is the default dimension for embedding vectors.
+	defaultVectorDimension = 1536
+	// defaultMaxResults is the default maximum number of search results.
+	defaultMaxResults = 10
+)
+
 // DocBuilderFunc is a function that builds a document from hit source.
 type DocBuilderFunc func(hitSource json.RawMessage) (*document.Document, []float64, error)
 
@@ -175,6 +186,9 @@ func WithMaxRetries(maxRetries int) Option {
 // WithIndexName sets the Elasticsearch index name.
 func WithIndexName(indexName string) Option {
 	return func(o *options) {
+		if indexName == "" {
+			indexName = defaultIndexName
+		}
 		o.indexName = indexName
 	}
 }
@@ -199,6 +213,9 @@ func WithMaxResults(maxResults int) Option {
 // WithVectorDimension sets the dimension of embedding vectors.
 func WithVectorDimension(dimension int) Option {
 	return func(o *options) {
+		if dimension <= 0 {
+			dimension = defaultVectorDimension
+		}
 		o.vectorDimension = dimension
 	}
 }

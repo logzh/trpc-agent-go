@@ -68,6 +68,21 @@ type Choice struct {
 	FinishReason *string `json:"finish_reason,omitempty"`
 }
 
+// TimingInfo represents timing information for token generation.
+// It accumulates durations across multiple LLM calls within a flow.
+type TimingInfo struct {
+
+	// FirstTokenDuration is the accumulated duration from request start to the first meaningful token.
+	// A "meaningful token" is defined as the first chunk containing reasoning content, regular content, or tool calls.
+	// Empty chunks are skipped. For multiple LLM calls (e.g., tool calls), this accumulates the duration of each call.
+	FirstTokenDuration time.Duration `json:"time_to_first_token,omitempty"`
+
+	// ReasoningDuration is the accumulated duration of reasoning phases (streaming mode only).
+	// Measured from the first reasoning chunk to the last reasoning chunk in each LLM call.
+	// For non-streaming requests, this field will remain 0 as reasoning duration cannot be measured precisely.
+	ReasoningDuration time.Duration `json:"reasoning_duration,omitempty"`
+}
+
 // Usage represents token usage information.
 type Usage struct {
 	// PromptTokens is the number of tokens in the prompt.
@@ -78,6 +93,18 @@ type Usage struct {
 
 	// TotalTokens is the total number of tokens in the response.
 	TotalTokens int `json:"total_tokens"`
+
+	// PromptTokensDetails is the details of the prompt tokens.
+	PromptTokensDetails PromptTokensDetails `json:"prompt_tokens_details"`
+
+	// TimingInfo contains detailed timing information for token generation.
+	TimingInfo *TimingInfo `json:"timing_info,omitempty"`
+}
+
+// PromptTokensDetails is the details of the prompt tokens.
+type PromptTokensDetails struct {
+	// CachedTokens is the number of cached tokens in the prompt.
+	CachedTokens int `json:"cached_tokens"`
 }
 
 // Response is the response from the model.
@@ -145,9 +172,17 @@ func (rsp *Response) Clone() *Response {
 	copy(clone.Choices, rsp.Choices)
 	if rsp.Usage != nil {
 		clone.Usage = &Usage{
-			PromptTokens:     rsp.Usage.PromptTokens,
-			CompletionTokens: rsp.Usage.CompletionTokens,
-			TotalTokens:      rsp.Usage.TotalTokens,
+			PromptTokens:        rsp.Usage.PromptTokens,
+			CompletionTokens:    rsp.Usage.CompletionTokens,
+			TotalTokens:         rsp.Usage.TotalTokens,
+			PromptTokensDetails: rsp.Usage.PromptTokensDetails,
+		}
+		// Deep copy TimingInfo if present
+		if rsp.Usage.TimingInfo != nil {
+			clone.Usage.TimingInfo = &TimingInfo{
+				FirstTokenDuration: rsp.Usage.TimingInfo.FirstTokenDuration,
+				ReasoningDuration:  rsp.Usage.TimingInfo.ReasoningDuration,
+			}
 		}
 	}
 	// Deep copy Error if present.
@@ -182,6 +217,19 @@ func (rsp *Response) IsValidContent() bool {
 			return true
 		}
 		if choice.Delta.Content != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// IsUserMessage checks if the response is a user message.
+func (rsp *Response) IsUserMessage() bool {
+	if rsp == nil || len(rsp.Choices) == 0 {
+		return false
+	}
+	for _, choice := range rsp.Choices {
+		if choice.Message.Role == RoleUser {
 			return true
 		}
 	}
@@ -232,7 +280,7 @@ func (rsp *Response) IsFinalResponse() bool {
 		return true
 	}
 
-	if rsp.IsToolCallResponse() {
+	if rsp.IsPartial || rsp.IsToolCallResponse() {
 		return false
 	}
 

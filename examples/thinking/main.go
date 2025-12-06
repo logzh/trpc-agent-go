@@ -34,6 +34,7 @@ var (
 	streaming       = flag.Bool("streaming", true, "Enable streaming mode for responses")
 	thinkingEnabled = flag.Bool("thinking", true, "Enable reasoning/thinking mode if provider supports it")
 	thinkingTokens  = flag.Int("thinking-tokens", 2048, "Max reasoning tokens if provider supports it")
+	variant         = flag.String("variant", "openai", "Name of Variant to use when use openai provider, openai / hunyuan / deepseek / qwen")
 )
 
 func main() {
@@ -45,7 +46,7 @@ func main() {
 	fmt.Printf("Thinking: %t (tokens=%d)\n", *thinkingEnabled, *thinkingTokens)
 	fmt.Println(strings.Repeat("=", 50))
 
-	chat := &thinkingChat{modelName: *modelName, streaming: *streaming}
+	chat := &thinkingChat{modelName: *modelName, streaming: *streaming, variant: *variant}
 	if err := chat.run(context.Background()); err != nil {
 		log.Fatalf("Thinking demo failed: %v", err)
 	}
@@ -59,17 +60,22 @@ type thinkingChat struct {
 	sessionID string
 	appName   string
 	sessSvc   session.Service
+	variant   string
 }
 
 func (c *thinkingChat) run(ctx context.Context) error {
 	if err := c.setup(ctx); err != nil {
 		return err
 	}
+
+	// Ensure runner resources are cleaned up (trpc-agent-go >= v0.5.0)
+	defer c.runner.Close()
+
 	return c.startChat(ctx)
 }
 
 func (c *thinkingChat) setup(_ context.Context) error {
-	modelInstance := openai.New(c.modelName)
+	modelInstance := openai.New(c.modelName, openai.WithVariant(openai.Variant(c.variant)))
 
 	// always use in-memory session for this demo
 	var sessionService session.Service = sessioninmemory.NewSessionService()
@@ -193,11 +199,45 @@ func (c *thinkingChat) processResponse(eventChan <-chan *event.Event) error {
 			}
 		}
 		if e.IsFinalResponse() {
+			// Print timing information at the end
+			c.printTimingInfo(e)
 			fmt.Printf("\n")
 			break
 		}
 	}
 	return nil
+}
+
+// printTimingInfo displays timing information from the final event.
+func (c *thinkingChat) printTimingInfo(event *event.Event) {
+	colorReset := "\033[0m"
+	colorYellow := "\033[33m" // For timing info
+	if event.Response == nil || event.Response.Usage == nil || event.Response.Usage.TimingInfo == nil {
+		return
+	}
+
+	timing := event.Response.Usage.TimingInfo
+	fmt.Printf("\n\n%s⏱️  Timing Info:%s\n", colorYellow, colorReset)
+
+	// Time to first token
+	if timing.FirstTokenDuration > 0 {
+		fmt.Printf("%s   • Time to first token: %v%s\n", colorYellow, timing.FirstTokenDuration, colorReset)
+	}
+
+	// Reasoning duration
+	if timing.ReasoningDuration > 0 {
+		fmt.Printf("%s   • Reasoning: %v%s\n", colorYellow, timing.ReasoningDuration, colorReset)
+	}
+
+	// Token usage
+	if event.Response.Usage.TotalTokens > 0 {
+		fmt.Printf("%s   • Tokens: %d (prompt: %d, completion: %d%s)\n",
+			colorYellow,
+			event.Response.Usage.TotalTokens,
+			event.Response.Usage.PromptTokens,
+			event.Response.Usage.CompletionTokens,
+			colorReset)
+	}
 }
 
 func (c *thinkingChat) extractContent(choice model.Choice) string {

@@ -79,6 +79,9 @@ func main() {
 		log.Fatalf("Failed to initialize workflow: %v", err)
 	}
 
+	// Ensure runner resources are cleaned up (trpc-agent-go >= v0.5.0)
+	defer workflow.runner.Close()
+
 	// Run interactive mode.
 	if err := workflow.runInteractive(); err != nil {
 		log.Fatalf("Interactive mode failed: %v", err)
@@ -474,7 +477,7 @@ func (w *diamondWorkflow) runWorkflow(ctx context.Context, inputData string) err
 	// Process events.
 	for event := range eventChan {
 		if event.Error != nil {
-			return fmt.Errorf("workflow error: %w", event.Error)
+			return fmt.Errorf("workflow error: %s", event.Error.Message)
 		}
 		// Silently consume events for cleaner output.
 	}
@@ -511,7 +514,7 @@ func (w *diamondWorkflow) runWorkflowWithLineage(ctx context.Context, inputData,
 
 	for event := range eventChan {
 		if event.Error != nil {
-			return fmt.Errorf("workflow error: %w", event.Error)
+			return fmt.Errorf("workflow error: %s", event.Error.Message)
 		}
 	}
 
@@ -555,7 +558,7 @@ func (w *diamondWorkflow) resumeWorkflow(ctx context.Context, lineageID, checkpo
 
 	for event := range eventChan {
 		if event.Error != nil {
-			return fmt.Errorf("workflow error: %w", event.Error)
+			return fmt.Errorf("workflow error: %s", event.Error.Message)
 		}
 	}
 

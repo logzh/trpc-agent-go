@@ -148,6 +148,33 @@ type Usage struct {
 
     // 响应中使用的总 Token 数量.
     TotalTokens int `json:"total_tokens"`
+
+    // 时间统计信息（可选）
+    TimingInfo *TimingInfo `json:"timing_info,omitempty"`
+}
+
+type TimingInfo struct {
+    // FirstTokenDuration 是从请求开始到第一个有意义 token 的累积时长
+    // "有意义的 token" 定义为：包含 reasoning 内容、常规内容或工具调用的第一个 chunk
+    // 
+    // 返回时机：
+    // - 流式请求：在收到第一个有意义的 chunk 时立即计算并返回
+    // - 非流式请求：在收到完整响应时计算并返回
+    FirstTokenDuration time.Duration `json:"time_to_first_token,omitempty"`
+
+    // ReasoningDuration 是 reasoning 阶段的累积时长（仅流式模式）
+    // 从每次 LLM 调用的第一个 reasoning chunk 到最后一个 reasoning chunk 的时间
+    //
+    // 测量细节：
+    // - 收到第一个包含 reasoning 内容的 chunk 时开始计时
+    // - 持续计时所有后续的 reasoning chunks
+    // - 收到第一个非 reasoning chunk（常规内容或工具调用）时停止计时
+    //
+    // 返回时机：
+    // - 流式请求：在检测到 reasoning 结束时（即收到第一个非 reasoning 的 content/tool call chunk）
+    //   立即计算并返回
+    // - 非流式请求：无法精确测量，此字段将保持为 0
+    ReasoningDuration time.Duration `json:"reasoning_duration,omitempty"`
 }
 ```
 
@@ -190,6 +217,30 @@ const (
     // Runner 完成事件
     ObjectTypeRunnerCompletion = "runner.completion"
 )
+```
+
+### 过滤委托提示（Transfer Announcements）
+
+委托提示（Agent 委托/转移说明）统一以 `Response.Object == "agent.transfer"` 的事件输出。
+
+常见形式为：
+- 交接提示：`Transferring control to agent: <name>`
+
+ 如需在 UI 层隐藏这些系统级提示，可以采用两种兼容方式：
+ - 按对象类型过滤：隐藏 `Response.Object == "agent.transfer"` 的事件。
+ - 按标签（Tag）过滤：隐藏 `Event.Tag` 中包含 `transfer` 的事件。框架会为与委托相关的事件（包括 transfer 工具结果）统一打上 `transfer` 标签，按标签过滤不会破坏 ToolCall/ToolResult 的配对关系。
+
+ 标签以分号（`;`）分隔。自定义事件可使用 `event.WithTag(tag)` 追加标签，多标签格式为 `tag1;tag2;...`。
+
+#### 辅助方法：检测 Runner 完成
+
+使用便捷方法来判断整次运行是否已完成，无论 Agent 类型如何：
+
+```go
+// e.IsRunnerCompletion() 会在终止的 runner-completion 事件上返回 true。
+if e.IsRunnerCompletion() {
+    // 可安全停止读取事件通道的时机
+}
 ```
 
 ### Event 创建
@@ -276,6 +327,14 @@ if evt.Response != nil && evt.Object == model.ObjectTypeToolResponse && len(evt.
 ```
 
 提示：自定义事件时，优先使用 `event.New(...)` 搭配 `WithResponse`、`WithBranch` 等，以保证 ID 和时间戳等元数据一致。
+
+### 标签（Tags）
+
+Event 支持通过 `Event.Tag` 添加简单标签，便于过滤与统计：
+
+- 分隔符：`;`（分号）。多标签拼接为 `tag1;tag2`。
+- 辅助函数：`event.WithTag("<tag>")` 在不覆盖已有标签的情况下追加新标签。
+- 内置用法：与委托相关的事件会统一打上 `transfer` 标签。UI 可据此隐藏内部委托类消息，同时保留完整事件流，便于调试与处理。
 
 ### Event 方法
 

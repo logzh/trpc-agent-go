@@ -13,6 +13,7 @@ package llmflow
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	oteltrace "go.opentelemetry.io/otel/trace"
@@ -20,6 +21,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/internal/flow"
+	"trpc.group/trpc-go/trpc-agent-go/internal/flow/processor"
 	itelemetry "trpc.group/trpc-go/trpc-agent-go/internal/telemetry"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -29,10 +31,15 @@ import (
 )
 
 const (
-	defaultChannelBufferSize = 256
-
 	// Timeout for event completion signaling.
 	eventCompletionTimeout = 5 * time.Second
+
+	// stateKeyToolsSnapshot is the invocation state key used to cache the
+	// final tool list for a single Invocation. This ensures that the tool
+	// set (including ToolSet-based tools and filters) stays stable for the
+	// entire lifetime of an Invocation, even when underlying ToolSets are
+	// dynamic.
+	stateKeyToolsSnapshot = "llmflow:tools_snapshot"
 )
 
 // Options contains configuration options for creating a Flow.
@@ -56,16 +63,10 @@ func New(
 	responseProcessors []flow.ResponseProcessor,
 	opts Options,
 ) *Flow {
-	// Set default channel buffer size if not specified.
-	channelBufferSize := opts.ChannelBufferSize
-	if channelBufferSize <= 0 {
-		channelBufferSize = defaultChannelBufferSize
-	}
-
 	return &Flow{
 		requestProcessors:  requestProcessors,
 		responseProcessors: responseProcessors,
-		channelBufferSize:  channelBufferSize,
+		channelBufferSize:  opts.ChannelBufferSize,
 		modelCallbacks:     opts.ModelCallbacks,
 	}
 }
@@ -76,6 +77,11 @@ func (f *Flow) Run(ctx context.Context, invocation *agent.Invocation) (<-chan *e
 
 	go func() {
 		defer close(eventChan)
+
+		// Optionally resume from pending tool calls before starting a new
+		// LLM cycle. This covers scenarios where the previous run stopped
+		// after an assistant tool_call response but before tools executed.
+		f.maybeResumePendingToolCalls(ctx, invocation, eventChan)
 
 		for {
 			// emit start event and wait for completion notice.
@@ -128,6 +134,54 @@ func (f *Flow) Run(ctx context.Context, invocation *agent.Invocation) (<-chan *e
 	return eventChan, nil
 }
 
+// maybeResumePendingToolCalls inspects the latest session events and, when
+// RunOptions.Resume is enabled, executes any pending tool calls before the
+// next LLM request. A pending tool call is defined as the latest persisted
+// event being an assistant response that contains tool calls but no tool
+// results after it.
+func (f *Flow) maybeResumePendingToolCalls(
+	ctx context.Context,
+	invocation *agent.Invocation,
+	eventChan chan<- *event.Event,
+) {
+	if invocation == nil || !invocation.RunOptions.Resume {
+		return
+	}
+	if invocation.Session == nil {
+		return
+	}
+
+	invocation.Session.EventMu.RLock()
+	events := invocation.Session.Events
+	var lastResp *model.Response
+	if len(events) > 0 {
+		last := events[len(events)-1]
+		if last.Response != nil && !last.IsPartial &&
+			last.IsValidContent() && last.Response.IsToolCallResponse() {
+			lastResp = last.Response
+		}
+	}
+	invocation.Session.EventMu.RUnlock()
+
+	if lastResp == nil {
+		return
+	}
+
+	req := &model.Request{
+		Tools: make(map[string]tool.Tool),
+	}
+	for _, t := range f.getFilteredTools(ctx, invocation) {
+		req.Tools[t.Declaration().Name] = t
+	}
+
+	for _, rp := range f.responseProcessors {
+		if toolRP, ok := rp.(*processor.FunctionCallResponseProcessor); ok {
+			toolRP.ProcessResponse(ctx, invocation, req, lastResp, eventChan)
+			break
+		}
+	}
+}
+
 func (f *Flow) emitStartEventAndWait(ctx context.Context, invocation *agent.Invocation,
 	eventChan chan<- *event.Event) error {
 	invocationID, agentName := "", ""
@@ -170,11 +224,11 @@ func (f *Flow) runOneStep(
 		return lastEvent, nil
 	}
 	var span oteltrace.Span
-	if invocation.Model == nil {
-		_, span = trace.Tracer.Start(ctx, itelemetry.NewChatSpanName(""))
-	} else {
-		_, span = trace.Tracer.Start(ctx, itelemetry.NewChatSpanName(invocation.Model.Info().Name))
+	var modelName string
+	if invocation.Model != nil {
+		modelName = invocation.Model.Info().Name
 	}
+	_, span = trace.Tracer.Start(ctx, itelemetry.NewChatSpanName(modelName))
 	defer span.End()
 
 	// 2. Call LLM (get response channel).
@@ -182,7 +236,6 @@ func (f *Flow) runOneStep(
 	if err != nil {
 		return nil, err
 	}
-
 	// 3. Process streaming responses.
 	return f.processStreamingResponses(ctx, invocation, llmRequest, responseChan, eventChan, span)
 }
@@ -195,10 +248,25 @@ func (f *Flow) processStreamingResponses(
 	responseChan <-chan *model.Response,
 	eventChan chan<- *event.Event,
 	span oteltrace.Span,
-) (*event.Event, error) {
-	var lastEvent *event.Event
+) (lastEvent *event.Event, err error) {
+	// Get or create timing info from invocation (only record first LLM call)
+	timingInfo := invocation.GetOrCreateTimingInfo()
+
+	// Create telemetry tracker and defer metrics recording
+	tracker := itelemetry.NewChatMetricsTracker(ctx, invocation, llmRequest, timingInfo, &err)
+	defer tracker.RecordMetrics()()
 
 	for response := range responseChan {
+		// Track response for telemetry (token usage and timing info)
+		tracker.TrackResponse(response)
+
+		// Attach timing info to response
+		if response.Usage == nil {
+			response.Usage = &model.Usage{}
+		}
+		// set timing info to response
+		response.Usage.TimingInfo = timingInfo
+
 		// Handle after model callbacks.
 		customResp, err := f.handleAfterModelCallbacks(ctx, invocation, llmRequest, response, eventChan)
 		if err != nil {
@@ -212,8 +280,9 @@ func (f *Flow) processStreamingResponses(
 		llmResponseEvent := f.createLLMResponseEvent(invocation, response, llmRequest)
 		agent.EmitEvent(ctx, invocation, eventChan, llmResponseEvent)
 		lastEvent = llmResponseEvent
+		tracker.SetLastEvent(lastEvent)
 		// 5. Check context cancellation.
-		if err := agent.CheckContextCancelled(ctx); err != nil {
+		if err = agent.CheckContextCancelled(ctx); err != nil {
 			return lastEvent, err
 		}
 
@@ -223,7 +292,8 @@ func (f *Flow) processStreamingResponses(
 			return lastEvent, err
 		}
 
-		itelemetry.TraceChat(span, invocation, llmRequest, response, llmResponseEvent.ID)
+		itelemetry.TraceChat(span, invocation, llmRequest, response, llmResponseEvent.ID, tracker.FirstTokenTimeDuration())
+
 	}
 
 	return lastEvent, nil
@@ -237,7 +307,7 @@ func (f *Flow) handleAfterModelCallbacks(
 	response *model.Response,
 	eventChan chan<- *event.Event,
 ) (*model.Response, error) {
-	customResp, err := f.runAfterModelCallbacks(ctx, llmRequest, response)
+	ctx, customResp, err := f.runAfterModelCallbacks(ctx, llmRequest, response)
 	if err != nil {
 		if _, ok := agent.AsStopError(err); ok {
 			return nil, err
@@ -286,11 +356,33 @@ func (f *Flow) runAfterModelCallbacks(
 	ctx context.Context,
 	req *model.Request,
 	response *model.Response,
-) (*model.Response, error) {
+) (context.Context, *model.Response, error) {
 	if f.modelCallbacks == nil {
-		return response, nil
+		return ctx, response, nil
 	}
-	return f.modelCallbacks.RunAfterModel(ctx, req, response, nil)
+
+	// Convert response.Error to Go error for callback.
+	var modelErr error
+	if response != nil && response.Error != nil {
+		modelErr = fmt.Errorf("%s: %s", response.Error.Type, response.Error.Message)
+	}
+
+	result, err := f.modelCallbacks.RunAfterModel(ctx, &model.AfterModelArgs{
+		Request:  req,
+		Response: response,
+		Error:    modelErr,
+	})
+	if err != nil {
+		return ctx, nil, err
+	}
+	// Use the context from result if provided for subsequent operations.
+	if result != nil && result.Context != nil {
+		ctx = result.Context
+	}
+	if result != nil && result.CustomResponse != nil {
+		return ctx, result.CustomResponse, nil
+	}
+	return ctx, response, nil
 }
 
 // preprocess handles pre-LLM call preparation using request processors.
@@ -305,12 +397,104 @@ func (f *Flow) preprocess(
 		processor.ProcessRequest(ctx, invocation, llmRequest, eventChan)
 	}
 
-	// Add tools to the request.
+	// Add tools to the request with optional filtering.
 	if invocation.Agent != nil {
-		for _, t := range invocation.Agent.Tools() {
+		tools := f.getFilteredTools(ctx, invocation)
+		for _, t := range tools {
 			llmRequest.Tools[t.Declaration().Name] = t
 		}
 	}
+}
+
+// UserToolsProvider is an optional interface that agents can implement to expose
+// which tools were explicitly registered by the user (WithTools, WithToolSets)
+// vs framework-added tools (Knowledge, SubAgents).
+//
+// User tools are subject to filtering via WithToolFilter.
+// Framework tools are never filtered and always available to the agent.
+type UserToolsProvider interface {
+	UserTools() []tool.Tool
+}
+
+// ToolFilterProvider is an optional interface that agents can implement to provide
+type ToolFilterProvider interface {
+	FilterTools(ctx context.Context) []tool.Tool
+}
+
+// getFilteredTools returns the list of tools for this invocation after applying the filter.
+//
+// User tools (can be filtered):
+//   - Tools registered via WithTools
+//   - Tools registered via WithToolSets
+//
+// Framework tools (never filtered):
+//   - transfer_to_agent (auto-added when SubAgents are configured)
+//   - knowledge_search / agentic_knowledge_search (auto-added when Knowledge is configured)
+//
+// This method is called during the preprocess stage, before sending the request to the model.
+func (f *Flow) getFilteredTools(ctx context.Context, invocation *agent.Invocation) []tool.Tool {
+	if invocation == nil || invocation.Agent == nil {
+		return nil
+	}
+
+	if cached, ok := agent.GetStateValue[[]tool.Tool](
+		invocation,
+		stateKeyToolsSnapshot,
+	); ok && cached != nil {
+		return cached
+	}
+
+	// Get all tools from the agent.
+	allTools := invocation.Agent.Tools()
+	if provider, ok := invocation.Agent.(ToolFilterProvider); ok {
+		allTools = provider.FilterTools(ctx)
+	}
+
+	// If no filter is specified, return all tools for this invocation.
+	if invocation.RunOptions.ToolFilter == nil {
+		invocation.SetState(stateKeyToolsSnapshot, allTools)
+		return allTools
+	}
+
+	// Get user tools (if the agent supports it).
+	// User tools are those explicitly registered via WithTools and WithToolSets.
+	// Framework tools (Knowledge, SubAgents) are never filtered.
+	var userToolNames map[string]bool
+	hasUserToolTracking := false
+	if provider, ok := invocation.Agent.(UserToolsProvider); ok {
+		userTools := provider.UserTools()
+		hasUserToolTracking = true
+		// Build a map for fast lookup.
+		userToolNames = make(map[string]bool, len(userTools))
+		for _, t := range userTools {
+			userToolNames[t.Declaration().Name] = true
+		}
+	}
+
+	// Apply the filter function to each tool.
+	// Framework tools are never filtered.
+	filtered := make([]tool.Tool, 0, len(allTools))
+	for _, t := range allTools {
+		toolName := t.Declaration().Name
+
+		// Determine if this is a user tool or framework tool.
+		isUserTool := !hasUserToolTracking || userToolNames[toolName]
+
+		// Framework tools are always included (never filtered).
+		if !isUserTool {
+			filtered = append(filtered, t)
+			continue
+		}
+
+		// User tool: apply the filter function.
+		if invocation.RunOptions.ToolFilter(ctx, t) {
+			filtered = append(filtered, t)
+		}
+	}
+
+	invocation.SetState(stateKeyToolsSnapshot, filtered)
+
+	return filtered
 }
 
 // callLLM performs the actual LLM call using core/model.
@@ -327,15 +511,21 @@ func (f *Flow) callLLM(
 
 	// Run before model callbacks if they exist.
 	if f.modelCallbacks != nil {
-		customResponse, err := f.modelCallbacks.RunBeforeModel(ctx, llmRequest)
+		result, err := f.modelCallbacks.RunBeforeModel(ctx, &model.BeforeModelArgs{
+			Request: llmRequest,
+		})
 		if err != nil {
 			log.Errorf("Before model callback failed for agent %s: %v", invocation.AgentName, err)
 			return nil, err
 		}
-		if customResponse != nil {
+		// Use the context from result if provided.
+		if result != nil && result.Context != nil {
+			ctx = result.Context
+		}
+		if result != nil && result.CustomResponse != nil {
 			// Create a channel that returns the custom response and then closes.
 			responseChan := make(chan *model.Response, 1)
-			responseChan <- customResponse
+			responseChan <- result.CustomResponse
 			close(responseChan)
 			return responseChan, nil
 		}

@@ -1,6 +1,5 @@
 //
-// Tencent is pleased to support the open source community by making
-// trpc-agent-go available.
+// Tencent is pleased to support the open source community by making trpc-agent-go available.
 //
 // Copyright (C) 2025 Tencent.  All rights reserved.
 //
@@ -125,6 +124,9 @@ func runOnce(userText string, sysText string) error {
 		gagent,
 		runner.WithSessionService(sessionService),
 	)
+
+	// Ensure runner resources are cleaned up (trpc-agent-go >= v0.5.0)
+	defer r.Close()
 
 	userID := "user"
 	sessionID := fmt.Sprintf("oneshot-%d", time.Now().Unix())

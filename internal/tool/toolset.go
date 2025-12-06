@@ -1,3 +1,12 @@
+//
+// Tencent is pleased to support the open source community by making trpc-agent-go available.
+//
+// Copyright (C) 2025 Tencent.  All rights reserved.
+//
+// trpc-agent-go is licensed under the Apache License Version 2.0.
+//
+//
+
 package tool
 
 import (
@@ -97,4 +106,14 @@ func (t *NamedTool) StreamableCall(ctx context.Context, jsonArgs []byte) (*tool.
 		return streamable.StreamableCall(ctx, jsonArgs)
 	}
 	return nil, fmt.Errorf("tool is not streamable")
+}
+
+// SkipSummarization delegates to the original tool when it implements
+// a SkipSummarization() bool preference; otherwise returns false.
+func (t *NamedTool) SkipSummarization() bool {
+	type skipper interface{ SkipSummarization() bool }
+	if s, ok := t.original.(skipper); ok {
+		return s.SkipSummarization()
+	}
+	return false
 }

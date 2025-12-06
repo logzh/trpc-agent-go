@@ -12,18 +12,19 @@ package pgvector
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/searchfilter"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore"
 	"trpc.group/trpc-go/trpc-agent-go/log"
+	"trpc.group/trpc-go/trpc-agent-go/storage/postgres"
 )
 
 var _ vectorstore.VectorStore = (*VectorStore)(nil)
@@ -55,8 +56,11 @@ const (
 			%s BIGINT                       -- Update timestamp (Unix timestamp)
 		)`
 
-	sqlCreateIndex = `
-		CREATE INDEX IF NOT EXISTS %s_embedding_idx ON %s USING hnsw (%s vector_cosine_ops) WITH (m = 32, ef_construction = 400)`
+	sqlCreateIndexHNSW = `
+		CREATE INDEX IF NOT EXISTS %s_embedding_idx ON %s USING hnsw (%s vector_cosine_ops) WITH (m = %d, ef_construction = %d)`
+
+	sqlCreateIndexIVFFlat = `
+		CREATE INDEX IF NOT EXISTS %s_embedding_idx ON %s USING ivfflat (%s vector_cosine_ops) WITH (lists = %d)`
 
 	sqlCreateTextIndex = `
 		CREATE INDEX IF NOT EXISTS %s_content_fts_idx ON %s USING gin (to_tsvector('%s', %s))`
@@ -76,13 +80,11 @@ const (
 	sqlDeleteDocument = `DELETE FROM %s WHERE %s = $1`
 
 	sqlTruncateTable = `TRUNCATE TABLE %s`
-
-	sqlDocumentExists = `SELECT 1 FROM %s WHERE %s = $1`
 )
 
 // VectorStore is the vector store for pgvector.
 type VectorStore struct {
-	pool            *pgxpool.Pool
+	client          postgres.Client
 	option          options
 	filterConverter searchfilter.Converter[*condConvertResult]
 }
@@ -94,29 +96,50 @@ func New(opts ...Option) (*VectorStore, error) {
 		opt(&option)
 	}
 
-	if option.user == "" {
-		return nil, errors.New("pgvector user is required")
-	}
-	if option.password == "" {
-		return nil, errors.New("pgvector password is required")
-	}
+	var client postgres.Client
+	var err error
+	builder := postgres.GetClientBuilder()
 
-	// Build connection string.
-	connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		option.host, option.port, option.user, option.password, option.database, option.sslMode)
+	// If instance name is set, use it to create postgres client
+	if option.instanceName != "" {
+		builderOpts, ok := postgres.GetPostgresInstance(option.instanceName)
+		if !ok {
+			return nil, fmt.Errorf("postgres instance %s not found", option.instanceName)
+		}
+		client, err = builder(context.Background(), builderOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("create postgres client from instance name failed: %w", err)
+		}
+	} else {
+		// Build connection string from individual parameters
+		// URL encode username and password to handle special characters
+		encodedUser := url.QueryEscape(option.user)
+		encodedPassword := url.QueryEscape(option.password)
+		connStr := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",
+			encodedUser, encodedPassword, option.host, option.port, option.database, option.sslMode)
 
-	pool, err := pgxpool.New(context.Background(), connStr)
-	if err != nil {
-		return nil, fmt.Errorf("pgvector create connection pool: %w", err)
+		builderOpts := []postgres.ClientBuilderOpt{
+			postgres.WithClientConnString(connStr),
+		}
+		if len(option.extraOptions) > 0 {
+			builderOpts = append(builderOpts, postgres.WithExtraOptions(option.extraOptions...))
+		}
+
+		client, err = builder(context.Background(), builderOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("create postgres client from connection string failed: %w", err)
+		}
 	}
 
 	vs := &VectorStore{
-		pool:            pool,
+		client:          client,
 		option:          option,
 		filterConverter: &pgVectorConverter{},
 	}
 
 	if err := vs.initDB(context.Background()); err != nil {
+		// Close client on initialization failure to prevent resource leak
+		_ = client.Close()
 		return nil, err
 	}
 
@@ -125,7 +148,7 @@ func New(opts ...Option) (*VectorStore, error) {
 
 func (vs *VectorStore) initDB(ctx context.Context) error {
 	// Enable pgvector extension.
-	_, err := vs.pool.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS vector")
+	_, err := vs.client.ExecContext(ctx, "CREATE EXTENSION IF NOT EXISTS vector")
 	if err != nil {
 		return fmt.Errorf("pgvector enable extension: %w", err)
 	}
@@ -140,26 +163,73 @@ func (vs *VectorStore) initDB(ctx context.Context) error {
 		vs.option.createdAtFieldName,
 		vs.option.updatedAtFieldName,
 	)
-	_, err = vs.pool.Exec(ctx, createTableSQL)
+	_, err = vs.client.ExecContext(ctx, createTableSQL)
 	if err != nil {
 		return fmt.Errorf("pgvector create table: %w", err)
 	}
 
-	// Create HNSW vector index for faster similarity search.
-	// Using cosine distance operator for semantic similarity.
-	indexSQL := fmt.Sprintf(sqlCreateIndex, vs.option.table, vs.option.table, vs.option.embeddingFieldName)
-	_, err = vs.pool.Exec(ctx, indexSQL)
-	if err != nil {
-		return fmt.Errorf("pgvector create vector index: %w", err)
+	// Create vector index based on configured type
+	if err := vs.createVectorIndex(ctx); err != nil {
+		return err
 	}
 
 	// If tsvector is enabled, create GIN index for full-text search on content.
 	if vs.option.enableTSVector {
 		textIndexSQL := fmt.Sprintf(sqlCreateTextIndex, vs.option.table, vs.option.table, vs.option.language, vs.option.contentFieldName)
-		_, err = vs.pool.Exec(ctx, textIndexSQL)
+		_, err = vs.client.ExecContext(ctx, textIndexSQL)
 		if err != nil {
 			return fmt.Errorf("pgvector create text search index: %w", err)
 		}
+	}
+
+	return nil
+}
+
+// createVectorIndex creates the appropriate vector index based on configuration.
+func (vs *VectorStore) createVectorIndex(ctx context.Context) error {
+	var indexSQL string
+
+	switch vs.option.vectorIndexType {
+	case VectorIndexHNSW:
+		// Create HNSW index for fast approximate nearest neighbor search
+		// Using cosine distance operator for semantic similarity
+		m := defaultHNSWM
+		efConstruction := defaultHNSWEfConstruction
+		if vs.option.hnswParams != nil {
+			if vs.option.hnswParams.M > 0 {
+				m = vs.option.hnswParams.M
+			}
+			if vs.option.hnswParams.EfConstruction > 0 {
+				efConstruction = vs.option.hnswParams.EfConstruction
+			}
+		}
+		indexSQL = fmt.Sprintf(sqlCreateIndexHNSW,
+			vs.option.table,
+			vs.option.table,
+			vs.option.embeddingFieldName,
+			m,
+			efConstruction,
+		)
+	case VectorIndexIVFFlat:
+		// Create IVFFlat index for memory-efficient approximate search
+		// Using cosine distance operator for semantic similarity
+		lists := defaultIVFFlatLists
+		if vs.option.ivfflatParams != nil && vs.option.ivfflatParams.Lists > 0 {
+			lists = vs.option.ivfflatParams.Lists
+		}
+		indexSQL = fmt.Sprintf(sqlCreateIndexIVFFlat,
+			vs.option.table,
+			vs.option.table,
+			vs.option.embeddingFieldName,
+			lists,
+		)
+	default:
+		return fmt.Errorf("pgvector unsupported vector index type: %s", vs.option.vectorIndexType)
+	}
+
+	_, err := vs.client.ExecContext(ctx, indexSQL)
+	if err != nil {
+		return fmt.Errorf("pgvector create vector index (%s): %w", vs.option.vectorIndexType, err)
 	}
 
 	return nil
@@ -185,7 +255,7 @@ func (vs *VectorStore) Add(ctx context.Context, doc *document.Document, embeddin
 	vector := pgvector.NewVector(convertToFloat32Vector(embedding))
 	metadataJSON := mapToJSON(doc.Metadata)
 
-	_, err := vs.pool.Exec(ctx, upsertSQL, doc.ID, doc.Name, doc.Content, vector, metadataJSON, now, now)
+	_, err := vs.client.ExecContext(ctx, upsertSQL, doc.ID, doc.Name, doc.Content, vector, metadataJSON, now, now)
 	if err != nil {
 		return fmt.Errorf("pgvector insert document: %w", err)
 	}
@@ -200,14 +270,30 @@ func (vs *VectorStore) Get(ctx context.Context, id string) (*document.Document, 
 	}
 
 	querySQL := fmt.Sprintf(sqlSelectDocument, vs.option.table, vs.option.idFieldName)
-	row := vs.pool.QueryRow(ctx, querySQL, id)
-	scoredDoc, embedding, err := vs.option.docBuilder(row)
+
+	var scoredDoc *vectorstore.ScoredDocument
+	var embedding []float64
+	var found bool
+
+	err := vs.client.Query(ctx, func(rows *sql.Rows) error {
+		if !rows.Next() {
+			return nil
+		}
+		found = true
+
+		var err error
+		scoredDoc, embedding, err = vs.option.docBuilder(rows)
+		if err != nil {
+			return fmt.Errorf("build document: %w", err)
+		}
+		return nil
+	}, querySQL, id)
 
 	if err != nil {
 		return nil, nil, fmt.Errorf("pgvector get document: %w", err)
 	}
 
-	if scoredDoc == nil || scoredDoc.Document == nil {
+	if !found || scoredDoc == nil || scoredDoc.Document == nil {
 		return nil, nil, fmt.Errorf("pgvector get document: not found")
 	}
 
@@ -221,15 +307,6 @@ func (vs *VectorStore) Update(ctx context.Context, doc *document.Document, embed
 	}
 	if doc.ID == "" {
 		return errDocumentIDRequired
-	}
-
-	// Check if document exists.
-	exists, err := vs.documentExists(ctx, doc.ID)
-	if err != nil {
-		return fmt.Errorf("pgvector check document existence: %w", err)
-	}
-	if !exists {
-		return fmt.Errorf("pgvector document not found: %s", doc.ID)
 	}
 
 	// Build update using updateBuilder.
@@ -255,12 +332,16 @@ func (vs *VectorStore) Update(ctx context.Context, doc *document.Document, embed
 	}
 
 	updateSQL, args := ub.build()
-	result, err := vs.pool.Exec(ctx, updateSQL, args...)
+	result, err := vs.client.ExecContext(ctx, updateSQL, args...)
 	if err != nil {
 		return fmt.Errorf("pgvector update document: %w", err)
 	}
 
-	if result.RowsAffected() == 0 {
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("pgvector get rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
 		return fmt.Errorf("pgvector document not updated: %s", doc.ID)
 	}
 	return nil
@@ -274,12 +355,16 @@ func (vs *VectorStore) Delete(ctx context.Context, id string) error {
 
 	deleteSQL := fmt.Sprintf(sqlDeleteDocument, vs.option.table, vs.option.idFieldName)
 
-	result, err := vs.pool.Exec(ctx, deleteSQL, id)
+	result, err := vs.client.ExecContext(ctx, deleteSQL, id)
 	if err != nil {
 		return fmt.Errorf("pgvector delete document: %w", err)
 	}
 
-	if result.RowsAffected() == 0 {
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("pgvector get rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
 		return fmt.Errorf("pgvector document not found: %s", id)
 	}
 	return nil
@@ -418,35 +503,31 @@ func (vs *VectorStore) searchByFilter(ctx context.Context, query *vectorstore.Se
 }
 
 // executeSearch executes the search query and returns results.
-func (vs *VectorStore) executeSearch(ctx context.Context, sql string, args []any, searchMode vectorstore.SearchMode) (*vectorstore.SearchResult, error) {
-	rows, err := vs.pool.Query(ctx, sql, args...)
-	if err != nil {
-		return nil, fmt.Errorf("pgvector search documents: %w", err)
-	}
-	defer rows.Close()
-
+func (vs *VectorStore) executeSearch(ctx context.Context, query string, args []any, searchMode vectorstore.SearchMode) (*vectorstore.SearchResult, error) {
 	result := &vectorstore.SearchResult{
 		Results: make([]*vectorstore.ScoredDocument, 0),
 	}
 
-	for rows.Next() {
-		scoredDoc, _, err := vs.option.docBuilder(rows)
-		if err != nil {
-			return nil, fmt.Errorf("pgvector parse document: %w", err)
+	err := vs.client.Query(ctx, func(rows *sql.Rows) error {
+		for rows.Next() {
+			scoredDoc, _, err := vs.option.docBuilder(rows)
+			if err != nil {
+				return fmt.Errorf("parse document: %w", err)
+			}
+			var score float64
+			var id string
+			if scoredDoc != nil && scoredDoc.Document != nil {
+				score = scoredDoc.Score
+				id = scoredDoc.Document.ID
+				result.Results = append(result.Results, scoredDoc)
+			}
+			log.Debugf("pgvector search result: score: %v id: %v searchMode: %v, query: %v", score, id, searchMode, query)
 		}
-		var score float64
-		var id string
-		if scoredDoc != nil && scoredDoc.Document != nil {
-			score = scoredDoc.Score
-			id = scoredDoc.Document.ID
-			result.Results = append(result.Results, scoredDoc)
-		}
-		log.Debugf("pgvector search result: score: %v id: %v searchMode: %v, sql: %v", score,
-			id, searchMode, sql)
-	}
+		return nil
+	}, query, args...)
 
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("pgvector iterate rows: %w", err)
+	if err != nil {
+		return nil, fmt.Errorf("pgvector search documents: %w", err)
 	}
 
 	return result, nil
@@ -480,7 +561,7 @@ func (vs *VectorStore) validateDeleteConfig(config *vectorstore.DeleteConfig) er
 
 func (vs *VectorStore) deleteAll(ctx context.Context) error {
 	truncateSQL := fmt.Sprintf(sqlTruncateTable, vs.option.table)
-	if _, err := vs.pool.Exec(ctx, truncateSQL); err != nil {
+	if _, err := vs.client.ExecContext(ctx, truncateSQL); err != nil {
 		return fmt.Errorf("pgvector delete all documents: %w", err)
 	}
 	log.Infof("pgvector truncated all documents from table %s", vs.option.table)
@@ -501,12 +582,16 @@ func (vs *VectorStore) deleteByFilter(ctx context.Context, config *vectorstore.D
 		return fmt.Errorf("pgvector delete by filter: failed to build delete query")
 	}
 
-	result, err := vs.pool.Exec(ctx, deleteSQL, args...)
+	result, err := vs.client.ExecContext(ctx, deleteSQL, args...)
 	if err != nil {
 		return fmt.Errorf("pgvector delete by filter: %w", err)
 	}
 
-	log.Infof("pgvector deleted %d documents by filter", result.RowsAffected())
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("pgvector get rows affected: %w", err)
+	}
+	log.Infof("pgvector deleted %d documents by filter", rowsAffected)
 	return nil
 }
 
@@ -526,7 +611,15 @@ func (vs *VectorStore) Count(ctx context.Context, opts ...vectorstore.CountOptio
 	query, args := cqb.build()
 
 	var count int
-	err := vs.pool.QueryRow(ctx, query, args...).Scan(&count)
+	err := vs.client.Query(ctx, func(rows *sql.Rows) error {
+		if rows.Next() {
+			if err := rows.Scan(&count); err != nil {
+				return fmt.Errorf("scan count: %w", err)
+			}
+		}
+		return nil
+	}, query, args...)
+
 	if err != nil {
 		return 0, fmt.Errorf("pgvector count documents: %w", err)
 	}
@@ -587,38 +680,35 @@ func (vs *VectorStore) queryMetadataBatch(
 		Metadata: filters,
 		IDs:      docIDs,
 	}); err != nil {
-		return nil, fmt.Errorf("pgvector delete by filter: %w", err)
+		return nil, fmt.Errorf("pgvector get metadata: %w", err)
 	}
 
 	// Build the query with pagination
 	query, args := qb.buildWithPagination(limit, offset)
 
-	rows, err := vs.pool.Query(ctx, query, args...)
+	result := make(map[string]vectorstore.DocumentMetadata)
+	err := vs.client.Query(ctx, func(rows *sql.Rows) error {
+		for rows.Next() {
+			scoredDoc, _, err := vs.option.docBuilder(rows)
+			if err != nil {
+				return fmt.Errorf("build document: %w", err)
+			}
+			if scoredDoc == nil || scoredDoc.Document == nil {
+				continue
+			}
+
+			docID := scoredDoc.Document.ID
+			metadata := scoredDoc.Document.Metadata
+
+			result[docID] = vectorstore.DocumentMetadata{
+				Metadata: metadata,
+			}
+		}
+		return nil
+	}, query, args...)
+
 	if err != nil {
 		return nil, fmt.Errorf("pgvector get metadata batch: %w", err)
-	}
-	defer rows.Close()
-
-	result := make(map[string]vectorstore.DocumentMetadata)
-	for rows.Next() {
-		scoredDoc, _, err := vs.option.docBuilder(rows)
-		if err != nil {
-			return nil, fmt.Errorf("pgvector get metadata batch: %w", err)
-		}
-		if scoredDoc == nil || scoredDoc.Document == nil {
-			continue
-		}
-
-		docID := scoredDoc.Document.ID
-		metadata := scoredDoc.Document.Metadata
-
-		result[docID] = vectorstore.DocumentMetadata{
-			Metadata: metadata,
-		}
-	}
-
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("pgvector iterate metadata rows: %w", err)
 	}
 
 	return result, nil
@@ -632,23 +722,12 @@ func (vs *VectorStore) getMaxResult(maxResults int) int {
 }
 
 // Close closes the vector store connection.
+// Each VectorStore instance owns its client and should close it when done.
 func (vs *VectorStore) Close() error {
-	vs.pool.Close()
-	return nil
-}
-
-// Helper functions.
-func (vs *VectorStore) documentExists(ctx context.Context, id string) (bool, error) {
-	querySQL := fmt.Sprintf(sqlDocumentExists, vs.option.table, vs.option.idFieldName)
-	var exists int
-	err := vs.pool.QueryRow(ctx, querySQL, id).Scan(&exists)
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			return false, nil
-		}
-		return false, err
+	if vs.client == nil {
+		return nil
 	}
-	return true, nil
+	return vs.client.Close()
 }
 
 func (vs *VectorStore) buildQueryFilter(qb queryFilterBuilder, cond *vectorstore.SearchFilter) error {

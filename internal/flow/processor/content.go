@@ -21,22 +21,36 @@ import (
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/graph"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
 
 // Content inclusion options.
 const (
-	IncludeContentsNone     = "none"
-	IncludeContentsAll      = "all"
-	IncludeContentsFiltered = "filtered"
+	// BranchFilterModePrefix Prefix matching pattern
+	BranchFilterModePrefix = "prefix"
+	// BranchFilterModeAll include all
+	BranchFilterModeAll = "all"
+	// BranchFilterModeExact exact match
+	BranchFilterModeExact = "exact"
+
+	// TimelineFilterAll includes all historical message records
+	// Suitable for scenarios requiring full conversation context
+	TimelineFilterAll = "all"
+	// TimelineFilterCurrentRequest only includes messages within the current request cycle
+	// Filters out previous historical records, keeping only messages related to this request
+	TimelineFilterCurrentRequest = "request"
+	// TimelineFilterCurrentInvocation only includes messages within the current invocation session
+	// Suitable for scenarios requiring isolation between different invocation cycles in long-running sessions
+	TimelineFilterCurrentInvocation = "invocation"
 )
 
 // ContentRequestProcessor implements content processing logic for agent requests.
 type ContentRequestProcessor struct {
-	// IncludeContents determines how to include content from session events.
-	// Options: "none", "all", "filtered" (default: "filtered").
-	IncludeContents string
+	// BranchFilterMode determines how to include content from session events.
+	// Options: "prefix", "all", "exact" (default: "prefix").
+	BranchFilterMode string
 	// AddContextPrefix controls whether to add "For context:" prefix when converting foreign events.
 	// When false, foreign agent events are passed directly without the prefix.
 	AddContextPrefix bool
@@ -51,15 +65,30 @@ type ContentRequestProcessor struct {
 	// allows graph executions to retain authentic assistant/tool transcripts
 	// while still enabling cross-agent contextualization when branches differ.
 	PreserveSameBranch bool
+	// TimelineFilterMode controls whether to append history messages to the request.
+	TimelineFilterMode string
 }
 
 // ContentOption is a functional option for configuring the ContentRequestProcessor.
 type ContentOption func(*ContentRequestProcessor)
 
-// WithIncludeContents sets how to include content from session events.
-func WithIncludeContents(includeContents string) ContentOption {
+// WithBranchFilterMode sets how to include content from session events.
+func WithBranchFilterMode(mode string) ContentOption {
 	return func(p *ContentRequestProcessor) {
-		p.IncludeContents = includeContents
+		if mode != BranchFilterModeAll && mode != BranchFilterModeExact {
+			mode = BranchFilterModePrefix
+		}
+		p.BranchFilterMode = mode
+	}
+}
+
+// WithTimelineFilterMode sets whether to append history messages to the request.
+func WithTimelineFilterMode(mode string) ContentOption {
+	return func(p *ContentRequestProcessor) {
+		if mode != TimelineFilterCurrentRequest && mode != TimelineFilterCurrentInvocation {
+			mode = TimelineFilterAll
+		}
+		p.TimelineFilterMode = mode
 	}
 }
 
@@ -96,11 +125,23 @@ func WithPreserveSameBranch(preserve bool) ContentOption {
 	}
 }
 
+const (
+	mergedUserSeparator = "\n\n"
+	contextPrefix       = "For context:"
+)
+
 // NewContentRequestProcessor creates a new content request processor.
 func NewContentRequestProcessor(opts ...ContentOption) *ContentRequestProcessor {
 	processor := &ContentRequestProcessor{
-		IncludeContents:  IncludeContentsFiltered, // Default only to include filtered contents.
-		AddContextPrefix: true,                    // Default to add context prefix.
+		BranchFilterMode: BranchFilterModePrefix, // Default only to include
+		// filtered contents.
+		AddContextPrefix: true, // Default to add context prefix.
+		// Default to rewriting same-branch lineage events to user context so
+		// that downstream subagents see a single consolidated user message
+		// stream unless explicitly opted back into preserving roles.
+		PreserveSameBranch: false,
+		// Default to append history message.
+		TimelineFilterMode: TimelineFilterAll,
 	}
 
 	// Apply options.
@@ -128,21 +169,42 @@ func (p *ContentRequestProcessor) ProcessRequest(
 		return
 	}
 
-	// 2) Append per-filter messages from session events when allowed.
+	// Honor per-invocation include_contents flag from runtime state when
+	// present. This allows callers (including GraphAgent subgraphs) to
+	// disable seeding session history for specific runs without changing
+	// the processor configuration.
+	includeMode := ""
+	if invocation.RunOptions.RuntimeState != nil {
+		if v, ok := invocation.RunOptions.RuntimeState[graph.CfgKeyIncludeContents]; ok {
+			if s, ok2 := v.(string); ok2 {
+				includeMode = strings.ToLower(s)
+			}
+		}
+	}
+	skipHistory := includeMode == "none"
+
+	// Append per-filter messages from session events when allowed.
 	needToAddInvocationMessage := true
-	if p.IncludeContents != IncludeContentsNone && invocation.Session != nil {
+	if !skipHistory && invocation.Session != nil {
 		var messages []model.Message
 		var summaryUpdatedAt time.Time
-		if p.AddSessionSummary {
-			// Prepend session summary as a system message if enabled and available.
+		if p.AddSessionSummary && p.TimelineFilterMode == TimelineFilterAll {
+			// Add session summary as a system message if enabled and available.
 			// Also get the summary's UpdatedAt to ensure consistency with incremental messages.
 			if msg, updatedAt := p.getSessionSummaryMessage(invocation); msg != nil {
-				// Prepend to the front of messages.
-				req.Messages = append([]model.Message{*msg}, req.Messages...)
+				// Merge existing system messages first, then merge summary into the single system message.
+				req.Messages = p.mergeSystemMessages(req.Messages)
+				if len(req.Messages) > 0 && req.Messages[0].Role == model.RoleSystem {
+					// Merge summary into the existing system message.
+					req.Messages[0].Content += "\n\n" + msg.Content
+				} else {
+					// No system message exists, prepend new system message.
+					req.Messages = append([]model.Message{*msg}, req.Messages...)
+				}
 				summaryUpdatedAt = updatedAt
 			}
 		}
-		messages = p.getHistoryMessages(invocation, summaryUpdatedAt)
+		messages = p.getIncrementMessages(invocation, summaryUpdatedAt)
 		req.Messages = append(req.Messages, messages...)
 		needToAddInvocationMessage = summaryUpdatedAt.IsZero() && len(messages) == 0
 	}
@@ -157,7 +219,7 @@ func (p *ContentRequestProcessor) ProcessRequest(
 	agent.EmitEvent(ctx, invocation, ch, event.New(
 		invocation.InvocationID,
 		invocation.AgentName,
-		event.WithObject(model.ObjectTypePreprocessingPlanning),
+		event.WithObject(model.ObjectTypePreprocessingContent),
 	))
 }
 
@@ -177,7 +239,7 @@ func (p *ContentRequestProcessor) getSessionSummaryMessage(inv *agent.Invocation
 	}
 	filter := inv.GetEventFilterKey()
 	// For IncludeContentsAll, prefer the full-session summary under empty filter key.
-	if p.IncludeContents == IncludeContentsAll {
+	if p.BranchFilterMode == BranchFilterModeAll {
 		filter = ""
 	}
 	sum := inv.Session.Summaries[filter]
@@ -189,20 +251,20 @@ func (p *ContentRequestProcessor) getSessionSummaryMessage(inv *agent.Invocation
 
 // getHistoryMessages gets history messages for the current filter, potentially truncated by MaxHistoryRuns.
 // This method is used when AddSessionSummary is false to get recent history messages.
-func (p *ContentRequestProcessor) getHistoryMessages(inv *agent.Invocation, since time.Time) []model.Message {
+func (p *ContentRequestProcessor) getIncrementMessages(inv *agent.Invocation, since time.Time) []model.Message {
 	if inv.Session == nil {
 		return nil
 	}
 	isZeroTime := since.IsZero()
 	filter := inv.GetEventFilterKey()
+
 	var events []event.Event
 	inv.Session.EventMu.RLock()
 	for _, evt := range inv.Session.Events {
-		if evt.Response != nil && !evt.IsPartial && evt.IsValidContent() &&
-			(p.IncludeContents != IncludeContentsFiltered || evt.Filter(filter)) &&
-			(isZeroTime || evt.Timestamp.After(since)) {
-			events = append(events, evt)
+		if !p.shouldIncludeEvent(evt, inv, filter, isZeroTime, since) {
+			continue
 		}
+		events = append(events, evt)
 	}
 	inv.Session.EventMu.RUnlock()
 
@@ -223,12 +285,153 @@ func (p *ContentRequestProcessor) getHistoryMessages(inv *agent.Invocation, sinc
 		}
 	}
 
-	// Apply MaxHistoryRuns limit if set MaxHistoryRuns and AddSessionSummary is false.
-	if !p.AddSessionSummary && p.MaxHistoryRuns > 0 && len(messages) > p.MaxHistoryRuns {
+	messages = p.mergeUserMessages(messages)
+
+	// Apply MaxHistoryRuns limit if set MaxHistoryRuns and
+	// AddSessionSummary is false.
+	if !p.AddSessionSummary && p.MaxHistoryRuns > 0 &&
+		len(messages) > p.MaxHistoryRuns {
 		startIdx := len(messages) - p.MaxHistoryRuns
 		messages = messages[startIdx:]
 	}
 	return messages
+}
+
+func (p *ContentRequestProcessor) mergeUserMessages(
+	messages []model.Message,
+) []model.Message {
+	if len(messages) <= 1 {
+		return messages
+	}
+	if !p.AddContextPrefix {
+		return messages
+	}
+	var merged []model.Message
+	var current *model.Message
+	appendCurrent := func() {
+		if current == nil {
+			return
+		}
+		merged = append(merged, *current)
+		current = nil
+	}
+	for i := range messages {
+		msg := messages[i]
+		if msg.Role != model.RoleUser ||
+			!strings.HasPrefix(msg.Content, contextPrefix) {
+			appendCurrent()
+			merged = append(merged, msg)
+			continue
+		}
+		if current == nil {
+			cloned := msg
+			current = &cloned
+			continue
+		}
+		if msg.Content != "" {
+			if current.Content == "" {
+				current.Content = msg.Content
+			} else {
+				current.Content = current.Content + mergedUserSeparator +
+					msg.Content
+			}
+		}
+		if len(msg.ContentParts) > 0 {
+			current.ContentParts = append(
+				current.ContentParts,
+				msg.ContentParts...,
+			)
+		}
+	}
+	appendCurrent()
+	if len(merged) == 0 {
+		return messages
+	}
+	return merged
+}
+
+// mergeSystemMessages merges all consecutive system messages at the beginning of the message list
+// into a single system message to ensure API compatibility.
+func (p *ContentRequestProcessor) mergeSystemMessages(messages []model.Message) []model.Message {
+	if len(messages) == 0 {
+		return messages
+	}
+
+	var systemContents []string
+	var result []model.Message
+
+	// Collect all system messages at the beginning
+	for _, msg := range messages {
+		if msg.Role == model.RoleSystem {
+			systemContents = append(systemContents, msg.Content)
+		} else {
+			break
+		}
+	}
+
+	// If we have system messages, merge them into one
+	if len(systemContents) > 0 {
+		mergedContent := strings.Join(systemContents, "\n\n")
+		mergedSystemMsg := model.Message{
+			Role:    model.RoleSystem,
+			Content: mergedContent,
+		}
+		result = append(result, mergedSystemMsg)
+	}
+
+	// Add the remaining non-system messages
+	startIdx := len(systemContents)
+	if startIdx < len(messages) {
+		result = append(result, messages[startIdx:]...)
+	}
+
+	return result
+}
+
+func (p *ContentRequestProcessor) shouldIncludeEvent(evt event.Event, inv *agent.Invocation, filter string,
+	isZeroTime bool, since time.Time) bool {
+	if evt.Response == nil || evt.IsPartial || !evt.IsValidContent() {
+		return false
+	}
+
+	if !isZeroTime && evt.Timestamp.Before(since) {
+		return false
+	}
+
+	// Check timeline filter
+	switch p.TimelineFilterMode {
+	case TimelineFilterCurrentRequest:
+		if inv.RunOptions.RequestID != evt.RequestID {
+			return false
+		}
+	case TimelineFilterCurrentInvocation:
+		if evt.InvocationID != inv.InvocationID {
+			if !evt.IsUserMessage() {
+				return false
+			}
+			// User messages are usually sent from the runner append to the session, so in most cases, the invocationID is not equal.
+			// Therefore, to prevent the loss of user messages, we need to make further judgments
+			if inv.RunOptions.RequestID != evt.RequestID || evt.Choices[0].Message.Content != inv.Message.Content {
+				return false
+			}
+		}
+	default:
+	}
+
+	// Check branch filter
+	switch p.BranchFilterMode {
+	case BranchFilterModeExact:
+		if evt.FilterKey != filter {
+			return false
+		}
+	case BranchFilterModePrefix:
+		if !evt.Filter(filter) {
+			return false
+		}
+	default:
+	}
+
+	return true
 }
 
 // isOtherAgentReply checks whether the event is a reply from another agent.
@@ -244,7 +447,12 @@ func (p *ContentRequestProcessor) isOtherAgentReply(
 		return false
 	}
 	if p.PreserveSameBranch && currentBranch != "" && evt.Branch != "" {
-		if evt.Branch == currentBranch || strings.HasPrefix(evt.Branch, currentBranch+agent.BranchDelimiter) {
+		// Treat events within the same branch lineage as non-foreign to
+		// preserve original roles. This includes both descendants and
+		// ancestors of the current branch.
+		if evt.Branch == currentBranch ||
+			strings.HasPrefix(evt.Branch, currentBranch+agent.BranchDelimiter) ||
+			strings.HasPrefix(currentBranch, evt.Branch+agent.BranchDelimiter) {
 			return false
 		}
 	}
@@ -263,7 +471,7 @@ func (p *ContentRequestProcessor) convertForeignEvent(evt *event.Event) event.Ev
 	// Build content parts for context.
 	var contentParts []string
 	if p.AddContextPrefix {
-		contentParts = append(contentParts, "For context:")
+		contentParts = append(contentParts, contextPrefix)
 	}
 
 	for _, choice := range evt.Choices {

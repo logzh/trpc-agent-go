@@ -246,7 +246,9 @@ func calculator(ctx context.Context, req calculatorReq) (calculatorRsp, error) {
         result = req.A * req.B
     case "div", "/":
         result = req.A / req.B
-    }
+	default:
+		return calculatorRsp{}, fmt.Errorf("invalid operation: %s", req.Op)
+	}
     return calculatorRsp{Result: result}, nil
 }
 
@@ -289,6 +291,31 @@ type calculatorRsp struct {
 ### 4. Graph Agent（[examples/graph](examples/graph)）
 
 - **GraphAgent** – 展示如何使用 `graph` 与 `agent/graph` 包来构建并执行复杂的、带条件的工作流。展示了如何构建基于图的 agent、安全管理状态、实现条件路由，并通过 Runner 进行编排执行。
+
+- 多条件扇出路由（一次返回多个分支并行执行）：
+
+```go
+// 返回多个分支键，分别触发目标节点并行执行。
+sg := graph.NewStateGraph(schema)
+sg.AddNode("router", func(ctx context.Context, s graph.State) (any, error) {
+    return nil, nil
+})
+sg.AddNode("A", func(ctx context.Context, s graph.State) (any, error) {
+    return graph.State{"a": 1}, nil
+})
+sg.AddNode("B", func(ctx context.Context, s graph.State) (any, error) {
+    return graph.State{"b": 1}, nil
+})
+sg.SetEntryPoint("router")
+sg.AddMultiConditionalEdges(
+    "router",
+    func(ctx context.Context, s graph.State) ([]string, error) {
+        return []string{"goA", "goB"}, nil
+    },
+    map[string]string{"goA": "A", "goB": "B"}, // 可用 PathMap 或 Ends
+)
+sg.SetFinishPoint("A").SetFinishPoint("B")
+```
 
 ### 5. Memory（[examples/memory](examples/memory)）
 
@@ -434,6 +461,12 @@ go vet ./...
 ### 🌟 **开源灵感**
 
 感谢优秀的开源框架如 **ADK**、**Agno**、**CrewAI**、**AutoGen** 等的启发。站在巨人的肩膀上！🙏
+
+---
+
+## ⭐ Star 历史
+
+[![Star History Chart](https://api.star-history.com/svg?repos=trpc-group/trpc-agent-go&type=Date)](https://star-history.com/#trpc-group/trpc-agent-go&Date)
 
 ---
 

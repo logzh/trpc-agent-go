@@ -11,6 +11,7 @@ package processor
 
 import (
 	"context"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -285,14 +286,15 @@ func TestContentRequestProcessor_getSessionSummaryMessageWithTime(t *testing.T) 
 		{
 			name:            "nil session",
 			session:         nil,
-			includeContents: IncludeContentsFiltered,
-			expectedMsg:     nil,
-			expectedTime:    time.Time{},
+			includeContents: BranchFilterModePrefix,
+
+			expectedMsg:  nil,
+			expectedTime: time.Time{},
 		},
 		{
 			name:            "nil summaries",
 			session:         &session.Session{},
-			includeContents: IncludeContentsFiltered,
+			includeContents: BranchFilterModePrefix,
 			expectedMsg:     nil,
 			expectedTime:    time.Time{},
 		},
@@ -306,7 +308,7 @@ func TestContentRequestProcessor_getSessionSummaryMessageWithTime(t *testing.T) 
 					},
 				},
 			},
-			includeContents: IncludeContentsFiltered,
+			includeContents: BranchFilterModePrefix,
 			expectedMsg:     nil,
 			expectedTime:    time.Time{},
 		},
@@ -320,7 +322,7 @@ func TestContentRequestProcessor_getSessionSummaryMessageWithTime(t *testing.T) 
 					},
 				},
 			},
-			includeContents: IncludeContentsFiltered,
+			includeContents: BranchFilterModePrefix,
 			expectedMsg: &model.Message{
 				Role:    model.RoleSystem,
 				Content: "Test summary content",
@@ -341,7 +343,7 @@ func TestContentRequestProcessor_getSessionSummaryMessageWithTime(t *testing.T) 
 					},
 				},
 			},
-			includeContents: IncludeContentsAll,
+			includeContents: BranchFilterModeAll,
 			expectedMsg: &model.Message{
 				Role:    model.RoleSystem,
 				Content: "Full session summary",
@@ -352,7 +354,7 @@ func TestContentRequestProcessor_getSessionSummaryMessageWithTime(t *testing.T) 
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p := NewContentRequestProcessor(WithIncludeContents(tt.includeContents))
+			p := NewContentRequestProcessor(WithBranchFilterMode(tt.includeContents))
 
 			inv := agent.NewInvocation(
 				agent.WithInvocationSession(tt.session),
@@ -527,7 +529,7 @@ func TestContentRequestProcessor_getFilterIncrementalMessagesWithTime(t *testing
 				agent.WithInvocationEventFilterKey("test-filter"),
 			)
 
-			messages := p.getHistoryMessages(inv, tt.summaryUpdatedAt)
+			messages := p.getIncrementMessages(inv, tt.summaryUpdatedAt)
 
 			assert.Len(t, messages, tt.expectedCount)
 
@@ -676,7 +678,7 @@ func TestContentRequestProcessor_ConcurrentFilterIncrementalMessages(t *testing.
 	)
 
 	// Test single call
-	messages := p.getHistoryMessages(inv, time.Time{})
+	messages := p.getIncrementMessages(inv, time.Time{})
 	assert.Len(t, messages, 1, "Should get one message")
 	assert.Equal(t, "test message", messages[0].Content)
 
@@ -688,7 +690,7 @@ func TestContentRequestProcessor_ConcurrentFilterIncrementalMessages(t *testing.
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			messages := p.getHistoryMessages(inv, time.Time{})
+			messages := p.getIncrementMessages(inv, time.Time{})
 			results <- len(messages)
 		}()
 	}
@@ -871,7 +873,7 @@ func TestContentRequestProcessor_getFilterHistoryMessages(t *testing.T) {
 				agent.WithInvocationEventFilterKey("test-filter"),
 			)
 
-			messages := tt.processor.getHistoryMessages(inv, time.Time{})
+			messages := tt.processor.getIncrementMessages(inv, time.Time{})
 
 			assert.Equal(t, tt.expectedCount, len(messages))
 			for i, expectedContent := range tt.expectedContent {
@@ -1067,6 +1069,1423 @@ func TestContentRequestProcessor_Integration_MaxHistoryRunsAndAddSessionSummary(
 			}
 
 			assert.Equal(t, tt.expectedCount, messageCount, tt.description)
+		})
+	}
+}
+
+func Test_toMap(t *testing.T) {
+	type args struct {
+		ids []string
+	}
+	tests := []struct {
+		name string
+		args args
+		want map[string]bool
+	}{
+		{
+			name: "empty slice",
+			args: args{ids: []string{}},
+			want: map[string]bool{},
+		},
+		{
+			name: "single element",
+			args: args{ids: []string{"a"}},
+			want: map[string]bool{"a": true},
+		},
+		{
+			name: "multiple unique elements",
+			args: args{ids: []string{"a", "b", "c"}},
+			want: map[string]bool{"a": true, "b": true, "c": true},
+		},
+		{
+			name: "duplicate elements",
+			args: args{ids: []string{"a", "a", "b"}},
+			want: map[string]bool{"a": true, "b": true},
+		},
+		{
+			name: "empty string element",
+			args: args{ids: []string{"", "b"}},
+			want: map[string]bool{"": true, "b": true},
+		},
+		{
+			name: "nil slice",
+			args: args{ids: nil},
+			want: map[string]bool{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := toMap(tt.args.ids); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("toMap() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewContentRequestProcessor(t *testing.T) {
+
+	defaultWant := &ContentRequestProcessor{
+		BranchFilterMode:   "prefix",
+		AddContextPrefix:   true,
+		PreserveSameBranch: false,
+		TimelineFilterMode: "all",
+		AddSessionSummary:  false,
+		MaxHistoryRuns:     0,
+	}
+
+	tests := []struct {
+		name string
+		args []ContentOption
+		want *ContentRequestProcessor
+	}{
+
+		{
+			name: "no options",
+			args: nil,
+			want: defaultWant,
+		},
+
+		{
+			name: "single option - AddContextPrefix false",
+			args: []ContentOption{WithAddContextPrefix(false)},
+			want: func() *ContentRequestProcessor {
+				w := *defaultWant
+				w.AddContextPrefix = false
+				return &w
+			}(),
+		},
+
+		{
+			name: "multiple options",
+			args: []ContentOption{
+				WithAddContextPrefix(false),
+				WithPreserveSameBranch(false),
+				WithTimelineFilterMode(TimelineFilterCurrentRequest),
+				WithBranchFilterMode("all"),
+			},
+			want: &ContentRequestProcessor{
+				BranchFilterMode:   "all",
+				AddContextPrefix:   false,
+				PreserveSameBranch: false,
+				TimelineFilterMode: TimelineFilterCurrentRequest,
+				AddSessionSummary:  false,
+				MaxHistoryRuns:     0,
+			},
+		},
+
+		{
+			name: "option override",
+			args: []ContentOption{
+				WithAddContextPrefix(true),
+				WithAddContextPrefix(false),
+				WithPreserveSameBranch(true),
+				WithPreserveSameBranch(false),
+			},
+			want: func() *ContentRequestProcessor {
+				w := *defaultWant
+				w.AddContextPrefix = false
+				w.PreserveSameBranch = false
+				return &w
+			}(),
+		},
+
+		{
+			name: "empty options slice",
+			args: []ContentOption{},
+			want: defaultWant,
+		},
+
+		{
+			name: "unhandled fields remain default",
+			args: []ContentOption{
+				WithBranchFilterMode("exact"),
+			},
+			want: func() *ContentRequestProcessor {
+				w := *defaultWant
+				w.BranchFilterMode = "exact"
+				return &w
+			}(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NewContentRequestProcessor(tt.args...)
+
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("NewContentRequestProcessor() = %v, want %v", got, tt.want)
+			}
+
+			assert.Equal(t, tt.want.BranchFilterMode, got.BranchFilterMode, "IncludeContentFilterMode mismatch")
+			assert.Equal(t, tt.want.AddContextPrefix, got.AddContextPrefix,
+				"AddContextPrefix mismatch")
+			assert.Equal(t, tt.want.PreserveSameBranch,
+				got.PreserveSameBranch,
+				"PreserveSameBranch mismatch")
+			assert.Equal(t, tt.want.TimelineFilterMode,
+				got.TimelineFilterMode, "TimelineFilterMode mismatch")
+			assert.Equal(t, tt.want.AddSessionSummary,
+				got.AddSessionSummary, "AddSessionSummary mismatch")
+			assert.Equal(t, tt.want.MaxHistoryRuns, got.MaxHistoryRuns,
+				"MaxHistoryRuns mismatch")
+		})
+	}
+}
+
+func TestContentRequestProcessor_mergeUserMessages(t *testing.T) {
+	tests := []struct {
+		name     string
+		messages []model.Message
+		want     []model.Message
+		desc     string
+	}{
+		{
+			name:     "empty slice",
+			messages: nil,
+			want:     nil,
+			desc:     "nil input should return nil",
+		},
+		{
+			name: "single user message",
+			messages: []model.Message{
+				model.NewUserMessage("hello"),
+			},
+			want: []model.Message{
+				model.NewUserMessage("hello"),
+			},
+			desc: "single message should be unchanged",
+		},
+		{
+			name: "mixed roles unchanged",
+			messages: []model.Message{
+				model.NewUserMessage("hello"),
+				model.NewAssistantMessage("hi"),
+				model.NewUserMessage("there"),
+			},
+			want: []model.Message{
+				model.NewUserMessage("hello"),
+				model.NewAssistantMessage("hi"),
+				model.NewUserMessage("there"),
+			},
+			desc: "non-context user and assistant messages stay as-is",
+		},
+		{
+			name: "merge consecutive context users",
+			messages: []model.Message{
+				model.NewUserMessage(contextPrefix + " A"),
+				model.NewUserMessage(contextPrefix + " B"),
+				model.NewAssistantMessage("keep"),
+			},
+			want: []model.Message{
+				model.NewUserMessage(
+					contextPrefix + " A" + mergedUserSeparator +
+						contextPrefix + " B",
+				),
+				model.NewAssistantMessage("keep"),
+			},
+			desc: "context user messages are merged into one",
+		},
+		{
+			name: "merge context users with content parts",
+			messages: []model.Message{
+				{
+					Role:    model.RoleUser,
+					Content: contextPrefix + " A",
+					ContentParts: []model.ContentPart{
+						{
+							Type: model.ContentTypeText,
+							Text: func() *string {
+								text := "part A"
+								return &text
+							}(),
+						},
+					},
+				},
+				{
+					Role:    model.RoleUser,
+					Content: contextPrefix + " B",
+					ContentParts: []model.ContentPart{
+						{
+							Type: model.ContentTypeText,
+							Text: func() *string {
+								text := "part B"
+								return &text
+							}(),
+						},
+					},
+				},
+			},
+			want: []model.Message{
+				{
+					Role: model.RoleUser,
+					Content: contextPrefix + " A" +
+						mergedUserSeparator +
+						contextPrefix + " B",
+					ContentParts: []model.ContentPart{
+						{
+							Type: model.ContentTypeText,
+							Text: func() *string {
+								text := "part A"
+								return &text
+							}(),
+						},
+						{
+							Type: model.ContentTypeText,
+							Text: func() *string {
+								text := "part B"
+								return &text
+							}(),
+						},
+					},
+				},
+			},
+			desc: "content parts from context users are merged",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &ContentRequestProcessor{
+				AddContextPrefix: true,
+			}
+			got := p.mergeUserMessages(tt.messages)
+			assert.Equal(t, tt.want, got, tt.desc)
+		})
+	}
+}
+
+func TestContentRequestProcessor_mergeUserMessages_NoPrefix(t *testing.T) {
+	p := &ContentRequestProcessor{
+		AddContextPrefix: false,
+	}
+	messages := []model.Message{
+		model.NewUserMessage(contextPrefix + " one"),
+		model.NewUserMessage(contextPrefix + " two"),
+	}
+
+	got := p.mergeUserMessages(messages)
+
+	assert.Equal(t, messages, got,
+		"when AddContextPrefix is false messages should be unchanged")
+}
+
+func TestContentRequestProcessor_mergeFunctionResponseEvents(t *testing.T) {
+	type fields struct {
+		IncludeContentFilterMode string
+		AddContextPrefix         bool
+		AddSessionSummary        bool
+		MaxHistoryRuns           int
+		PreserveSameBranch       bool
+	}
+	type args struct {
+		functionResponseEvents []event.Event
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		args   args
+		want   event.Event
+	}{
+		{
+			name: "empty input",
+			args: args{
+				functionResponseEvents: []event.Event{},
+			},
+			want: event.Event{},
+		},
+		{
+			name: "single event with valid choices",
+			args: args{
+				functionResponseEvents: []event.Event{
+					{
+						Author: "agent1",
+						Response: &model.Response{
+							Choices: []model.Choice{
+								{
+									Message: model.Message{
+										ToolID:  "tool1",
+										Content: "result1",
+									},
+								},
+								{
+									Message: model.Message{
+										ToolID:  "tool2",
+										Content: "result2",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: event.Event{
+				Author: "agent1",
+				Response: &model.Response{
+					Choices: []model.Choice{
+						{
+							Message: model.Message{
+								ToolID:  "tool1",
+								Content: "result1",
+							},
+						},
+						{
+							Message: model.Message{
+								ToolID:  "tool2",
+								Content: "result2",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "multiple events with valid choices",
+			args: args{
+				functionResponseEvents: []event.Event{
+					{
+						Author: "agent1",
+						Response: &model.Response{
+							Choices: []model.Choice{
+								{
+									Message: model.Message{
+										ToolID:  "tool1",
+										Content: "result1",
+									},
+								},
+							},
+						},
+					},
+					{
+						Author: "agent2",
+						Response: &model.Response{
+							Choices: []model.Choice{
+								{
+									Message: model.Message{
+										ToolID:  "tool2",
+										Content: "result2",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: event.Event{
+				Author: "agent1",
+				Response: &model.Response{
+					Choices: []model.Choice{
+						{
+							Message: model.Message{
+								ToolID:  "tool1",
+								Content: "result1",
+							},
+						},
+						{
+							Message: model.Message{
+								ToolID:  "tool2",
+								Content: "result2",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "event with invalid choices",
+			args: args{
+				functionResponseEvents: []event.Event{
+					{
+						Author: "agent1",
+						Response: &model.Response{
+							Choices: []model.Choice{
+								{
+									Message: model.Message{
+										ToolID: "tool1",
+									},
+								},
+								{
+									Message: model.Message{
+										Content: "result2",
+									},
+								},
+								{
+									Message: model.Message{
+										ToolID:  "tool3",
+										Content: "result3",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: event.Event{
+				Author: "agent1",
+				Response: &model.Response{
+					Choices: []model.Choice{
+						{
+							Message: model.Message{
+								ToolID:  "tool3",
+								Content: "result3",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "multiple events with mixed choices",
+			args: args{
+				functionResponseEvents: []event.Event{
+					{
+						Author: "agent1",
+						Response: &model.Response{
+							Choices: []model.Choice{
+								{
+									Message: model.Message{
+										ToolID: "tool1",
+									},
+								},
+								{
+									Message: model.Message{
+										ToolID:  "tool2",
+										Content: "result2",
+									},
+								},
+							},
+						},
+					},
+					{
+						Author: "agent2",
+						Response: &model.Response{
+							Choices: []model.Choice{
+								{
+									Message: model.Message{
+										ToolID:  "tool3",
+										Content: "result3",
+									},
+								},
+								{
+									Message: model.Message{
+										Content: "result4",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: event.Event{
+				Author: "agent1",
+				Response: &model.Response{
+					Choices: []model.Choice{
+						{
+							Message: model.Message{
+								ToolID:  "tool2",
+								Content: "result2",
+							},
+						},
+						{
+							Message: model.Message{
+								ToolID:  "tool3",
+								Content: "result3",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "first event has no choices",
+			args: args{
+				functionResponseEvents: []event.Event{
+					{
+						Author:   "agent1",
+						Response: &model.Response{},
+					},
+					{
+						Author: "agent2",
+						Response: &model.Response{
+							Choices: []model.Choice{
+								{
+									Message: model.Message{
+										ToolID:  "tool1",
+										Content: "result1",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: event.Event{
+				Author: "agent1",
+				Response: &model.Response{
+					Choices: []model.Choice{
+						{
+							Message: model.Message{
+								ToolID:  "tool1",
+								Content: "result1",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &ContentRequestProcessor{
+				BranchFilterMode:   tt.fields.IncludeContentFilterMode,
+				AddContextPrefix:   tt.fields.AddContextPrefix,
+				AddSessionSummary:  tt.fields.AddSessionSummary,
+				MaxHistoryRuns:     tt.fields.MaxHistoryRuns,
+				PreserveSameBranch: tt.fields.PreserveSameBranch,
+			}
+			if got := p.mergeFunctionResponseEvents(tt.args.functionResponseEvents); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("%q. mergeFunctionResponseEvents() = %v, want %v", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestContentRequestProcessor_isOtherAgentReply(t *testing.T) {
+	type fields struct {
+		PreserveSameBranch bool
+	}
+	type args struct {
+		currentAgentName string
+		currentBranch    string
+		evt              *event.Event
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		args   args
+		want   bool
+	}{
+
+		{
+			name: "nil event",
+			fields: fields{
+				PreserveSameBranch: true,
+			},
+			args: args{
+				currentAgentName: "agent1",
+				currentBranch:    "branch1",
+				evt:              nil,
+			},
+			want: false,
+		},
+
+		{
+			name: "empty agent name",
+			fields: fields{
+				PreserveSameBranch: true,
+			},
+			args: args{
+				currentAgentName: "",
+				currentBranch:    "branch1",
+				evt: &event.Event{
+					Author: "agent2",
+					Branch: "branch2",
+				},
+			},
+			want: false,
+		},
+
+		{
+			name: "user event",
+			fields: fields{
+				PreserveSameBranch: true,
+			},
+			args: args{
+				currentAgentName: "agent1",
+				currentBranch:    "branch1",
+				evt: &event.Event{
+					Author: "user",
+				},
+			},
+			want: false,
+		},
+
+		{
+			name: "self agent event",
+			fields: fields{
+				PreserveSameBranch: true,
+			},
+			args: args{
+				currentAgentName: "agent1",
+				currentBranch:    "branch1",
+				evt: &event.Event{
+					Author: "agent1",
+					Branch: "branch1",
+				},
+			},
+			want: false,
+		},
+
+		{
+			name: "same branch with preserve",
+			fields: fields{
+				PreserveSameBranch: true,
+			},
+			args: args{
+				currentAgentName: "agent1",
+				currentBranch:    "branch1",
+				evt: &event.Event{
+					Author: "agent2",
+					Branch: "branch1",
+				},
+			},
+			want: false,
+		},
+
+		{
+			name: "child branch with preserve",
+			fields: fields{
+				PreserveSameBranch: true,
+			},
+			args: args{
+				currentAgentName: "agent1",
+				currentBranch:    "branch1",
+				evt: &event.Event{
+					Author: "agent2",
+					Branch: "branch1/child",
+				},
+			},
+			want: false,
+		},
+
+		{
+			name: "parent branch with preserve",
+			fields: fields{
+				PreserveSameBranch: true,
+			},
+			args: args{
+				currentAgentName: "agent1",
+				currentBranch:    "branch1/child",
+				evt: &event.Event{
+					Author: "agent2",
+					Branch: "branch1",
+				},
+			},
+			want: false,
+		},
+
+		{
+			name: "unrelated branch with preserve",
+			fields: fields{
+				PreserveSameBranch: true,
+			},
+			args: args{
+				currentAgentName: "agent1",
+				currentBranch:    "branch1",
+				evt: &event.Event{
+					Author: "agent2",
+					Branch: "branch2",
+				},
+			},
+			want: true,
+		},
+
+		{
+			name: "same branch without preserve",
+			fields: fields{
+				PreserveSameBranch: false,
+			},
+			args: args{
+				currentAgentName: "agent1",
+				currentBranch:    "branch1",
+				evt: &event.Event{
+					Author: "agent2",
+					Branch: "branch1",
+				},
+			},
+			want: true,
+		},
+
+		{
+			name: "empty branch",
+			fields: fields{
+				PreserveSameBranch: true,
+			},
+			args: args{
+				currentAgentName: "agent1",
+				currentBranch:    "",
+				evt: &event.Event{
+					Author: "agent2",
+					Branch: "",
+				},
+			},
+			want: true,
+		},
+
+		{
+			name: "exact branch match",
+			fields: fields{
+				PreserveSameBranch: true,
+			},
+			args: args{
+				currentAgentName: "agent1",
+				currentBranch:    "branch1",
+				evt: &event.Event{
+					Author: "agent2",
+					Branch: "branch1",
+				},
+			},
+			want: false,
+		},
+
+		{
+			name: "branch prefix match",
+			fields: fields{
+				PreserveSameBranch: true,
+			},
+			args: args{
+				currentAgentName: "agent1",
+				currentBranch:    "branch1",
+				evt: &event.Event{
+					Author: "agent2",
+					Branch: "branch1/child",
+				},
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &ContentRequestProcessor{
+				PreserveSameBranch: tt.fields.PreserveSameBranch,
+			}
+			if got := p.isOtherAgentReply(
+				tt.args.currentAgentName,
+				tt.args.currentBranch,
+				tt.args.evt,
+			); got != tt.want {
+				t.Errorf("isOtherAgentReply() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func getSession(evts ...event.Event) *session.Session {
+	return &session.Session{
+		Events: evts,
+	}
+}
+
+func createEvent(requestID, invocationID, filterKey, content string, timestamp time.Time, isPartial bool) event.Event {
+	evt := event.Event{
+		Author:       "assistant",
+		RequestID:    requestID,
+		InvocationID: invocationID,
+		FilterKey:    filterKey,
+		Timestamp:    timestamp,
+		Version:      event.CurrentVersion,
+		Response: &model.Response{
+			IsPartial: false,
+			Choices: []model.Choice{
+				{
+					Message: model.Message{
+						Role:    model.RoleAssistant,
+						Content: content,
+					},
+				},
+			},
+		},
+	}
+	if isPartial {
+		evt.Response = &model.Response{
+			IsPartial: true,
+			Choices: []model.Choice{
+				{
+					Delta: model.Message{
+						Role:    model.RoleAssistant,
+						Content: content,
+					},
+				},
+			},
+		}
+	}
+	return evt
+}
+
+func TestContentRequestProcessor_IncludeContentsNoneSkipsHistory(t *testing.T) {
+	p := NewContentRequestProcessor()
+
+	sess := &session.Session{
+		Events: []event.Event{
+			{
+				Author: "user",
+				Response: &model.Response{
+					Choices: []model.Choice{
+						{
+							Message: model.Message{
+								Role:    model.RoleUser,
+								Content: "old message",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	inv := agent.NewInvocation(
+		agent.WithInvocationSession(sess),
+		agent.WithInvocationMessage(model.NewUserMessage("current")),
+	)
+	inv.RunOptions = agent.RunOptions{
+		RuntimeState: map[string]any{
+			"include_contents": "none",
+		},
+	}
+
+	req := &model.Request{}
+	p.ProcessRequest(context.Background(), inv, req, nil)
+
+	if len(req.Messages) != 1 {
+		t.Fatalf("expected only invocation message, got %d messages", len(req.Messages))
+	}
+	msg := req.Messages[0]
+	if msg.Role != model.RoleUser || msg.Content != "current" {
+		t.Fatalf("unexpected message: %+v", msg)
+	}
+}
+
+func TestContentRequestProcessor_getFilterIncrementMessages(t *testing.T) {
+	baseTime := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	sess := getSession(
+		// invalid content
+		createEvent("test-request-id", "test-invocation-id", "test-filter", "message1", baseTime.Add(time.Second), true),
+		// different requestID and invocationID
+		createEvent("test-request-id-2", "test-invocation-id-4", "test-filter", "message2", baseTime.Add(time.Second), false),
+		createEvent("test-request-id-3", "test-invocation-id-5", "test-filter/a", "message3", baseTime.Add(time.Second), false),
+		createEvent("test-request-id-4", "test-invocation-id-6", "test-filter-a", "message4", baseTime.Add(time.Second), false),
+		createEvent("test-request-id-2", "test-invocation-id-4", "test-filter", "message5", baseTime.Add(-10*time.Second), false),
+		createEvent("test-request-id-3", "test-invocation-id-5", "test-filter/a", "message6", baseTime.Add(-10*time.Second), false),
+		createEvent("test-request-id-4", "test-invocation-id-6", "test-filter-a", "message7", baseTime.Add(-10*time.Second), false),
+
+		// same requestID and different invocationID
+		createEvent("test-request-id", "test-invocation-id-1", "test-filter", "message8", baseTime.Add(time.Second), false),
+		createEvent("test-request-id", "test-invocation-id-2", "test-filter/a", "message9", baseTime.Add(time.Second), false),
+		createEvent("test-request-id", "test-invocation-id-3", "test-filter-a", "message10", baseTime.Add(time.Second), false),
+		createEvent("test-request-id", "test-invocation-id-1", "test-filter", "message11", baseTime.Add(-10*time.Second), false),
+		createEvent("test-request-id", "test-invocation-id-2", "test-filter/a", "message12", baseTime.Add(-10*time.Second), false),
+		createEvent("test-request-id", "test-invocation-id-3", "test-filter-a", "message13", baseTime.Add(-10*time.Second), false),
+
+		// same requestID and invocationID
+		createEvent("test-request-id", "test-invocation-id", "test-filter", "message14", baseTime.Add(time.Second), false),
+		createEvent("test-request-id", "test-invocation-id", "test-filter/a", "message15", baseTime.Add(time.Second), false),
+		createEvent("test-request-id", "test-invocation-id", "test-filter-a", "message16", baseTime.Add(time.Second), false),
+		createEvent("test-request-id", "test-invocation-id", "test-filter", "message17", baseTime.Add(-10*time.Second), false),
+		createEvent("test-request-id", "test-invocation-id", "test-filter/a", "message18", baseTime.Add(-10*time.Second), false),
+		createEvent("test-request-id", "test-invocation-id", "test-filter-a", "message19", baseTime.Add(-10*time.Second), false),
+	)
+	inv := agent.NewInvocation(
+		agent.WithInvocationEventFilterKey("test-filter"),
+		agent.WithInvocationSession(sess),
+		agent.WithInvocationRunOptions(agent.RunOptions{
+			RequestID: "test-request-id",
+		}),
+	)
+	inv.InvocationID = "test-invocation-id"
+
+	tests := []struct {
+		name               string
+		summaryUpdatedAt   time.Time
+		expectedCount      int
+		expectedContent    []string
+		timelineFilterMode string
+		branchFilterMode   string
+	}{
+		{
+			name:             "BranchFilterModeAll and TimelineFilterAll and zero time",
+			expectedCount:    18,
+			summaryUpdatedAt: time.Time{},
+			expectedContent: []string{
+				"message2", "message3", "message4", "message5", "message6", "message7",
+				"message8", "message9", "message10", "message11", "message12", "message13",
+				"message14", "message15", "message16", "message17", "message18", "message19",
+			},
+			branchFilterMode:   BranchFilterModeAll,
+			timelineFilterMode: TimelineFilterAll,
+		},
+		{
+			name:             "BranchFilterPrefix and TimelineFilterAll and zero time",
+			expectedCount:    12,
+			summaryUpdatedAt: time.Time{},
+			expectedContent: []string{
+				"message2", "message3", "message5", "message6",
+				"message8", "message9", "message11", "message12",
+				"message14", "message15", "message17", "message18",
+			},
+			branchFilterMode:   BranchFilterModePrefix,
+			timelineFilterMode: TimelineFilterAll,
+		},
+		{
+			name:             "BranchFilterModeExact and TimelineFilterAll and zero time",
+			expectedCount:    6,
+			summaryUpdatedAt: time.Time{},
+			expectedContent: []string{
+				"message2", "message5",
+				"message8", "message11",
+				"message14", "message17",
+			},
+			branchFilterMode:   BranchFilterModeExact,
+			timelineFilterMode: TimelineFilterAll,
+		},
+		{
+			name:             "BranchFilterModeAll and TimelineFilterCurrentRequest and zero time",
+			expectedCount:    12,
+			summaryUpdatedAt: time.Time{},
+			expectedContent: []string{
+				"message8", "message9", "message10", "message11", "message12", "message13",
+				"message14", "message15", "message16", "message17", "message18", "message19",
+			},
+			branchFilterMode:   BranchFilterModeAll,
+			timelineFilterMode: TimelineFilterCurrentRequest,
+		},
+		{
+			name:             "BranchFilterModeAll and TimelineFilterCurrentInvocation and zero time",
+			expectedCount:    6,
+			summaryUpdatedAt: time.Time{},
+			expectedContent: []string{
+				"message14", "message15", "message16", "message17", "message18", "message19",
+			},
+			branchFilterMode:   BranchFilterModeAll,
+			timelineFilterMode: TimelineFilterCurrentInvocation,
+		},
+		{
+			name:             "BranchFilterModeAll and TimelineFilterAll and has time",
+			summaryUpdatedAt: baseTime,
+			expectedCount:    9,
+			expectedContent: []string{
+				"message2", "message3", "message4",
+				"message8", "message9", "message10",
+				"message14", "message15", "message16",
+			},
+			branchFilterMode:   BranchFilterModeAll,
+			timelineFilterMode: TimelineFilterAll,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewContentRequestProcessor(
+				WithBranchFilterMode(tt.branchFilterMode),
+				WithTimelineFilterMode(tt.timelineFilterMode),
+			)
+
+			messages := p.getIncrementMessages(inv, tt.summaryUpdatedAt)
+
+			assert.Len(t, messages, tt.expectedCount)
+
+			for i, expectedContent := range tt.expectedContent {
+				assert.Equal(t, expectedContent, messages[i].Content)
+			}
+		})
+	}
+}
+
+func TestContentRequestProcessor_shouldIncludeEvent(t *testing.T) {
+	baseTime := time.Now()
+	sinceTime := baseTime.Add(-time.Hour)
+
+	tests := []struct {
+		name     string
+		setup    func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time)
+		expected bool
+	}{
+		{
+			name: "nil response",
+			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
+				p := &ContentRequestProcessor{}
+				evt := event.Event{}
+				inv := &agent.Invocation{}
+				return p, evt, inv, "", true, baseTime
+			},
+			expected: false,
+		},
+		{
+			name: "is partial event",
+			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
+				p := &ContentRequestProcessor{}
+				evt := event.Event{
+					RequestID:    "123",
+					InvocationID: "123",
+					Version:      event.CurrentVersion,
+					Response: &model.Response{
+						IsPartial: true,
+						Choices: []model.Choice{
+							{
+								Delta: model.Message{
+									Content: "test-content",
+								},
+							},
+						},
+					},
+				}
+				inv := &agent.Invocation{InvocationID: "123", RunOptions: agent.RunOptions{RequestID: "123"}}
+				return p, evt, inv, "", true, baseTime
+			},
+			expected: false,
+		},
+		{
+			name: "invalid content",
+			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
+				p := &ContentRequestProcessor{}
+				evt := event.Event{
+					RequestID:    "123",
+					InvocationID: "123",
+					Version:      event.CurrentVersion,
+					Response: &model.Response{
+						Choices: []model.Choice{
+							{
+								Message: model.Message{
+									Content: "",
+								},
+							},
+						},
+					},
+				}
+				inv := &agent.Invocation{InvocationID: "123", RunOptions: agent.RunOptions{RequestID: "123"}}
+				return p, evt, inv, "", true, baseTime
+			},
+			expected: false,
+		},
+		{
+			name: "timestamp before since when not zero time",
+			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
+				p := &ContentRequestProcessor{}
+				evt := event.Event{
+					RequestID:    "123",
+					InvocationID: "123",
+					Version:      event.CurrentVersion,
+					Response: &model.Response{
+						Choices: []model.Choice{
+							{
+								Message: model.Message{
+									Content: "content",
+								},
+							},
+						},
+					},
+					Timestamp: sinceTime.Add(-time.Hour),
+				}
+				inv := &agent.Invocation{InvocationID: "123", RunOptions: agent.RunOptions{RequestID: "123"}}
+				return p, evt, inv, "", false, sinceTime
+			},
+			expected: false,
+		},
+		{
+			name: "TimelineFilterCurrentRequest with different request ID",
+			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
+				p := &ContentRequestProcessor{
+					TimelineFilterMode: TimelineFilterCurrentRequest,
+				}
+				evt := event.Event{
+					RequestID: "req1",
+					Version:   event.CurrentVersion,
+					Response: &model.Response{
+						Choices: []model.Choice{
+							{
+								Message: model.Message{
+									Content: "content",
+								},
+							},
+						},
+					},
+					Timestamp: baseTime,
+				}
+				inv := &agent.Invocation{
+					RunOptions: agent.RunOptions{RequestID: "req2"},
+				}
+				return p, evt, inv, "", true, baseTime
+			},
+			expected: false,
+		},
+		{
+			name: "TimelineFilterCurrentRequest with same request ID",
+			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
+				p := &ContentRequestProcessor{
+					TimelineFilterMode: TimelineFilterCurrentRequest,
+				}
+				evt := event.Event{
+					Version: event.CurrentVersion,
+					Response: &model.Response{
+						Choices: []model.Choice{
+							{
+								Message: model.Message{
+									Content: "content",
+								},
+							},
+						},
+					},
+					Timestamp: baseTime,
+					RequestID: "req1",
+				}
+				inv := &agent.Invocation{
+					RunOptions: agent.RunOptions{RequestID: "req1"},
+				}
+				return p, evt, inv, "", true, baseTime
+			},
+			expected: true,
+		},
+		{
+			name: "TimelineFilterCurrentInvocation with same invocation ID",
+			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
+				p := &ContentRequestProcessor{
+					TimelineFilterMode: TimelineFilterCurrentInvocation,
+				}
+				evt := event.Event{
+					Version: event.CurrentVersion,
+					Response: &model.Response{
+						Choices: []model.Choice{
+							{
+								Message: model.Message{
+									Content: "content",
+								},
+							},
+						},
+					},
+					Timestamp:    baseTime,
+					InvocationID: "inv1",
+				}
+				inv := &agent.Invocation{
+					InvocationID: "inv1",
+				}
+				return p, evt, inv, "", true, baseTime
+			},
+			expected: true,
+		},
+		{
+			name: "TimelineFilterCurrentInvocation with different invocation ID and non-user message",
+			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
+				p := &ContentRequestProcessor{
+					TimelineFilterMode: TimelineFilterCurrentInvocation,
+				}
+				evt := event.Event{
+					Version: event.CurrentVersion,
+					Response: &model.Response{
+						Choices: []model.Choice{
+							{
+								Message: model.Message{
+									Content: "content",
+								},
+							},
+						},
+					},
+					Timestamp:    baseTime,
+					InvocationID: "inv1",
+				}
+				inv := &agent.Invocation{
+					InvocationID: "inv2",
+				}
+				return p, evt, inv, "", true, baseTime
+			},
+			expected: false,
+		},
+		{
+			name: "TimelineFilterCurrentInvocation with different invocation ID, user message, but different request ID",
+			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
+				p := &ContentRequestProcessor{
+					TimelineFilterMode: TimelineFilterCurrentInvocation,
+				}
+				evt := event.Event{
+					Version: event.CurrentVersion,
+					Response: &model.Response{
+						Choices: []model.Choice{
+							{Message: model.Message{Content: "test content", Role: model.RoleUser}},
+						},
+					},
+					Timestamp:    baseTime,
+					InvocationID: "inv1",
+					RequestID:    "req1",
+				}
+				inv := &agent.Invocation{
+					InvocationID: "inv2",
+					Message:      model.Message{Content: "test content"},
+					RunOptions:   agent.RunOptions{RequestID: "req2"},
+				}
+				return p, evt, inv, "", true, baseTime
+			},
+			expected: false,
+		},
+		{
+			name: "TimelineFilterCurrentInvocation with different invocation ID, user message, but different content",
+			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
+				p := &ContentRequestProcessor{
+					TimelineFilterMode: TimelineFilterCurrentInvocation,
+				}
+				evt := event.Event{
+					Version: event.CurrentVersion,
+					Response: &model.Response{
+						Choices: []model.Choice{
+							{Message: model.Message{Content: "content1", Role: model.RoleUser}},
+						},
+					},
+					Timestamp:    baseTime,
+					InvocationID: "inv1",
+					RequestID:    "req1",
+				}
+				inv := &agent.Invocation{
+					InvocationID: "inv2",
+					Message:      model.Message{Content: "content2"},
+					RunOptions:   agent.RunOptions{RequestID: "req1"},
+				}
+				return p, evt, inv, "", true, baseTime
+			},
+			expected: false,
+		},
+		{
+			name: "TimelineFilterCurrentInvocation with different invocation ID, user message, matching request ID and content",
+			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
+				p := &ContentRequestProcessor{
+					TimelineFilterMode: TimelineFilterCurrentInvocation,
+				}
+				evt := event.Event{
+					Version: event.CurrentVersion,
+					Response: &model.Response{
+						Choices: []model.Choice{
+							{Message: model.Message{Content: "test content", Role: model.RoleUser}},
+						},
+					},
+					Timestamp:    baseTime,
+					InvocationID: "inv1",
+					RequestID:    "req1",
+				}
+				inv := &agent.Invocation{
+					InvocationID: "inv2",
+					Message:      model.Message{Content: "test content"},
+					RunOptions:   agent.RunOptions{RequestID: "req1"},
+				}
+				return p, evt, inv, "", true, baseTime
+			},
+			expected: true,
+		},
+		{
+			name: "BranchFilterModeExact with different filter key",
+			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
+				p := &ContentRequestProcessor{
+					BranchFilterMode: BranchFilterModeExact,
+				}
+				evt := event.Event{
+					Version: event.CurrentVersion,
+					Response: &model.Response{
+						Choices: []model.Choice{
+							{Message: model.Message{Content: "test content"}},
+						},
+					},
+					Timestamp: baseTime,
+					FilterKey: "filter1",
+				}
+				inv := &agent.Invocation{}
+				return p, evt, inv, "filter2", true, baseTime
+			},
+			expected: false,
+		},
+		{
+			name: "BranchFilterModeExact with same filter key",
+			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
+				p := &ContentRequestProcessor{
+					BranchFilterMode: BranchFilterModeExact,
+				}
+				evt := event.Event{
+					Version: event.CurrentVersion,
+					Response: &model.Response{
+						Choices: []model.Choice{
+							{Message: model.Message{Content: "test content"}},
+						},
+					},
+					Timestamp: baseTime,
+					FilterKey: "filter1",
+				}
+				inv := &agent.Invocation{}
+				return p, evt, inv, "filter1", true, baseTime
+			},
+			expected: true,
+		},
+		{
+			name: "BranchFilterModePrefix with non-matching filter",
+			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
+				p := &ContentRequestProcessor{
+					BranchFilterMode: BranchFilterModePrefix,
+				}
+				evt := event.Event{
+					Version:   event.CurrentVersion,
+					FilterKey: "filter1",
+					Response: &model.Response{
+						Choices: []model.Choice{
+							{Message: model.Message{Content: "test content"}},
+						},
+					},
+					Timestamp: baseTime,
+				}
+				inv := &agent.Invocation{}
+				return p, evt, inv, "filter", true, baseTime
+			},
+			expected: false,
+		},
+		{
+			name: "BranchFilterModePrefix with matching filter",
+			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
+				p := &ContentRequestProcessor{
+					BranchFilterMode: BranchFilterModePrefix,
+				}
+				evt := event.Event{
+					Version:   event.CurrentVersion,
+					FilterKey: "filter/a",
+					Response: &model.Response{
+						Choices: []model.Choice{
+							{Message: model.Message{Content: "test content"}},
+						},
+					},
+					Timestamp: baseTime,
+				}
+				inv := &agent.Invocation{}
+				return p, evt, inv, "filter", true, baseTime
+			},
+			expected: true,
+		},
+		{
+			name: "all conditions satisfied",
+			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
+				p := &ContentRequestProcessor{
+					TimelineFilterMode: TimelineFilterCurrentRequest,
+					BranchFilterMode:   BranchFilterModeExact,
+				}
+				evt := event.Event{
+					Version: event.CurrentVersion,
+					Response: &model.Response{
+						Choices: []model.Choice{
+							{Message: model.Message{Content: "test content"}},
+						},
+					},
+					Timestamp: baseTime,
+					RequestID: "req1",
+					FilterKey: "filter1",
+				}
+				inv := &agent.Invocation{
+					RunOptions: agent.RunOptions{RequestID: "req1"},
+				}
+				return p, evt, inv, "filter1", true, baseTime
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p, evt, inv, filter, isZeroTime, since := tt.setup()
+			result := p.shouldIncludeEvent(evt, inv, filter, isZeroTime, since)
+			if result != tt.expected {
+				t.Errorf("shouldIncludeEvent() = %v, want %v", result, tt.expected)
+			}
 		})
 	}
 }

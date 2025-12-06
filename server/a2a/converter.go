@@ -15,6 +15,7 @@ import (
 
 	"trpc.group/trpc-go/trpc-a2a-go/protocol"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	ia2a "trpc.group/trpc-go/trpc-agent-go/internal/a2a"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
@@ -68,22 +69,28 @@ func (c *defaultA2AMessageToAgentMessage) ConvertToAgentMessage(
 	for _, part := range message.Parts {
 		switch part.GetKind() {
 		case protocol.KindText:
-			p, ok := part.(*protocol.TextPart)
-			if !ok {
+			var textPart *protocol.TextPart
+			if p, ok := part.(*protocol.TextPart); ok {
+				textPart = p
+			} else if p, ok := part.(protocol.TextPart); ok {
+				textPart = &p
+			} else {
 				continue
 			}
-			content += p.Text
-			contentParts = append(contentParts, model.ContentPart{
-				Type: model.ContentTypeText,
-				Text: &p.Text,
-			})
+			// Only add to content string, not to contentParts
+			// to avoid duplication when converting back to A2A message
+			content += textPart.Text
 		case protocol.KindFile:
-			f, ok := part.(*protocol.FilePart)
-			if !ok {
+			var filePart *protocol.FilePart
+			if f, ok := part.(*protocol.FilePart); ok {
+				filePart = f
+			} else if f, ok := part.(protocol.FilePart); ok {
+				filePart = &f
+			} else {
 				continue
 			}
 			// Convert FilePart to model.ContentPart
-			switch fileData := f.File.(type) {
+			switch fileData := filePart.File.(type) {
 			case *protocol.FileWithBytes:
 				// Handle file with bytes data
 				fileName := ""
@@ -122,12 +129,15 @@ func (c *defaultA2AMessageToAgentMessage) ConvertToAgentMessage(
 				})
 			}
 		case protocol.KindData:
-			d, ok := part.(*protocol.DataPart)
-			if !ok {
+			var dataPart *protocol.DataPart
+			if d, ok := part.(*protocol.DataPart); ok {
+				dataPart = d
+			} else if d, ok := part.(protocol.DataPart); ok {
+				dataPart = &d
+			} else {
 				continue
 			}
-			// Convert DataPart to text
-			dataStr := fmt.Sprintf("%s", d.Data)
+			dataStr := fmt.Sprintf("%s", dataPart.Data)
 			contentParts = append(contentParts, model.ContentPart{
 				Type: model.ContentTypeText,
 				Text: &dataStr,
@@ -146,10 +156,12 @@ func (c *defaultA2AMessageToAgentMessage) ConvertToAgentMessage(
 }
 
 // defaultEventToA2AMessage is the default implementation of EventToA2AMessageConverter.
-type defaultEventToA2AMessage struct{}
+type defaultEventToA2AMessage struct {
+	adkCompatibility bool // Enable ADK-compatible metadata keys (e.g., "adk_type" instead of "type")
+}
 
 // ConvertToA2AMessage converts an Agent event to an A2A protocol message.
-// For non-streaming responses, it returns the full content and filters out toolcall events.
+// For non-streaming responses, it returns the full content including tool calls.
 func (c *defaultEventToA2AMessage) ConvertToA2AMessage(
 	ctx context.Context,
 	event *event.Event,
@@ -164,17 +176,25 @@ func (c *defaultEventToA2AMessage) ConvertToA2AMessage(
 			event.ID, event.Response.Error)
 	}
 
-	// Filter out toolcall events for non-streaming responses
-	if isToolCallEvent(event) || len(event.Response.Choices) == 0 {
-		return nil, nil
-	}
-
 	// Additional safety check for choices array bounds
 	if len(event.Response.Choices) == 0 {
 		log.Debugf("no choices in response, event: %v", event.ID)
 		return nil, nil
 	}
 
+	// Check if this is a tool call event
+	if isToolCallEvent(event) {
+		return c.convertToolCallToA2AMessage(event)
+	}
+
+	return c.convertContentToA2AMessage(event)
+}
+
+// convertContentToA2AMessage converts message content to A2A message.
+// It creates a message with text parts containing the content.
+func (c *defaultEventToA2AMessage) convertContentToA2AMessage(
+	event *event.Event,
+) (protocol.UnaryMessageResult, error) {
 	choice := event.Response.Choices[0]
 	if choice.Message.Content != "" {
 		var parts []protocol.Part
@@ -188,7 +208,7 @@ func (c *defaultEventToA2AMessage) ConvertToA2AMessage(
 }
 
 // ConvertStreamingToA2AMessage converts an Agent event to an A2A protocol message for streaming.
-// For streaming responses, it returns delta content and filters out tool call events.
+// For streaming responses, it returns delta content as task artifact updates and converts tool calls.
 func (c *defaultEventToA2AMessage) ConvertStreamingToA2AMessage(
 	ctx context.Context,
 	event *event.Event,
@@ -203,29 +223,42 @@ func (c *defaultEventToA2AMessage) ConvertStreamingToA2AMessage(
 			event.ID, event.Response.Error)
 	}
 
-	// Filter out tool call events for streaming responses
-	if isToolCallEvent(event) || len(event.Response.Choices) == 0 {
-		return nil, nil
-	}
-
 	// Additional safety check for choices array bounds
 	if len(event.Response.Choices) == 0 {
 		log.Debugf("no choices in response, event: %v", event.ID)
 		return nil, nil
 	}
 
-	var parts []protocol.Part
+	// Check if this is a tool call event
+	if isToolCallEvent(event) {
+		return c.convertToolCallToA2AStreamingMessage(event, options)
+	}
+
+	return c.convertDeltaContentToA2AStreamingMessage(event, options)
+}
+
+// convertDeltaContentToA2AStreamingMessage converts delta content to A2A streaming message.
+// It creates a task artifact update event for incremental content updates.
+func (c *defaultEventToA2AMessage) convertDeltaContentToA2AStreamingMessage(
+	event *event.Event,
+	options EventToA2AStreamingOptions,
+) (protocol.StreamingMessageResult, error) {
 	choice := event.Response.Choices[0]
-	// Use delta choice.Message.Content for non-streaming events mixed in streaming
+	// Use delta content for streaming updates
 	if choice.Delta.Content != "" {
-		parts = append(parts, protocol.NewTextPart(choice.Delta.Content))
-		taskStatus := protocol.NewTaskArtifactUpdateEvent(
+		parts := []protocol.Part{protocol.NewTextPart(choice.Delta.Content)}
+		// Send as task artifact update (not status update) for incremental content
+		// This follows ADK pattern: artifacts for content, status for state changes
+		taskArtifact := protocol.NewTaskArtifactUpdateEvent(
 			options.TaskID,
 			options.CtxID,
-			protocol.Artifact{Parts: parts},
+			protocol.Artifact{
+				ArtifactID: event.Response.ID,
+				Parts:      parts,
+			},
 			false,
 		)
-		return &taskStatus, nil
+		return &taskArtifact, nil
 	}
 
 	log.Debugf("delta content is empty, event: %v", event)
@@ -256,4 +289,114 @@ func isToolCallEvent(event *event.Event) bool {
 	}
 
 	return false
+}
+
+// convertToolCallToA2AMessage converts tool call events to A2A DataPart messages.
+// This handles both tool call requests and tool call responses.
+func (c *defaultEventToA2AMessage) convertToolCallToA2AMessage(
+	event *event.Event) (protocol.UnaryMessageResult, error) {
+	if len(event.Response.Choices) == 0 {
+		return nil, nil
+	}
+
+	var parts []protocol.Part
+
+	// Handle tool call requests (assistant making function calls)
+	// OpenAI returns tool calls in a single choice with multiple ToolCalls
+	choice := event.Response.Choices[0]
+	if len(choice.Message.ToolCalls) > 0 {
+		for _, toolCall := range choice.Message.ToolCalls {
+			// Convert ToolCall to map for DataPart
+			toolCallData := map[string]any{
+				ia2a.ToolCallFieldID:   toolCall.ID,
+				ia2a.ToolCallFieldType: toolCall.Type,
+				ia2a.ToolCallFieldName: toolCall.Function.Name,
+				ia2a.ToolCallFieldArgs: string(toolCall.Function.Arguments),
+			}
+
+			// Create DataPart with metadata indicating this is a function call
+			dataPart := protocol.NewDataPart(toolCallData)
+
+			// Use ADK-compatible metadata key if enabled
+			metadataTypeKey := ia2a.DataPartMetadataTypeKey
+			if c.adkCompatibility {
+				metadataTypeKey = ia2a.GetADKMetadataKey(ia2a.DataPartMetadataTypeKey)
+			}
+
+			dataPart.Metadata = map[string]any{
+				metadataTypeKey: ia2a.DataPartMetadataTypeFunctionCall,
+			}
+			parts = append(parts, dataPart)
+		}
+	}
+
+	// Handle tool call responses (tool returning results)
+	// OpenAI returns each tool response in a separate choice
+	for _, choice := range event.Response.Choices {
+		if choice.Message.Role == model.RoleTool || choice.Message.ToolID != "" {
+			// Convert tool response to DataPart
+			toolResponseData := map[string]any{
+				ia2a.ToolCallFieldName: choice.Message.ToolName,
+				ia2a.ToolCallFieldID:   choice.Message.ToolID,
+			}
+
+			// Pass content as-is without parsing
+			// Client will receive the raw response string and display it directly
+			if choice.Message.Content != "" {
+				toolResponseData[ia2a.ToolCallFieldResponse] = choice.Message.Content
+			}
+
+			// Create DataPart with metadata indicating this is a function response
+			dataPart := protocol.NewDataPart(toolResponseData)
+
+			// Use ADK-compatible metadata key if enabled
+			metadataTypeKey := ia2a.DataPartMetadataTypeKey
+			if c.adkCompatibility {
+				metadataTypeKey = ia2a.GetADKMetadataKey(ia2a.DataPartMetadataTypeKey)
+			}
+
+			dataPart.Metadata = map[string]any{
+				metadataTypeKey: ia2a.DataPartMetadataTypeFunctionResp,
+			}
+			parts = append(parts, dataPart)
+		}
+	}
+
+	if len(parts) == 0 {
+		return nil, nil
+	}
+
+	msg := protocol.NewMessage(protocol.MessageRoleAgent, parts)
+	return &msg, nil
+}
+
+// convertToolCallToA2AStreamingMessage converts tool call events to A2A streaming messages.
+// For streaming mode, tool calls are sent as TaskArtifactUpdateEvent.
+func (c *defaultEventToA2AMessage) convertToolCallToA2AStreamingMessage(
+	event *event.Event,
+	options EventToA2AStreamingOptions,
+) (protocol.StreamingMessageResult, error) {
+	// For streaming, we convert tool calls to task artifact updates
+	// First get the message parts using the unary converter
+	unaryResult, err := c.convertToolCallToA2AMessage(event)
+	if err != nil || unaryResult == nil {
+		return nil, err
+	}
+
+	msg, ok := unaryResult.(*protocol.Message)
+	if !ok || len(msg.Parts) == 0 {
+		return nil, nil
+	}
+
+	// Create a task artifact update with the tool call parts
+	taskArtifact := protocol.NewTaskArtifactUpdateEvent(
+		options.TaskID,
+		options.CtxID,
+		protocol.Artifact{
+			ArtifactID: event.Response.ID,
+			Parts:      msg.Parts,
+		},
+		false, // append=false for tool calls (complete events, not incremental)
+	)
+	return &taskArtifact, nil
 }

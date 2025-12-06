@@ -149,6 +149,33 @@ type Usage struct {
 
     // Total number of tokens used in response.
     TotalTokens int `json:"total_tokens"`
+
+    // Timing statistics (optional).
+    TimingInfo *TimingInfo `json:"timing_info,omitempty"`
+}
+
+type TimingInfo struct {
+    // FirstTokenDuration is the accumulated duration from request start to the first meaningful token.
+    // A "meaningful token" is defined as the first chunk containing reasoning content, regular content, or tool calls.
+    //
+    // Return timing:
+    // - Streaming requests: Calculated and returned immediately when the first meaningful chunk is received
+    // - Non-streaming requests: Calculated and returned when the complete response is received
+    FirstTokenDuration time.Duration `json:"time_to_first_token,omitempty"`
+
+    // ReasoningDuration is the accumulated duration of reasoning phases (streaming mode only).
+    // Measured from the first reasoning chunk to the last reasoning chunk in each LLM call.
+    //
+    // Measurement details:
+    // - Starts timing when the first chunk with reasoning content is received
+    // - Continues timing for all subsequent reasoning chunks
+    // - Stops timing when the first non-reasoning chunk (regular content or tool call) is received
+    //
+    // Return timing:
+    // - Streaming requests: Calculated and returned immediately when reasoning ends (i.e., when the first
+    //   non-reasoning content/tool call chunk is received)
+    // - Non-streaming requests: Cannot be measured precisely, this field will remain 0
+    ReasoningDuration time.Duration `json:"reasoning_duration,omitempty"`
 }
 ```
 
@@ -191,6 +218,29 @@ const (
     // Runner completion event.
     ObjectTypeRunnerCompletion = "runner.completion"
 )
+```
+
+### Filtering Transfer Announcements
+
+Transfer announcements (Agent delegation notices) are emitted as Events with `Response.Object == "agent.transfer"`.
+
+This typically appears as a handoff notice: "Transferring control to agent: <name>".
+
+ If your UI should not display these system-level notices, you have two compatible strategies:
+ - Filter by `Object`: hide events where `Response.Object == "agent.transfer"`.
+ - Filter by `Tag`: hide events whose `Event.Tag` contains the `transfer` tag. The framework adds this tag to delegation-related events (including transfer tool results), so filtering by tag avoids breaking ToolCall/ToolResult alignment.
+
+ Tags are appended using a semicolon delimiter (`;`). Use `event.WithTag(tag)` when creating custom events; multiple tags are stored as `tag1;tag2;...`.
+
+#### Helper: Detect Runner Completion
+
+Use the convenience method to detect when the whole run has finished regardless of Agent type:
+
+```go
+// e.IsRunnerCompletion() returns true for the terminal runner-completion event.
+if e.IsRunnerCompletion() {
+    // Safe point to stop reading the channel
+}
 ```
 
 ### Event Creation
@@ -245,6 +295,7 @@ response := &model.Response{
 evt := event.NewResponseEvent("invoke-123", "agent", response)
 ```
 
+
 ### Tool Response Streaming (including AgentTool forwarding)
 
 When a Streamable tool is invoked (including AgentTool), the framework emits `tool.response` events. In streaming mode:
@@ -278,6 +329,14 @@ if evt.Response != nil && evt.Object == model.ObjectTypeToolResponse && len(evt.
 ```
 
 Tip: For custom events, always use `event.New(...)` with `WithResponse`, `WithBranch`, etc., to ensure IDs and timestamps are set consistently.
+
+### Tags
+
+Events support simple tagging via `Event.Tag` to annotate business labels for filtering and analytics:
+
+- Delimiter: `;` (semicolon). Multiple tags concatenate as `tag1;tag2`.
+- Helper: `event.WithTag("<tag>")` to append a tag without losing existing ones.
+- Built-in usage: delegation-related events are tagged with `transfer`. UIs can hide these internal messages while preserving the complete event stream for debugging and processing.
 
 ### Event Methods
 

@@ -19,46 +19,51 @@ import (
 	"strconv"
 	"strings"
 
+	anthropicsdk "github.com/anthropics/anthropic-sdk-go"
+	"github.com/ollama/ollama/api"
+	openaisdk "github.com/openai/openai-go"
+
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
-	"trpc.group/trpc-go/trpc-agent-go/model/openai"
+	"trpc.group/trpc-go/trpc-agent-go/model/provider"
 	"trpc.group/trpc-go/trpc-agent-go/model/tiktoken"
 )
 
 var (
-	flagModel                = flag.String("model", "deepseek-chat", "Model name, e.g., deepseek-chat or gpt-4o")
+	flagProvider             = flag.String("provider", "openai", "Name of the provider to use, openai/anthropic/ollama")
+	flagModel                = flag.String("model", "", "Model name (auto-detected if empty)")
 	flagEnableTokenTailoring = flag.Bool("enable-token-tailoring", true, "Enable automatic token tailoring based on model context window")
 	flagMaxInputTokens       = flag.Int("max-input-tokens", 0, "Max input tokens for token tailoring (0 = auto-calculate from context window)")
 	flagCounter              = flag.String("counter", "simple", "Token counter: simple|tiktoken")
 	flagStrategy             = flag.String("strategy", "middle", "Tailoring strategy: middle|head|tail")
 	flagStreaming            = flag.Bool("streaming", true, "Stream assistant responses")
+	flagDebug                = flag.Bool("debug", false, "Enable debug logging")
 )
 
 // Interactive demo with /bulk to generate many messages and showcase
 // counter/strategy usage without runner/session dependencies.
 func main() {
 	flag.Parse()
-
-	// Build model with dual-mode token tailoring support.
-	var opts []openai.Option
-	opts = append(opts, openai.WithEnableTokenTailoring(*flagEnableTokenTailoring))
-
-	if *flagMaxInputTokens > 0 {
-		opts = append(opts, openai.WithMaxInputTokens(*flagMaxInputTokens))
+	if *flagDebug {
+		log.SetLevel(log.LevelDebug)
 	}
 
-	counter := buildCounter(strings.ToLower(*flagCounter), *flagModel)
-	opts = append(opts, openai.WithTokenCounter(counter))
-
-	if *flagStrategy != "middle" {
-		strategy := buildStrategy(counter, strings.ToLower(*flagStrategy))
-		opts = append(opts, openai.WithTailoringStrategy(strategy))
+	// Auto-detect model name if not specified.
+	provider := strings.ToLower(*flagProvider)
+	modelName := *flagModel
+	if modelName == "" {
+		modelName = getDefaultModel(provider)
 	}
 
-	modelInstance := openai.New(*flagModel, opts...)
+	// Build model using provider package.
+	modelInstance, err := buildModel(provider, modelName)
+	if err != nil {
+		log.Fatalf("Failed to build model: %v", err)
+	}
 
 	fmt.Printf("✂️  Token Tailoring Demo\n")
-	fmt.Printf("🧩 model: %s\n", *flagModel)
+	fmt.Printf("🔌 provider: %s\n", provider)
+	fmt.Printf("🧩 model: %s\n", modelName)
 	fmt.Printf("🔧 enable-token-tailoring: %t\n", *flagEnableTokenTailoring)
 	if *flagMaxInputTokens > 0 {
 		fmt.Printf("🔢 max-input-tokens: %d\n", *flagMaxInputTokens)
@@ -71,11 +76,13 @@ func main() {
 	fmt.Println("==================================================")
 	fmt.Println("💡 Commands:")
 	fmt.Println("  /bulk N     - append N synthetic user messages")
+	fmt.Println("  /load FILE  - load messages from JSON file (e.g., /load input.json)")
 	fmt.Println("  /history    - show current message count")
 	fmt.Println("  /show       - display current messages (head + tail)")
 	fmt.Println("  /exit       - quit")
 	fmt.Println()
 
+	counter := buildCounter(strings.ToLower(*flagCounter), modelName)
 	scanner := bufio.NewScanner(os.Stdin)
 	messages := []model.Message{model.NewSystemMessage("You are a helpful assistant.")}
 	for {
@@ -94,8 +101,105 @@ func main() {
 			}
 			continue
 		}
-		processTurn(context.Background(), modelInstance, &messages, line)
+		processTurn(context.Background(), modelInstance, counter, &messages, line)
 	}
+}
+
+func getDefaultModel(provider string) string {
+	switch provider {
+	case "anthropic":
+		return "claude-3-5-sonnet"
+	case "ollama":
+		return "llama3.2:latest"
+	default:
+		return "deepseek-chat"
+	}
+}
+
+// buildModel creates a model instance using the provider package with unified configuration.
+func buildModel(providerName, modelName string) (model.Model, error) {
+	counter := buildCounter(strings.ToLower(*flagCounter), modelName)
+	strategy := buildStrategy(counter, strings.ToLower(*flagStrategy))
+
+	// Build common provider options.
+	var opts []provider.Option
+	opts = append(opts, provider.WithEnableTokenTailoring(*flagEnableTokenTailoring))
+	if *flagMaxInputTokens > 0 {
+		opts = append(opts, provider.WithMaxInputTokens(*flagMaxInputTokens))
+	}
+	opts = append(opts, provider.WithTokenCounter(counter))
+	opts = append(opts, provider.WithTailoringStrategy(strategy))
+
+	// Set provider-specific callbacks for token statistics display.
+	switch providerName {
+	case "openai":
+		opts = append(opts, provider.WithCallbacks(provider.Callbacks{
+			OpenAIChatRequest: func(ctx context.Context, req *openaisdk.ChatCompletionNewParams) {
+				// Convert OpenAI messages back to model.Message for token counting.
+				messages := convertFromOpenAIMessages(req.Messages)
+				tokensAfter, _ := counter.CountTokensRange(ctx, messages, 0, len(messages))
+
+				// Display tailoring statistics.
+				if *flagMaxInputTokens > 0 {
+					fmt.Printf("\n✂️  [Tailoring] maxInputTokens=%d 📨 messages=%d 🎯 tokens=%d\n",
+						*flagMaxInputTokens, len(messages), tokensAfter)
+				} else {
+					fmt.Printf("\n✂️  [Tailoring] maxInputTokens=auto 📨 messages=%d 🎯 tokens=%d\n",
+						len(messages), tokensAfter)
+				}
+
+				// Show head and tail messages to visualize what was kept/removed.
+				fmt.Printf("📝 Messages (after tailoring, showing head + tail):\n%s",
+					summarizeMessagesHeadTail(messages, 5, 5))
+			},
+		}))
+	case "anthropic":
+		opts = append(opts, provider.WithCallbacks(provider.Callbacks{
+			AnthropicChatRequest: func(ctx context.Context, req *anthropicsdk.MessageNewParams) {
+				// Convert Anthropic messages back to model.Message for token counting.
+				messages := convertFromAnthropicMessages(req.Messages, req.System)
+				tokensAfter, _ := counter.CountTokensRange(ctx, messages, 0, len(messages))
+
+				// Display tailoring statistics.
+				if *flagMaxInputTokens > 0 {
+					fmt.Printf("\n✂️  [Tailoring] maxInputTokens=%d 📨 messages=%d 🎯 tokens=%d\n",
+						*flagMaxInputTokens, len(messages), tokensAfter)
+				} else {
+					fmt.Printf("\n✂️  [Tailoring] maxInputTokens=auto 📨 messages=%d 🎯 tokens=%d\n",
+						len(messages), tokensAfter)
+				}
+
+				// Show head and tail messages to visualize what was kept/removed.
+				fmt.Printf("📝 Messages (after tailoring, showing head + tail):\n%s",
+					summarizeMessagesHeadTail(messages, 5, 5))
+			},
+		}))
+	case "ollama":
+		opts = append(opts, provider.WithCallbacks(provider.Callbacks{
+			OllamaChatRequest: func(ctx context.Context, req *api.ChatRequest) {
+				// Convert Ollama messages back to model.Message for token counting.
+				messages := convertFromOllamaMessages(req.Messages)
+				tokensAfter, _ := counter.CountTokensRange(ctx, messages, 0, len(messages))
+
+				// Display tailoring statistics.
+				if *flagMaxInputTokens > 0 {
+					fmt.Printf("\n✂️  [Tailoring] maxInputTokens=%d 📨 messages=%d 🎯 tokens=%d\n",
+						*flagMaxInputTokens, len(messages), tokensAfter)
+				} else {
+					fmt.Printf("\n✂️  [Tailoring] maxInputTokens=auto 📨 messages=%d 🎯 tokens=%d\n",
+						len(messages), tokensAfter)
+				}
+
+				// Show head and tail messages to visualize what was kept/removed.
+				fmt.Printf("📝 Messages (after tailoring, showing head + tail):\n%s",
+					summarizeMessagesHeadTail(messages, 5, 5))
+			},
+		}))
+	default:
+		return nil, fmt.Errorf("invalid provider: %s (must be 'openai' or 'anthropic')", providerName)
+	}
+
+	return provider.Model(providerName, modelName, opts...)
 }
 
 func buildStrategy(counter model.TokenCounter, strategyName string) model.TailoringStrategy {
@@ -135,6 +239,27 @@ func handleCommand(messages *[]model.Message, line string) bool {
 		fmt.Printf("📋 Current messages (total: %d):\n", len(*messages))
 		fmt.Print(summarizeMessagesHeadTail(*messages, 10, 10))
 		return true
+	case strings.HasPrefix(line, "/load"):
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			fmt.Println("❌ Usage: /load <filename>")
+			return true
+		}
+		filename := parts[1]
+		loaded, err := loadMessagesFromJSON(filename)
+		if err != nil {
+			fmt.Printf("❌ Failed to load %s: %v\n", filename, err)
+			return true
+		}
+		// Replace messages with loaded ones (keep system message if first is not system).
+		if len(loaded) > 0 && loaded[0].Role == model.RoleSystem {
+			*messages = loaded
+		} else {
+			// Prepend system message if not present.
+			*messages = append([]model.Message{model.NewSystemMessage("You are a helpful assistant.")}, loaded...)
+		}
+		fmt.Printf("✅ Loaded %d messages from %s. Total=%d\n", len(loaded), filename, len(*messages))
+		return true
 	case strings.HasPrefix(line, "/bulk"):
 		parts := strings.Fields(line)
 		n := 10
@@ -153,44 +278,25 @@ func handleCommand(messages *[]model.Message, line string) bool {
 	}
 }
 
-func processTurn(ctx context.Context, m *openai.Model, messages *[]model.Message, userLine string) {
+func processTurn(ctx context.Context, m model.Model, counter model.TokenCounter, messages *[]model.Message, userLine string) {
 	*messages = append(*messages, model.NewUserMessage(userLine))
-	before := len(*messages)
-
-	// Calculate token count before tailoring.
-	counter := model.NewSimpleTokenCounter()
-	tokensBefore, _ := counter.CountTokensRange(ctx, *messages, 0, len(*messages))
-
 	req := &model.Request{
-		Messages:         cloneMessages(*messages),
+		Messages:         *messages,
 		GenerationConfig: model.GenerationConfig{Stream: *flagStreaming},
 	}
 
 	ch, err := m.GenerateContent(ctx, req)
 	if err != nil {
 		log.Warn("generate content failed", err)
+		return
 	}
 
 	final := renderResponse(ch, *flagStreaming)
 
-	// Calculate token count after tailoring.
-	tokensAfter, _ := counter.CountTokensRange(ctx, req.Messages, 0, len(req.Messages))
-
-	// Display tailoring statistics.
-	if *flagMaxInputTokens > 0 {
-		fmt.Printf("\n✂️  [Tailoring] maxInputTokens=%d 📨 messages=%d→%d 🎯 tokens=%d→%d\n",
-			*flagMaxInputTokens, before, len(req.Messages), tokensBefore, tokensAfter)
-	} else {
-		fmt.Printf("\n✂️  [Tailoring] maxInputTokens=auto 📨 messages=%d→%d 🎯 tokens=%d→%d\n",
-			before, len(req.Messages), tokensBefore, tokensAfter)
-	}
-
-	// Show head and tail messages to visualize what was kept/removed.
-	fmt.Printf("📝 Messages (after tailoring, showing head + tail):\n%s",
-		summarizeMessagesHeadTail(req.Messages, 5, 5))
-
 	if !*flagStreaming && final != "" {
 		fmt.Printf("🤖 Assistant: %s\n\n", strings.TrimSpace(final))
+	}
+	if final != "" {
 		*messages = append(*messages, model.NewAssistantMessage(final))
 	}
 }
@@ -236,117 +342,4 @@ func renderResponse(ch <-chan *model.Response, streaming bool) string {
 		}
 	}
 	return final
-}
-
-func cloneMessages(in []model.Message) []model.Message {
-	out := make([]model.Message, len(in))
-	copy(out, in)
-	return out
-}
-
-func long(s string) string { return s + ": " + repeat("lorem ipsum ", 40) }
-
-func repeat(s string, n int) string {
-	out := make([]byte, 0, len(s)*n)
-	for i := 0; i < n; i++ {
-		out = append(out, s...)
-	}
-	return string(out)
-}
-
-// summarizeMessages returns a concise multi-line preview of messages with truncation.
-func summarizeMessages(msgs []model.Message, maxItems int) string {
-	var b strings.Builder
-	for i, m := range msgs {
-		if i >= maxItems {
-			fmt.Fprintf(&b, "... (%d more)\n", len(msgs)-i)
-			break
-		}
-		role := string(m.Role)
-		content := firstNonEmpty(
-			strings.TrimSpace(m.Content),
-			strings.TrimSpace(m.ReasoningContent),
-			firstTextPart(m),
-		)
-		content = truncate(content, 100)
-		// replace newlines to keep one-line per message
-		content = strings.ReplaceAll(content, "\n", " ")
-		fmt.Fprintf(&b, "[%d] %s: %s\n", i, role, content)
-	}
-	return b.String()
-}
-
-// summarizeMessagesHeadTail shows head and tail messages with omitted middle count.
-func summarizeMessagesHeadTail(msgs []model.Message, headCount, tailCount int) string {
-	var b strings.Builder
-	total := len(msgs)
-
-	if total <= headCount+tailCount {
-		// All messages fit, show them all.
-		return summarizeMessages(msgs, total)
-	}
-
-	// Show head messages.
-	for i := 0; i < headCount && i < total; i++ {
-		m := msgs[i]
-		role := string(m.Role)
-		content := firstNonEmpty(
-			strings.TrimSpace(m.Content),
-			strings.TrimSpace(m.ReasoningContent),
-			firstTextPart(m),
-		)
-		content = truncate(content, 100)
-		content = strings.ReplaceAll(content, "\n", " ")
-		fmt.Fprintf(&b, "[%d] %s: %s\n", i, role, content)
-	}
-
-	// Show omitted count.
-	omitted := total - headCount - tailCount
-	if omitted > 0 {
-		fmt.Fprintf(&b, "... (%d messages omitted)\n", omitted)
-	}
-
-	// Show tail messages.
-	for i := total - tailCount; i < total; i++ {
-		m := msgs[i]
-		role := string(m.Role)
-		content := firstNonEmpty(
-			strings.TrimSpace(m.Content),
-			strings.TrimSpace(m.ReasoningContent),
-			firstTextPart(m),
-		)
-		content = truncate(content, 100)
-		content = strings.ReplaceAll(content, "\n", " ")
-		fmt.Fprintf(&b, "[%d] %s: %s\n", i, role, content)
-	}
-
-	return b.String()
-}
-
-func firstTextPart(m model.Message) string {
-	for _, p := range m.ContentParts {
-		if p.Text != nil {
-			return strings.TrimSpace(*p.Text)
-		}
-	}
-	return ""
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, v := range values {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	if max <= 3 {
-		return s[:max]
-	}
-	return s[:max-3] + "..."
 }

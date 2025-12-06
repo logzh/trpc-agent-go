@@ -7,6 +7,7 @@
 //
 //
 
+// Package main is the main package for the AG-UI server.
 package main
 
 import (
@@ -65,6 +66,8 @@ func main() {
 		llmagent.WithPlanner(react.New()),
 	)
 	runner := runner.NewRunner(agent.Info().Name, agent)
+	// Ensure runner resources are cleaned up (trpc-agent-go >= v0.5.0)
+	defer runner.Close()
 	server, err := agui.New(
 		runner,
 		agui.WithPath(*path),
@@ -85,15 +88,15 @@ type reactTranslator struct {
 	receivingMessage bool
 }
 
-func newReactTranslator(input *adapter.RunAgentInput) translator.Translator {
+func newReactTranslator(ctx context.Context, input *adapter.RunAgentInput) translator.Translator {
 	return &reactTranslator{
-		inner: translator.New(input.ThreadID, input.RunID),
+		inner: translator.New(ctx, input.ThreadID, input.RunID),
 	}
 }
 
 // Translate routes AG-UI events through a small state machine to rebuild final answers and custom sections for React UI consumption.
-func (t *reactTranslator) Translate(event *event.Event) ([]aguievents.Event, error) {
-	events, err := t.inner.Translate(event)
+func (t *reactTranslator) Translate(ctx context.Context, event *event.Event) ([]aguievents.Event, error) {
+	events, err := t.inner.Translate(ctx, event)
 	if err != nil {
 		return nil, err
 	}

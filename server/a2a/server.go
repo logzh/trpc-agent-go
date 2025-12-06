@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"time"
 
 	"trpc.group/trpc-go/trpc-a2a-go/auth"
@@ -23,6 +24,7 @@ import (
 	"trpc.group/trpc-go/trpc-a2a-go/taskmanager"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	ia2a "trpc.group/trpc-go/trpc-agent-go/internal/a2a"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
@@ -33,7 +35,8 @@ import (
 // New creates a new a2a server.
 func New(opts ...Option) (*a2a.A2AServer, error) {
 	options := &options{
-		errorHandler: defaultErrorHandler,
+		errorHandler:     defaultErrorHandler,
+		adkCompatibility: true, // Enable ADK compatibility by default
 	}
 	for _, opt := range opts {
 		opt(options)
@@ -47,8 +50,10 @@ func New(opts ...Option) (*a2a.A2AServer, error) {
 		return nil, errors.New("agent is required")
 	}
 
-	if options.host == "" {
-		return nil, errors.New("host is required")
+	// Host is only required if we need to build an agent card
+	// If user provides a custom agent card, host is optional
+	if options.agentCard == nil && options.host == "" {
+		return nil, errors.New("host is required when agent card is not provided")
 	}
 
 	return buildA2AServer(options)
@@ -61,7 +66,9 @@ func buildAgentCard(options *options) a2a.AgentCard {
 	agent := options.agent
 	desc := agent.Info().Description
 	name := agent.Info().Name
-	url := fmt.Sprintf("http://%s", options.host)
+
+	// Normalize the host to ensure it has a proper URL scheme
+	url := ia2a.NormalizeURL(options.host)
 
 	// Build skills from agent tools
 	skills := buildSkillsFromTools(agent, name, desc)
@@ -90,7 +97,7 @@ func buildProcessor(agent agent.Agent, sessionService session.Service, options *
 
 	eventToA2AConverter := options.eventToA2AConverter
 	if eventToA2AConverter == nil {
-		eventToA2AConverter = &defaultEventToA2AMessage{}
+		eventToA2AConverter = &defaultEventToA2AMessage{adkCompatibility: options.adkCompatibility}
 	}
 
 	return &messageProcessor{
@@ -99,6 +106,8 @@ func buildProcessor(agent agent.Agent, sessionService session.Service, options *
 		eventToA2AConverter: eventToA2AConverter,
 		errorHandler:        options.errorHandler,
 		debugLogging:        options.debugLogging,
+		adkCompatibility:    options.adkCompatibility,
+		agentName:           agentName,
 	}
 }
 
@@ -131,17 +140,57 @@ func buildA2AServer(options *options) (*a2a.A2AServer, error) {
 		}
 	}
 
-	opts := []a2a.Option{
-		a2a.WithAuthProvider(&defaultAuthProvider{}),
+	// Set default UserID header if not configured
+	userIDHeader := options.userIDHeader
+	if userIDHeader == "" {
+		userIDHeader = serverUserIDHeader
 	}
 
-	// if other AuthProvider is set, user info should be covered
+	// Extract base path from agent card URL for request routing.
+	// If the URL contains a path component (e.g., "http://example.com/api/v1"),
+	// it will be extracted and used as the base path for routing incoming requests.
+	basePath := extractBasePath(ia2a.NormalizeURL(agentCard.URL))
+
+	opts := []a2a.Option{
+		a2a.WithAuthProvider(&defaultAuthProvider{userIDHeader: userIDHeader}),
+		a2a.WithBasePath(basePath),
+	}
 	opts = append(opts, options.extraOptions...)
 	a2aServer, err := a2a.NewA2AServer(agentCard, taskManager, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create a2a server: %w", err)
 	}
 	return a2aServer, nil
+}
+
+// extractBasePath extracts the path component from a URL for request routing.
+// It parses the URL and returns the path if the URL has a valid scheme.
+//
+// Examples:
+//   - "http://example.com/api/v1" → "/api/v1"
+//   - "https://example.com/docs" → "/docs"
+//   - "grpc://service:9090/rpc" → "/rpc"
+//   - "http://example.com" → "" (no path)
+//   - "invalid-url" → "" (no scheme)
+//
+// The extracted path is used as the base path for routing incoming A2A requests.
+func extractBasePath(urlStr string) string {
+	if urlStr == "" {
+		return ""
+	}
+
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return ""
+	}
+
+	// Extract path if URL has a valid scheme
+	if u.Scheme != "" {
+		return u.Path
+	}
+
+	// No valid scheme, return empty string
+	return ""
 }
 
 // messageProcessor is the message processor for the a2a server.
@@ -151,6 +200,8 @@ type messageProcessor struct {
 	eventToA2AConverter EventToA2AMessage
 	errorHandler        ErrorHandler
 	debugLogging        bool
+	adkCompatibility    bool
+	agentName           string
 }
 
 func isFinalStreamingEvent(evt *event.Event) bool {
@@ -248,8 +299,15 @@ func (m *messageProcessor) ProcessMessage(
 		return m.handleError(ctx, &message, options.Streaming, errors.New("context id not exists"))
 	}
 
-	userID := user.ID
 	ctxID := *message.ContextID
+
+	// Get user ID from auth context, or generate from context ID if not available
+	// This follows ADK pattern: use auth user if available, otherwise use A2A_USER_{context_id}
+	userID := user.ID
+	if userID == "" {
+		userID = fmt.Sprintf("A2A_USER_%s", ctxID)
+		log.Debugf("UserID not set in auth context, using generated ID from context: %s", userID)
+	}
 
 	// Convert A2A message to agent message
 	agentMsg, err := m.a2aToAgentConverter.ConvertToAgentMessage(ctx, message)
@@ -270,7 +328,7 @@ func (m *messageProcessor) ProcessMessage(
 	if options.Streaming {
 		return m.processStreamingMessage(ctx, userID, ctxID, &message, agentMsg, handler, runnerOpts)
 	}
-	return m.processMessage(ctx, userID, ctxID, &message, agentMsg, handler, runnerOpts)
+	return m.processMessage(ctx, userID, ctxID, &message, agentMsg, runnerOpts)
 }
 
 func (m *messageProcessor) processStreamingMessage(
@@ -319,7 +377,7 @@ func (m *messageProcessor) processStreamingMessage(
 				}
 			}
 		}()
-		m.processAgentStreamingEvents(ctx, taskID, a2aMsg, agentMsgChan, subscriber, handler)
+		m.processAgentStreamingEvents(ctx, taskID, userID, ctxID, a2aMsg, agentMsgChan, subscriber, handler)
 	}()
 
 	return &taskmanager.MessageProcessingResult{
@@ -331,6 +389,8 @@ func (m *messageProcessor) processStreamingMessage(
 func (m *messageProcessor) processAgentStreamingEvents(
 	ctx context.Context,
 	taskID string,
+	userID string,
+	sessionID string,
 	a2aMsg *protocol.Message,
 	agentMsgChan <-chan *event.Event,
 	subscriber taskmanager.TaskSubscriber,
@@ -367,6 +427,8 @@ func (m *messageProcessor) processAgentStreamingEvents(
 		},
 		false,
 	)
+	// Add ADK-compatible metadata if enabled
+	m.addTaskMetadata(&taskSubmitted, userID, sessionID)
 	if err := subscriber.Send(protocol.StreamingMessageEvent{Result: &taskSubmitted}); err != nil {
 		log.Errorf("failed to send task submitted message: %v", err)
 		m.handleStreamingProcessingError(ctx, a2aMsg, subscriber, err)
@@ -379,7 +441,9 @@ func (m *messageProcessor) processAgentStreamingEvents(
 		m.handleStreamingProcessingError(ctx, a2aMsg, subscriber, err)
 	}
 
-	finalArtifact := protocol.NewTaskArtifactUpdateEvent(taskID, *a2aMsg.ContextID, protocol.Artifact{}, true)
+	finalArtifact := protocol.NewTaskArtifactUpdateEvent(taskID, *a2aMsg.ContextID, protocol.Artifact{
+		Parts: []protocol.Part{},
+	}, true)
 	if err := subscriber.Send(protocol.StreamingMessageEvent{Result: &finalArtifact}); err != nil {
 		log.Errorf("failed to send final artifact message: %v", err)
 		m.handleStreamingProcessingError(ctx, a2aMsg, subscriber, err)
@@ -475,7 +539,6 @@ func (m *messageProcessor) processMessage(
 	ctxID string,
 	a2aMsg *protocol.Message,
 	agentMsg *model.Message,
-	handler taskmanager.TaskHandler,
 	runnerOpts []agent.RunOption,
 ) (*taskmanager.MessageProcessingResult, error) {
 	if agentMsg == nil {
@@ -598,4 +661,22 @@ func buildSkillsFromTools(agent agent.Agent, agentName, agentDesc string) []a2a.
 	}
 
 	return skills
+}
+
+// addTaskMetadata adds ADK-compatible metadata to task status update events.
+// When ADK compatibility mode is enabled, it adds metadata with "adk_" prefix
+// (e.g., "adk_app_name", "adk_user_id", "adk_session_id") to match ADK Python implementation.
+func (m *messageProcessor) addTaskMetadata(event *protocol.TaskStatusUpdateEvent, userID, sessionID string) {
+	if !m.adkCompatibility {
+		return
+	}
+
+	if event.Metadata == nil {
+		event.Metadata = make(map[string]any)
+	}
+
+	// Add ADK-compatible metadata keys
+	event.Metadata[ia2a.GetADKMetadataKey("app_name")] = m.agentName
+	event.Metadata[ia2a.GetADKMetadataKey("user_id")] = userID
+	event.Metadata[ia2a.GetADKMetadataKey("session_id")] = sessionID
 }

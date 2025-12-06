@@ -722,19 +722,24 @@ func (dk *BuiltinKnowledge) addDocumentWithSync(
 
 // addDocument adds a document to the knowledge base (internal method).
 func (dk *BuiltinKnowledge) addDocument(ctx context.Context, doc *document.Document) error {
-	// Generate embedding and store in vector store.
-	if dk.embedder != nil && dk.vectorStore != nil {
-		// Get content directly as string for embedding generation.
-		content := doc.Content
+	if dk.vectorStore == nil {
+		return fmt.Errorf("vector store is not configured")
+	}
 
-		embedding, err := dk.embedder.GetEmbedding(ctx, content)
+	var embedding []float64
+	if dk.embedder != nil {
+		var err error
+		embedding, err = dk.embedder.GetEmbedding(ctx, doc.Content)
 		if err != nil {
 			return fmt.Errorf("failed to generate embedding: %w", err)
 		}
+	} else {
+		// When embedder is not set, pass empty slice for remote embedding
+		embedding = []float64{}
+	}
 
-		if err := dk.vectorStore.Add(ctx, doc, embedding); err != nil {
-			return fmt.Errorf("failed to store embedding: %w", err)
-		}
+	if err := dk.vectorStore.Add(ctx, doc, embedding); err != nil {
+		return fmt.Errorf("failed to store embedding: %w", err)
 	}
 	return nil
 }
@@ -1151,13 +1156,17 @@ func convertToInt(value any) (int, bool) {
 	}
 }
 
-// generateDocumentID generates a unique document ID based on source name, content, chunk index and source metadata.
+// generateDocumentID generates a unique document ID based on source name, URI, content, chunk index and source metadata.
 // Uses SHA256 hash to ensure uniqueness and avoid collisions.
 func generateDocumentID(sourceName, uri, content string, chunkIndex int, sourceMetadata map[string]any) string {
 	hasher := sha256.New()
 
 	// Write source name
 	hasher.Write([]byte(sourceName))
+	hasher.Write([]byte(":"))
+
+	// Write URI
+	hasher.Write([]byte(uri))
 	hasher.Write([]byte(":"))
 
 	// Write content

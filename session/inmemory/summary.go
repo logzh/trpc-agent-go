@@ -15,10 +15,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/spaolacci/murmur3"
+	"trpc.group/trpc-go/trpc-agent-go/internal/session/summary"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/session"
-	isession "trpc.group/trpc-go/trpc-agent-go/session/internal/session"
 )
 
 // CreateSessionSummary generates a summary for the session and stores it on the session object.
@@ -38,16 +37,23 @@ func (s *SessionService) CreateSessionSummary(ctx context.Context, sess *session
 
 	// Run summarization based on the provided session. Persistence path will
 	// validate app/session existence under lock.
-	updated, err := isession.SummarizeSession(ctx, s.opts.summarizer, sess, filterKey, force)
+	updated, err := summary.SummarizeSession(ctx, s.opts.summarizer, sess, filterKey, force)
 	if err != nil {
 		return fmt.Errorf("summarize and persist failed: %w", err)
 	}
 	if !updated {
 		return nil
 	}
+
 	// Persist to in-memory store under lock.
+	sess.SummariesMu.RLock()
+	sum := sess.Summaries[filterKey]
+	sess.SummariesMu.RUnlock()
+
 	app := s.getOrCreateAppSessions(key.AppName)
-	if err := s.writeSummaryUnderLock(app, key, filterKey, sess.Summaries[filterKey].Summary); err != nil {
+	if err := s.writeSummaryUnderLock(
+		app, key, filterKey, sum.Summary,
+	); err != nil {
 		return fmt.Errorf("write summary under lock failed: %w", err)
 	}
 	return nil
@@ -124,10 +130,9 @@ func (s *SessionService) EnqueueSummaryJob(ctx context.Context, sess *session.Se
 
 	// Create summary job.
 	job := &summaryJob{
-		sessionKey: key,
-		filterKey:  filterKey,
-		force:      force,
-		session:    sess,
+		filterKey: filterKey,
+		force:     force,
+		session:   sess,
 	}
 
 	// Try to enqueue the job asynchronously.
@@ -141,27 +146,42 @@ func (s *SessionService) EnqueueSummaryJob(ctx context.Context, sess *session.Se
 
 // tryEnqueueJob attempts to enqueue a summary job to the appropriate channel.
 // Returns true if successful, false if the job should be processed synchronously.
+// Note: This method assumes channels are already initialized. Callers should check
+// len(s.summaryJobChans) > 0 before calling this method.
 func (s *SessionService) tryEnqueueJob(ctx context.Context, job *summaryJob) bool {
 	// Select a channel using hash distribution.
-	keyStr := fmt.Sprintf("%s:%s:%s", job.sessionKey.AppName, job.sessionKey.UserID, job.sessionKey.SessionID)
-	index := int(murmur3.Sum32([]byte(keyStr))) % len(s.summaryJobChans)
+	index := job.session.Hash % len(s.summaryJobChans)
 
-	// Use a defer-recover pattern to handle potential panic from sending to closed channel.
+	// If context already cancelled, do not enqueue.
+	if err := ctx.Err(); err != nil {
+		log.Debugf(
+			"summary job context cancelled before enqueue: %v", err,
+		)
+		return false
+	}
+
+	// Use a defer-recover pattern to handle potential panic from
+	// sending to a closed channel.
 	defer func() {
 		if r := recover(); r != nil {
-			log.Warnf("summary job channel may be closed, falling back to synchronous processing: %v", r)
+			log.Warnf(
+				"summary job channel may be closed, falling back to "+
+					"synchronous processing: %v",
+				r,
+			)
 		}
 	}()
 
+	// Non-blocking enqueue to avoid waiting when the queue is full.
 	select {
 	case s.summaryJobChans[index] <- job:
 		return true // Successfully enqueued.
-	case <-ctx.Done():
-		log.Debugf("summary job channel context cancelled, falling back to synchronous processing, error: %v", ctx.Err())
-		return false // Context cancelled.
 	default:
 		// Queue is full, fall back to synchronous processing.
-		log.Warnf("summary job queue is full, falling back to synchronous processing")
+		log.Warnf(
+			"summary job queue is full, falling back to synchronous " +
+				"processing",
+		)
 		return false
 	}
 }
@@ -174,8 +194,10 @@ func (s *SessionService) startAsyncSummaryWorker() {
 		s.summaryJobChans[i] = make(chan *summaryJob, s.opts.summaryQueueSize)
 	}
 
+	s.summaryWg.Add(summaryNum)
 	for _, summaryJobChan := range s.summaryJobChans {
 		go func(summaryJobChan chan *summaryJob) {
+			defer s.summaryWg.Done()
 			for job := range summaryJobChan {
 				s.processSummaryJob(job)
 				// After branch summary, cascade a full-session summary by
@@ -207,27 +229,19 @@ func (s *SessionService) processSummaryJob(job *summaryJob) {
 		defer cancel()
 	}
 
-	// Perform the actual summary generation for the requested filterKey.
-	updated, err := isession.SummarizeSession(ctx, s.opts.summarizer, job.session, job.filterKey, job.force)
-	if err != nil {
-		log.Errorf("summary worker failed to generate summary: %v", err)
-		return
-	}
-	if !updated {
-		return
-	}
-
-	// Persist to in-memory store under lock.
-	app := s.getOrCreateAppSessions(job.sessionKey.AppName)
-	if err := s.writeSummaryUnderLock(app, job.sessionKey, job.filterKey, job.session.Summaries[job.filterKey].Summary); err != nil {
-		log.Errorf("summary worker failed to write summary: %v", err)
+	if err := s.CreateSessionSummary(ctx, job.session, job.filterKey, job.force); err != nil {
+		log.Warnf("summary worker failed to create session summary: %v", err)
 	}
 }
 
 // stopAsyncSummaryWorker stops all async summary workers and closes their channels.
 func (s *SessionService) stopAsyncSummaryWorker() {
+	if len(s.summaryJobChans) == 0 {
+		return
+	}
 	for _, ch := range s.summaryJobChans {
 		close(ch)
 	}
+	s.summaryWg.Wait()
 	s.summaryJobChans = nil
 }

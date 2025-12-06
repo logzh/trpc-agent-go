@@ -14,7 +14,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
 	"trpc.group/trpc-go/trpc-a2a-go/auth"
 	"trpc.group/trpc-go/trpc-a2a-go/protocol"
 	a2a "trpc.group/trpc-go/trpc-a2a-go/server"
@@ -137,7 +137,7 @@ func TestDefaultAuthProvider_Authenticate(t *testing.T) {
 			name: "request with user ID header",
 			request: func() *http.Request {
 				req, _ := http.NewRequest("GET", "/test", nil)
-				req.Header.Set(userIDHeader, "test-user-789")
+				req.Header.Set(serverUserIDHeader, "test-user-789")
 				return req
 			}(),
 			expectError: false,
@@ -150,21 +150,21 @@ func TestDefaultAuthProvider_Authenticate(t *testing.T) {
 				return req
 			}(),
 			expectError: false,
-			checkUserID: false, // Will generate UUID
+			checkUserID: false, // Will be empty, generated from context ID in ProcessMessage
 		},
 		{
 			name: "request with empty user ID header",
 			request: func() *http.Request {
 				req, _ := http.NewRequest("GET", "/test", nil)
-				req.Header.Set(userIDHeader, "")
+				req.Header.Set(serverUserIDHeader, "")
 				return req
 			}(),
 			expectError: false,
-			checkUserID: false, // Will generate UUID
+			checkUserID: false, // Will be empty, generated from context ID in ProcessMessage
 		},
 	}
 
-	provider := &defaultAuthProvider{}
+	provider := &defaultAuthProvider{userIDHeader: serverUserIDHeader}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -188,18 +188,14 @@ func TestDefaultAuthProvider_Authenticate(t *testing.T) {
 			}
 
 			if tt.checkUserID {
-				expectedUserID := tt.request.Header.Get(userIDHeader)
+				expectedUserID := tt.request.Header.Get(serverUserIDHeader)
 				if user.ID != expectedUserID {
 					t.Errorf("Authenticate() userID = %v, want %v", user.ID, expectedUserID)
 				}
 			} else {
-				// Should be a valid UUID when no user ID provided
-				if user.ID == "" {
-					t.Errorf("Authenticate() userID should not be empty")
-				}
-				// Validate it's a valid UUID format
-				if _, err := uuid.Parse(user.ID); err != nil {
-					t.Errorf("Authenticate() userID should be valid UUID, got: %v", user.ID)
+				// Should be empty when no user ID provided - will be generated from context ID in ProcessMessage
+				if user.ID != "" {
+					t.Errorf("Authenticate() userID should be empty when not provided, got: %v", user.ID)
 				}
 			}
 		})
@@ -472,17 +468,157 @@ func TestWithOptions(t *testing.T) {
 	}
 }
 
-// Mock assert for testing
-var assert = struct {
-	AnError error
-}{
-	AnError: &mockError{msg: "test error"},
+func TestDefaultAuthProvider_CustomUserIDHeader(t *testing.T) {
+	customHeader := "X-Custom-User-ID"
+	tests := []struct {
+		name        string
+		provider    *defaultAuthProvider
+		request     *http.Request
+		expectError bool
+		checkUserID bool
+		expectedID  string
+	}{
+		{
+			name:     "custom header with user ID",
+			provider: &defaultAuthProvider{userIDHeader: customHeader},
+			request: func() *http.Request {
+				req, _ := http.NewRequest("GET", "/test", nil)
+				req.Header.Set(customHeader, "custom-user-123")
+				return req
+			}(),
+			expectError: false,
+			checkUserID: true,
+			expectedID:  "custom-user-123",
+		},
+		{
+			name:     "custom header without user ID",
+			provider: &defaultAuthProvider{userIDHeader: customHeader},
+			request: func() *http.Request {
+				req, _ := http.NewRequest("GET", "/test", nil)
+				return req
+			}(),
+			expectError: false,
+			checkUserID: false, // Will be empty, generated from context ID in ProcessMessage
+		},
+		{
+			name:     "default header still works",
+			provider: &defaultAuthProvider{userIDHeader: serverUserIDHeader},
+			request: func() *http.Request {
+				req, _ := http.NewRequest("GET", "/test", nil)
+				req.Header.Set(serverUserIDHeader, "default-user-456")
+				return req
+			}(),
+			expectError: false,
+			checkUserID: true,
+			expectedID:  "default-user-456",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			user, err := tt.provider.Authenticate(tt.request)
+
+			if tt.expectError {
+				if err == nil {
+					t.Errorf("Authenticate() expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("Authenticate() unexpected error: %v", err)
+				return
+			}
+
+			if user == nil {
+				t.Errorf("Authenticate() returned nil user")
+				return
+			}
+
+			if tt.checkUserID {
+				if user.ID != tt.expectedID {
+					t.Errorf("Authenticate() userID = %v, want %v", user.ID, tt.expectedID)
+				}
+			} else {
+				// Should be empty when no user ID provided - will be generated from context ID in ProcessMessage
+				if user.ID != "" {
+					t.Errorf("Authenticate() userID should be empty when not provided, got: %v", user.ID)
+				}
+			}
+		})
+	}
 }
 
-type mockError struct {
-	msg string
+func TestWithUserIDHeader(t *testing.T) {
+	tests := []struct {
+		name           string
+		header         string
+		expectedHeader string
+	}{
+		{
+			name:           "set custom header",
+			header:         "X-Custom-User-ID",
+			expectedHeader: "X-Custom-User-ID",
+		},
+		{
+			name:           "empty header uses default",
+			header:         "",
+			expectedHeader: "",
+		},
+		{
+			name:           "another custom header",
+			header:         "X-User-Identifier",
+			expectedHeader: "X-User-Identifier",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := &options{}
+			option := WithUserIDHeader(tt.header)
+			option(opts)
+
+			if tt.expectedHeader == "" {
+				// Empty header should not be set
+				if opts.userIDHeader != "" {
+					t.Errorf("WithUserIDHeader() with empty string should not set header, got %v", opts.userIDHeader)
+				}
+			} else {
+				if opts.userIDHeader != tt.expectedHeader {
+					t.Errorf("WithUserIDHeader() userIDHeader = %v, want %v", opts.userIDHeader, tt.expectedHeader)
+				}
+			}
+		})
+	}
 }
 
-func (e *mockError) Error() string {
-	return e.msg
+func TestWithADKCompatibility(t *testing.T) {
+	tests := []struct {
+		name     string
+		enabled  bool
+		expected bool
+	}{
+		{
+			name:     "ADK compatibility enabled",
+			enabled:  true,
+			expected: true,
+		},
+		{
+			name:     "ADK compatibility disabled",
+			enabled:  false,
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := &options{}
+			WithADKCompatibility(tt.enabled)(opts)
+
+			if opts.adkCompatibility != tt.expected {
+				t.Errorf("WithADKCompatibility(%v) adkCompatibility = %v, want %v",
+					tt.enabled, opts.adkCompatibility, tt.expected)
+			}
+		})
+	}
 }

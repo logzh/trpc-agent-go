@@ -91,6 +91,9 @@ func run() error {
 	sessionSvc := inmemory.NewSessionService()
 	r := runner.NewRunner("subagent-runtime-state", ga, runner.WithSessionService(sessionSvc))
 
+	// Ensure runner resources are cleaned up (trpc-agent-go >= v0.5.0)
+	defer r.Close()
+
 	// Interactive loop
 	userID := "user"
 	sessionID := fmt.Sprintf("subagent-%d", time.Now().Unix())
@@ -168,7 +171,7 @@ func buildGraphAndSubAgent(modelName, baseURL, apiKey string) (*graph.Graph, age
 	)
 
 	// 2) Sub‑agent model callbacks – inject scene knowledge (English, tool-friendly)
-	modelCbs := model.NewCallbacks().RegisterBeforeModel(func(ctx context.Context, req *model.Request) (*model.Response, error) {
+	modelCbs := model.NewCallbacks().RegisterBeforeModel(func(ctx context.Context, args *model.BeforeModelArgs) (*model.BeforeModelResult, error) {
 		inv, _ := agent.InvocationFromContext(ctx)
 		if inv == nil || inv.RunOptions.RuntimeState == nil {
 			return nil, nil
@@ -178,12 +181,12 @@ func buildGraphAndSubAgent(modelName, baseURL, apiKey string) (*graph.Graph, age
 			// Prepend a system message carrying scene knowledge and guidance.
 			// Always keep it English and tool-friendly to avoid suppressing tool calls.
 			sys := sceneInfo + `\n\nGuidance:\n- Always respond in English.\n- If the user asks to schedule a meeting, CALL the schedule_meeting tool.\n- Use parsed_time from runtime state when present. If time is missing/ambiguous, ask a clarifying question.\n- Derive a concise meeting title from the user request.`
-			req.Messages = append([]model.Message{model.NewSystemMessage(sys)}, req.Messages...)
+			args.Request.Messages = append([]model.Message{model.NewSystemMessage(sys)}, args.Request.Messages...)
 		}
 		return nil, nil
 	})
 
-	toolCbs := (&tool.Callbacks{}).RegisterBeforeTool(func(ctx context.Context, toolName string, decl *tool.Declaration, args *[]byte) (any, error) {
+	toolCbs := (&tool.Callbacks{}).RegisterBeforeTool(func(ctx context.Context, args *tool.BeforeToolArgs) (*tool.BeforeToolResult, error) {
 		// Demonstrate we can read parsed_time from runtime state inside sub‑agent callback
 		if inv, ok := agent.InvocationFromContext(ctx); ok && inv != nil && inv.RunOptions.RuntimeState != nil {
 			if v, ok2 := inv.RunOptions.RuntimeState["parsed_time"].(string); ok2 && v != "" {
@@ -263,7 +266,7 @@ func preNode(ctx context.Context, state graph.State) (any, error) {
 	// Scene info in English to prevent non-English model behavior
 	sceneInfo := fmt.Sprintf("[Scene %s] You are helping with event-related tasks (schedule, tickets, times).", sceneID)
 
-	// Naive time parsing from Chinese phrases like 今天/明天HH:MM or explicit 2006-01-02 15:04
+	// Naive time parsing from phrases like "today/tomorrow HH:MM" or explicit 2006-01-02 15:04
 	parsed := parseTimeInText(input)
 
 	out := graph.State{
@@ -287,11 +290,11 @@ func parseTimeInText(s string) string {
 			return t.Format(time.RFC3339)
 		}
 	}
-	// Simple 今天/明天 HH:MM
-	re2 := regexp.MustCompile(`(今天|明天)\s*(\d{1,2}:\d{2})`)
+	// Simple today/tomorrow HH:MM (using keywords: today, tomorrow)
+	re2 := regexp.MustCompile(`(today|tomorrow)\s*(\d{1,2}:\d{2})`)
 	if m := re2.FindStringSubmatch(s); len(m) == 3 {
 		base := time.Now()
-		if m[1] == "明天" {
+		if m[1] == "tomorrow" {
 			base = base.Add(24 * time.Hour)
 		}
 		tday := time.Date(base.Year(), base.Month(), base.Day(), 0, 0, 0, 0, base.Location())

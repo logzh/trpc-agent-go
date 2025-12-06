@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -87,10 +88,77 @@ func WithNodeType(nodeType NodeType) Option {
 	}
 }
 
-// WithToolSets sets the tool sets for the node.
+// WithToolSets sets the ToolSets for the node. This is a declarative
+// per-node configuration used by AddLLMNode to build the LLM runner.
 func WithToolSets(toolSets []tool.ToolSet) Option {
 	return func(node *Node) {
-		node.toolSets = toolSets
+		if len(toolSets) == 0 {
+			node.toolSets = nil
+			return
+		}
+		copied := make([]tool.ToolSet, len(toolSets))
+		copy(copied, toolSets)
+		node.toolSets = copied
+	}
+}
+
+// WithRefreshToolSetsOnRun controls whether tools from ToolSets are
+// refreshed from the underlying ToolSet on each node run.
+// When false (default), tools from ToolSets are resolved once when the
+// node is created. When true, the graph will call ToolSet.Tools again
+// when building the tools map for each execution.
+func WithRefreshToolSetsOnRun(refresh bool) Option {
+	return func(node *Node) {
+		node.refreshToolSetsOnRun = refresh
+	}
+}
+
+// WithEnableParallelTools enables parallel tool execution for a Tools node.
+// When enabled, if the last assistant message contains multiple tool calls,
+// they will be executed concurrently and their responses will be merged in
+// the original order. By default, tools run serially for compatibility.
+func WithEnableParallelTools(enable bool) Option {
+	return func(node *Node) {
+		node.enableParallelTools = enable
+	}
+}
+
+// WithCacheKeyFields sets a cache key selector that derives the cache key
+// input from a subset of fields in the sanitized input map. This helps avoid
+// including unrelated or volatile keys in the cache key.
+func WithCacheKeyFields(fields ...string) Option {
+	// copy fields to avoid external mutation
+	fcopy := append([]string(nil), fields...)
+	return func(node *Node) {
+		node.cacheKeySelector = func(m map[string]any) any {
+			if m == nil {
+				return nil
+			}
+			out := make(map[string]any, len(fcopy))
+			for _, k := range fcopy {
+				if v, ok := m[k]; ok {
+					out[k] = v
+				}
+			}
+			return out
+		}
+	}
+}
+
+// WithCacheKeySelector sets a custom selector for deriving the cache key input
+// from the sanitized input map. The returned value will be passed to the
+// CachePolicy.KeyFunc.
+func WithCacheKeySelector(selector func(map[string]any) any) Option {
+	return func(node *Node) {
+		node.cacheKeySelector = selector
+	}
+}
+
+// WithNodeCachePolicy sets a cache policy for this node.
+// When set, the executor will attempt to cache the node's final result using this policy.
+func WithNodeCachePolicy(policy *CachePolicy) Option {
+	return func(node *Node) {
+		node.cachePolicy = policy
 	}
 }
 
@@ -126,6 +194,35 @@ func WithDestinations(dests map[string]string) Option {
 		}
 		for k, v := range dests {
 			node.destinations[k] = v
+		}
+	}
+}
+
+// WithEndsMap declares per-node named ends and their concrete destinations.
+// The map keys are local symbolic names (e.g., "approved"), and values are
+// concrete node IDs (or the special End) this node may route to.
+// These ends are used at runtime to resolve Command.GoTo and conditional
+// branch results, and at compile time for stronger validation.
+func WithEndsMap(ends map[string]string) Option {
+	return func(node *Node) {
+		if node.ends == nil {
+			node.ends = make(map[string]string)
+		}
+		for k, v := range ends {
+			node.ends[k] = v
+		}
+	}
+}
+
+// WithEnds declares per-node named ends where the symbolic names are also the
+// destination node IDs. Equivalent to WithEndsMap({name: name}).
+func WithEnds(names ...string) Option {
+	return func(node *Node) {
+		if node.ends == nil {
+			node.ends = make(map[string]string)
+		}
+		for _, n := range names {
+			node.ends[n] = n
 		}
 	}
 }
@@ -248,6 +345,22 @@ func WithSubgraphIsolatedMessages(isolate bool) Option {
 	}
 }
 
+// WithSubgraphInputFromLastResponse maps the parent's last_response to the
+// child sub-agent's user_input for this agent node.
+//
+// Use this option when you want the downstream agent to consume only the
+// upstream agent's result as its current-round input, without injecting the
+// session history. This keeps agent nodes as black boxes while enabling
+// explicit result passing.
+//
+// Note: For even stricter isolation from session history, combine with
+// WithSubgraphIsolatedMessages(true).
+func WithSubgraphInputFromLastResponse() Option {
+	return func(node *Node) {
+		node.agentInputFromLastResponse = true
+	}
+}
+
 // WithSubgraphEventScope customizes the child invocation's filter scope segment.
 // Docs note: Scope may be hierarchical (can include '/'). If empty, it
 // defaults to the child agent name. The final filterKey becomes
@@ -302,9 +415,16 @@ func (sg *StateGraph) AddLLMNode(
 		opt(node)
 	}
 	// Build LLM-specific options from node config
-	llmOptsForFunc := []LLMNodeFuncOption{WithLLMNodeID(id), WithLLMToolSets(node.toolSets)}
+	llmOptsForFunc := []LLMNodeFuncOption{
+		WithLLMNodeID(id),
+		WithLLMRefreshToolSetsOnRun(node.refreshToolSetsOnRun),
+		WithLLMToolSets(node.toolSets),
+	}
 	if node.llmGenerationConfig != nil {
-		llmOptsForFunc = append(llmOptsForFunc, WithLLMGenerationConfig(*node.llmGenerationConfig))
+		llmOptsForFunc = append(
+			llmOptsForFunc,
+			WithLLMGenerationConfig(*node.llmGenerationConfig),
+		)
 	}
 	llmNodeFunc := NewLLMNodeFunc(model, instruction, tools, llmOptsForFunc...)
 	// Add LLM node type option
@@ -373,12 +493,28 @@ func (sg *StateGraph) AddEdge(from, to string) *StateGraph {
 // AddConditionalEdges adds conditional routing from a node.
 func (sg *StateGraph) AddConditionalEdges(
 	from string,
-	condition ConditionalFunc,
+	condFunc any,
 	pathMap map[string]string,
 ) *StateGraph {
 	condEdge := &ConditionalEdge{
 		From:      from,
-		Condition: condition,
+		Condition: wrapperCondFunc(condFunc),
+		PathMap:   pathMap,
+	}
+	sg.graph.addConditionalEdge(condEdge)
+	return sg
+}
+
+// AddMultiConditionalEdges adds multi-conditional routing from a node.
+// The condition returns multiple branch keys for parallel routing.
+func (sg *StateGraph) AddMultiConditionalEdges(
+	from string,
+	condFunc MultiConditionalFunc,
+	pathMap map[string]string,
+) *StateGraph {
+	condEdge := &ConditionalEdge{
+		From:      from,
+		Condition: wrapperCondFunc(condFunc),
 		PathMap:   pathMap,
 	}
 	sg.graph.addConditionalEdge(condEdge)
@@ -393,15 +529,15 @@ func (sg *StateGraph) AddToolsConditionalEdges(
 	toToolsNode string,
 	fallbackNode string,
 ) *StateGraph {
-	condition := func(ctx context.Context, state State) (string, error) {
+	condition := func(ctx context.Context, state State) (ConditionResult, error) {
 		if msgs, ok := state[StateKeyMessages].([]model.Message); ok {
 			if len(msgs) > 0 {
 				if len(msgs[len(msgs)-1].ToolCalls) > 0 {
-					return toToolsNode, nil
+					return ConditionResult{NextNodes: []string{toToolsNode}}, nil
 				}
 			}
 		}
-		return fallbackNode, nil
+		return ConditionResult{NextNodes: []string{fallbackNode}}, nil
 	}
 	condEdge := &ConditionalEdge{
 		From:      fromLLMNode,
@@ -450,6 +586,44 @@ func (sg *StateGraph) WithNodeCallbacks(callbacks *NodeCallbacks) *StateGraph {
 	return sg
 }
 
+// WithCache sets the graph-level cache implementation.
+func (sg *StateGraph) WithCache(cache Cache) *StateGraph {
+	if cache != nil {
+		sg.graph.setCache(cache)
+	}
+	return sg
+}
+
+// WithCachePolicy sets the default cache policy for all nodes (can be overridden per-node).
+func (sg *StateGraph) WithCachePolicy(policy *CachePolicy) *StateGraph {
+	sg.graph.setCachePolicy(policy)
+	return sg
+}
+
+// WithGraphVersion sets an optional version string used for cache namespacing.
+// This helps avoid stale cache collisions across graph code changes or deployments.
+func (sg *StateGraph) WithGraphVersion(version string) *StateGraph {
+	sg.graph.setGraphVersion(version)
+	return sg
+}
+
+// ClearCache clears caches for the specified nodes. If nodes is empty, it clears all nodes currently in the graph.
+func (sg *StateGraph) ClearCache(nodes ...string) *StateGraph {
+	if len(nodes) == 0 {
+		// collect all nodes
+		var all []string
+		sg.graph.mu.RLock()
+		for id := range sg.graph.nodes {
+			all = append(all, id)
+		}
+		sg.graph.mu.RUnlock()
+		sg.graph.clearCacheForNodes(all)
+		return sg
+	}
+	sg.graph.clearCacheForNodes(nodes)
+	return sg
+}
+
 // MustCompile compiles the graph or panics if invalid.
 func (sg *StateGraph) MustCompile() *Graph {
 	graph, err := sg.Compile()
@@ -469,22 +643,62 @@ func WithLLMNodeID(nodeID string) LLMNodeFuncOption {
 	}
 }
 
+// WithLLMRefreshToolSetsOnRun controls whether tools from ToolSets are
+// refreshed from the underlying ToolSet on each LLM node run.
+func WithLLMRefreshToolSetsOnRun(refresh bool) LLMNodeFuncOption {
+	return func(runner *llmRunner) {
+		runner.refreshToolSetsOnRun = refresh
+	}
+}
+
+func mergeToolsWithToolSets(
+	ctx context.Context,
+	base map[string]tool.Tool,
+	toolSets []tool.ToolSet,
+) map[string]tool.Tool {
+	if len(toolSets) == 0 {
+		return base
+	}
+	out := make(map[string]tool.Tool, len(base))
+	for name, t := range base {
+		out[name] = t
+	}
+	for _, toolSet := range toolSets {
+		namedToolSet := itool.NewNamedToolSet(toolSet)
+		setTools := namedToolSet.Tools(ctx)
+		for _, t := range setTools {
+			name := t.Declaration().Name
+			if _, ok := out[name]; ok {
+				log.Warnf(
+					"tool %s already exists at %s toolset, "+
+						"will be overridden",
+					name, toolSet.Name(),
+				)
+			}
+			out[name] = t
+		}
+	}
+	return out
+}
+
 // WithLLMToolSets sets the tool sets for the LLM node function.
 func WithLLMToolSets(toolSets []tool.ToolSet) LLMNodeFuncOption {
 	return func(runner *llmRunner) {
+		if len(toolSets) == 0 {
+			return
+		}
+		if runner.refreshToolSetsOnRun {
+			runner.toolSets = append(runner.toolSets, toolSets...)
+			return
+		}
 		if runner.tools == nil {
 			runner.tools = make(map[string]tool.Tool)
 		}
-		for _, toolSet := range toolSets {
-			// Create named toolset wrapper to avoid name conflicts
-			namedToolSet := itool.NewNamedToolSet(toolSet)
-			for _, t := range namedToolSet.Tools(context.Background()) {
-				if _, ok := runner.tools[t.Declaration().Name]; ok {
-					log.Warnf("tool %s already exists at %s toolset, will be overridden", t.Declaration().Name, toolSet.Name())
-				}
-				runner.tools[t.Declaration().Name] = t
-			}
-		}
+		runner.tools = mergeToolsWithToolSets(
+			context.Background(),
+			runner.tools,
+			toolSets,
+		)
 	}
 }
 
@@ -513,6 +727,7 @@ func NewLLMNodeFunc(
 		opt(runner)
 	}
 	return func(ctx context.Context, state State) (any, error) {
+
 		_, span := trace.Tracer.Start(ctx, itelemetry.NewChatSpanName(llmModel.Info().Name))
 		defer span.End()
 		result, err := runner.execute(ctx, state, span)
@@ -527,11 +742,13 @@ func NewLLMNodeFunc(
 // llmRunner encapsulates LLM execution dependencies to avoid long parameter
 // lists.
 type llmRunner struct {
-	llmModel         model.Model
-	instruction      string
-	tools            map[string]tool.Tool
-	nodeID           string
-	generationConfig model.GenerationConfig
+	llmModel             model.Model
+	instruction          string
+	tools                map[string]tool.Tool
+	toolSets             []tool.ToolSet
+	refreshToolSetsOnRun bool
+	nodeID               string
+	generationConfig     model.GenerationConfig
 }
 
 // execute implements the three-stage rule for LLM execution.
@@ -571,6 +788,7 @@ func (r *llmRunner) executeOneShotStage(
 		StateKeyMessages:        ops,
 		StateKeyOneShotMessages: []model.Message(nil), // Clear one-shot messages after execution.
 		StateKeyLastResponse:    asst.Content,
+		StateKeyLastResponseID:  extractResponseID(result),
 		StateKeyNodeResponses: map[string]any{
 			r.nodeID: asst.Content,
 		},
@@ -610,6 +828,9 @@ func (r *llmRunner) executeUserInputStage(
 		StateKeyMessages:     ops,
 		StateKeyUserInput:    "", // Clear user input after execution.
 		StateKeyLastResponse: asst.Content,
+		StateKeyLastResponseID: func() string {
+			return extractResponseID(result)
+		}(),
 		StateKeyNodeResponses: map[string]any{
 			r.nodeID: asst.Content,
 		},
@@ -634,6 +855,9 @@ func (r *llmRunner) executeHistoryStage(ctx context.Context, state State, span o
 		return State{
 			StateKeyMessages:     AppendMessages{Items: []model.Message{*asst}},
 			StateKeyLastResponse: asst.Content,
+			StateKeyLastResponseID: func() string {
+				return extractResponseID(result)
+			}(),
 			StateKeyNodeResponses: map[string]any{
 				r.nodeID: asst.Content,
 			},
@@ -649,12 +873,16 @@ func (r *llmRunner) executeModel(
 	span oteltrace.Span,
 	instructionUsed string,
 ) (any, error) {
+	tools := r.tools
+	if r.refreshToolSetsOnRun && len(r.toolSets) > 0 {
+		tools = mergeToolsWithToolSets(ctx, tools, r.toolSets)
+	}
 	request := &model.Request{
 		Messages:         messages,
-		Tools:            r.tools,
+		Tools:            tools,
 		GenerationConfig: r.generationConfig,
 	}
-	invocationID, sessionID, eventChan := extractExecutionContext(state)
+	invocationID, sessionID, appName, userID, eventChan := extractExecutionContext(state)
 	modelCallbacks, _ := state[StateKeyModelCallbacks].(*model.Callbacks)
 	var nodeID string
 	if nodeIDData, exists := state[StateKeyCurrentNodeID]; exists {
@@ -675,17 +903,33 @@ func (r *llmRunner) executeModel(
 		EventChan:      eventChan,
 		InvocationID:   invocationID,
 		SessionID:      sessionID,
+		AppName:        appName,
+		UserID:         userID,
 		Span:           span,
 		NodeID:         nodeID,
 	})
 	endTime := time.Now()
 	var modelOutput string
+	var responseID string
 	if err == nil && result != nil {
 		if finalResponse, ok := result.(*model.Response); ok && len(finalResponse.Choices) > 0 {
 			modelOutput = finalResponse.Choices[0].Message.Content
+			responseID = finalResponse.ID
 		}
 	}
-	emitModelCompleteEvent(ctx, eventChan, invocationID, modelName, nodeID, modelInput, modelOutput, startTime, endTime, err)
+	emitModelCompleteEvent(
+		ctx,
+		eventChan,
+		invocationID,
+		modelName,
+		nodeID,
+		modelInput,
+		modelOutput,
+		responseID,
+		startTime,
+		endTime,
+		err,
+	)
 	return result, err
 }
 
@@ -721,6 +965,14 @@ func extractAssistantMessage(result any) *model.Message {
 	return nil
 }
 
+// extractResponseID extracts response ID from model result.
+func extractResponseID(result any) string {
+	if response, ok := result.(*model.Response); ok {
+		return response.ID
+	}
+	return ""
+}
+
 // ensureSystemHead ensures system prompt is at the head if provided.
 func ensureSystemHead(in []model.Message, sys string) []model.Message {
 	if sys == "" {
@@ -736,7 +988,7 @@ func ensureSystemHead(in []model.Message, sys string) []model.Message {
 }
 
 // extractExecutionContext extracts execution context from state.
-func extractExecutionContext(state State) (invocationID string, sessionID string, eventChan chan<- *event.Event) {
+func extractExecutionContext(state State) (invocationID, sessionID, appName, userID string, eventChan chan<- *event.Event) {
 	if execCtx, exists := state[StateKeyExecContext]; exists {
 		execContext, ok := execCtx.(*ExecutionContext)
 		if ok {
@@ -747,10 +999,12 @@ func extractExecutionContext(state State) (invocationID string, sessionID string
 	if sess, ok := state[StateKeySession]; ok {
 		if s, ok := sess.(*session.Session); ok && s != nil {
 			sessionID = s.ID
+			appName = s.AppName
+			userID = s.UserID
 		}
 
 	}
-	return invocationID, sessionID, eventChan
+	return invocationID, sessionID, appName, userID, eventChan
 }
 
 // modelResponseConfig contains configuration for processing model responses.
@@ -768,23 +1022,39 @@ type modelResponseConfig struct {
 }
 
 // processModelResponse processes a single model response.
-func processModelResponse(ctx context.Context, config modelResponseConfig) error {
+func processModelResponse(ctx context.Context, config modelResponseConfig) (context.Context, *event.Event, error) {
 	if config.ModelCallbacks != nil {
-		customResponse, err := config.ModelCallbacks.RunAfterModel(ctx, config.Request, config.Response, nil)
+		// Convert response.Error to Go error for callback.
+		var modelErr error
+		if config.Response != nil && config.Response.Error != nil {
+			modelErr = fmt.Errorf("%s: %s", config.Response.Error.Type, config.Response.Error.Message)
+		}
+
+		args := &model.AfterModelArgs{
+			Request:  config.Request,
+			Response: config.Response,
+			Error:    modelErr,
+		}
+		result, err := config.ModelCallbacks.RunAfterModel(ctx, args)
 		if err != nil {
 			config.Span.SetAttributes(attribute.String("trpc.go.agent.error", err.Error()))
-			return fmt.Errorf("callback after model error: %w", err)
+			return ctx, nil, fmt.Errorf("callback after model error: %w", err)
 		}
-		if customResponse != nil {
-			config.Response = customResponse
+		// Use the context from result if provided for subsequent operations.
+		if result != nil && result.Context != nil {
+			ctx = result.Context
+		}
+		if result != nil && result.CustomResponse != nil {
+			config.Response = result.CustomResponse
 		}
 	}
+	var llmEvent *event.Event
+	author := config.LLMModel.Info().Name
+	if config.NodeID != "" {
+		author = config.NodeID
+	}
+	llmEvent = event.NewResponseEvent(config.InvocationID, author, config.Response)
 	if config.EventChan != nil && !config.Response.Done {
-		author := config.LLMModel.Info().Name
-		if config.NodeID != "" {
-			author = config.NodeID
-		}
-		llmEvent := event.NewResponseEvent(config.InvocationID, author, config.Response)
 		invocation, ok := agent.InvocationFromContext(ctx)
 		if !ok {
 			invocation = agent.NewInvocation(
@@ -794,17 +1064,15 @@ func processModelResponse(ctx context.Context, config modelResponseConfig) error
 			)
 		}
 
-		// Trace the LLM call using the telemetry package.
-		itelemetry.TraceChat(config.Span, invocation, config.Request, config.Response, llmEvent.ID)
 		if err := agent.EmitEvent(ctx, invocation, config.EventChan, llmEvent); err != nil {
-			return err
+			return ctx, nil, err
 		}
 	}
 	if config.Response.Error != nil {
 		config.Span.SetAttributes(attribute.String("trpc.go.agent.error", config.Response.Error.Message))
-		return fmt.Errorf("model API error: %s", config.Response.Error.Message)
+		return ctx, nil, fmt.Errorf("model API error: %s", config.Response.Error.Message)
 	}
-	return nil
+	return ctx, llmEvent, nil
 }
 
 func runModel(
@@ -812,7 +1080,7 @@ func runModel(
 	modelCallbacks *model.Callbacks,
 	llmModel model.Model,
 	request *model.Request,
-) (<-chan *model.Response, error) {
+) (context.Context, <-chan *model.Response, error) {
 	ctx, span := trace.Tracer.Start(ctx, "run_model")
 	defer span.End()
 
@@ -822,25 +1090,30 @@ func runModel(
 	)
 
 	if modelCallbacks != nil {
-		customResponse, err := modelCallbacks.RunBeforeModel(ctx, request)
+		args := &model.BeforeModelArgs{Request: request}
+		result, err := modelCallbacks.RunBeforeModel(ctx, args)
 		if err != nil {
 			span.SetAttributes(attribute.String("trpc.go.agent.error", err.Error()))
-			return nil, fmt.Errorf("callback before model error: %w", err)
+			return ctx, nil, fmt.Errorf("callback before model error: %w", err)
 		}
-		if customResponse != nil {
+		// Use the context from result if provided.
+		if result != nil && result.Context != nil {
+			ctx = result.Context
+		}
+		if result != nil && result.CustomResponse != nil {
 			responseChan := make(chan *model.Response, 1)
-			responseChan <- customResponse
+			responseChan <- result.CustomResponse
 			close(responseChan)
-			return responseChan, nil
+			return ctx, responseChan, nil
 		}
 	}
 	// Generate content.
 	responseChan, err := llmModel.GenerateContent(ctx, request)
 	if err != nil {
 		span.SetAttributes(attribute.String("trpc.go.agent.error", err.Error()))
-		return nil, fmt.Errorf("failed to generate content: %w", err)
+		return ctx, nil, fmt.Errorf("failed to generate content: %w", err)
 	}
-	return responseChan, nil
+	return ctx, responseChan, nil
 }
 
 // NewToolsNodeFunc creates a NodeFunc that uses the tools package directly.
@@ -853,13 +1126,20 @@ func NewToolsNodeFunc(tools map[string]tool.Tool, opts ...Option) NodeFunc {
 	if tools == nil {
 		tools = make(map[string]tool.Tool)
 	}
-	for _, toolSet := range node.toolSets {
-		// Create named toolset wrapper to avoid name conflicts
-		namedToolSet := itool.NewNamedToolSet(toolSet)
-		for _, t := range namedToolSet.Tools(context.Background()) {
-			tools[t.Declaration().Name] = t
-		}
+	baseTools := tools
+	var staticTools map[string]tool.Tool
+	if node.refreshToolSetsOnRun {
+		staticTools = baseTools
+	} else {
+		staticTools = mergeToolsWithToolSets(
+			context.Background(),
+			baseTools,
+			node.toolSets,
+		)
 	}
+	// Capture whether to execute tools in parallel.
+	parallel := node.enableParallelTools
+
 	return func(ctx context.Context, state State) (any, error) {
 		ctx, span := trace.Tracer.Start(ctx, "execute_tools_node")
 		defer span.End()
@@ -871,16 +1151,26 @@ func NewToolsNodeFunc(tools map[string]tool.Tool, opts ...Option) NodeFunc {
 		}
 
 		// Extract execution context for event emission.
-		invocationID, _, eventChan := extractExecutionContext(state)
+		invocationID, _, _, _, eventChan := extractExecutionContext(state)
+
+		effectiveTools := staticTools
+		if node.refreshToolSetsOnRun && len(node.toolSets) > 0 {
+			effectiveTools = mergeToolsWithToolSets(
+				ctx,
+				baseTools,
+				node.toolSets,
+			)
+		}
 
 		// Process all tool calls and collect results.
 		newMessages, err := processToolCalls(ctx, toolCallsConfig{
-			ToolCalls:    toolCalls,
-			Tools:        tools,
-			InvocationID: invocationID,
-			EventChan:    eventChan,
-			Span:         span,
-			State:        state,
+			ToolCalls:      toolCalls,
+			Tools:          effectiveTools,
+			InvocationID:   invocationID,
+			EventChan:      eventChan,
+			Span:           span,
+			State:          state,
+			EnableParallel: parallel,
 		})
 		if err != nil {
 			return nil, err
@@ -925,12 +1215,13 @@ func NewAgentNodeFunc(agentName string, opts ...Option) NodeFunc {
 	outputMapper := dummyNode.agentOutputMapper
 	isolated := dummyNode.agentIsolatedMessages
 	scope := dummyNode.agentEventScope
+	inputFromLast := dummyNode.agentInputFromLastResponse
 	return func(ctx context.Context, state State) (any, error) {
 		ctx, span := trace.Tracer.Start(ctx, "agent_node_execution")
 		defer span.End()
 
 		// Extract execution context for event emission.
-		invocationID, _, eventChan := extractExecutionContext(state)
+		invocationID, _, _, _, eventChan := extractExecutionContext(state)
 
 		// Extract current node ID from state.
 		var nodeID string
@@ -972,8 +1263,21 @@ func NewAgentNodeFunc(agentName string, opts ...Option) NodeFunc {
 			childState[CfgKeyIncludeContents] = "none"
 		}
 
+		// Optionally map parent's last_response to user_input for this agent node.
+		parentForInput := state
+		if inputFromLast {
+			if lr, ok := state[StateKeyLastResponse]; ok {
+				if v, ok2 := lr.(string); ok2 && v != "" {
+					// Clone a shallow copy to avoid mutating the original state view.
+					cloned := state.Clone()
+					cloned[StateKeyUserInput] = v
+					parentForInput = cloned
+				}
+			}
+		}
+
 		// Build invocation for the target agent with custom runtime state and scope.
-		invocation := buildAgentInvocationWithStateAndScope(ctx, state, childState, targetAgent, scope)
+		invocation := buildAgentInvocationWithStateAndScope(ctx, parentForInput, childState, targetAgent, scope)
 
 		// Emit agent execution start event.
 		startTime := time.Now()
@@ -1138,6 +1442,7 @@ func buildAgentInvocationWithStateAndScope(
 //   - t: the tool implementation to execute
 //
 // Returns:
+//   - context.Context: the updated context from callbacks (if any)
 //   - any: the result from tool execution or custom callback result
 //   - []byte: the modified arguments after before-tool callbacks (for telemetry)
 //   - error: any error that occurred during execution
@@ -1146,35 +1451,58 @@ func runTool(
 	toolCall model.ToolCall,
 	toolCallbacks *tool.Callbacks,
 	t tool.Tool,
-) (any, []byte, error) {
+) (context.Context, any, []byte, error) {
 	if toolCallbacks != nil {
-		customResult, err := toolCallbacks.RunBeforeTool(
-			ctx, toolCall.Function.Name, t.Declaration(), &toolCall.Function.Arguments)
-		if err != nil {
-			return nil, toolCall.Function.Arguments, fmt.Errorf("callback before tool error: %w", err)
+		args := &tool.BeforeToolArgs{
+			ToolName:    toolCall.Function.Name,
+			Declaration: t.Declaration(),
+			Arguments:   toolCall.Function.Arguments,
 		}
-		if customResult != nil {
-			return customResult, toolCall.Function.Arguments, nil
+		result, err := toolCallbacks.RunBeforeTool(ctx, args)
+		if err != nil {
+			return ctx, nil, toolCall.Function.Arguments, fmt.Errorf("callback before tool error: %w", err)
+		}
+		// Use the context from result if provided.
+		if result != nil && result.Context != nil {
+			ctx = result.Context
+		}
+		if result != nil && result.CustomResult != nil {
+			return ctx, result.CustomResult, toolCall.Function.Arguments, nil
+		}
+		if result != nil && result.ModifiedArguments != nil {
+			toolCall.Function.Arguments = result.ModifiedArguments
 		}
 	}
 	if callableTool, ok := t.(tool.CallableTool); ok {
 		result, err := callableTool.Call(ctx, toolCall.Function.Arguments)
-		if err != nil {
-			return nil, toolCall.Function.Arguments, fmt.Errorf("tool %s call failed: %w", toolCall.Function.Name, err)
-		}
+		// Run after tool callbacks if they exist.
+		// If the tool returns an error, the callback function will still execute to allow the user to handle the error.
 		if toolCallbacks != nil {
-			customResult, err := toolCallbacks.RunAfterTool(
-				ctx, toolCall.Function.Name, t.Declaration(), toolCall.Function.Arguments, result, err)
-			if err != nil {
-				return nil, toolCall.Function.Arguments, fmt.Errorf("callback after tool error: %w", err)
+			args := &tool.AfterToolArgs{
+				ToolName:    toolCall.Function.Name,
+				Declaration: t.Declaration(),
+				Arguments:   toolCall.Function.Arguments,
+				Result:      result,
+				Error:       err,
 			}
-			if customResult != nil {
-				return customResult, toolCall.Function.Arguments, nil
+			afterResult, afterErr := toolCallbacks.RunAfterTool(ctx, args)
+			if afterErr != nil {
+				return ctx, nil, toolCall.Function.Arguments, fmt.Errorf("callback after tool error: %w", afterErr)
+			}
+			// Use the context from result if provided for subsequent operations.
+			if afterResult != nil && afterResult.Context != nil {
+				ctx = afterResult.Context
+			}
+			if afterResult != nil && afterResult.CustomResult != nil {
+				return ctx, afterResult.CustomResult, toolCall.Function.Arguments, nil
 			}
 		}
-		return result, toolCall.Function.Arguments, nil
+		if err != nil {
+			return ctx, nil, toolCall.Function.Arguments, fmt.Errorf("tool %s call failed: %w", toolCall.Function.Name, err)
+		}
+		return ctx, result, toolCall.Function.Arguments, nil
 	}
-	return nil, toolCall.Function.Arguments, fmt.Errorf("tool %s is not callable", toolCall.Function.Name)
+	return ctx, nil, toolCall.Function.Arguments, fmt.Errorf("tool %s is not callable", toolCall.Function.Name)
 }
 
 // extractModelInput extracts the model input from state and instruction.
@@ -1229,7 +1557,7 @@ func emitModelStartEvent(
 func emitModelCompleteEvent(
 	ctx context.Context,
 	eventChan chan<- *event.Event,
-	invocationID, modelName, nodeID, modelInput, modelOutput string,
+	invocationID, modelName, nodeID, modelInput, modelOutput, responseID string,
 	startTime, endTime time.Time,
 	err error,
 ) {
@@ -1247,6 +1575,7 @@ func emitModelCompleteEvent(
 		WithModelEventInput(modelInput),
 		WithModelEventOutput(modelOutput),
 		WithModelEventError(err),
+		WithModelEventResponseID(responseID),
 	)
 
 	invocation, _ := agent.InvocationFromContext(ctx)
@@ -1261,23 +1590,55 @@ type modelExecutionConfig struct {
 	EventChan      chan<- *event.Event
 	InvocationID   string
 	SessionID      string
+	AppName        string
+	UserID         string
 	NodeID         string // Add NodeID for parallel execution support
 	NodeResultKey  string // Add NodeResultKey for configurable result key pattern
 	Span           oteltrace.Span
 }
 
+const (
+	errMsgNoModelResponse = "no response received from model"
+	errMsgNoModelChoices  = "model returned no choices"
+)
+
 // executeModelWithEvents executes the model with event processing.
 func executeModelWithEvents(ctx context.Context, config modelExecutionConfig) (any, error) {
-	responseChan, err := runModel(ctx, config.ModelCallbacks, config.LLMModel, config.Request)
+	ctx, responseChan, err := runModel(ctx, config.ModelCallbacks, config.LLMModel, config.Request)
 	if err != nil {
 		config.Span.SetAttributes(attribute.String("trpc.go.agent.error", err.Error()))
 		return nil, fmt.Errorf("failed to run model: %w", err)
 	}
+	invocation, ok := agent.InvocationFromContext(ctx)
+	if !ok {
+		invocation = agent.NewInvocation(
+			agent.WithInvocationID(config.InvocationID),
+			agent.WithInvocationModel(config.LLMModel),
+			agent.WithInvocationSession(&session.Session{ID: config.SessionID}),
+		)
+	}
+
+	var lastEvent *event.Event
+	// Get or create timing info from invocation (only record first LLM call)
+	timingInfo := invocation.GetOrCreateTimingInfo()
+	// Create telemetry tracker and defer metrics recording
+	tracker := itelemetry.NewChatMetricsTracker(ctx, invocation, config.Request, timingInfo, &err)
+	defer tracker.RecordMetrics()()
+
 	// Process response.
 	var finalResponse *model.Response
 	var toolCalls []model.ToolCall
 	for response := range responseChan {
-		if err := processModelResponse(ctx, modelResponseConfig{
+		// Track response for telemetry
+		tracker.TrackResponse(response)
+
+		// set timing info to response
+		if response.Usage == nil {
+			response.Usage = &model.Usage{}
+		}
+		response.Usage.TimingInfo = timingInfo
+
+		ctx, lastEvent, err = processModelResponse(ctx, modelResponseConfig{
 			Response:       response,
 			ModelCallbacks: config.ModelCallbacks,
 			EventChan:      config.EventChan,
@@ -1287,8 +1648,13 @@ func executeModelWithEvents(ctx context.Context, config modelExecutionConfig) (a
 			Request:        config.Request,
 			Span:           config.Span,
 			NodeID:         config.NodeID,
-		}); err != nil {
+		})
+		if err != nil {
 			return nil, err
+		}
+		if lastEvent != nil {
+			tracker.SetLastEvent(lastEvent)
+			itelemetry.TraceChat(config.Span, invocation, config.Request, response, lastEvent.ID, tracker.FirstTokenTimeDuration())
 		}
 
 		if len(response.Choices) > 0 && len(response.Choices[0].Message.ToolCalls) > 0 {
@@ -1297,8 +1663,18 @@ func executeModelWithEvents(ctx context.Context, config modelExecutionConfig) (a
 		finalResponse = response
 	}
 	if finalResponse == nil {
-		config.Span.SetAttributes(attribute.String("trpc.go.agent.error", "no response received from model"))
-		return nil, errors.New("no response received from model")
+		config.Span.SetAttributes(attribute.String(
+			"trpc.go.agent.error",
+			errMsgNoModelResponse,
+		))
+		return nil, errors.New(errMsgNoModelResponse)
+	}
+	if len(finalResponse.Choices) == 0 {
+		config.Span.SetAttributes(attribute.String(
+			"trpc.go.agent.error",
+			errMsgNoModelChoices,
+		))
+		return nil, errors.New(errMsgNoModelChoices)
 	}
 	if len(finalResponse.Choices[0].Message.ToolCalls) < len(toolCalls) {
 		finalResponse.Choices[0].Message.ToolCalls = toolCalls
@@ -1354,30 +1730,99 @@ type toolCallsConfig struct {
 	EventChan    chan<- *event.Event
 	Span         oteltrace.Span
 	State        State
+	// EnableParallel controls whether multiple tool calls are executed concurrently.
+	// When false or when there is only one tool call, execution is serial.
+	EnableParallel bool
 }
 
 // processToolCalls executes all tool calls and returns the resulting messages.
 func processToolCalls(ctx context.Context, config toolCallsConfig) ([]model.Message, error) {
 	toolCallbacks, _ := extractToolCallbacks(config.State)
-	newMessages := make([]model.Message, 0, len(config.ToolCalls))
-
-	for _, toolCall := range config.ToolCalls {
-		toolMessage, err := executeSingleToolCall(ctx, singleToolCallConfig{
-			ToolCall:      toolCall,
-			Tools:         config.Tools,
-			InvocationID:  config.InvocationID,
-			EventChan:     config.EventChan,
-			Span:          config.Span,
-			ToolCallbacks: toolCallbacks,
-			State:         config.State,
-		})
-		if err != nil {
-			return nil, err
+	// Serial path or single tool call.
+	if !config.EnableParallel || len(config.ToolCalls) <= 1 {
+		newMessages := make([]model.Message, 0, len(config.ToolCalls))
+		for _, toolCall := range config.ToolCalls {
+			toolMessage, err := executeSingleToolCall(ctx, singleToolCallConfig{
+				ToolCall:      toolCall,
+				Tools:         config.Tools,
+				InvocationID:  config.InvocationID,
+				EventChan:     config.EventChan,
+				Span:          config.Span,
+				ToolCallbacks: toolCallbacks,
+				State:         config.State,
+			})
+			if err != nil {
+				return nil, err
+			}
+			newMessages = append(newMessages, toolMessage)
 		}
-		newMessages = append(newMessages, toolMessage)
+		return newMessages, nil
 	}
 
-	return newMessages, nil
+	// Parallel path: execute each tool call in its own goroutine while
+	// preserving the original order in the resulting messages slice.
+	type result struct {
+		idx int
+		msg model.Message
+		err error
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make(chan result, len(config.ToolCalls))
+	var wg sync.WaitGroup
+	wg.Add(len(config.ToolCalls))
+
+	for i, tc := range config.ToolCalls {
+		i, tc := i, tc
+		go func() {
+			defer wg.Done()
+			msg, err := executeSingleToolCall(ctx, singleToolCallConfig{
+				ToolCall:      tc,
+				Tools:         config.Tools,
+				InvocationID:  config.InvocationID,
+				EventChan:     config.EventChan,
+				Span:          config.Span,
+				ToolCallbacks: toolCallbacks,
+				State:         config.State,
+			})
+			// On error, cancel siblings but still report result so collector can exit cleanly.
+			if err != nil {
+				cancel()
+				results <- result{idx: i, err: err}
+				return
+			}
+			results <- result{idx: i, msg: msg}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Aggregate while preserving order.
+	out := make([]model.Message, len(config.ToolCalls))
+	var firstErr error
+	received := 0
+	for r := range results {
+		received++
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
+		}
+		// Only set when message exists; zero value is fine otherwise.
+		if r.err == nil {
+			out[r.idx] = r.msg
+		}
+		if received == len(config.ToolCalls) {
+			break
+		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return out, nil
 }
 
 // singleToolCallConfig contains configuration for executing a single tool call.
@@ -1404,23 +1849,44 @@ func executeSingleToolCall(ctx context.Context, config singleToolCallConfig) (mo
 
 	// Extract current node ID from state for event authoring.
 	var nodeID string
+	var responseID string
+	sessInfo := &session.Session{}
 	if state := config.State; state != nil {
 		if nodeIDData, exists := state[StateKeyCurrentNodeID]; exists {
 			if id, ok := nodeIDData.(string); ok {
 				nodeID = id
 			}
 		}
+		if rid, ok := state[StateKeyLastResponseID].(string); ok {
+			responseID = rid
+		}
+		if sess, ok := state[StateKeySession]; ok {
+			if s, ok := sess.(*session.Session); ok && s != nil {
+				sessInfo.ID = s.ID
+				sessInfo.AppName = s.AppName
+				sessInfo.UserID = s.UserID
+			}
+		}
 	}
 
 	// Execute the tool with callbacks and get modified arguments.
 	_, span := trace.Tracer.Start(ctx, itelemetry.NewExecuteToolSpanName(config.ToolCall.Function.Name))
-	result, modifiedArgs, err := runTool(ctx, config.ToolCall, config.ToolCallbacks, t)
+	ctx, result, modifiedArgs, err := runTool(ctx, config.ToolCall, config.ToolCallbacks, t)
 
 	// Emit tool execution start event with modified arguments.
 	emitToolStartEvent(
 		ctx, config.EventChan, config.InvocationID, name, id, nodeID,
-		startTime, modifiedArgs,
+		startTime, modifiedArgs, responseID,
 	)
+
+	var interruptErr *InterruptError
+	eventErr := err
+	if err != nil {
+		if errors.As(err, &interruptErr) {
+			// Do not emit error payload for interrupt so clients treat it as pause.
+			eventErr = nil
+		}
+	}
 	// Emit tool execution complete event.
 	event := emitToolCompleteEvent(ctx, toolCompleteEventConfig{
 		EventChan:    config.EventChan,
@@ -1430,13 +1896,26 @@ func executeSingleToolCall(ctx context.Context, config singleToolCallConfig) (mo
 		NodeID:       nodeID,
 		StartTime:    startTime,
 		Result:       result,
-		Error:        err,
+		Error:        eventErr,
 		Arguments:    modifiedArgs,
+		ResponseID:   responseID,
 	})
-	itelemetry.TraceToolCall(span, t.Declaration(), modifiedArgs, event)
+	itelemetry.TraceToolCall(span, sessInfo, t.Declaration(), modifiedArgs, event, err)
+	itelemetry.ReportExecuteToolMetrics(ctx, itelemetry.ExecuteToolAttributes{
+		RequestModelName: "trpc-agent-go-graph",
+		ToolName:         name,
+		AgentName:        fmt.Sprintf("trpc-agent-go-graph-node-id: %s", nodeID),
+		AppName:          sessInfo.AppName,
+		UserID:           sessInfo.UserID,
+		SessionID:        sessInfo.ID,
+		Error:            err,
+	}, time.Since(startTime))
 	span.End()
 
 	if err != nil {
+		if interruptErr != nil {
+			return model.Message{}, interruptErr
+		}
 		config.Span.SetAttributes(attribute.String("trpc.go.agent.error", err.Error()))
 		return model.Message{}, fmt.Errorf("tool %s call failed: %w", name, err)
 	}
@@ -1458,6 +1937,7 @@ func emitToolStartEvent(
 	invocationID, toolName, toolID, nodeID string,
 	startTime time.Time,
 	arguments []byte,
+	responseID string,
 ) {
 	if eventChan == nil {
 		return
@@ -1467,6 +1947,7 @@ func emitToolStartEvent(
 		WithToolEventInvocationID(invocationID),
 		WithToolEventToolName(toolName),
 		WithToolEventToolID(toolID),
+		WithToolEventResponseID(responseID),
 		WithToolEventNodeID(nodeID),
 		WithToolEventPhase(ToolExecutionPhaseStart),
 		WithToolEventStartTime(startTime),
@@ -1484,6 +1965,7 @@ type toolCompleteEventConfig struct {
 	ToolName     string
 	ToolID       string
 	NodeID       string
+	ResponseID   string
 	StartTime    time.Time
 	Result       any
 	Error        error
@@ -1508,6 +1990,7 @@ func emitToolCompleteEvent(ctx context.Context, config toolCompleteEventConfig) 
 		WithToolEventInvocationID(config.InvocationID),
 		WithToolEventToolName(config.ToolName),
 		WithToolEventToolID(config.ToolID),
+		WithToolEventResponseID(config.ResponseID),
 		WithToolEventNodeID(config.NodeID),
 		WithToolEventPhase(ToolExecutionPhaseComplete),
 		WithToolEventStartTime(config.StartTime),
@@ -1545,6 +2028,10 @@ func MessagesStateSchema() *StateSchema {
 		Reducer: DefaultReducer,
 	})
 	schema.AddField(StateKeyLastResponse, StateField{
+		Type:    reflect.TypeOf(""),
+		Reducer: DefaultReducer,
+	})
+	schema.AddField(StateKeyLastResponseID, StateField{
 		Type:    reflect.TypeOf(""),
 		Reducer: DefaultReducer,
 	})

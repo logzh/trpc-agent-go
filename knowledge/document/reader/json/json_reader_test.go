@@ -18,13 +18,14 @@ import (
 	"testing"
 
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
+	"trpc.group/trpc-go/trpc-agent-go/knowledge/document/reader"
 )
 
 func TestJSONReadFromReaderNoChunk(t *testing.T) {
 	data := `{"name":"Alice","age":30}`
 
 	rdr := New(
-		WithChunking(false),
+		reader.WithChunk(false),
 	)
 
 	docs, err := rdr.ReadFromReader("person", strings.NewReader(data))
@@ -82,7 +83,7 @@ func (e errChunker) Chunk(doc *document.Document) ([]*document.Document, error) 
 }
 
 func TestJSONReader_jsonToTextError(t *testing.T) {
-	rdr := New()
+	rdr := New().(*Reader)
 	_, err := rdr.jsonToText("{invalid json}")
 	if err == nil {
 		t.Fatalf("expected error for invalid json")
@@ -90,7 +91,7 @@ func TestJSONReader_jsonToTextError(t *testing.T) {
 }
 
 func TestJSONReader_CustomChunkerError(t *testing.T) {
-	rdr := New(WithChunkingStrategy(errChunker{}))
+	rdr := New(reader.WithCustomChunkingStrategy(errChunker{}))
 	// use simple valid json
 	docs, err := rdr.ReadFromReader("n", strings.NewReader(`{"a":1}`))
 	if err == nil {
@@ -100,4 +101,97 @@ func TestJSONReader_CustomChunkerError(t *testing.T) {
 		t.Fatalf("expected nil docs on error")
 	}
 	_ = http.MethodGet // silence unused import due to build tags
+}
+
+// TestJSONReader_SupportedExtensions verifies the list of supported extensions.
+func TestJSONReader_SupportedExtensions(t *testing.T) {
+	rdr := New()
+	exts := rdr.SupportedExtensions()
+
+	if len(exts) == 0 {
+		t.Fatal("expected non-empty supported extensions")
+	}
+
+	// JSON reader should support .json extension
+	found := false
+	for _, ext := range exts {
+		if ext == ".json" {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		t.Error("expected '.json' in supported extensions")
+	}
+}
+
+// TestJSONReader_ReadFromFileError verifies error handling for non-existent files.
+func TestJSONReader_ReadFromFileError(t *testing.T) {
+	rdr := New()
+	_, err := rdr.ReadFromFile("/nonexistent/path/file.json")
+	if err == nil {
+		t.Error("expected error for non-existent file")
+	}
+}
+
+// TestJSONReader_ReadFromURLErrors verifies error handling for invalid URLs.
+func TestJSONReader_ReadFromURLErrors(t *testing.T) {
+	rdr := New()
+
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{"invalid_scheme_ftp", "ftp://example.com/data.json"},
+		{"invalid_scheme_file", "file:///local/data.json"},
+		{"malformed_url", "://invalid-url"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := rdr.ReadFromURL(tt.url)
+			if err == nil {
+				t.Errorf("expected error for %s", tt.name)
+			}
+		})
+	}
+}
+
+// TestJSONReader_ChunkDocumentDefaultStrategy verifies default chunking strategy initialization.
+func TestJSONReader_ChunkDocumentDefaultStrategy(t *testing.T) {
+	rdr := New(reader.WithChunk(true))
+
+	jsonData := `{"name":"test","value":123}`
+	docs, err := rdr.ReadFromReader("test", strings.NewReader(jsonData))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(docs) == 0 {
+		t.Error("expected at least one document")
+	}
+}
+
+// TestJSONReader_ExtractFileNameFromURL tests URL filename extraction.
+func TestJSONReader_ExtractFileNameFromURL(t *testing.T) {
+	rdr := New().(*Reader)
+
+	tests := []struct {
+		name     string
+		url      string
+		expected string
+	}{
+		{"simple_filename", "https://api.example.com/data.json", "data"},
+		{"with_query_params", "https://api.example.com/api.json?key=value", "api"},
+		{"root_path", "https://example.com/", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := rdr.extractFileNameFromURL(tt.url)
+			if result != tt.expected {
+				t.Errorf("extractFileNameFromURL(%q) = %q, want %q", tt.url, result, tt.expected)
+			}
+		})
+	}
 }

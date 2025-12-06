@@ -187,6 +187,83 @@ func TestCheckpointManager_Put_Smoke(t *testing.T) {
 	assert.Equal(t, ck.ID, got.ID)
 }
 
+// capturingSaver captures the last Put request for assertions.
+type capturingSaver struct{ lastPut PutRequest }
+
+func (c *capturingSaver) Get(
+	_ context.Context, _ map[string]any,
+) (*Checkpoint, error) {
+	return nil, nil
+}
+func (c *capturingSaver) GetTuple(
+	_ context.Context, _ map[string]any,
+) (*CheckpointTuple, error) {
+	return nil, nil
+}
+func (c *capturingSaver) List(
+	_ context.Context, _ map[string]any, _ *CheckpointFilter,
+) ([]*CheckpointTuple, error) {
+	return nil, nil
+}
+func (c *capturingSaver) Put(
+	_ context.Context, req PutRequest,
+) (map[string]any, error) {
+	c.lastPut = req
+	// echo back config as-is
+	return req.Config, nil
+}
+func (c *capturingSaver) PutWrites(
+	_ context.Context, _ PutWritesRequest,
+) error {
+	return nil
+}
+func (c *capturingSaver) PutFull(
+	_ context.Context, req PutFullRequest,
+) (map[string]any, error) {
+	// route through Put to capture
+	return c.Put(
+		context.Background(),
+		PutRequest{
+			Config:      req.Config,
+			Checkpoint:  req.Checkpoint,
+			Metadata:    req.Metadata,
+			NewVersions: req.NewVersions,
+		},
+	)
+}
+func (c *capturingSaver) DeleteLineage(
+	_ context.Context, _ string,
+) error {
+	return nil
+}
+func (c *capturingSaver) Close() error { return nil }
+
+func TestCreateCheckpoint_SkipsUnsafeKeys(t *testing.T) {
+	saver := &capturingSaver{}
+	cm := NewCheckpointManager(saver)
+	cfg := CreateCheckpointConfig("ln-unsafe", "", "")
+	// Include both a safe key and unsafe keys (callbacks, exec context).
+	st := State{
+		"keep":                 1,
+		StateKeyNodeCallbacks:  NewNodeCallbacks(),
+		StateKeyExecContext:    &ExecutionContext{InvocationID: "x"},
+		StateKeyModelCallbacks: "mc", // unsafe
+	}
+	ck, err := cm.CreateCheckpoint(
+		context.Background(), cfg, st, CheckpointSourceInput, 0,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, ck)
+
+	// Assert that unsafe keys are filtered from persisted channel values.
+	vals := saver.lastPut.Checkpoint.ChannelValues
+	require.NotNil(t, vals)
+	require.Contains(t, vals, "keep")
+	require.NotContains(t, vals, StateKeyNodeCallbacks)
+	require.NotContains(t, vals, StateKeyExecContext)
+	require.NotContains(t, vals, StateKeyModelCallbacks)
+}
+
 // minimal in-memory saver mock for manager.put test
 type mockSaver struct{ byID map[string]*CheckpointTuple }
 
@@ -377,7 +454,7 @@ func TestToolEvents_And_ExecuteSingleToolCall(t *testing.T) {
 	// prepare event channel
 	ch := make(chan *event.Event, 10)
 	// emit start
-	emitToolStartEvent(context.Background(), ch, "inv-id", "echo", "id-1", "nodeA", time.Now(), []byte(`{"a":1}`))
+	emitToolStartEvent(context.Background(), ch, "inv-id", "echo", "id-1", "nodeA", time.Now(), []byte(`{"a":1}`), "")
 	// emit complete
 	emitToolCompleteEvent(context.Background(), toolCompleteEventConfig{EventChan: ch, InvocationID: "inv-id", ToolName: "echo", ToolID: "id-1", NodeID: "nodeA", StartTime: time.Now(), Result: map[string]any{"x": 1}, Error: nil, Arguments: []byte(`{"a":1}`)})
 	// ensure two events were sent
@@ -410,6 +487,138 @@ func TestToolEvents_And_ExecuteSingleToolCall(t *testing.T) {
 	// executeSingleToolCall error - tool not found
 	_, err = executeSingleToolCall(ctx, singleToolCallConfig{ToolCall: model.ToolCall{ID: "tid2", Function: model.FunctionDefinitionParam{Name: "notfound"}}, Tools: map[string]tool.Tool{}, InvocationID: "inv2", EventChan: ch, Span: span, State: State{}})
 	require.Error(t, err)
+}
+
+// interruptTool is a dummy tool that always interrupts.
+type interruptTool struct{ name string }
+
+func (it *interruptTool) Declaration() *tool.Declaration {
+	return &tool.Declaration{Name: it.name}
+}
+
+func (it *interruptTool) Call(ctx context.Context, jsonArgs []byte) (any, error) {
+	return nil, NewInterruptError("ask?")
+}
+
+// When a tool interrupts, executeSingleToolCall should:
+// - emit a tool complete event WITHOUT an error payload, and
+// - return the interrupt error (not wrapped).
+func TestExecuteSingleToolCall_Interrupt_NoErrorInEvent(t *testing.T) {
+	ch := make(chan *event.Event, 4)
+	tracer := oteltrace.NewNoopTracerProvider().Tracer("test-int")
+	ctx, span := tracer.Start(context.Background(), "span")
+	defer span.End()
+
+	// Configure a tool call that yields an interrupt.
+	args := []byte(`{"x":1}`)
+	cfg := singleToolCallConfig{
+		ToolCall: model.ToolCall{ID: "tid",
+			Function: model.FunctionDefinitionParam{
+				Name:      "interrupt",
+				Arguments: args,
+			}},
+		Tools: map[string]tool.Tool{
+			"interrupt": &interruptTool{name: "interrupt"},
+		},
+		InvocationID: "inv-int",
+		EventChan:    ch,
+		Span:         span,
+		State:        State{StateKeyCurrentNodeID: "nodeInt"},
+	}
+
+	_, err := executeSingleToolCall(ctx, cfg)
+	require.Error(t, err)
+	require.True(t, IsInterruptError(err))
+	if intr, ok := GetInterruptError(err); ok {
+		require.Equal(t, "ask?", intr.Value)
+	}
+
+	// Drain events; find the tool complete event and assert no error.
+	var complete *event.Event
+	drain := len(ch)
+	for i := 0; i < drain; i++ {
+		e := <-ch
+		if e == nil || e.StateDelta == nil {
+			continue
+		}
+		if b, ok := e.StateDelta[MetadataKeyTool]; ok {
+			var meta ToolExecutionMetadata
+			if json.Unmarshal(b, &meta) == nil &&
+				meta.Phase == ToolExecutionPhaseComplete {
+				complete = e
+				// Meta.Error must be empty for interrupts
+				require.Equal(t, "", meta.Error)
+				break
+			}
+		}
+	}
+	require.NotNil(t, complete, "expected tool complete event")
+	// Response.Error must be nil for interrupt tool completes.
+	if complete.Response != nil {
+		require.Nil(t, complete.Response.Error)
+	}
+}
+
+// A tool that returns a normal error should produce an error payload in the
+// tool complete event and return a wrapped error from executeSingleToolCall.
+type errorTool struct{ name string }
+
+func (et *errorTool) Declaration() *tool.Declaration {
+	return &tool.Declaration{Name: et.name}
+}
+
+func (et *errorTool) Call(ctx context.Context, jsonArgs []byte) (any, error) {
+	return nil, fmt.Errorf("boom")
+}
+
+func TestExecuteSingleToolCall_Error_ErrorInEvent(t *testing.T) {
+	ch := make(chan *event.Event, 4)
+	tracer := oteltrace.NewNoopTracerProvider().Tracer("test-err")
+	ctx, span := tracer.Start(context.Background(), "span")
+	defer span.End()
+
+	args := []byte(`{"x":1}`)
+	cfg := singleToolCallConfig{
+		ToolCall: model.ToolCall{ID: "tid2",
+			Function: model.FunctionDefinitionParam{
+				Name:      "errtool",
+				Arguments: args,
+			}},
+		Tools: map[string]tool.Tool{
+			"errtool": &errorTool{name: "errtool"},
+		},
+		InvocationID: "inv-err",
+		EventChan:    ch,
+		Span:         span,
+		State:        State{StateKeyCurrentNodeID: "nodeErr"},
+	}
+
+	_, err := executeSingleToolCall(ctx, cfg)
+	require.Error(t, err)
+	// Should not be an interrupt error
+	require.False(t, IsInterruptError(err))
+
+	// Find the tool complete event and assert error surfaced.
+	var complete *event.Event
+	drain := len(ch)
+	for i := 0; i < drain; i++ {
+		e := <-ch
+		if e == nil || e.StateDelta == nil {
+			continue
+		}
+		if b, ok := e.StateDelta[MetadataKeyTool]; ok {
+			var meta ToolExecutionMetadata
+			if json.Unmarshal(b, &meta) == nil &&
+				meta.Phase == ToolExecutionPhaseComplete {
+				complete = e
+				require.NotEqual(t, "", meta.Error)
+				break
+			}
+		}
+	}
+	require.NotNil(t, complete)
+	require.NotNil(t, complete.Response)
+	require.NotNil(t, complete.Response.Error)
 }
 
 func TestExtractToolCallbacks_NotFound(t *testing.T) {
@@ -490,7 +699,7 @@ func TestRunTool_CallbackShortCircuitAndErrors(t *testing.T) {
 	cbs := tool.NewCallbacks().RegisterBeforeTool(func(ctx context.Context, toolName string, d *tool.Declaration, args *[]byte) (any, error) {
 		return map[string]any{"short": true}, nil
 	})
-	res, _, err := runTool(ctx, call, cbs, tdecl)
+	_, res, _, err := runTool(ctx, call, cbs, tdecl)
 	require.NoError(t, err)
 	m, _ := res.(map[string]any)
 	require.Equal(t, true, m["short"])
@@ -499,20 +708,20 @@ func TestRunTool_CallbackShortCircuitAndErrors(t *testing.T) {
 	cbs2 := tool.NewCallbacks().RegisterBeforeTool(func(ctx context.Context, toolName string, d *tool.Declaration, args *[]byte) (any, error) {
 		return nil, assert.AnError
 	})
-	_, _, err = runTool(ctx, call, cbs2, tdecl)
+	_, _, _, err = runTool(ctx, call, cbs2, tdecl)
 	require.Error(t, err)
 
 	// After callback returns custom result
 	cbs3 := tool.NewCallbacks().RegisterAfterTool(func(ctx context.Context, toolName string, d *tool.Declaration, args []byte, result any, runErr error) (any, error) {
 		return map[string]any{"override": true}, nil
 	})
-	res, _, err = runTool(ctx, call, cbs3, tdecl)
+	_, res, _, err = runTool(ctx, call, cbs3, tdecl)
 	require.NoError(t, err)
 	m2, _ := res.(map[string]any)
 	require.Equal(t, true, m2["override"])
 
 	// Not callable tool
-	_, _, err = runTool(ctx, call, nil, &notCallableTool{})
+	_, _, _, err = runTool(ctx, call, nil, &notCallableTool{})
 	require.Error(t, err)
 }
 
@@ -562,6 +771,173 @@ func TestBuildAgentInvocation(t *testing.T) {
 	require.Equal(t, "ag", newInv.AgentName)
 	require.Equal(t, "hello", newInv.Message.Content)
 
+}
+
+// Additional manager and builder coverage using configurable fake saver
+type fakeSaver2 struct {
+	put      func(context.Context, PutRequest) (map[string]any, error)
+	putFull  func(context.Context, PutFullRequest) (map[string]any, error)
+	get      func(context.Context, map[string]any) (*Checkpoint, error)
+	getTuple func(context.Context, map[string]any) (*CheckpointTuple, error)
+	list     func(context.Context, map[string]any, *CheckpointFilter) ([]*CheckpointTuple, error)
+	del      func(context.Context, string) error
+}
+
+func (f fakeSaver2) Put(ctx context.Context, req PutRequest) (map[string]any, error) {
+	if f.put != nil {
+		return f.put(ctx, req)
+	}
+	return map[string]any{}, nil
+}
+func (f fakeSaver2) PutWrites(context.Context, PutWritesRequest) error { return nil }
+func (f fakeSaver2) PutFull(ctx context.Context, req PutFullRequest) (map[string]any, error) {
+	if f.putFull != nil {
+		return f.putFull(ctx, req)
+	}
+	return map[string]any{}, nil
+}
+func (f fakeSaver2) Get(ctx context.Context, cfg map[string]any) (*Checkpoint, error) {
+	if f.get != nil {
+		return f.get(ctx, cfg)
+	}
+	return nil, nil
+}
+func (f fakeSaver2) GetTuple(ctx context.Context, cfg map[string]any) (*CheckpointTuple, error) {
+	if f.getTuple != nil {
+		return f.getTuple(ctx, cfg)
+	}
+	return nil, nil
+}
+func (f fakeSaver2) List(ctx context.Context, cfg map[string]any, filter *CheckpointFilter) ([]*CheckpointTuple, error) {
+	if f.list != nil {
+		return f.list(ctx, cfg, filter)
+	}
+	return nil, nil
+}
+func (f fakeSaver2) DeleteLineage(ctx context.Context, id string) error {
+	if f.del != nil {
+		return f.del(ctx, id)
+	}
+	return nil
+}
+func (f fakeSaver2) Close() error { return nil }
+
+func TestGetLineageID_And_GetResumeMap_Branches(t *testing.T) {
+	if GetLineageID(nil) != "" {
+		t.Fatalf("expected empty lineage id")
+	}
+	if GetResumeMap(nil) != nil {
+		t.Fatalf("expected nil resume map")
+	}
+	if GetLineageID(map[string]any{"x": 1}) != "" {
+		t.Fatalf("expected empty lineage id")
+	}
+	if GetResumeMap(map[string]any{"x": 1}) != nil {
+		t.Fatalf("expected nil resume map")
+	}
+	if GetLineageID(map[string]any{CfgKeyConfigurable: map[string]any{}}) != "" {
+		t.Fatalf("expected empty lineage id")
+	}
+	if GetResumeMap(map[string]any{CfgKeyConfigurable: map[string]any{}}) != nil {
+		t.Fatalf("expected nil resume map")
+	}
+}
+
+func TestCheckpointManager_CreateCheckpoint_Success(t *testing.T) {
+	called := false
+	cm := NewCheckpointManager(fakeSaver2{put: func(ctx context.Context, req PutRequest) (map[string]any, error) {
+		called = true
+		if req.Checkpoint == nil || req.Metadata == nil {
+			t.Fatalf("missing data")
+		}
+		return map[string]any{"ok": true}, nil
+	}})
+	st := State{"a": 1, "b": "x"}
+	ck, err := cm.CreateCheckpoint(context.Background(), map[string]any{"k": "v"}, st, CheckpointSourceInput, 0)
+	if err != nil || ck == nil || !called {
+		t.Fatalf("unexpected: %v %v %v", ck, err, called)
+	}
+}
+
+func TestCheckpointManager_Latest_Success(t *testing.T) {
+	expect := &CheckpointTuple{Checkpoint: NewCheckpoint(map[string]any{"a": 1}, map[string]int64{}, nil)}
+	cm := NewCheckpointManager(fakeSaver2{list: func(context.Context, map[string]any, *CheckpointFilter) ([]*CheckpointTuple, error) {
+		return []*CheckpointTuple{expect}, nil
+	}})
+	tup, err := cm.Latest(context.Background(), "ln", "ns")
+	if err != nil || tup != expect {
+		t.Fatalf("latest failed: %v %v", tup, err)
+	}
+}
+
+func TestCheckpointManager_BranchFrom_ErrorsAndSuccess(t *testing.T) {
+	cm := NewCheckpointManager(fakeSaver2{getTuple: func(context.Context, map[string]any) (*CheckpointTuple, error) {
+		return nil, fmt.Errorf("get source err")
+	}})
+	if _, err := cm.BranchFrom(context.Background(), "ln", "ns", "cid", "ns2"); err == nil {
+		t.Fatalf("expected error")
+	}
+	cm = NewCheckpointManager(fakeSaver2{getTuple: func(context.Context, map[string]any) (*CheckpointTuple, error) { return nil, nil }})
+	if _, err := cm.BranchFrom(context.Background(), "ln", "ns", "cid", "ns2"); err == nil {
+		t.Fatalf("expected not found")
+	}
+	src := &CheckpointTuple{Checkpoint: NewCheckpoint(map[string]any{}, map[string]int64{}, nil), Metadata: NewCheckpointMetadata(CheckpointSourceInput, 3)}
+	cm = NewCheckpointManager(fakeSaver2{getTuple: func(context.Context, map[string]any) (*CheckpointTuple, error) { return src, nil }, putFull: func(context.Context, PutFullRequest) (map[string]any, error) { return nil, fmt.Errorf("putfull") }})
+	if _, err := cm.BranchFrom(context.Background(), "ln", "ns", "cid", "ns2"); err == nil {
+		t.Fatalf("expected putfull error")
+	}
+	cm = NewCheckpointManager(fakeSaver2{getTuple: func(context.Context, map[string]any) (*CheckpointTuple, error) { return src, nil }, putFull: func(context.Context, PutFullRequest) (map[string]any, error) { return map[string]any{"ok": true}, nil }})
+	out, err := cm.BranchFrom(context.Background(), "ln", "ns", "cid", "ns2")
+	if err != nil || out == nil || out.Config["ok"] != true {
+		t.Fatalf("unexpected: %v %v", out, err)
+	}
+}
+
+func TestCheckpointManager_BranchToNewLineage_Variants(t *testing.T) {
+	src := NewCheckpoint(map[string]any{}, map[string]int64{}, nil)
+	src.Timestamp = time.Now().Add(-time.Minute)
+	cm := NewCheckpointManager(fakeSaver2{getTuple: func(context.Context, map[string]any) (*CheckpointTuple, error) {
+		return &CheckpointTuple{Checkpoint: src, Metadata: NewCheckpointMetadata(CheckpointSourceInput, 2)}, nil
+	}, put: func(context.Context, PutRequest) (map[string]any, error) { return map[string]any{"ok": true}, nil }})
+	if out, err := cm.BranchToNewLineage(context.Background(), "srcLn", "", "", "newLn", "ns"); err != nil || out == nil || out.Config["ok"] != true {
+		t.Fatalf("expected success: %v %v", out, err)
+	}
+	cm = NewCheckpointManager(fakeSaver2{getTuple: func(context.Context, map[string]any) (*CheckpointTuple, error) { return nil, nil }})
+	if _, err := cm.BranchToNewLineage(context.Background(), "srcLn", "nsA", "cidX", "newLn", "nsB"); err == nil {
+		t.Fatalf("expected not found")
+	}
+}
+
+func TestCheckpointManager_ResumeFromLatest_Variants(t *testing.T) {
+	cm := NewCheckpointManager(fakeSaver2{list: func(context.Context, map[string]any, *CheckpointFilter) ([]*CheckpointTuple, error) {
+		return nil, fmt.Errorf("list err")
+	}})
+	if _, err := cm.ResumeFromLatest(context.Background(), "ln", "ns", &Command{}); err == nil {
+		t.Fatalf("expected error")
+	}
+	cm = NewCheckpointManager(fakeSaver2{list: func(context.Context, map[string]any, *CheckpointFilter) ([]*CheckpointTuple, error) {
+		return []*CheckpointTuple{}, nil
+	}})
+	if _, err := cm.ResumeFromLatest(context.Background(), "ln", "ns", nil); err == nil {
+		t.Fatalf("expected none found error")
+	}
+	ck := NewCheckpoint(map[string]any{"a": 1}, map[string]int64{}, nil)
+	cm = NewCheckpointManager(fakeSaver2{list: func(context.Context, map[string]any, *CheckpointFilter) ([]*CheckpointTuple, error) {
+		return []*CheckpointTuple{{Checkpoint: ck}}, nil
+	}})
+	st, err := cm.ResumeFromLatest(context.Background(), "ln", "ns", &Command{Resume: "v"})
+	if err != nil || st[StateKeyCommand] == nil {
+		t.Fatalf("expected command in state: %v %v", st, err)
+	}
+}
+
+func TestCheckpointManager_ResumeFromCheckpoint_NilCheckpointError(t *testing.T) {
+	cm := NewCheckpointManager(fakeSaver2{getTuple: func(context.Context, map[string]any) (*CheckpointTuple, error) {
+		return &CheckpointTuple{Checkpoint: nil}, nil
+	}})
+	if _, err := cm.ResumeFromCheckpoint(context.Background(), map[string]any{}); err == nil {
+		t.Fatalf("expected error when tuple.Checkpoint is nil")
+	}
 }
 
 func TestExtractToolCallsFromState_SuccessAndErrors(t *testing.T) {
@@ -736,6 +1112,22 @@ func (e *emptyModel) GenerateContent(ctx context.Context, req *model.Request) (<
 }
 func (e *emptyModel) Info() model.Info { return model.Info{Name: "empty"} }
 
+type emptyChoicesModel struct{}
+
+func (e *emptyChoicesModel) GenerateContent(
+	ctx context.Context,
+	req *model.Request,
+) (<-chan *model.Response, error) {
+	ch := make(chan *model.Response, 1)
+	ch <- &model.Response{}
+	close(ch)
+	return ch, nil
+}
+
+func (e *emptyChoicesModel) Info() model.Info {
+	return model.Info{Name: "empty_choices"}
+}
+
 func TestExecuteModelWithEvents_NoResponseError(t *testing.T) {
 	tracer := oteltrace.NewNoopTracerProvider().Tracer("t")
 	_, span := tracer.Start(context.Background(), "s")
@@ -746,9 +1138,34 @@ func TestExecuteModelWithEvents_NoResponseError(t *testing.T) {
 		EventChan:      make(chan *event.Event, 1),
 		InvocationID:   "inv",
 		SessionID:      "sid",
+		AppName:        "app",
+		UserID:         "user",
 		Span:           span,
 		NodeID:         "n",
 	})
+	require.Error(t, err)
+}
+
+func TestExecuteModelWithEvents_NoChoicesError(t *testing.T) {
+	tracer := oteltrace.NewNoopTracerProvider().Tracer("t")
+	_, span := tracer.Start(context.Background(), "s")
+	_, err := executeModelWithEvents(context.Background(),
+		modelExecutionConfig{
+			ModelCallbacks: nil,
+			LLMModel:       &emptyChoicesModel{},
+			Request: &model.Request{
+				Messages: []model.Message{
+					model.NewUserMessage("hi"),
+				},
+			},
+			EventChan:    make(chan *event.Event, 1),
+			InvocationID: "inv",
+			SessionID:    "sid",
+			AppName:      "app",
+			UserID:       "user",
+			Span:         span,
+			NodeID:       "n",
+		})
 	require.Error(t, err)
 }
 
@@ -757,7 +1174,7 @@ func TestRunModel_BeforeModelCustomResponse(t *testing.T) {
 	cbs := model.NewCallbacks().RegisterBeforeModel(func(ctx context.Context, req *model.Request) (*model.Response, error) {
 		return &model.Response{Choices: []model.Choice{{Index: 0, Message: model.NewAssistantMessage("custom")}}}, nil
 	})
-	ch, err := runModel(context.Background(), cbs, &dummyModel{}, &model.Request{Messages: []model.Message{model.NewUserMessage("hi")}})
+	_, ch, err := runModel(context.Background(), cbs, &dummyModel{}, &model.Request{Messages: []model.Message{model.NewUserMessage("hi")}})
 	require.NoError(t, err)
 	rsp := <-ch
 	require.NotNil(t, rsp)
@@ -770,7 +1187,7 @@ func TestProcessModelResponse_EventAndErrors(t *testing.T) {
 	// Event emission path
 	evch := make(chan *event.Event, 1)
 	rsp := &model.Response{Choices: []model.Choice{{Index: 0, Message: model.NewAssistantMessage("ok")}}}
-	err := processModelResponse(context.Background(), modelResponseConfig{
+	_, _, err := processModelResponse(context.Background(), modelResponseConfig{
 		Response:       rsp,
 		ModelCallbacks: nil,
 		EventChan:      evch,
@@ -786,7 +1203,7 @@ func TestProcessModelResponse_EventAndErrors(t *testing.T) {
 
 	// Model API error path
 	errRsp := &model.Response{Error: &model.ResponseError{Message: "boom"}}
-	err = processModelResponse(context.Background(), modelResponseConfig{
+	_, _, err = processModelResponse(context.Background(), modelResponseConfig{
 		Response:     errRsp,
 		EventChan:    make(chan *event.Event, 1),
 		InvocationID: "inv",
@@ -801,7 +1218,7 @@ func TestProcessModelResponse_EventAndErrors(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	// unbuffered channel; since ctx already canceled, select should choose ctx.Done
-	err = processModelResponse(ctx, modelResponseConfig{
+	_, _, err = processModelResponse(ctx, modelResponseConfig{
 		Response:     rsp,
 		EventChan:    make(chan *event.Event),
 		InvocationID: "inv",
@@ -818,7 +1235,7 @@ func TestProcessModelResponse_DoneSkipsEvent(t *testing.T) {
 	_, span := tracer.Start(context.Background(), "s")
 	evch := make(chan *event.Event, 1)
 	rsp := &model.Response{Done: true, Choices: []model.Choice{{Index: 0, Message: model.NewAssistantMessage("ok")}}}
-	err := processModelResponse(context.Background(), modelResponseConfig{
+	_, _, err := processModelResponse(context.Background(), modelResponseConfig{
 		Response:     rsp,
 		EventChan:    evch,
 		InvocationID: "inv",
@@ -843,7 +1260,7 @@ func TestProcessModelResponse_AfterModelCustomResponse(t *testing.T) {
 		return &model.Response{Choices: []model.Choice{{Index: 0, Message: model.NewAssistantMessage("after")}}}, nil
 	})
 	evch := make(chan *event.Event, 1)
-	err := processModelResponse(context.Background(), modelResponseConfig{
+	_, _, err := processModelResponse(context.Background(), modelResponseConfig{
 		Response:       &model.Response{Choices: []model.Choice{{Index: 0, Message: model.NewAssistantMessage("ok")}}},
 		ModelCallbacks: cbs,
 		EventChan:      evch,
@@ -878,6 +1295,8 @@ func TestExecuteModelWithEvents_ToolCallsMerged(t *testing.T) {
 		EventChan:      make(chan *event.Event, 2),
 		InvocationID:   "inv",
 		SessionID:      "sid",
+		AppName:        "app",
+		UserID:         "user",
 		Span:           span,
 		NodeID:         "node",
 	})
@@ -945,15 +1364,19 @@ func TestEnsureSystemHead_And_ExtractExecutionContext(t *testing.T) {
 	require.Equal(t, model.RoleSystem, out2[0].Role)
 	// extractExecutionContext: only execctx
 	exec := &ExecutionContext{InvocationID: "inv", EventChan: make(chan *event.Event, 1)}
-	inv, sess, ch := extractExecutionContext(State{StateKeyExecContext: exec})
+	inv, sess, appName, userID, ch := extractExecutionContext(State{StateKeyExecContext: exec})
 	require.Equal(t, "inv", inv)
 	require.Equal(t, "", sess)
+	require.Equal(t, "", appName)
+	require.Equal(t, "", userID)
 	require.NotNil(t, ch)
 	// extractExecutionContext: only session
-	s := &session.Session{ID: "sid"}
-	inv2, sess2, ch2 := extractExecutionContext(State{StateKeySession: s})
+	s := &session.Session{ID: "sid", AppName: "app", UserID: "user"}
+	inv2, sess2, appName2, userID2, ch2 := extractExecutionContext(State{StateKeySession: s})
 	require.Equal(t, "", inv2)
 	require.Equal(t, "sid", sess2)
+	require.Equal(t, "app", appName2)
+	require.Equal(t, "user", userID2)
 	require.Nil(t, ch2)
 }
 
@@ -1037,7 +1460,7 @@ func TestProcessModelResponse_AfterModelError(t *testing.T) {
 	cbs := model.NewCallbacks().RegisterAfterModel(func(ctx context.Context, req *model.Request, rsp *model.Response, modelErr error) (*model.Response, error) {
 		return nil, assert.AnError
 	})
-	err := processModelResponse(context.Background(), modelResponseConfig{
+	_, _, err := processModelResponse(context.Background(), modelResponseConfig{
 		Response:       &model.Response{Choices: []model.Choice{{Index: 0, Message: model.NewAssistantMessage("ok")}}},
 		ModelCallbacks: cbs,
 		EventChan:      make(chan *event.Event, 1),
@@ -1058,8 +1481,112 @@ func (e *errModel) GenerateContent(ctx context.Context, req *model.Request) (<-c
 func (e *errModel) Info() model.Info { return model.Info{Name: "err"} }
 
 func TestRunModel_GenerateContentError(t *testing.T) {
-	_, err := runModel(context.Background(), nil, &errModel{}, &model.Request{Messages: []model.Message{model.NewUserMessage("hi")}})
+	_, _, err := runModel(context.Background(), nil, &errModel{}, &model.Request{Messages: []model.Message{model.NewUserMessage("hi")}})
 	require.Error(t, err)
+}
+
+// TestRunModel_CallbackContextPropagation tests that context values set in
+// BeforeModel callback can be retrieved in AfterModel callback through processModelResponse.
+func TestRunModel_CallbackContextPropagation(t *testing.T) {
+	type contextKey string
+	const testKey contextKey = "test-key"
+	const testValue = "test-value-from-before"
+
+	// Create callbacks that set and read context values.
+	callbacks := model.NewCallbacks()
+	var capturedValue any
+
+	// BeforeModel callback sets a context value.
+	callbacks.RegisterBeforeModel(func(ctx context.Context, args *model.BeforeModelArgs) (*model.BeforeModelResult, error) {
+		ctxWithValue := context.WithValue(ctx, testKey, testValue)
+		return &model.BeforeModelResult{
+			Context: ctxWithValue,
+		}, nil
+	})
+
+	// AfterModel callback reads the context value.
+	callbacks.RegisterAfterModel(func(ctx context.Context, args *model.AfterModelArgs) (*model.AfterModelResult, error) {
+		capturedValue = ctx.Value(testKey)
+		return nil, nil
+	})
+
+	// Create a dummy model that returns a response.
+	dummyModel := &dummyModel{}
+
+	// Run the model.
+	ctx := context.Background()
+	request := &model.Request{
+		Messages: []model.Message{model.NewUserMessage("test")},
+	}
+
+	ctx, responseChan, err := runModel(ctx, callbacks, dummyModel, request)
+	require.NoError(t, err)
+
+	// Process the response to trigger AfterModel callback.
+	tracer := oteltrace.NewNoopTracerProvider().Tracer("t")
+	_, span := tracer.Start(ctx, "s")
+	defer span.End()
+
+	// Consume all responses.
+	for response := range responseChan {
+		// Process each response to trigger AfterModel callback.
+		_, _, err = processModelResponse(ctx, modelResponseConfig{
+			Response:       response,
+			ModelCallbacks: callbacks,
+			EventChan:      make(chan *event.Event, 1),
+			InvocationID:   "test-inv",
+			SessionID:      "test-session",
+			LLMModel:       dummyModel,
+			Request:        request,
+			Span:           span,
+		})
+		require.NoError(t, err)
+	}
+
+	// Verify that the context value was captured in AfterModel callback.
+	require.Equal(t, testValue, capturedValue, "context value should be propagated from BeforeModel to AfterModel")
+}
+
+// TestRunTool_CallbackContextPropagation tests that context values set in
+// BeforeTool callback can be retrieved in AfterTool callback.
+func TestRunTool_CallbackContextPropagation(t *testing.T) {
+	type contextKey string
+	const testKey contextKey = "test-key"
+	const testValue = "test-value-from-before"
+
+	// Create callbacks that set and read context values.
+	callbacks := tool.NewCallbacks()
+	var capturedValue any
+
+	// BeforeTool callback sets a context value.
+	callbacks.RegisterBeforeTool(func(ctx context.Context, args *tool.BeforeToolArgs) (*tool.BeforeToolResult, error) {
+		ctxWithValue := context.WithValue(ctx, testKey, testValue)
+		return &tool.BeforeToolResult{
+			Context: ctxWithValue,
+		}, nil
+	})
+
+	// AfterTool callback reads the context value.
+	callbacks.RegisterAfterTool(func(ctx context.Context, args *tool.AfterToolArgs) (*tool.AfterToolResult, error) {
+		capturedValue = ctx.Value(testKey)
+		return nil, nil
+	})
+
+	// Create a dummy tool that returns a result.
+	dummyTool := &dummyTool{name: "echo"}
+	toolCall := model.ToolCall{
+		ID:       "id",
+		Function: model.FunctionDefinitionParam{Name: "echo", Arguments: []byte(`{"x":1}`)},
+	}
+
+	// Run the tool.
+	ctx := context.Background()
+	ctx, result, _, err := runTool(ctx, toolCall, callbacks, dummyTool)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	// Verify that the context value was captured in AfterTool callback.
+	require.Equal(t, testValue, capturedValue, "context value should be propagated from BeforeTool to AfterTool")
 }
 
 // Mock saver to cover GetParent fallback cross-namespace path

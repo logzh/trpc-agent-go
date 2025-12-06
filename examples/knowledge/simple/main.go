@@ -27,15 +27,20 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge"
+	"trpc.group/trpc-go/trpc-agent-go/knowledge/searchfilter"
+	knowledgetool "trpc.group/trpc-go/trpc-agent-go/knowledge/tool"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	openaimodel "trpc.group/trpc-go/trpc-agent-go/model/openai"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
 	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
+	"trpc.group/trpc-go/trpc-agent-go/tool"
 
 	// Embedder.
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/embedder"
 	geminiembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/gemini"
+	huggingfaceembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/huggingface"
+	ollamaembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/ollama"
 	openaiembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/openai"
 
 	// Source.
@@ -60,7 +65,7 @@ import (
 var (
 	modelName     = flag.String("model", "deepseek-chat", "Name of the model to use")
 	streaming     = flag.Bool("streaming", true, "Enable streaming mode for responses")
-	embedderType  = flag.String("embedder", "openai", "Embedder type: openai, gemini")
+	embedderType  = flag.String("embedder", "openai", "Embedder type: openai, gemini, ollama, huggingface")
 	vectorStore   = flag.String("vectorstore", "inmemory", "Vector store type: inmemory, pgvector, tcvector, elasticsearch")
 	esVersion     = flag.String("es-version", "v9", "Elasticsearch version: v7, v8, v9 (only used when vectorstore=elasticsearch)")
 	agenticFilter = flag.Bool("agentic_filter", true, "Enable agentic filter for knowledge search")
@@ -148,6 +153,9 @@ func (c *knowledgeChat) run() error {
 		return fmt.Errorf("setup failed: %w", err)
 	}
 
+	// Ensure runner resources are cleaned up (trpc-agent-go >= v0.5.0)
+	defer c.runner.Close()
+
 	// Start interactive chat.
 	return c.startChat(ctx)
 }
@@ -172,39 +180,46 @@ func (c *knowledgeChat) setup(ctx context.Context) error {
 	// get all metadata from sources, it contains keys and values, llm will choose keys values for the filter
 	sourcesMetadata := source.GetAllMetadata(c.sources)
 
-	agentName := "knowledge-assistant"
-	llmAgent := llmagent.New(
-		agentName,
-		llmagent.WithModel(modelInstance),
-		llmagent.WithDescription("A helpful AI assistant with knowledge base access."),
-		llmagent.WithInstruction("Use the knowledge_search tool to find relevant information from the knowledge base. Be helpful and conversational."),
-		llmagent.WithGenerationConfig(genConfig),
-		llmagent.WithKnowledge(c.kb),
-		// This will automatically add the knowledge_search tool.
-		llmagent.WithEnableKnowledgeAgenticFilter(*agenticFilter),
-		llmagent.WithKnowledgeAgenticFilterInfo(sourcesMetadata),
-	)
+	// You can also bind knowledge base on agent directly.
+	// It's equal with set knowledge tool in agent.
+	// But you can only set one knowledgebase for one agent.
 
-	// You can also create the knowledge search tool manually.
-	// It's equal with set knowledgeBase to the agent.
-	// And you can set more than one knowledge search tool to the agent.
-
-	// knowledgeTool := knowledgetool.NewAgenticFilterSearchTool(
-	// 	c.kb,
-	// 	sourcesMetadata,
-	// 	knowledgetool.WithToolName("knowledge_search"),
-	// 	knowledgetool.WithFilter(map[string]any{
-	// 		"topic": "programming",
-	// 	}),
-	// 	knowledgetool.WithToolDescription("Use the knowledge_search tool to find relevant information from the knowledge base. Be helpful and conversational."))
 	// llmAgent := llmagent.New(
 	// 	agentName,
 	// 	llmagent.WithModel(modelInstance),
-	// 	llmagent.WithDescription("A helpful AI assistant."),
+	// 	llmagent.WithDescription("A helpful AI assistant with knowledge base access."),
 	// 	llmagent.WithInstruction("Use the knowledge_search tool to find relevant information from the knowledge base. Be helpful and conversational."),
 	// 	llmagent.WithGenerationConfig(genConfig),
-	// 	llmagent.WithTools([]tool.Tool{knowledgeTool}),
+	// 	llmagent.WithKnowledge(c.kb),
+	// 	// This will automatically add the knowledge_search tool.
+	// 	llmagent.WithEnableKnowledgeAgenticFilter(*agenticFilter),
+	// 	llmagent.WithKnowledgeAgenticFilterInfo(sourcesMetadata),
 	// )
+
+	agentName := "knowledge-assistant"
+	knowledgeTool := knowledgetool.NewAgenticFilterSearchTool(
+		c.kb,
+		sourcesMetadata,
+		knowledgetool.WithToolName("knowledge_search"),
+		// filter by topic = programming and content_type = llm
+		knowledgetool.WithConditionedFilter(
+			searchfilter.Or(
+				searchfilter.Equal("topic", "programming"),
+				searchfilter.Equal("content_type", "llm"),
+			),
+		),
+		knowledgetool.WithToolDescription(
+			"Use the knowledge_search tool to find relevant information from the knowledge base. Be helpful and conversational."),
+	)
+
+	llmAgent := llmagent.New(
+		agentName,
+		llmagent.WithModel(modelInstance),
+		llmagent.WithDescription("A helpful AI assistant."),
+		llmagent.WithInstruction("Use the knowledge_search tool to find relevant information from the knowledge base. Be helpful and conversational."),
+		llmagent.WithGenerationConfig(genConfig),
+		llmagent.WithTools([]tool.Tool{knowledgeTool}),
+	)
 
 	// Create session service.
 	sessionService := sessioninmemory.NewSessionService()
@@ -286,9 +301,7 @@ func (c *knowledgeChat) setupVectorDB() (vectorstore.VectorStore, error) {
 			vectortcvector.WithUsername(tcvectorUsername),
 			vectortcvector.WithPassword(tcvectorPassword),
 			vectortcvector.WithCollection("tcvector-agent-go"),
-			// tcvector need build index for the filter fields
-			vectortcvector.WithFilterIndexFields(source.GetAllMetadataKeys(c.sources)),
-			// 用于文档检索时的自定义文档构建方法。若不提供，则使用默认构建方法。
+			// used for build document from tcvector query result
 			vectortcvector.WithDocBuilder(docBuilder),
 		)
 		if err != nil {
@@ -335,7 +348,7 @@ func (c *knowledgeChat) setupVectorDB() (vectorstore.VectorStore, error) {
 			vectorelasticsearch.WithIndexName(elasticsearchIndexName),
 			vectorelasticsearch.WithMaxRetries(3),
 			vectorelasticsearch.WithVersion(*esVersion),
-			// 用于文档检索时的自定义文档构建方法。若不提供，则使用默认构建方法。
+			// Custom document builder for document retrieval. If not provided, uses default builder.
 			vectorelasticsearch.WithDocBuilder(docBuilder),
 		)
 		if err != nil {
@@ -352,6 +365,10 @@ func (c *knowledgeChat) setupEmbedder(ctx context.Context) (embedder.Embedder, e
 	switch strings.ToLower(c.embedderType) {
 	case "gemini":
 		return geminiembedder.New(ctx)
+	case "ollama":
+		return ollamaembedder.New(), nil
+	case "huggingface":
+		return huggingfaceembedder.New(), nil
 	default: // openai
 		return openaiembedder.New(
 			openaiembedder.WithModel(openaiEmbeddingModel),

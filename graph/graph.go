@@ -55,10 +55,44 @@ type NodeResult any
 
 // ConditionalFunc is a function that determines the next node(s) based on state.
 // Conditional edge function signature.
-type ConditionalFunc func(ctx context.Context, state State) (string, error)
+type ConditionalFunc = func(ctx context.Context, state State) (string, error)
 
 // MultiConditionalFunc returns multiple next nodes for parallel execution.
-type MultiConditionalFunc func(ctx context.Context, state State) ([]string, error)
+type MultiConditionalFunc = func(ctx context.Context, state State) ([]string, error)
+
+// UniversalCondFunc is a function that determines the next node(s) based on state.
+type UniversalCondFunc = func(ctx context.Context, state State) (ConditionResult, error)
+
+// ConditionResult represents the result of executing a conditional edge function.
+type ConditionResult struct {
+	NextNodes []string
+}
+
+func wrapperCondFunc(condFunc any) UniversalCondFunc {
+	if condFunc == nil {
+		panic("conditional function is nil")
+	}
+
+	var uniFunc UniversalCondFunc
+	switch cdFunc := condFunc.(type) {
+	case ConditionalFunc:
+		uniFunc = func(ctx context.Context, state State) (ConditionResult, error) {
+			nextNode, err := cdFunc(ctx, state)
+			return ConditionResult{NextNodes: []string{nextNode}}, err
+		}
+	case MultiConditionalFunc:
+		uniFunc = func(ctx context.Context, state State) (ConditionResult, error) {
+			nextNodes, err := cdFunc(ctx, state)
+			return ConditionResult{NextNodes: nextNodes}, err
+		}
+	case UniversalCondFunc:
+		uniFunc = cdFunc
+	default:
+		panic(fmt.Sprintf("unsupported conditional function type: %T", condFunc))
+	}
+
+	return uniFunc
+}
 
 // channelWriteEntry represents a write operation to a channel.
 type channelWriteEntry struct {
@@ -77,9 +111,17 @@ type Node struct {
 	Function    NodeFunc
 	Type        NodeType // Type of the node (function, llm, tool, etc.)
 
-	toolSets []tool.ToolSet
+	toolSets             []tool.ToolSet
+	refreshToolSetsOnRun bool
 	// Per-node callbacks for fine-grained control
 	callbacks *NodeCallbacks
+	// Optional per-node cache policy. If nil, graph-level policy applies.
+	cachePolicy *CachePolicy
+	// Optional per-node cache key selector. When set, the executor applies this
+	// selector to the sanitized node input before invoking the CachePolicy.KeyFunc.
+	// The selector receives a sanitized map[string]any view and should return a
+	// projection to be used for key derivation (e.g., subset of fields).
+	cacheKeySelector func(map[string]any) any
 
 	// Retry policies configured for this node. When empty, executor defaults
 	// (if any) will be used. Policies are evaluated in order to determine
@@ -96,10 +138,22 @@ type Node struct {
 	// Keys are target node IDs; values are optional labels.
 	destinations map[string]string
 
+	// ends holds per-node named ends mapping for stronger branch semantics.
+	// Keys are symbolic branch names returned by node logic (e.g. "approved",
+	// "rejected"). Values are destination node IDs (or the special End).
+	// This allows nodes to route via Command.GoTo using symbolic names and for
+	// conditional branches to resolve results with clearer, local semantics.
+	ends map[string]string
+
 	// It's effect just for LLM node
 	modelCallbacks *model.Callbacks
 	// just for tool node.
 	toolCallbacks *tool.Callbacks
+
+	// enableParallelTools toggles parallel execution for Tools nodes.
+	// When true, multiple tool calls in a single assistant response are executed concurrently.
+	// Default is false (serial execution) for compatibility and safety.
+	enableParallelTools bool
 
 	// llmGenerationConfig stores per-node generation configuration for LLM nodes.
 	// If set, AddLLMNode forwards it to the underlying LLM runner.
@@ -110,6 +164,13 @@ type Node struct {
 	agentOutputMapper     SubgraphOutputMapper
 	agentIsolatedMessages bool
 	agentEventScope       string
+	// agentInputFromLastResponse indicates whether the agent node should
+	// construct the child invocation's user input from the parent's
+	// StateKeyLastResponse. When true, the framework will map
+	// last_response -> user_input for this agent node before invoking the
+	// sub-agent. This provides a concise way to implement "pass only the
+	// result" pipelines between agent nodes without extra glue nodes.
+	agentInputFromLastResponse bool
 }
 
 // Edge represents an edge in the graph.
@@ -122,7 +183,7 @@ type Edge struct {
 // ConditionalEdge represents a conditional edge with routing logic.
 type ConditionalEdge struct {
 	From      string
-	Condition ConditionalFunc
+	Condition UniversalCondFunc
 	PathMap   map[string]string // Maps condition result to target node.
 }
 
@@ -143,6 +204,13 @@ type Graph struct {
 	// Pregel-style extensions
 	channelManager *channel.Manager
 	triggerToNodes map[string][]string // Maps channel names to nodes that are triggered
+
+	// Caching
+	cache       Cache
+	cachePolicy *CachePolicy
+	// Optional graph version used to scope cache namespaces, helping avoid
+	// stale cache collisions across graph code changes or deployments.
+	graphVersion string
 }
 
 // New creates a new empty graph with the given state schema.
@@ -196,6 +264,65 @@ func (g *Graph) Schema() *StateSchema {
 	return g.schema
 }
 
+// Cache returns the graph-level cache (may be nil).
+func (g *Graph) Cache() Cache {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.cache
+}
+
+// CachePolicy returns the graph-level cache policy (may be nil).
+func (g *Graph) CachePolicy() *CachePolicy {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.cachePolicy
+}
+
+// setCache sets the graph-level cache.
+func (g *Graph) setCache(c Cache) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.cache = c
+}
+
+// setCachePolicy sets the graph-level cache policy.
+func (g *Graph) setCachePolicy(p *CachePolicy) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.cachePolicy = p
+}
+
+// setGraphVersion sets an optional version string used for cache namespacing.
+func (g *Graph) setGraphVersion(v string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.graphVersion = v
+}
+
+// cacheNamespace builds a per-node namespace including optional graph version.
+func (g *Graph) cacheNamespace(nodeID string) string {
+	g.mu.RLock()
+	v := g.graphVersion
+	g.mu.RUnlock()
+	if v == "" {
+		return fmt.Sprintf("%s:%s", CacheNamespacePrefix, nodeID)
+	}
+	return fmt.Sprintf("%s:%s:%s", CacheNamespacePrefix, v, nodeID)
+}
+
+// clearCacheForNodes clears cache entries for the given node IDs.
+func (g *Graph) clearCacheForNodes(nodes []string) {
+	g.mu.RLock()
+	c := g.cache
+	g.mu.RUnlock()
+	if c == nil {
+		return
+	}
+	for _, id := range nodes {
+		c.Clear(g.cacheNamespace(id))
+	}
+}
+
 // validate validates the graph structure.
 func (g *Graph) validate() error {
 	g.mu.RLock()
@@ -209,14 +336,27 @@ func (g *Graph) validate() error {
 	// Validate declared destinations exist.
 	for _, n := range g.nodes {
 		if n == nil || n.destinations == nil || len(n.destinations) == 0 {
-			continue
+			// fallthrough to ends check
 		}
-		for to := range n.destinations {
-			if to == End {
-				continue
+		if n != nil && n.destinations != nil {
+			for to := range n.destinations {
+				if to == End {
+					continue
+				}
+				if _, ok := g.nodes[to]; !ok {
+					return fmt.Errorf("node %s declares destination %s which does not exist", n.ID, to)
+				}
 			}
-			if _, ok := g.nodes[to]; !ok {
-				return fmt.Errorf("node %s declares destination %s which does not exist", n.ID, to)
+		}
+		// Validate per-node ends mapping targets exist.
+		if n != nil && n.ends != nil {
+			for _, target := range n.ends {
+				if target == End {
+					continue
+				}
+				if _, ok := g.nodes[target]; !ok {
+					return fmt.Errorf("node %s declares end target %s which does not exist", n.ID, target)
+				}
 			}
 		}
 	}
@@ -304,6 +444,10 @@ func (g *Graph) addConditionalEdge(condEdge *ConditionalEdge) error {
 	defer g.mu.Unlock()
 	if condEdge.From == "" {
 		return fmt.Errorf("conditional edge from cannot be empty")
+	}
+	// Validate condition presence and exclusivity.
+	if condEdge.Condition == nil {
+		return fmt.Errorf("exactly conditionFunc must be set")
 	}
 	if condEdge.From != Start {
 		if _, exists := g.nodes[condEdge.From]; !exists {

@@ -267,6 +267,32 @@ func TestNodeCallbacks_RunOnNodeError(t *testing.T) {
 	assert.Equal(t, expectedOrder, executionOrder)
 }
 
+// Defensive behavior: nil callbacks should be skipped without panic.
+func TestNodeCallbacks_SkipNilEntries(t *testing.T) {
+	c := NewNodeCallbacks()
+	// Manually inject nil callbacks to simulate corrupted state.
+	c.BeforeNode = append(c.BeforeNode, nil)
+	c.AfterNode = append(c.AfterNode, nil)
+	c.OnNodeError = append(c.OnNodeError, nil)
+
+	ctx := context.Background()
+	cbCtx := &NodeCallbackContext{NodeID: "n"}
+	st := State{}
+
+	// Expect no panic and nil result / no error for before.
+	res, err := c.RunBeforeNode(ctx, cbCtx, st)
+	require.NoError(t, err)
+	require.Nil(t, res)
+
+	// Expect no panic and passthrough for after.
+	out, err := c.RunAfterNode(ctx, cbCtx, st, "x", nil)
+	require.NoError(t, err)
+	require.Equal(t, "x", out)
+
+	// Expect no panic for error callbacks.
+	c.RunOnNodeError(ctx, cbCtx, st, errors.New("boom"))
+}
+
 func TestNodeCallbackContext_Complete(t *testing.T) {
 	now := time.Now()
 	callbackCtx := &NodeCallbackContext{
@@ -341,4 +367,41 @@ func TestStateGraph_WithNodeCallbacks(t *testing.T) {
 
 	// Verify callback was called
 	assert.True(t, beforeCalled)
+}
+
+// Additional after-node callback coverage: error short-circuit and custom result propagation.
+func TestRunAfterNode_ErrorAndCustomResult(t *testing.T) {
+	cbs := NewNodeCallbacks()
+	ctx := context.Background()
+	cbCtx := &NodeCallbackContext{NodeID: "n"}
+	st := State{}
+
+	// First callback yields custom result
+	cbs.RegisterAfterNode(func(ctx context.Context, c *NodeCallbackContext, s State, result any, nodeErr error) (any, error) {
+		return State{"a": 1}, nil
+	})
+	// Second callback returns error; should short-circuit and return error
+	cbs.RegisterAfterNode(func(ctx context.Context, c *NodeCallbackContext, s State, result any, nodeErr error) (any, error) {
+		return nil, errors.New("boom")
+	})
+
+	_, err := cbs.RunAfterNode(ctx, cbCtx, st, State{"orig": true}, nil)
+	if err == nil {
+		t.Fatalf("expected error from second callback")
+	}
+
+	// Now test no error path: single after callback transforming the result
+	cbs2 := NewNodeCallbacks()
+	cbs2.RegisterAfterNode(func(ctx context.Context, c *NodeCallbackContext, s State, result any, nodeErr error) (any, error) {
+		m, _ := result.(State)
+		m["z"] = 9
+		return m, nil
+	})
+	out, err := cbs2.RunAfterNode(ctx, cbCtx, st, State{"k": 7}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if m, ok := out.(State); !ok || m["z"].(int) != 9 {
+		t.Fatalf("unexpected result: %#v", out)
+	}
 }

@@ -69,6 +69,23 @@ llmAgent := llmagent.New(
     llmagent.WithDescription("A helpful AI assistant for demonstrations"),              // 设置描述
     llmagent.WithInstruction("Be helpful, concise, and informative in your responses"), // 设置指令
     llmagent.WithGenerationConfig(genConfig),                                           // 设置生成参数
+
+    // 设置传给模型的消息过滤模式，最终传给模型的消息需同时满足WithMessageTimelineFilterMode与WithMessageBranchFilterMode条件
+    // 时间维度过滤条件
+    // 默认值: llmagent.TimelineFilterAll
+    // 可选值:
+    //  - llmagent.TimelineFilterAll: 包含历史消息以及当前请求中所生成的消息
+    //  - llmagent.TimelineFilterCurrentRequest: 仅包含当前请求中所生成的消息
+    //  - llmagent.TimelineFilterCurrentInvocation: 仅包含当前invocation上下文中生成的消息
+    llmagent.WithMessageTimelineFilterMode(llmagent.BranchFilterModeAll),
+    // 分支维度过滤条件
+    // 默认值: llmagent.BranchFilterModePrefix
+    // 可选值:
+    //  - llmagent.BranchFilterModeAll: 包含所有agent的消息, 当前agent与模型交互时,如需将所有agent生成的有效内容消息同步给模型时可设置该值
+    //  - llmagent.BranchFilterModePrefix: 通过Event.FilterKey与Invocation.eventFilterKey做前缀匹配过滤消息, 期望将与当前agent以及相关上下游agent生成的消息传递给模型时，可设置该值
+    //  - llmagent.BranchFilterModeExact: 通过Event.FilterKey==Invocation.eventFilterKey过滤消息，当前agent与模型交互时,仅需使用当前agent生成的消息时可设置该值
+    llmagent.WithMessageBranchFilterMode(llmagent.TimelineFilterAll),
+
 )
 ```
 
@@ -132,6 +149,32 @@ if err != nil {
     log.Fatalf("执行 Agent 失败: %v", err)
 }
 ```
+
+### 委托可见性选项
+
+在构建多 Agent（智能体）系统（Agent 之间的任务委托）时，LLMAgent 提供“默认占位消息”的统一配置。转移（transfer）事件始终包含提示文本，并统一打上 `transfer` 标签，前端（UI, User Interface）可按标签过滤。
+
+- `llmagent.WithDefaultTransferMessage(string)`
+  - 配置当模型未提供 `message` 时的“转移默认消息”。
+  - 传入空字符串表示“禁用默认消息注入”；传入非空字符串表示“启用并使用该字符串作为默认消息”。
+
+用法示例：
+
+```go
+coordinator := llmagent.New(
+  "coordinator",
+  llmagent.WithModel(modelInstance),
+  llmagent.WithSubAgents([]agent.Agent{mathAgent, weatherAgent}),
+  // 转移提示事件总是会输出（带有 `transfer` 标签），如需隐藏可在 UI 层按标签过滤
+  // 当模型未传 message 时，自定义默认消息（传空字符串可禁用）
+  llmagent.WithDefaultTransferMessage("Handing off to the specialist"),
+)
+```
+
+说明：
+
+- 这些选项不会改变真实的委托/切换逻辑，只影响“对外可见的提示文本”或“是否注入默认占位消息”。
+- 转移提示事件统一以 `Response.Object == "agent.transfer"` 输出；如需在 UI 层隐藏系统级提示，可直接过滤该对象类型的事件。
 
 ### 处理事件流
 
@@ -228,38 +271,111 @@ if err != nil {
 - 调试和测试场景
 
 ```go
-// Invocation 是 Agent 执行流程的上下文对象，包含了单次调用所需的所有信息
+// Invocation 是 Agent 执行流程的上下文对象，包含单次调用所需的全部信息
 type Invocation struct {
-	// Agent 指定要调用的 Agent 实例
-	Agent Agent
-	// AgentName 标识要调用的 Agent 实例名称
-	AgentName string
-	// InvocationID 为每次调用提供唯一标识
-	InvocationID string
-	// Branch 用于分层事件过滤的分支标识符
-	Branch string
-	// EndInvocation 标识是否结束调用的标志
-	EndInvocation bool
-	// Session 维护对话的上下文状态
-	Session *session.Session
-	// Model 指定要使用的模型实例
-	Model model.Model
-	// Message 是用户发送给 Agent 的具体内容
-	Message model.Message
-	// RunOptions 是 Run 方法的选项配置
-	RunOptions RunOptions
-	// TransferInfo 支持 Agent 之间的控制权转移
-	TransferInfo *TransferInfo
-	// ModelCallbacks 允许在模型调用的不同阶段插入自定义逻辑
-	ModelCallbacks *model.ModelCallbacks
-	// ToolCallbacks 允许在工具调用的不同阶段插入自定义逻辑
-	ToolCallbacks *tool.ToolCallbacks
+    // Agent 指定要调用的 Agent 实例
+    Agent Agent
+    // AgentName 标识要调用的 Agent 实例名称
+    AgentName string
+    // InvocationID 为每次调用提供唯一标识
+    InvocationID string
+    // Branch 用于分层事件过滤的分支标识符
+    Branch string
+    // EndInvocation 标识是否结束调用
+    EndInvocation bool
 
-    // notice
-	noticeChanMap map[string]chan any
-	noticeMu      *sync.Mutex
+    // Session 维护对话上下文状态
+    Session *session.Session
+    // Model 指定要使用的模型实例
+    Model model.Model
+    // Message 是用户发送给 Agent 的具体内容
+    Message model.Message
+    // RunOptions 是 Run 方法的选项配置
+    RunOptions RunOptions
+    // TransferInfo 支持 Agent 间的控制权转移
+    TransferInfo *TransferInfo
+
+    // 结构化输出配置（可选）
+    StructuredOutput     *model.StructuredOutput
+    StructuredOutputType reflect.Type
+
+    // 为本次调用注入的服务
+    MemoryService   memory.Service
+    ArtifactService artifact.Service
+
+    // 内部通知：当事件写入会话时发出通知
+    noticeChanMap map[string]chan any
+    noticeMu      *sync.Mutex
+
+    // 内部：事件过滤键与父调用（用于嵌套流程）
+    eventFilterKey string
+    parent         *Invocation
+
+    // 调用级别的状态（延迟初始化，通过 stateMu 保护并发）
+    state   map[string]any
+    stateMu sync.RWMutex
 }
 ```
+
+#### Invocation State
+
+`Invocation` 提供了通用的状态存储机制，用于在单次调用的生命周期内共享数据。这对于 callbacks、middleware 或任何需要在 invocation 级别存储临时数据的场景都很有用。
+
+**核心方法：**
+
+```go
+// 设置状态值
+inv.SetState(key string, value any)
+
+// 获取状态值
+value, ok := inv.GetState(key string)
+
+// 删除状态值
+inv.DeleteState(key string)
+```
+
+**特点：**
+
+- **Invocation 级作用域**：状态自动限定在单次 Invocation 内
+- **线程安全**：内置 RWMutex 保护，支持并发访问
+- **懒初始化**：首次使用时才分配内存
+- **通用性强**：可用于 callbacks、middleware、自定义逻辑等多种场景
+
+**使用示例：**
+
+> **版本要求**  
+> 结构化回调 API（推荐）需要 **trpc-agent-go >= 0.6.0**。
+
+```go
+// 在 BeforeAgentCallback 中存储数据
+// 注意：结构化回调 API 需要 trpc-agent-go >= 0.6.0
+callbacks := agent.NewCallbacks()
+callbacks.RegisterBeforeAgent(func(ctx context.Context, args *agent.BeforeAgentArgs) (*agent.BeforeAgentResult, error) {
+    args.Invocation.SetState("agent:start_time", time.Now())
+    args.Invocation.SetState("custom:request_id", "req-123")
+    return nil, nil
+})
+
+// 在 AfterAgentCallback 中读取数据
+callbacks.RegisterAfterAgent(func(ctx context.Context, args *agent.AfterAgentArgs) (*agent.AfterAgentResult, error) {
+    if startTime, ok := args.Invocation.GetState("agent:start_time"); ok {
+        duration := time.Since(startTime.(time.Time))
+        log.Printf("Execution took: %v", duration)
+        args.Invocation.DeleteState("agent:start_time")
+    }
+    return nil, nil
+})
+```
+
+**推荐的键名约定：**
+
+- Agent 回调：`"agent:xxx"`
+- Model 回调：`"model:xxx"`
+- Tool 回调：`"tool:toolName:xxx"`
+- 中间件：`"middleware:xxx"`
+- 自定义逻辑：`"custom:xxx"`
+
+详细的使用说明和更多示例请参考 [Callbacks](./callbacks.md#invocation-state)。
 
 ### Event
 
@@ -322,6 +438,9 @@ type Agent interface {
 
 Callbacks 提供了丰富的回调机制，让你能够在 Agent 执行的关键节点注入自定义逻辑。
 
+> **版本要求**  
+> 结构化回调 API（推荐）需要 **trpc-agent-go >= 0.6.0**。
+
 ### 回调类型
 
 框架提供了三种类型的回调：
@@ -329,54 +448,44 @@ Callbacks 提供了丰富的回调机制，让你能够在 Agent 执行的关键
 **Agent Callbacks**：在 Agent 执行前后触发
 
 ```go
-type AgentCallbacks struct {
-    BeforeAgent []BeforeAgentCallback  // Agent 运行前的回调
-    AfterAgent  []AfterAgentCallback   // Agent 运行后的回调
-}
+// 使用 agent.NewCallbacks() 创建回调
+callbacks := agent.NewCallbacks()
 ```
 
 **Model Callbacks**：在模型调用前后触发
 
 ```go
-type ModelCallbacks struct {
-    BeforeModel []BeforeModelCallback  // 模型调用前的回调
-    AfterModel  []AfterModelCallback   // 模型调用后的回调
-}
+// 使用 model.NewCallbacks() 创建回调
+callbacks := model.NewCallbacks()
 ```
 
 **Tool Callbacks**：在工具调用前后触发
 
 ```go
-type ToolCallbacks struct {
-	BeforeTool []BeforeToolCallback  // 工具调用前的回调
-	AfterTool []AfterToolCallback    // 工具调用后的回调
-}
+// 使用 tool.NewCallbacks() 创建回调
+callbacks := tool.NewCallbacks()
 ```
 
 ### 使用示例
 
 ```go
-// 创建 Agent 回调
-callbacks := &agent.AgentCallbacks{
-    BeforeAgent: []agent.BeforeAgentCallback{
-        func(ctx context.Context, invocation *agent.Invocation) (*model.Response, error) {
-            log.Printf("Agent %s 开始执行", invocation.AgentName)
-            return nil, nil
-        },
-    },
-    AfterAgent: []agent.AfterAgentCallback{
-        func(ctx context.Context, invocation *agent.Invocation, runErr error) (*model.Response, error) {
-            if runErr != nil {
-                log.Printf("Agent %s 执行出错: %v", invocation.AgentName, runErr)
-            } else {
-                log.Printf("Agent %s 执行完成", invocation.AgentName)
-            }
-            return nil, nil
-        },
-    },
-}
+// 创建 Agent 回调（使用结构化 API）
+// 注意：结构化回调 API 需要 trpc-agent-go >= 0.6.0
+callbacks := agent.NewCallbacks()
+callbacks.RegisterBeforeAgent(func(ctx context.Context, args *agent.BeforeAgentArgs) (*agent.BeforeAgentResult, error) {
+    log.Printf("Agent %s 开始执行", args.Invocation.AgentName)
+    return nil, nil
+})
+callbacks.RegisterAfterAgent(func(ctx context.Context, args *agent.AfterAgentArgs) (*agent.AfterAgentResult, error) {
+    if args.Error != nil {
+        log.Printf("Agent %s 执行出错: %v", args.Invocation.AgentName, args.Error)
+    } else {
+        log.Printf("Agent %s 执行完成", args.Invocation.AgentName)
+    }
+    return nil, nil
+})
 
-// 在 llmAgent中使用回掉
+// 在 llmAgent 中使用回调
 llmagent := llmagent.New("llmagent", llmagent.WithAgentCallbacks(callbacks))
 ```
 
@@ -397,3 +506,121 @@ Memory Service 用于记录用户的偏好信息，支持个性化体验。
 1. [Runner](runner.md) - 学习推荐的使用方式
 2. [Session](session.md) - 了解会话管理
 3. [Multi-Agent](multiagent.md) - 学习多 Agent 系统
+
+## 运行时动态更新 Instruction
+
+你可以在 Agent 已经创建并被 Runner 使用的情况下，动态更新其行为文案：
+
+- Instruction：用于约束 Agent 行为的说明文本（追加到系统消息中）。
+- Global Instruction（系统提示词）：系统级前言（作为系统消息的前缀）。
+
+两者都可以在已有的 `LLMAgent` 实例上动态设置，新值会作用于后续的模型请求。
+
+示例
+
+```go
+import (
+    "context"
+
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+    "trpc.group/trpc-go/trpc-agent-go/runner"
+)
+
+// 1）服务启动时只构建一次模型与 Agent
+mdl := openai.New("gpt-4o-mini", openai.Options{})
+llm := llmagent.New(
+    "support-bot",
+    llmagent.WithModel(mdl),
+    llmagent.WithInstruction("Be helpful and concise."),
+)
+run := runner.NewRunner("my-app", llm)
+
+// 2）运行中根据用户在后台修改的提示词，动态更新
+llm.SetInstruction("Translate all user inputs to French.")
+llm.SetGlobalInstruction("System: Safety first. No PII leakage.")
+
+// 3）之后的对话轮次将使用最新的提示词
+msg := model.NewUserMessage("Where is the nearest museum?")
+ch, err := run.Run(context.Background(), "u1", "s1", msg)
+_ = ch; _ = err
+```
+
+注意
+
+- 线程安全：上述设置方法是并发安全的，可在服务处理请求时调用。
+- 同一轮次内的效果：若一次调用过程中会触发多次模型请求（例如工具调用后再次提问），更新可能会对同一轮后续的请求生效。若需要“每次调用内保持稳定”，可在调用开始时确定或冻结提示词。
+- 个性化上下文：若需按用户/会话动态注入内容，优先使用指令中的占位符加会话状态注入（见上文“占位符变量”一节）。
+
+### 另一种方式：用占位符驱动动态 System Prompt
+
+如果不想在运行时调用 setter，也可以把 Instruction 写成模板，然后用会话状态（Session/App/User/Temp）来“喂”值。指令处理器会在每次请求时注入占位符。
+
+模式
+
+- 持久化“按用户”：写到 `user:*`，在模板里用 `{user:key}` 引用
+- 持久化“按应用”：写到 `app:*`，在模板里用 `{app:key}` 引用
+- 每轮一次（临时）：写入会话的 `temp:*` 命名空间，模板用 `{temp:key}`（不会持久化）
+
+示例：按用户动态提示词
+
+```go
+import (
+    "context"
+
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/runner"
+    "trpc.group/trpc-go/trpc-agent-go/session"
+    "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
+)
+
+svc := inmemory.NewSessionService()
+app, user, sid := "my-app", "u1", "s1"
+
+// 1）在指令模板里引用用户态 key
+llm := llmagent.New(
+  "dyn-agent",
+  llmagent.WithInstruction("{user:system_prompt}"),
+)
+run := runner.NewRunner(app, llm, runner.WithSessionService(svc))
+
+// 2）当用户在后台改设置时，更新用户态状态
+_ = svc.UpdateUserState(context.Background(), session.UserKey{AppName: app, UserID: user}, session.StateMap{
+  "system_prompt": []byte("You are a helpful assistant. Always answer in English."),
+})
+
+// 3）后续运行会通过占位符读取最新值
+_, _ = run.Run(context.Background(), user, sid, model.NewUserMessage("Hi!"))
+```
+
+示例：通过前置回调注入本轮临时值（temp）
+
+> **版本要求**  
+> 结构化回调 API（推荐）需要 **trpc-agent-go >= 0.6.0**。
+
+```go
+// 注意：结构化回调 API 需要 trpc-agent-go >= 0.6.0
+callbacks := agent.NewCallbacks()
+callbacks.RegisterBeforeAgent(func(ctx context.Context, args *agent.BeforeAgentArgs) (*agent.BeforeAgentResult, error) {
+  if args.Invocation != nil && args.Invocation.Session != nil {
+    if args.Invocation.Session.State == nil {
+      args.Invocation.Session.State = make(map[string][]byte)
+    }
+    // 为"本轮"临时指定指令
+    args.Invocation.Session.State["temp:sys"] = []byte("Translate to French.")
+  }
+  return nil, nil
+})
+
+llm := llmagent.New(
+  "temp-agent",
+  llmagent.WithInstruction("{temp:sys}"),
+  llmagent.WithAgentCallbacks(callbacks), // 需要 trpc-agent-go >= 0.6.0
+)
+```
+
+注意事项
+
+- 内存版 `UpdateUserState` 出于安全设计禁止写 `temp:*`；需要临时值时，直接往 `invocation.Session.State` 写（例如通过回调）。
+- 占位符是在“请求时”解析；只要你换了存储的值，下一次模型请求就会用新值，无需重建 Agent。

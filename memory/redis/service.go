@@ -26,6 +26,11 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
+const (
+	// defaultConnectionTimeout is the default timeout for Redis connection test.
+	defaultConnectionTimeout = 5 * time.Second
+)
+
 var _ memory.Service = (*Service)(nil)
 
 // Service is the redis memory service.
@@ -41,50 +46,36 @@ type Service struct {
 
 // NewService creates a new redis memory service.
 func NewService(options ...ServiceOpt) (*Service, error) {
-	opts := ServiceOpts{
-		memoryLimit:  imemory.DefaultMemoryLimit,
-		toolCreators: make(map[string]memory.ToolCreator),
-		enabledTools: make(map[string]bool),
-	}
-	// Enable default tools.
-	for name, creator := range imemory.DefaultEnabledTools {
-		opts.toolCreators[name] = creator
-		opts.enabledTools[name] = true
-	}
+	opts := defaultOptions.clone()
 	for _, option := range options {
 		option(&opts)
 	}
 
-	builder := storage.GetClientBuilder()
-	var (
-		redisClient redis.UniversalClient
-		err         error
-	)
+	builderOpts := []storage.ClientBuilderOpt{
+		storage.WithClientBuilderURL(opts.url),
+		storage.WithExtraOptions(opts.extraOptions...),
+	}
 
 	// if instance name set, and url not set, use instance name to create redis client
 	if opts.url == "" && opts.instanceName != "" {
-		builderOpts, ok := storage.GetRedisInstance(opts.instanceName)
-		if !ok {
+		var ok bool
+		if builderOpts, ok = storage.GetRedisInstance(opts.instanceName); !ok {
 			return nil, fmt.Errorf("redis instance %s not found", opts.instanceName)
 		}
-		redisClient, err = builder(builderOpts...)
-		if err != nil {
-			return nil, fmt.Errorf("create redis client from instance name failed: %w", err)
-		}
-		return &Service{
-			opts:        opts,
-			redisClient: redisClient,
-			cachedTools: make(map[string]tool.Tool),
-		}, nil
 	}
 
-	redisClient, err = builder(
-		storage.WithClientBuilderURL(opts.url),
-		storage.WithExtraOptions(opts.extraOptions...),
-	)
+	redisClient, err := storage.GetClientBuilder()(builderOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("create redis client from url failed: %w", err)
+		return nil, fmt.Errorf("create redis client failed: %w", err)
 	}
+
+	// Test connection with Ping to ensure Redis is accessible.
+	ctx, cancel := context.WithTimeout(context.Background(), defaultConnectionTimeout)
+	defer cancel()
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		return nil, fmt.Errorf("redis connection test failed: %w", err)
+	}
+
 	return &Service{
 		opts:        opts,
 		redisClient: redisClient,
@@ -263,9 +254,9 @@ func (s *Service) SearchMemories(ctx context.Context, userKey memory.UserKey, qu
 // Tools returns the list of available memory tools.
 func (s *Service) Tools() []tool.Tool {
 	// Concurrency-safe and stable order by name.
-	// Protect tool creators/enabled flags and cache with a single lock at call-site
-	// by converting to a local snapshot first (no struct-level mutex exists).
-	// We assume opts are immutable after construction.
+	// Protect tool creators/enabled flags and cache with a single lock at
+	// call-site by converting to a local snapshot first (no struct-level
+	// mutex exists). We assume opts are immutable after construction.
 	names := make([]string, 0, len(s.opts.toolCreators))
 	for name := range s.opts.toolCreators {
 		if s.opts.enabledTools[name] {

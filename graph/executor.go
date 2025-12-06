@@ -146,11 +146,12 @@ func NewExecutor(graph *Graph, opts ...ExecutorOption) (*Executor, error) {
 	if err := graph.validate(); err != nil {
 		return nil, fmt.Errorf("invalid graph: %w", err)
 	}
-	var options ExecutorOptions
-	options.ChannelBufferSize = defaultChannelBufferSize         // Default buffer size.
-	options.MaxSteps = defaultMaxSteps                           // Default max steps.
-	options.StepTimeout = defaultStepTimeout                     // Default step timeout.
-	options.CheckpointSaveTimeout = defaultCheckpointSaveTimeout // Default checkpoint save timeout.
+	options := ExecutorOptions{
+		ChannelBufferSize:     defaultChannelBufferSize,
+		MaxSteps:              defaultMaxSteps,
+		StepTimeout:           defaultStepTimeout,
+		CheckpointSaveTimeout: defaultCheckpointSaveTimeout,
+	}
 	// Apply function options.
 	for _, opt := range opts {
 		opt(&options)
@@ -539,15 +540,7 @@ func (e *Executor) buildCompletionEvent(
 	// Take a deep snapshot of the final state under read lock.
 	// IMPORTANT: Skip volatile/non-serializable keys (e.g., Session, callbacks, exec context)
 	// to avoid racing on their internal maps/slices managed by other goroutines.
-	execCtx.stateMutex.RLock()
-	finalStateCopy := make(State, len(execCtx.State))
-	for k, v := range execCtx.State {
-		if isUnsafeStateKey(k) {
-			continue
-		}
-		finalStateCopy[k] = deepCopyAny(v)
-	}
-	execCtx.stateMutex.RUnlock()
+	finalStateCopy := execCtx.State.deepCopy(false, e.graph.Schema().Fields)
 	completionEvent := NewGraphCompletionEvent(
 		WithCompletionEventInvocationID(execCtx.InvocationID),
 		WithCompletionEventFinalState(finalStateCopy),
@@ -567,70 +560,6 @@ func (e *Executor) buildCompletionEvent(
 	return completionEvent
 }
 
-// isUnsafeStateKey reports whether the key points to values that are
-// non-serializable or potentially mutated concurrently by other subsystems
-// (e.g., session service), which should be excluded from final snapshots.
-func isUnsafeStateKey(key string) bool {
-	switch key {
-	case StateKeyExecContext,
-		StateKeyParentAgent,
-		StateKeyToolCallbacks,
-		StateKeyModelCallbacks,
-		StateKeyAgentCallbacks,
-		StateKeyCurrentNodeID,
-		StateKeySession:
-		return true
-	default:
-		return false
-	}
-}
-
-// createCheckpoint creates a checkpoint for the current state.
-func (e *Executor) createCheckpoint(ctx context.Context, config map[string]any, state State, source string, step int) error {
-	if e.checkpointSaver == nil {
-		return nil
-	}
-
-	// Convert state to channel values with deep copy to avoid concurrent
-	// mutations of nested maps/slices during checkpoint serialization.
-	channelValues := make(map[string]any)
-	for k, v := range state {
-		if isUnsafeStateKey(k) {
-			continue
-		}
-		channelValues[k] = deepCopyAny(v)
-	}
-
-	// Create channel versions (simple incrementing integers for now).
-	channelVersions := make(map[string]int64)
-	for k := range state {
-		channelVersions[k] = 1 // This should be managed by the graph execution.
-	}
-
-	// Create versions seen (simplified for now).
-	versionsSeen := make(map[string]map[string]int64)
-
-	// Create checkpoint.
-	checkpoint := NewCheckpoint(channelValues, channelVersions, versionsSeen)
-
-	// Create metadata..
-	metadata := NewCheckpointMetadata(source, step)
-
-	// Store checkpoint.
-	req := PutRequest{
-		Config:      config,
-		Checkpoint:  checkpoint,
-		Metadata:    metadata,
-		NewVersions: channelVersions,
-	}
-	_, err := e.checkpointSaver.Put(ctx, req)
-	if err != nil {
-		return fmt.Errorf("failed to store checkpoint: %w", err)
-	}
-
-	return nil
-}
-
 // createCheckpointAndSave creates a checkpoint and persists any pending writes
 // associated with the current step atomically, updating the provided config with the
 // returned value from saver.PutFull (which may include the new checkpoint_id).
@@ -646,17 +575,8 @@ func (e *Executor) createCheckpointAndSave(
 		return nil
 	}
 
-	// Use the current state from execCtx which has all node updates,
-	// not the state parameter which may be stale.
-	stateCopy := make(State)
-	execCtx.stateMutex.RLock()
-	for k, v := range execCtx.State {
-		stateCopy[k] = v
-	}
-	execCtx.stateMutex.RUnlock()
-
 	// Create checkpoint object.
-	checkpoint := e.createCheckpointFromState(stateCopy, step, execCtx)
+	checkpoint := e.createCheckpointFromState(execCtx.State, step, execCtx)
 	if checkpoint == nil {
 		log.Debug("Failed to create checkpoint object")
 		return fmt.Errorf("failed to create checkpoint")
@@ -678,11 +598,9 @@ func (e *Executor) createCheckpointAndSave(
 	}
 
 	// Get pending writes atomically.
-	execCtx.pendingMu.Lock()
 	pendingWrites := make([]PendingWrite, len(execCtx.pendingWrites))
 	copy(pendingWrites, execCtx.pendingWrites)
 	execCtx.pendingWrites = nil // Clear after copying.
-	execCtx.pendingMu.Unlock()
 
 	// Track new versions for channels that were updated.
 	newVersions := make(map[string]int64)
@@ -840,11 +758,7 @@ func (e *Executor) resumeFromCheckpoint(
 
 // initializeState initializes the execution state with schema defaults.
 func (e *Executor) initializeState(initialState State) State {
-	execState := make(State)
-	// Copy initial state.
-	for key, value := range initialState {
-		execState[key] = value
-	}
+	execState := initialState.Clone()
 	// Add schema defaults for missing fields.
 	if e.graph.Schema() != nil {
 		for key, field := range e.graph.Schema().Fields {
@@ -893,9 +807,7 @@ func (e *Executor) planStep(ctx context.Context, invocation *agent.Invocation,
 
 	// Check if we have nodes to execute from a resumed checkpoint stored in state
 	// This needs to be checked regardless of step number when resuming
-	execCtx.stateMutex.RLock()
 	nextNodesValue, hasNextNodes := execCtx.State[StateKeyNextNodes]
-	execCtx.stateMutex.RUnlock()
 
 	if hasNextNodes {
 		log.Debugf("planStep: step=%d, found %s in state", step, StateKeyNextNodes)
@@ -904,33 +816,22 @@ func (e *Executor) planStep(ctx context.Context, invocation *agent.Invocation,
 			log.Debugf("Using %s from state: %v", StateKeyNextNodes, nextNodes)
 			// Create tasks for the nodes stored in the state
 			for _, nodeID := range nextNodes {
-				execCtx.stateMutex.RLock()
-				stateCopy := make(State, len(execCtx.State))
-				for key, value := range execCtx.State {
-					stateCopy[key] = value
-				}
-				execCtx.stateMutex.RUnlock()
-
-				task := e.createTask(nodeID, stateCopy, step)
+				task := e.createTask(nodeID, execCtx.State, step)
 				if task != nil {
 					tasks = append(tasks, task)
 				}
 			}
 			// Remove the special key from state after using it
-			execCtx.stateMutex.Lock()
 			delete(execCtx.State, StateKeyNextNodes)
-			execCtx.stateMutex.Unlock()
 			return tasks, nil
 		}
 	}
 
 	// If there are pending tasks produced by prior fan-out, schedule them first.
-	execCtx.tasksMutex.Lock()
 	if len(execCtx.pendingTasks) > 0 {
 		tasks = append(tasks, execCtx.pendingTasks...)
 		execCtx.pendingTasks = nil
 	}
-	execCtx.tasksMutex.Unlock()
 	if len(tasks) > 0 {
 		return tasks, nil
 	}
@@ -942,17 +843,7 @@ func (e *Executor) planStep(ctx context.Context, invocation *agent.Invocation,
 		if entryPoint == "" {
 			return nil, errors.New("no entry point defined")
 		}
-		// Planning step 0, entry point
-
-		// Acquire read lock to safely access state for task creation.
-		execCtx.stateMutex.RLock()
-		stateCopy := make(State, len(execCtx.State))
-		for key, value := range execCtx.State {
-			stateCopy[key] = value
-		}
-		execCtx.stateMutex.RUnlock()
-
-		task := e.createTask(entryPoint, stateCopy, step)
+		task := e.createTask(entryPoint, execCtx.State, step)
 		if task != nil {
 			tasks = append(tasks, task)
 		} else if entryPoint != End {
@@ -1095,13 +986,13 @@ func (e *Executor) createTask(nodeID string, state State, step int) *Task {
 	// Log key state values that we're interested in tracking
 	// State prepared for task
 
-	if stepCountVal, exists := state["step_count"]; exists {
+	if stepCountVal, exists := state[StateFieldStepCount]; exists {
 		log.Debugf("🔧 createTask: state contains step_count=%v (type: %T)", stepCountVal, stepCountVal)
 	}
 
 	// Special logging for final node to track the counter issue
 	if nodeID == "final" {
-		log.Debugf("🔧 createTask: FINAL NODE - counter=%v, step_count=%v", state["counter"], state["step_count"])
+		log.Debugf("🔧 createTask: FINAL NODE - counter=%v, step_count=%v", state[StateFieldCounter], state[StateFieldStepCount])
 	}
 
 	return &Task{
@@ -1199,24 +1090,53 @@ func (e *Executor) executeSingleTask(
 	t *Task,
 	step int,
 ) error {
+	// Initialize node execution context with retry policies and metadata.
+	nodeCtx := e.initializeNodeContext(ctx, invocation, execCtx, t, step)
+
+	// Run before node callbacks.
+	if handled, err := e.runBeforeCallbacks(
+		ctx, invocation, nodeCtx.mergedCallbacks, nodeCtx.callbackCtx,
+		nodeCtx.stateCopy, execCtx, t, nodeCtx.nodeType, nodeCtx.nodeStart, step,
+	); handled || err != nil {
+		return err
+	}
+
+	// Ensure pre-callback state mutations are visible to the node function.
+	// We pass the callback-mutated state copy as the task input so that
+	// executeNodeFunction uses it (instead of rebuilding from the global state).
+	// This preserves overlay application done in buildTaskStateCopy and respects
+	// any in-place state changes made by before-node callbacks.
+	t.Input = nodeCtx.stateCopy
+
+	// Attempt cache lookup; if hit, handle cached result and return.
+	if cacheHit, result := e.attemptCacheLookup(t); cacheHit {
+		return e.handleCachedResult(ctx, invocation, execCtx, t, result, step, nodeCtx)
+	}
+
+	// Execute with retry logic (emits completion event downstream on success).
+	return e.executeTaskWithRetry(ctx, invocation, execCtx, t, step, nodeCtx)
+}
+
+// initializeNodeContext initializes the node execution context with all
+// necessary metadata, policies, and callbacks.
+func (e *Executor) initializeNodeContext(
+	ctx context.Context,
+	invocation *agent.Invocation,
+	execCtx *ExecutionContext,
+	t *Task,
+	step int,
+) *nodeExecutionContext {
 	// Get node type and determine retry policies for metadata.
 	nodeType := e.getNodeType(t.NodeID)
 	nodeStart := time.Now()
-	var nodePolicies []RetryPolicy
-	if node, ok := e.graph.Node(t.NodeID); ok && node != nil && len(node.retryPolicies) > 0 {
-		nodePolicies = node.retryPolicies
-	} else if len(e.defaultRetry) > 0 {
-		nodePolicies = e.defaultRetry
-	}
+	nodePolicies := e.getNodeRetryPolicies(t.NodeID)
+
 	// Best-effort max attempts hint for start event (first policy wins).
-	maxAttempts := 0
-	if len(nodePolicies) > 0 {
-		if nodePolicies[0].MaxAttempts > 0 {
-			maxAttempts = nodePolicies[0].MaxAttempts
-		}
-	}
-	e.emitNodeStartEvent(ctx, invocation, execCtx, t.NodeID, nodeType, step, nodeStart,
-		WithNodeEventAttempt(1), WithNodeEventMaxAttempts(maxAttempts))
+	maxAttempts := e.getMaxAttemptsHint(nodePolicies)
+
+	// Emit node start event with attempt metadata.
+	e.emitNodeStartEvent(ctx, invocation, execCtx, t.NodeID, nodeType, step,
+		nodeStart, WithNodeEventAttempt(1), WithNodeEventMaxAttempts(maxAttempts))
 
 	// Create callback context.
 	callbackCtx := e.newNodeCallbackContext(execCtx, t.NodeID, nodeType, step, nodeStart)
@@ -1227,23 +1147,7 @@ func (e *Executor) executeSingleTask(
 	// Merge callbacks: global callbacks run first, then per-node callbacks.
 	mergedCallbacks := e.getMergedCallbacks(stateCopy, t.NodeID)
 
-	// Run before node callbacks.
-	if handled, err := e.runBeforeCallbacks(
-		ctx, invocation, mergedCallbacks, callbackCtx, stateCopy, execCtx, t,
-		nodeType, nodeStart, step,
-	); handled || err != nil {
-		return err
-	}
-
-	// Ensure pre-callback state mutations are visible to the node function.
-	// We pass the callback-mutated state copy as the task input so that
-	// executeNodeFunction uses it (instead of rebuilding from the global state).
-	// This preserves overlay application done in buildTaskStateCopy and respects
-	// any in-place state changes made by before-node callbacks.
-	t.Input = stateCopy
-
-	// Package execution context into a struct to reduce parameter count.
-	nodeCtx := &nodeExecutionContext{
+	return &nodeExecutionContext{
 		nodeType:        nodeType,
 		nodeStart:       nodeStart,
 		nodePolicies:    nodePolicies,
@@ -1251,9 +1155,105 @@ func (e *Executor) executeSingleTask(
 		stateCopy:       stateCopy,
 		mergedCallbacks: mergedCallbacks,
 	}
+}
 
-	// Execute with retry logic.
-	return e.executeTaskWithRetry(ctx, invocation, execCtx, t, step, nodeCtx)
+// getNodeRetryPolicies retrieves retry policies for the given node.
+// Returns node-specific policies if available, otherwise returns default policies.
+func (e *Executor) getNodeRetryPolicies(nodeID string) []RetryPolicy {
+	if node, ok := e.graph.Node(nodeID); ok && node != nil && len(node.retryPolicies) > 0 {
+		return node.retryPolicies
+	}
+	if len(e.defaultRetry) > 0 {
+		return e.defaultRetry
+	}
+	return nil
+}
+
+// getMaxAttemptsHint extracts the max attempts hint from retry policies.
+// Returns the MaxAttempts value from the first policy, or 0 if not available.
+func (e *Executor) getMaxAttemptsHint(policies []RetryPolicy) int {
+	if len(policies) > 0 && policies[0].MaxAttempts > 0 {
+		return policies[0].MaxAttempts
+	}
+	return 0
+}
+
+// attemptCacheLookup attempts to retrieve a cached result for the task.
+// Returns true and the cached result if found, false otherwise.
+func (e *Executor) attemptCacheLookup(t *Task) (bool, any) {
+	c := e.graph.Cache()
+	if c == nil {
+		return false, nil
+	}
+
+	pol := e.getEffectiveCachePolicy(t.NodeID)
+	if pol == nil || pol.KeyFunc == nil {
+		return false, nil
+	}
+
+	sanitized := sanitizeForCacheKey(t.Input)
+
+	// Apply optional cache key selector (node-level) to focus on relevant inputs.
+	if node, ok := e.graph.Node(t.NodeID); ok && node != nil && node.cacheKeySelector != nil {
+		if m, ok2 := sanitized.(map[string]any); ok2 {
+			sanitized = node.cacheKeySelector(m)
+		}
+	}
+
+	keyBytes, kerr := pol.KeyFunc(sanitized)
+	if kerr != nil {
+		return false, nil
+	}
+
+	ns := e.graph.cacheNamespace(t.NodeID)
+	if cached, ok := c.Get(ns, string(keyBytes)); ok {
+		return true, cached
+	}
+	return false, nil
+}
+
+// handleCachedResult processes a cache hit by running callbacks and handling
+// the result without executing the node function.
+func (e *Executor) handleCachedResult(
+	ctx context.Context,
+	invocation *agent.Invocation,
+	execCtx *ExecutionContext,
+	t *Task,
+	result any,
+	step int,
+	nodeCtx *nodeExecutionContext,
+) error {
+	// Run after node callbacks on cache hit.
+	if res, err := e.runAfterCallbacks(
+		ctx, invocation, nodeCtx.mergedCallbacks, nodeCtx.callbackCtx,
+		nodeCtx.stateCopy, result, execCtx, t.NodeID, nodeCtx.nodeType, step,
+	); err != nil {
+		return err
+	} else if res != nil {
+		result = res
+	}
+	e.syncResumeState(execCtx, nodeCtx.stateCopy)
+
+	// Handle result and process channel writes.
+	routed, herr := e.handleNodeResult(ctx, invocation, execCtx, t, result)
+	if herr != nil {
+		return herr
+	}
+
+	// Update versions seen for this node after successful execution.
+	e.updateVersionsSeen(execCtx, t.NodeID, t.Triggers)
+
+	// Process conditional edges after node execution.
+	if !routed {
+		if perr := e.processConditionalEdges(ctx, invocation, execCtx, t.NodeID, step); perr != nil {
+			return fmt.Errorf("conditional edge processing failed for node %s: %w", t.NodeID, perr)
+		}
+	}
+
+	// Emit node completion event with cache-hit metadata.
+	e.emitNodeCompleteEvent(ctx, invocation, execCtx, t.NodeID, nodeCtx.nodeType,
+		step, nodeCtx.nodeStart, true)
+	return nil
 }
 
 // nodeExecutionContext holds node execution related state.
@@ -1286,6 +1286,7 @@ func (e *Executor) executeTaskWithRetry(
 	for {
 		// Execute single attempt.
 		result, err := e.executeSingleAttempt(ctx, execCtx, t)
+		e.syncResumeState(execCtx, nodeCtx.stateCopy)
 		if err == nil {
 			// Handle successful execution.
 			return e.finalizeSuccessfulExecution(ctx, invocation, execCtx, t, result, step, nodeCtx)
@@ -1333,11 +1334,29 @@ func (e *Executor) finalizeSuccessfulExecution(
 	} else if res != nil {
 		result = res
 	}
+	e.syncResumeState(execCtx, nodeCtx.stateCopy)
 
 	// Handle result and process channel writes.
 	routed, herr := e.handleNodeResult(ctx, invocation, execCtx, t, result)
 	if herr != nil {
 		return herr
+	}
+
+	// After successful writes, persist cache entry if cache policy exists.
+	if c := e.graph.Cache(); c != nil {
+		if pol := e.getEffectiveCachePolicy(t.NodeID); pol != nil && pol.KeyFunc != nil {
+			// Use the same sanitized input used for lookup (post-callback state copy).
+			sanitized := sanitizeForCacheKey(nodeCtx.stateCopy)
+			if node, ok := e.graph.Node(t.NodeID); ok && node != nil && node.cacheKeySelector != nil {
+				if m, ok2 := sanitized.(map[string]any); ok2 {
+					sanitized = node.cacheKeySelector(m)
+				}
+			}
+			if keyBytes, kerr := pol.KeyFunc(sanitized); kerr == nil {
+				ns := e.graph.cacheNamespace(t.NodeID)
+				c.Set(ns, string(keyBytes), result, pol.TTL)
+			}
+		}
 	}
 
 	// Update versions seen for this node after successful execution.
@@ -1350,8 +1369,8 @@ func (e *Executor) finalizeSuccessfulExecution(
 		}
 	}
 
-	// Emit node completion event for the overall node run.
-	e.emitNodeCompleteEvent(ctx, invocation, execCtx, t.NodeID, nodeCtx.nodeType, step, nodeCtx.nodeStart)
+	// Emit node completion event for the overall node run (no cache hit).
+	e.emitNodeCompleteEvent(ctx, invocation, execCtx, t.NodeID, nodeCtx.nodeType, step, nodeCtx.nodeStart, false)
 	return nil
 }
 
@@ -1386,6 +1405,7 @@ func (e *Executor) evaluateRetryDecision(
 	if nodeCtx.mergedCallbacks != nil {
 		nodeCtx.mergedCallbacks.RunOnNodeError(ctx, nodeCtx.callbackCtx, nodeCtx.stateCopy, retryCtx.err)
 	}
+	e.syncResumeState(execCtx, nodeCtx.stateCopy)
 
 	// Evaluate retry policy.
 	matched, pol, maxAttempts := e.selectRetryPolicy(retryCtx.err, nodeCtx.nodePolicies)
@@ -1552,31 +1572,7 @@ func (e *Executor) buildTaskStateCopy(execCtx *ExecutionContext, t *Task) State 
 		base = execCtx.State
 	}
 
-	stateCopy := make(State, len(base))
-	for k, v := range base {
-		if isUnsafeStateKey(k) {
-			// Preserve pointer/reference without deep copying to avoid racing
-			// on nested structures (e.g., session internals) during reflection.
-			stateCopy[k] = v
-			continue
-		}
-		stateCopy[k] = deepCopyAny(v)
-	}
-
-	// Preserve callback pointers that contain function values which cannot be
-	// deep-copied safely via reflection (functions would become nil and cause
-	// panics when invoked). For these keys, reuse the original pointer from the
-	// base state.
-	for _, cbKey := range []string{
-		StateKeyNodeCallbacks,
-		StateKeyToolCallbacks,
-		StateKeyModelCallbacks,
-		StateKeyAgentCallbacks,
-	} {
-		if v, ok := base[cbKey]; ok && v != nil {
-			stateCopy[cbKey] = v
-		}
-	}
+	stateCopy := base.deepCopy(true, e.graph.Schema().Fields)
 
 	// Apply overlay if present to form the isolated input view.
 	if t.Overlay != nil && e.graph.Schema() != nil {
@@ -1625,6 +1621,7 @@ func (e *Executor) runBeforeCallbacks(
 	if customResult == nil {
 		return false, nil
 	}
+	e.syncResumeState(execCtx, stateCopy)
 	routed, err := e.handleNodeResult(ctx, invocation, execCtx, t, customResult)
 	if err != nil {
 		return true, err
@@ -1637,7 +1634,7 @@ func (e *Executor) runBeforeCallbacks(
 		}
 	}
 
-	e.emitNodeCompleteEvent(ctx, invocation, execCtx, t.NodeID, nodeType, step, nodeStart)
+	e.emitNodeCompleteEvent(ctx, invocation, execCtx, t.NodeID, nodeType, step, nodeStart, false)
 	return true, nil
 }
 
@@ -1778,14 +1775,7 @@ func (e *Executor) executeNodeFunction(
 
 	if input == nil {
 		execCtx.stateMutex.RLock()
-		tmp := make(State, len(execCtx.State))
-		for k, v := range execCtx.State {
-			if isUnsafeStateKey(k) {
-				tmp[k] = v
-				continue
-			}
-			tmp[k] = deepCopyAny(v)
-		}
+		tmp := execCtx.State.deepCopy(true, e.graph.Schema().Fields)
 		// Apply overlay if present to form the isolated input view.
 		if t.Overlay != nil && e.graph.Schema() != nil {
 			tmp = e.graph.Schema().ApplyUpdate(tmp, t.Overlay)
@@ -1847,6 +1837,12 @@ func (e *Executor) handleNodeResult(ctx context.Context, invocation *agent.Invoc
 			e.updateStateFromResult(execCtx, v)
 		case *Command: // Single command.
 			if v != nil {
+				// Resolve GoTo via per-node ends if provided.
+				if v.GoTo != "" {
+					if resolved := e.resolveTargetByEnds(t.NodeID, v.GoTo); resolved != "" {
+						v.GoTo = resolved
+					}
+				}
 				if err := e.handleCommandResult(ctx, invocation, execCtx, v); err != nil {
 					return false, err
 				}
@@ -1860,6 +1856,14 @@ func (e *Executor) handleNodeResult(ctx context.Context, invocation *agent.Invoc
 		case []*Command: // Fan-out commands.
 			// Fan-out: enqueue tasks with overlays.
 			routed = true
+			// Resolve per-node ends for each command before enqueue.
+			for _, c := range v {
+				if c != nil && c.GoTo != "" {
+					if resolved := e.resolveTargetByEnds(t.NodeID, c.GoTo); resolved != "" {
+						c.GoTo = resolved
+					}
+				}
+			}
 			e.enqueueCommands(execCtx, t, v)
 		default:
 		}
@@ -1873,6 +1877,22 @@ func (e *Executor) handleNodeResult(ctx context.Context, invocation *agent.Invoc
 	}
 
 	return routed, nil
+}
+
+// resolveTargetByEnds resolves a symbolic target name using the node's per-node
+// ends mapping. If no mapping is found, returns an empty string.
+func (e *Executor) resolveTargetByEnds(fromNodeID, target string) string {
+	if target == "" {
+		return ""
+	}
+	node, ok := e.graph.Node(fromNodeID)
+	if !ok || node == nil || node.ends == nil {
+		return ""
+	}
+	if concrete, exists := node.ends[target]; exists {
+		return concrete
+	}
+	return ""
 }
 
 // enqueueCommands enqueues a set of commands as pending tasks for subsequent steps.
@@ -1937,6 +1957,22 @@ func (e *Executor) updateStateFromResult(execCtx *ExecutionContext, stateResult 
 	execCtx.stateMutex.Lock()
 	defer execCtx.stateMutex.Unlock()
 
+	// Sanitize: drop internal/ephemeral keys from user node updates.
+	// These keys (e.g., exec_context) are maintained by the executor and
+	// may contain concurrently-mutated maps. Accepting them causes
+	// reflective deep copies to iterate maps while other goroutines write.
+	// That leads to "concurrent map iteration and map write" panics.
+	if stateResult != nil {
+		cleaned := make(State, len(stateResult))
+		for k, v := range stateResult {
+			if isInternalStateKey(k) {
+				continue
+			}
+			cleaned[k] = v
+		}
+		stateResult = cleaned
+	}
+
 	// Use schema-based reducers when available for proper merging.
 	if e.graph != nil && e.graph.Schema() != nil {
 		execCtx.State = e.graph.Schema().ApplyUpdate(execCtx.State, stateResult)
@@ -1944,6 +1980,34 @@ func (e *Executor) updateStateFromResult(execCtx *ExecutionContext, stateResult 
 	}
 	// Fallback to direct assignment if no schema available.
 	maps.Copy(execCtx.State, stateResult)
+}
+
+// syncResumeState copies resume-related keys from a node-local state view into the shared executor state.
+func (e *Executor) syncResumeState(execCtx *ExecutionContext, source State) {
+	if execCtx == nil || source == nil {
+		return
+	}
+	execCtx.stateMutex.Lock()
+	defer execCtx.stateMutex.Unlock()
+	if execCtx.State == nil {
+		execCtx.State = make(State)
+	}
+	syncResumeKey(execCtx.State, source, ResumeChannel)
+	syncResumeKey(execCtx.State, source, StateKeyResumeMap)
+	syncResumeKey(execCtx.State, source, StateKeyUsedInterrupts)
+}
+
+// syncResumeKey applies a specific resume key mutation from the node state.
+func syncResumeKey(target, source State, key string) {
+	if value, exists := source[key]; exists {
+		if value == nil {
+			delete(target, key)
+			return
+		}
+		target[key] = deepCopyAny(value)
+		return
+	}
+	delete(target, key)
 }
 
 // handleCommandResult handles a Command result from node execution.
@@ -2066,6 +2130,7 @@ func (e *Executor) emitNodeCompleteEvent(
 	nodeType NodeType,
 	step int,
 	startTime time.Time,
+	cacheHit bool,
 ) {
 	if execCtx.EventChan == nil {
 		return
@@ -2085,7 +2150,30 @@ func (e *Executor) emitNodeCompleteEvent(
 		WithNodeEventEndTime(execEndTime),
 		WithNodeEventOutputKeys(outputKeys),
 	)
+	// Attach cache-hit metadata if supported by the event schema.
+	// We piggyback on node metadata extension by encoding a boolean marker inside
+	// the existing Node metadata via StateDelta in NewNodeCompleteEvent.
+	// Here we cannot mutate the event payload directly, so we re-emit a separate
+	// event that carries cache info is not strictly necessary. As a lightweight
+	// approach, when cacheHit=true we append a synthetic key in OutputKeys to
+	// aid debugging without breaking compatibility.
+	if cacheHit {
+		if completeEvent.StateDelta == nil {
+			completeEvent.StateDelta = make(map[string][]byte)
+		}
+		// Best-effort hint: add a virtual output key for observability.
+		completeEvent.StateDelta[MetadataKeyCacheHit] = []byte("true")
+	}
 	agent.EmitEvent(ctx, invocation, execCtx.EventChan, completeEvent)
+}
+
+// getEffectiveCachePolicy returns the node-level cache policy if set, otherwise the graph-level policy.
+func (e *Executor) getEffectiveCachePolicy(nodeID string) *CachePolicy {
+	node, exists := e.graph.Node(nodeID)
+	if exists && node != nil && node.cachePolicy != nil {
+		return node.cachePolicy
+	}
+	return e.graph.CachePolicy()
 }
 
 // updateChannels processes channel updates and emits events.
@@ -2197,9 +2285,20 @@ func (e *Executor) processConditionalEdges(
 	if err != nil {
 		return fmt.Errorf("conditional edge evaluation failed for node %s: %w", nodeID, err)
 	}
-
-	// Process the conditional result.
-	return e.processConditionalResult(ctx, invocation, execCtx, condEdge, result, step)
+	// Deduplicate results to avoid double triggers.
+	seen := make(map[string]bool)
+	for _, r := range result.NextNodes {
+		if seen[r] {
+			continue
+		}
+		seen[r] = true
+		if err := e.processConditionalResult(
+			ctx, invocation, execCtx, condEdge, r, step,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // processConditionalResult processes the result of a conditional edge evaluation.
@@ -2211,10 +2310,20 @@ func (e *Executor) processConditionalResult(
 	result string,
 	step int,
 ) error {
-	target, exists := condEdge.PathMap[result]
-	if !exists {
-		log.Warnf("⚠️ Step %d: No target found for conditional result %v in path map", step, result)
-		return nil
+	// Determine target by precedence:
+	// 1) explicit PathMap mapping
+	// 2) node-level ends mapping (symbolic -> concrete)
+	// 3) treat result as a concrete node id
+	// First, check explicit PathMap mapping.
+	target, ok := condEdge.PathMap[result]
+	if !ok {
+		// Then resolve by node-level ends mapping (symbolic -> concrete).
+		if concrete := e.resolveTargetByEnds(condEdge.From, result); concrete != "" {
+			target = concrete
+		} else {
+			// Finally, fallback to treating the result as a concrete node id.
+			target = result
+		}
 	}
 
 	// Create and trigger the target channel.
@@ -2245,19 +2354,8 @@ func (e *Executor) handleInterrupt(
 ) error {
 	// Create an interrupt checkpoint with the current state.
 	if e.checkpointSaver != nil && checkpointConfig != nil {
-		// Get the current state with all updates from nodes
-		execCtx.stateMutex.RLock()
-		currentState := make(State)
-		for k, v := range execCtx.State {
-			currentState[k] = v
-		}
-		execCtx.stateMutex.RUnlock()
-
-		// Note: We do NOT remove resume values from state here because
-		// they may be needed when the node is re-executed after resume
-
 		// Set interrupt state in the checkpoint.
-		checkpoint := e.createCheckpointFromState(currentState, step, execCtx)
+		checkpoint := e.createCheckpointFromState(execCtx.State, step, execCtx)
 
 		// IMPORTANT: Set parent checkpoint ID from current config to maintain proper tree structure
 		if parentCheckpointID := GetCheckpointID(checkpointConfig); parentCheckpointID != "" {
@@ -2335,7 +2433,11 @@ func (e *Executor) handleInterrupt(
 		WithPregelEventInterruptValue(interrupt.Value),
 	)
 
-	agent.EmitEvent(ctx, invocation, execCtx.EventChan, interruptEvent)
+	// Replace ctx with a fresh eventCtx derived from background to avoid cancel warning.
+	const defaultEmitTimeout = time.Second
+	eventCtx, cancel := context.WithTimeout(context.Background(), defaultEmitTimeout)
+	defer cancel()
+	agent.EmitEvent(eventCtx, invocation, execCtx.EventChan, interruptEvent)
 
 	// Return the interrupt error to propagate it to the caller.
 	return interrupt
@@ -2345,13 +2447,8 @@ func (e *Executor) handleInterrupt(
 func (e *Executor) createCheckpointFromState(state State, step int, execCtx *ExecutionContext) *Checkpoint {
 	// Convert state to channel values, ensuring we capture the latest state
 	// including any updates from nodes that haven't been written to channels yet.
-	channelValues := make(map[string]any)
-	for k, v := range state {
-		if isUnsafeStateKey(k) {
-			continue
-		}
-		channelValues[k] = deepCopyAny(v)
-	}
+	// No deep copy is required here
+	channelValues := state.safeClone()
 
 	// Create channel versions from current channel states
 	channelVersions := make(map[string]int64)

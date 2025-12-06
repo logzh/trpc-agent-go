@@ -11,44 +11,73 @@
 package translator
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	agentevent "trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/graph"
+	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
 
 // Translator translates trpc-agent-go events to AG-UI events.
 type Translator interface {
 	// Translate translates a trpc-agent-go event to AG-UI events.
-	Translate(event *agentevent.Event) ([]aguievents.Event, error)
+	Translate(ctx context.Context, event *agentevent.Event) ([]aguievents.Event, error)
 }
 
 // New creates a new event translator.
-func New(threadID, runID string) Translator {
+func New(ctx context.Context, threadID, runID string) Translator {
 	return &translator{
-		threadID: threadID,
-		runID:    runID,
+		threadID:         threadID,
+		runID:            runID,
+		lastMessageID:    "",
+		receivingMessage: false,
+		seenResponseIDs:  make(map[string]struct{}),
+		seenToolCallIDs:  make(map[string]struct{}),
 	}
 }
 
 // translator is the default implementation of the Translator.
 type translator struct {
-	threadID      string
-	runID         string
-	lastMessageID string
+	threadID         string
+	runID            string
+	lastMessageID    string
+	receivingMessage bool
+	seenResponseIDs  map[string]struct{}
+	seenToolCallIDs  map[string]struct{}
 }
 
 // Translate translates one trpc-agent-go event into zero or more AG-UI events.
-func (t *translator) Translate(event *agentevent.Event) ([]aguievents.Event, error) {
-	if event == nil || event.Response == nil {
+func (t *translator) Translate(ctx context.Context, event *agentevent.Event) ([]aguievents.Event, error) {
+	if event == nil {
 		return nil, errors.New("event is nil")
 	}
+
+	var events []aguievents.Event
+	hasGraphDelta := event.StateDelta != nil &&
+		(len(event.StateDelta[graph.MetadataKeyModel]) > 0 || len(event.StateDelta[graph.MetadataKeyTool]) > 0)
+
+	// GraphAgent emits model/tool metadata via StateDelta instead of raw tool_calls.
+	events = append(events, t.graphModelEvents(event)...)
+	events = append(events, t.graphToolEvents(event)...)
+
 	rsp := event.Response
-	if rsp.Error != nil {
-		return []aguievents.Event{aguievents.NewRunErrorEvent(rsp.Error.Message, aguievents.WithRunID(t.runID))}, nil
+	if rsp == nil {
+		if len(events) > 0 || hasGraphDelta {
+			return events, nil
+		}
+		return nil, errors.New("event response is nil")
 	}
-	events := []aguievents.Event{}
+	if rsp.Error != nil {
+		log.Errorf("agui: threadID: %s, runID: %s, error in response: %v", t.threadID, t.runID, rsp.Error)
+		events = append(events, aguievents.NewRunErrorEvent(rsp.Error.Message, aguievents.WithRunID(t.runID)))
+		return events, nil
+	}
 	if rsp.Object == model.ObjectTypeChatCompletionChunk || rsp.Object == model.ObjectTypeChatCompletion {
 		textMessageEvents, err := t.textMessageEvent(rsp)
 		if err != nil {
@@ -64,13 +93,16 @@ func (t *translator) Translate(event *agentevent.Event) ([]aguievents.Event, err
 		events = append(events, toolCallEvents...)
 	}
 	if rsp.IsToolResultResponse() {
-		toolResultEvents, err := t.toolResultEvent(rsp)
+		toolResultEvents, err := t.toolResultEvent(rsp, event.ID)
 		if err != nil {
 			return nil, err
 		}
 		events = append(events, toolResultEvents...)
 	}
-	if rsp.IsFinalResponse() {
+	if event.IsRunnerCompletion() {
+		if t.receivingMessage {
+			events = append(events, aguievents.NewTextMessageEndEvent(t.lastMessageID))
+		}
 		events = append(events, aguievents.NewRunFinishedEvent(t.threadID, t.runID))
 	}
 	return events, nil
@@ -81,18 +113,32 @@ func (t *translator) textMessageEvent(rsp *model.Response) ([]aguievents.Event, 
 	if rsp == nil || len(rsp.Choices) == 0 {
 		return nil, nil
 	}
+	t.recordResponseID(rsp.ID)
 	var events []aguievents.Event
 	// Different message ID means a new message.
 	if t.lastMessageID != rsp.ID {
-		t.lastMessageID = rsp.ID
 		switch rsp.Object {
 		case model.ObjectTypeChatCompletionChunk:
+			if rsp.Choices[0].Delta.Content == "" {
+				return nil, nil
+			}
+			if t.receivingMessage {
+				events = append(events, aguievents.NewTextMessageEndEvent(t.lastMessageID))
+				t.receivingMessage = false
+			}
+			t.lastMessageID = rsp.ID
+			t.receivingMessage = true
 			role := rsp.Choices[0].Delta.Role.String()
 			events = append(events, aguievents.NewTextMessageStartEvent(rsp.ID, aguievents.WithRole(role)))
 		case model.ObjectTypeChatCompletion:
 			if rsp.Choices[0].Message.Content == "" {
 				return nil, nil
 			}
+			if t.receivingMessage {
+				events = append(events, aguievents.NewTextMessageEndEvent(t.lastMessageID))
+				t.receivingMessage = false
+			}
+			t.lastMessageID = rsp.ID
 			role := rsp.Choices[0].Message.Role.String()
 			events = append(events,
 				aguievents.NewTextMessageStartEvent(rsp.ID, aguievents.WithRole(role)),
@@ -114,6 +160,7 @@ func (t *translator) textMessageEvent(rsp *model.Response) ([]aguievents.Event, 
 	// For streaming response, don't need to emit final completion event.
 	// It means the response is ended.
 	case model.ObjectTypeChatCompletion:
+		t.receivingMessage = false
 		events = append(events, aguievents.NewTextMessageEndEvent(rsp.ID))
 	default:
 		return nil, errors.New("invalid response object")
@@ -123,12 +170,13 @@ func (t *translator) textMessageEvent(rsp *model.Response) ([]aguievents.Event, 
 
 // toolCallEvent translates a tool call trpc-agent-go event to AG-UI events.
 func (t *translator) toolCallEvent(rsp *model.Response) ([]aguievents.Event, error) {
-	var events []aguievents.Event
 	if rsp == nil || len(rsp.Choices) == 0 {
-		return events, nil
+		return nil, nil
 	}
+	events := make([]aguievents.Event, 0, len(rsp.Choices))
 	for _, choice := range rsp.Choices {
 		for _, toolCall := range choice.Message.ToolCalls {
+			t.recordToolCallID(toolCall.ID)
 			// Tool Call Start Event.
 			startOpt := []aguievents.ToolCallStartOption{aguievents.WithParentMessageID(rsp.ID)}
 			toolCallStartEvent := aguievents.NewToolCallStartEvent(toolCall.ID, toolCall.Function.Name, startOpt...)
@@ -138,6 +186,8 @@ func (t *translator) toolCallEvent(rsp *model.Response) ([]aguievents.Event, err
 			if toolCallArguments != "" {
 				events = append(events, aguievents.NewToolCallArgsEvent(toolCall.ID, toolCallArguments))
 			}
+			// Tool call end should precede result to align with AG-UI protocol.
+			events = append(events, aguievents.NewToolCallEndEvent(toolCall.ID))
 		}
 	}
 	t.lastMessageID = rsp.ID
@@ -145,14 +195,16 @@ func (t *translator) toolCallEvent(rsp *model.Response) ([]aguievents.Event, err
 }
 
 // toolResultEvent translates a tool result trpc-agent-go event to AG-UI events.
-func (t *translator) toolResultEvent(rsp *model.Response) ([]aguievents.Event, error) {
-	var events []aguievents.Event
-	choice := rsp.Choices[0]
-	// Tool call end event.
-	events = append(events, aguievents.NewToolCallEndEvent(choice.Message.ToolID))
-	// Tool call result event.
-	events = append(events, aguievents.NewToolCallResultEvent(t.lastMessageID,
-		choice.Message.ToolID, choice.Message.Content))
+func (t *translator) toolResultEvent(rsp *model.Response, messageID string) ([]aguievents.Event, error) {
+	if rsp == nil || len(rsp.Choices) == 0 {
+		return nil, nil
+	}
+	events := make([]aguievents.Event, 0, len(rsp.Choices))
+	for _, choice := range rsp.Choices {
+		events = append(events, aguievents.NewToolCallResultEvent(messageID,
+			choice.Message.ToolID, choice.Message.Content))
+	}
+	t.lastMessageID = messageID
 	return events, nil
 }
 
@@ -162,4 +214,96 @@ func formatToolCallArguments(arguments []byte) string {
 		return ""
 	}
 	return string(arguments)
+}
+
+// graphModelEvents converts graph model metadata (from StateDelta) into text events.
+func (t *translator) graphModelEvents(evt *agentevent.Event) []aguievents.Event {
+	if evt.StateDelta == nil {
+		return nil
+	}
+	raw, ok := evt.StateDelta[graph.MetadataKeyModel]
+	if !ok || len(raw) == 0 {
+		return nil
+	}
+	var meta graph.ModelExecutionMetadata
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return []aguievents.Event{aguievents.NewRunErrorEvent(
+			fmt.Sprintf("invalid graph model metadata: %v", err),
+			aguievents.WithRunID(t.runID),
+		)}
+	}
+	if meta.Output == "" {
+		return nil
+	}
+	responseID := meta.ResponseID
+	if t.hasSeenResponseID(responseID) {
+		return nil
+	}
+	var events []aguievents.Event
+	if t.receivingMessage && t.lastMessageID != responseID {
+		events = append(events, aguievents.NewTextMessageEndEvent(t.lastMessageID))
+		t.receivingMessage = false
+	}
+	events = append(events,
+		aguievents.NewTextMessageStartEvent(responseID, aguievents.WithRole(model.RoleAssistant.String())),
+		aguievents.NewTextMessageContentEvent(responseID, meta.Output),
+		aguievents.NewTextMessageEndEvent(responseID),
+	)
+	t.lastMessageID = responseID
+	t.recordResponseID(responseID)
+	return events
+}
+
+// graphToolEvents converts graph tool metadata (from StateDelta) into tool call events.
+func (t *translator) graphToolEvents(evt *agentevent.Event) []aguievents.Event {
+	if evt.StateDelta == nil {
+		return nil
+	}
+	raw, ok := evt.StateDelta[graph.MetadataKeyTool]
+	if !ok || len(raw) == 0 {
+		return nil
+	}
+	var meta graph.ToolExecutionMetadata
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return []aguievents.Event{aguievents.NewRunErrorEvent(
+			fmt.Sprintf("invalid graph tool metadata: %v", err),
+			aguievents.WithRunID(t.runID),
+		)}
+	}
+	if t.hasSeenToolCallID(meta.ToolID) {
+		return nil
+	}
+
+	switch meta.Phase {
+	case graph.ToolExecutionPhaseStart:
+		var events []aguievents.Event
+		opts := []aguievents.ToolCallStartOption{aguievents.WithParentMessageID(meta.ResponseID)}
+		events = append(events, aguievents.NewToolCallStartEvent(meta.ToolID, meta.ToolName, opts...))
+		if strings.TrimSpace(meta.Input) != "" {
+			events = append(events, aguievents.NewToolCallArgsEvent(meta.ToolID, meta.Input))
+		}
+		events = append(events, aguievents.NewToolCallEndEvent(meta.ToolID))
+		t.recordToolCallID(meta.ToolID)
+		return events
+	default:
+		return nil
+	}
+}
+
+func (t *translator) recordResponseID(id string) {
+	t.seenResponseIDs[id] = struct{}{}
+}
+
+func (t *translator) hasSeenResponseID(id string) bool {
+	_, ok := t.seenResponseIDs[id]
+	return ok
+}
+
+func (t *translator) recordToolCallID(id string) {
+	t.seenToolCallIDs[id] = struct{}{}
+}
+
+func (t *translator) hasSeenToolCallID(id string) bool {
+	_, ok := t.seenToolCallIDs[id]
+	return ok
 }

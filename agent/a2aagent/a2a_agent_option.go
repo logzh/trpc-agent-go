@@ -77,6 +77,9 @@ func WithA2AClientExtraOptions(opts ...client.Option) Option {
 // WithStreamingChannelBufSize set the buf size of streaming protocol
 func WithStreamingChannelBufSize(size int) Option {
 	return func(a *A2AAgent) {
+		if size < 0 {
+			size = defaultStreamingChannelSize
+		}
 		a.streamingBufSize = size
 	}
 }
@@ -92,5 +95,25 @@ func WithStreamingRespHandler(handler StreamingRespHandler) Option {
 func WithTransferStateKey(key ...string) Option {
 	return func(a *A2AAgent) {
 		a.transferStateKey = append(a.transferStateKey, key...)
+	}
+}
+
+// WithUserIDHeader sets the HTTP header name to send UserID to the A2A server.
+// If not set, defaults to "X-User-ID".
+// The UserID will be extracted from invocation.Session.UserID and sent via the specified header.
+func WithUserIDHeader(header string) Option {
+	return func(a *A2AAgent) {
+		if header != "" {
+			a.userIDHeader = header
+		}
+	}
+}
+
+// WithEnableStreaming explicitly controls whether to use streaming protocol.
+// If not set (nil), the agent will use the streaming capability from the agent card.
+// This option overrides the agent card's capability setting.
+func WithEnableStreaming(enable bool) Option {
+	return func(a *A2AAgent) {
+		a.enableStreaming = &enable
 	}
 }
