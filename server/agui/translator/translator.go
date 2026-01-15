@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
+	"github.com/google/uuid"
 	agentevent "trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/graph"
 	"trpc.group/trpc-go/trpc-agent-go/log"
@@ -31,25 +32,30 @@ type Translator interface {
 }
 
 // New creates a new event translator.
-func New(ctx context.Context, threadID, runID string) Translator {
+func New(ctx context.Context, threadID, runID string, opts ...Option) (Translator, error) {
+	options := newOptions(opts...)
 	return &translator{
-		threadID:         threadID,
-		runID:            runID,
-		lastMessageID:    "",
-		receivingMessage: false,
-		seenResponseIDs:  make(map[string]struct{}),
-		seenToolCallIDs:  make(map[string]struct{}),
-	}
+		threadID:                          threadID,
+		runID:                             runID,
+		lastMessageID:                     "",
+		receivingMessage:                  false,
+		seenResponseIDs:                   make(map[string]struct{}),
+		seenToolCallIDs:                   make(map[string]struct{}),
+		graphNodeLifecycleActivityEnabled: options.graphNodeLifecycleActivityEnabled,
+		graphNodeInterruptActivityEnabled: options.graphNodeInterruptActivityEnabled,
+	}, nil
 }
 
 // translator is the default implementation of the Translator.
 type translator struct {
-	threadID         string
-	runID            string
-	lastMessageID    string
-	receivingMessage bool
-	seenResponseIDs  map[string]struct{}
-	seenToolCallIDs  map[string]struct{}
+	threadID                          string
+	runID                             string
+	lastMessageID                     string
+	receivingMessage                  bool
+	seenResponseIDs                   map[string]struct{}
+	seenToolCallIDs                   map[string]struct{}
+	graphNodeLifecycleActivityEnabled bool
+	graphNodeInterruptActivityEnabled bool
 }
 
 // Translate translates one trpc-agent-go event into zero or more AG-UI events.
@@ -60,11 +66,23 @@ func (t *translator) Translate(ctx context.Context, event *agentevent.Event) ([]
 
 	var events []aguievents.Event
 	hasGraphDelta := event.StateDelta != nil &&
-		(len(event.StateDelta[graph.MetadataKeyModel]) > 0 || len(event.StateDelta[graph.MetadataKeyTool]) > 0)
+		(len(event.StateDelta[graph.MetadataKeyModel]) > 0 ||
+			len(event.StateDelta[graph.MetadataKeyTool]) > 0 ||
+			len(event.StateDelta[graph.MetadataKeyNodeCustom]) > 0 ||
+			len(event.StateDelta[graph.MetadataKeyNode]) > 0 ||
+			len(event.StateDelta[graph.MetadataKeyPregel]) > 0)
 
 	// GraphAgent emits model/tool metadata via StateDelta instead of raw tool_calls.
+	if t.graphNodeLifecycleActivityEnabled {
+		events = append(events, t.graphNodeActivityEvents(event)...)
+	}
+	if t.graphNodeInterruptActivityEnabled {
+		events = append(events, t.graphNodeInterruptActivityEvents(event)...)
+	}
 	events = append(events, t.graphModelEvents(event)...)
 	events = append(events, t.graphToolEvents(event)...)
+	// Handle node custom events (progress, text, custom).
+	events = append(events, t.graphNodeCustomEvents(event)...)
 
 	rsp := event.Response
 	if rsp == nil {
@@ -106,6 +124,110 @@ func (t *translator) Translate(ctx context.Context, event *agentevent.Event) ([]
 		events = append(events, aguievents.NewRunFinishedEvent(t.threadID, t.runID))
 	}
 	return events, nil
+}
+
+const (
+	graphNodeLifecycleActivityType = "graph.node.lifecycle"
+	graphNodePatchPath             = "/node"
+	graphNodeInterruptActivityType = "graph.node.interrupt"
+	graphNodeInterruptPatchPath    = "/interrupt"
+)
+
+type graphNodePatchValue struct {
+	NodeID string `json:"nodeId"`
+	Phase  string `json:"phase"`
+	Error  string `json:"error,omitempty"`
+}
+
+type graphNodeInterruptPatchValue struct {
+	NodeID       string `json:"nodeId"`
+	Key          string `json:"key,omitempty"`
+	Prompt       any    `json:"prompt"`
+	CheckpointID string `json:"checkpointId,omitempty"`
+	LineageID    string `json:"lineageId,omitempty"`
+}
+
+func (t *translator) graphNodeActivityEvents(evt *agentevent.Event) []aguievents.Event {
+	if evt == nil || evt.StateDelta == nil {
+		return nil
+	}
+	raw, ok := evt.StateDelta[graph.MetadataKeyNode]
+	if !ok || len(raw) == 0 {
+		return nil
+	}
+	var meta graph.NodeExecutionMetadata
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return []aguievents.Event{aguievents.NewRunErrorEvent(
+			fmt.Sprintf("invalid graph node metadata: %v", err),
+			aguievents.WithRunID(t.runID),
+		)}
+	}
+	if meta.NodeID == "" {
+		return nil
+	}
+	// Agent nodes emit an additional start event without attempt metadata; ignore it to avoid duplicates.
+	if meta.NodeType == graph.NodeTypeAgent && meta.Attempt == 0 {
+		return nil
+	}
+
+	value := graphNodePatchValue{NodeID: meta.NodeID, Phase: string(meta.Phase)}
+	switch meta.Phase {
+	case graph.ExecutionPhaseStart, graph.ExecutionPhaseComplete:
+	case graph.ExecutionPhaseError:
+		value.Error = meta.Error
+	default:
+		return nil
+	}
+
+	patch := []aguievents.JSONPatchOperation{
+		{
+			Op:    "add",
+			Path:  graphNodePatchPath,
+			Value: value,
+		},
+	}
+
+	return []aguievents.Event{
+		aguievents.NewActivityDeltaEvent(uuid.NewString(), graphNodeLifecycleActivityType, patch),
+	}
+}
+
+func (t *translator) graphNodeInterruptActivityEvents(evt *agentevent.Event) []aguievents.Event {
+	if evt == nil || evt.StateDelta == nil {
+		return nil
+	}
+	raw, ok := evt.StateDelta[graph.MetadataKeyPregel]
+	if !ok || len(raw) == 0 {
+		return nil
+	}
+	var meta graph.PregelStepMetadata
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return []aguievents.Event{aguievents.NewRunErrorEvent(
+			fmt.Sprintf("invalid graph pregel metadata: %v", err),
+			aguievents.WithRunID(t.runID),
+		)}
+	}
+	if meta.NodeID == "" {
+		return nil
+	}
+
+	patch := []aguievents.JSONPatchOperation{
+		{
+			Op:   "add",
+			Path: graphNodeInterruptPatchPath,
+			Value: graphNodeInterruptPatchValue{
+				NodeID:       meta.NodeID,
+				Key:          meta.InterruptKey,
+				Prompt:       meta.InterruptValue,
+				CheckpointID: meta.CheckpointID,
+				LineageID:    meta.LineageID,
+			},
+		},
+	}
+
+	return []aguievents.Event{
+		aguievents.NewActivityDeltaEvent(uuid.NewString(), graphNodeInterruptActivityType, patch),
+	}
 }
 
 // textMessageEvent translates a text message trpc-agent-go event to AG-UI events.
@@ -157,11 +279,17 @@ func (t *translator) textMessageEvent(rsp *model.Response) ([]aguievents.Event, 
 		if rsp.Choices[0].Delta.Content != "" {
 			events = append(events, aguievents.NewTextMessageContentEvent(rsp.ID, rsp.Choices[0].Delta.Content))
 		}
+		if rsp.Choices[0].FinishReason != nil && *rsp.Choices[0].FinishReason != "" {
+			t.receivingMessage = false
+			events = append(events, aguievents.NewTextMessageEndEvent(rsp.ID))
+		}
 	// For streaming response, don't need to emit final completion event.
 	// It means the response is ended.
 	case model.ObjectTypeChatCompletion:
-		t.receivingMessage = false
-		events = append(events, aguievents.NewTextMessageEndEvent(rsp.ID))
+		if t.receivingMessage {
+			t.receivingMessage = false
+			events = append(events, aguievents.NewTextMessageEndEvent(rsp.ID))
+		}
 	default:
 		return nil, errors.New("invalid response object")
 	}
@@ -306,4 +434,114 @@ func (t *translator) recordToolCallID(id string) {
 func (t *translator) hasSeenToolCallID(id string) bool {
 	_, ok := t.seenToolCallIDs[id]
 	return ok
+}
+
+// graphNodeCustomEvents converts graph node custom metadata (from StateDelta) into AG-UI events.
+// It handles three types of node custom events:
+//   - Custom events: Converted to AG-UI Custom events with full payload
+//   - Progress events: Converted to AG-UI Custom events with progress information
+//   - Text events: Converted to TextMessageContent events if in message context,
+//     otherwise converted to AG-UI Custom events
+func (t *translator) graphNodeCustomEvents(evt *agentevent.Event) []aguievents.Event {
+	if evt.StateDelta == nil {
+		return nil
+	}
+	raw, ok := evt.StateDelta[graph.MetadataKeyNodeCustom]
+	if !ok || len(raw) == 0 {
+		return nil
+	}
+	var meta graph.NodeCustomEventMetadata
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return []aguievents.Event{aguievents.NewRunErrorEvent(
+			fmt.Sprintf("invalid graph node custom metadata: %v", err),
+			aguievents.WithRunID(t.runID),
+		)}
+	}
+
+	switch meta.Category {
+	case graph.NodeCustomEventCategoryProgress:
+		return t.handleProgressEvent(meta)
+	case graph.NodeCustomEventCategoryText:
+		return t.handleTextEvent(meta)
+	default:
+		return t.handleCustomEvent(meta)
+	}
+}
+
+// handleProgressEvent converts a progress event to AG-UI Custom events.
+func (t *translator) handleProgressEvent(meta graph.NodeCustomEventMetadata) []aguievents.Event {
+	eventType := "node.progress"
+	if meta.EventType != "" {
+		eventType = meta.EventType
+	}
+
+	payload := map[string]any{
+		"nodeId":   meta.NodeID,
+		"progress": meta.Progress,
+		"message":  meta.Message,
+	}
+	if meta.StepNumber > 0 {
+		payload["stepNumber"] = meta.StepNumber
+	}
+
+	return []aguievents.Event{
+		aguievents.NewCustomEvent(eventType, aguievents.WithValue(payload)),
+	}
+}
+
+// handleTextEvent converts a text event to AG-UI events.
+// If currently receiving a message, it emits a TextMessageContent event;
+// otherwise, it emits a Custom event.
+func (t *translator) handleTextEvent(meta graph.NodeCustomEventMetadata) []aguievents.Event {
+	// If we're currently in a message context and the text is from the same
+	// message context, emit as TextMessageContent for seamless streaming.
+	if t.receivingMessage && meta.Message != "" {
+		return []aguievents.Event{
+			aguievents.NewTextMessageContentEvent(t.lastMessageID, meta.Message),
+		}
+	}
+
+	// Otherwise emit as Custom event with text content.
+	eventType := "node.text"
+	if meta.EventType != "" {
+		eventType = meta.EventType
+	}
+
+	payload := map[string]any{
+		"nodeId":  meta.NodeID,
+		"content": meta.Message,
+	}
+	if meta.StepNumber > 0 {
+		payload["stepNumber"] = meta.StepNumber
+	}
+
+	return []aguievents.Event{
+		aguievents.NewCustomEvent(eventType, aguievents.WithValue(payload)),
+	}
+}
+
+// handleCustomEvent converts a generic custom event to AG-UI Custom events.
+func (t *translator) handleCustomEvent(meta graph.NodeCustomEventMetadata) []aguievents.Event {
+	eventType := "node.custom"
+	if meta.EventType != "" {
+		eventType = meta.EventType
+	}
+
+	payload := map[string]any{
+		"nodeId": meta.NodeID,
+	}
+	if meta.Payload != nil {
+		payload["payload"] = meta.Payload
+	}
+	if meta.Message != "" {
+		payload["message"] = meta.Message
+	}
+	if meta.StepNumber > 0 {
+		payload["stepNumber"] = meta.StepNumber
+	}
+	payload["timestamp"] = meta.Timestamp
+
+	return []aguievents.Event{
+		aguievents.NewCustomEvent(eventType, aguievents.WithValue(payload)),
+	}
 }

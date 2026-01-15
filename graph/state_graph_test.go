@@ -23,7 +23,10 @@ import (
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	ichannel "trpc.group/trpc-go/trpc-agent-go/graph/internal/channel"
+	itelemetry "trpc.group/trpc-go/trpc-agent-go/internal/telemetry"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/telemetry/trace"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
@@ -122,6 +125,28 @@ func TestWithToolSets_CopiesSlice(t *testing.T) {
 	}
 	if node.toolSets[0] == originalToolSets[0] {
 		t.Fatalf("expected node toolsets slice to be copied")
+	}
+}
+
+func TestMergeToolsWithToolSets_EmitsConflictWarning(t *testing.T) {
+	base := map[string]tool.Tool{
+		"simple_echo": &echoTool{name: "simple_echo"},
+	}
+	toolSets := []tool.ToolSet{
+		&simpleToolSet{name: "simple"},
+	}
+
+	out := mergeToolsWithToolSets(
+		context.Background(),
+		base,
+		toolSets,
+	)
+
+	if len(out) != 1 {
+		t.Fatalf("expected 1 tool, got %d", len(out))
+	}
+	if _, ok := out["simple_echo"]; !ok {
+		t.Fatalf("expected key simple_echo in merged tools")
 	}
 }
 
@@ -306,6 +331,146 @@ func TestProcessToolCalls_SerialVsParallel(t *testing.T) {
 	})
 }
 
+func TestProcessAgentEventStream_UnmarshalErrorLogged(t *testing.T) {
+	ctx := context.Background()
+	agentEvents := make(chan *event.Event, 1)
+	parentEventChan := make(chan *event.Event, 1)
+
+	agentEvents <- &event.Event{
+		Response: &model.Response{
+			Object: ObjectTypeGraphExecution,
+			Done:   true,
+		},
+		StateDelta: map[string][]byte{
+			"bad": []byte("not-json"),
+		},
+	}
+	close(agentEvents)
+
+	res, err := processAgentEventStream(
+		ctx,
+		agentEvents,
+		nil,
+		"node",
+		State{},
+		parentEventChan,
+		"agent",
+		&itelemetry.InvokeAgentTracker{},
+	)
+	require.NoError(t, err)
+	require.Equal(t, "", res.lastResponse)
+	require.NotNil(t, res.finalState)
+	require.Len(t, res.rawDelta, 1)
+}
+
+func TestProcessAgentEventStream_AccumulatesTokenUsage(t *testing.T) {
+	ctx := context.Background()
+	agentEvents := make(chan *event.Event, 2)
+	parentEventChan := make(chan *event.Event, 2)
+
+	agentEvents <- &event.Event{
+		Response: &model.Response{
+			IsPartial: true,
+			Usage: &model.Usage{
+				PromptTokens:     1,
+				CompletionTokens: 2,
+				TotalTokens:      3,
+			},
+			Choices: []model.Choice{{Message: model.NewAssistantMessage("partial")}},
+		},
+	}
+
+	finalUsage := &model.Usage{
+		PromptTokens:     10,
+		CompletionTokens: 20,
+		TotalTokens:      30,
+	}
+	finalEvent := &event.Event{
+		Response: &model.Response{
+			IsPartial: false,
+			Usage:     finalUsage,
+			Choices:   []model.Choice{{Message: model.NewAssistantMessage("final")}},
+		},
+	}
+	agentEvents <- finalEvent
+	close(agentEvents)
+
+	res, err := processAgentEventStream(
+		ctx,
+		agentEvents,
+		nil,
+		"node",
+		State{},
+		parentEventChan,
+		"agent",
+		&itelemetry.InvokeAgentTracker{},
+	)
+	require.NoError(t, err)
+	require.Equal(t, "final", res.lastResponse)
+	require.Equal(t, finalUsage.PromptTokens, res.tokenUsage.PromptTokens)
+	require.Equal(
+		t,
+		finalUsage.CompletionTokens,
+		res.tokenUsage.CompletionTokens,
+	)
+	require.Equal(t, finalUsage.TotalTokens, res.tokenUsage.TotalTokens)
+	require.Equal(t, finalEvent, res.fullRespEvent)
+	require.Len(t, parentEventChan, 2)
+}
+
+func TestProcessAgentEventStream_CapturesStructuredOutput(t *testing.T) {
+	ctx := context.Background()
+	agentEvents := make(chan *event.Event, 2)
+	parentEventChan := make(chan *event.Event, 2)
+
+	// First event without structured output
+	agentEvents <- &event.Event{
+		Response: &model.Response{
+			IsPartial: false,
+			Choices:   []model.Choice{{Message: model.NewAssistantMessage("text response")}},
+		},
+	}
+
+	// Second event with structured output
+	structuredData := map[string]any{
+		"status": "success",
+		"data":   []string{"item1", "item2"},
+		"count":  2,
+	}
+	agentEvents <- &event.Event{
+		Response: &model.Response{
+			IsPartial: false,
+			Choices:   []model.Choice{{Message: model.NewAssistantMessage("final")}},
+		},
+		StructuredOutput: structuredData,
+	}
+	close(agentEvents)
+
+	res, err := processAgentEventStream(
+		ctx,
+		agentEvents,
+		nil,
+		"node",
+		State{},
+		parentEventChan,
+		"agent",
+		&itelemetry.InvokeAgentTracker{},
+	)
+	require.NoError(t, err)
+	require.Equal(t, "final", res.lastResponse)
+	require.NotNil(
+		t,
+		res.structuredOutput,
+		"should capture structured output from event",
+	)
+	require.Equal(
+		t,
+		structuredData,
+		res.structuredOutput,
+		"captured output should match event payload",
+	)
+}
+
 func TestProcessToolCalls_ParallelCancelOnFirstError(t *testing.T) {
 	started := make(chan string, 2)
 	// Tool X errors immediately; Tool Y waits but respects context and should be canceled.
@@ -413,6 +578,139 @@ func TestBuilderEdges(t *testing.T) {
 	if edges[0].To != "node2" {
 		t.Errorf("Expected edge to node2, got %s", edges[0].To)
 	}
+}
+
+func TestBuilderJoinEdges(t *testing.T) {
+	builder := NewStateGraph(NewStateSchema())
+
+	testFunc := func(ctx context.Context, state State) (any, error) {
+		return nil, nil
+	}
+
+	graph, err := builder.
+		AddNode("a", testFunc).
+		AddNode("b", testFunc).
+		AddNode("c", testFunc).
+		SetEntryPoint("a").
+		AddJoinEdge([]string{"a", "b"}, "c").
+		SetFinishPoint("c").
+		Compile()
+	require.NoError(t, err)
+
+	edgesA := graph.Edges("a")
+	require.Len(t, edgesA, 1)
+	require.Equal(t, "c", edgesA[0].To)
+
+	edgesB := graph.Edges("b")
+	require.Len(t, edgesB, 1)
+	require.Equal(t, "c", edgesB[0].To)
+
+	starts := []string{"a", "b"}
+	joinChan := joinChannelName("c", starts)
+
+	ch, ok := graph.getChannel(joinChan)
+	require.True(t, ok)
+	require.Equal(t, ichannel.BehaviorBarrier, ch.Behavior)
+	require.Equal(t, starts, ch.BarrierExpected)
+
+	nodeC, exists := graph.Node("c")
+	require.True(t, exists)
+	require.Contains(t, nodeC.triggers, joinChan)
+
+	nodeA, exists := graph.Node("a")
+	require.True(t, exists)
+	require.True(t, hasJoinWriter(nodeA.writers, joinChan, "a"))
+
+	nodeB, exists := graph.Node("b")
+	require.True(t, exists)
+	require.True(t, hasJoinWriter(nodeB.writers, joinChan, "b"))
+}
+
+func TestBuilderJoinEdges_ChannelNameAvoidsCollisions(t *testing.T) {
+	builder := NewStateGraph(NewStateSchema())
+
+	testFunc := func(ctx context.Context, state State) (any, error) {
+		return nil, nil
+	}
+
+	joinNode := "join"
+
+	starts1 := normalizeJoinStarts([]string{"a+b", "c"})
+	starts2 := normalizeJoinStarts([]string{"a", "b+c"})
+	require.NotEqual(t, starts1, starts2)
+
+	graph, err := builder.
+		AddNode(starts1[0], testFunc).
+		AddNode(starts1[1], testFunc).
+		AddNode(starts2[0], testFunc).
+		AddNode(starts2[1], testFunc).
+		AddNode(joinNode, testFunc).
+		SetEntryPoint(starts1[0]).
+		AddJoinEdge(starts1, joinNode).
+		AddJoinEdge(starts2, joinNode).
+		SetFinishPoint(joinNode).
+		Compile()
+	require.NoError(t, err)
+
+	joinChan1 := joinChannelName(joinNode, starts1)
+	joinChan2 := joinChannelName(joinNode, starts2)
+	require.NotEqual(t, joinChan1, joinChan2)
+
+	ch1, ok := graph.getChannel(joinChan1)
+	require.True(t, ok)
+	require.Equal(t, ichannel.BehaviorBarrier, ch1.Behavior)
+	require.Equal(t, starts1, ch1.BarrierExpected)
+
+	ch2, ok := graph.getChannel(joinChan2)
+	require.True(t, ok)
+	require.Equal(t, ichannel.BehaviorBarrier, ch2.Behavior)
+	require.Equal(t, starts2, ch2.BarrierExpected)
+}
+
+func TestNormalizeJoinStarts(t *testing.T) {
+	require.Nil(t, normalizeJoinStarts(nil))
+	require.Nil(t, normalizeJoinStarts([]string{}))
+
+	in := []string{"b", "", Start, "a", "b", End}
+	require.Equal(t, []string{"a", "b"}, normalizeJoinStarts(in))
+}
+
+func TestBuilderJoinEdges_IgnoresInvalidInput(t *testing.T) {
+	builder := NewStateGraph(NewStateSchema())
+
+	testFunc := func(ctx context.Context, state State) (any, error) {
+		return nil, nil
+	}
+
+	graph, err := builder.
+		AddNode("a", testFunc).
+		AddNode("b", testFunc).
+		SetEntryPoint("a").
+		AddJoinEdge(nil, "b").
+		AddJoinEdge([]string{""}, "b").
+		AddJoinEdge([]string{"a"}, "").
+		AddJoinEdge([]string{"a"}, Start).
+		SetFinishPoint("b").
+		Compile()
+	require.NoError(t, err)
+
+	for name := range graph.getAllChannels() {
+		require.False(t, strings.HasPrefix(name, ChannelJoinPrefix))
+	}
+}
+
+func hasJoinWriter(
+	writers []channelWriteEntry,
+	channelName string,
+	value string,
+) bool {
+	for _, w := range writers {
+		v, ok := w.Value.(string)
+		if w.Channel == channelName && ok && v == value {
+			return true
+		}
+	}
+	return false
 }
 
 func TestStateGraphBasic(t *testing.T) {
@@ -1133,6 +1431,67 @@ func TestStateGraph_AddSubgraphNode(t *testing.T) {
 	}
 }
 
+func TestBuildAgentInvocationWithStateAndScope_PreservesRequestID(
+	t *testing.T,
+) {
+	const (
+		parentKey = "test_app"
+		requestID = "req-123"
+		userInput = "hi"
+	)
+
+	sess := &session.Session{}
+	parentInv := agent.NewInvocation(
+		agent.WithInvocationAgent(&messageEchoAgent{name: "parent"}),
+		agent.WithInvocationMessage(model.NewUserMessage(userInput)),
+		agent.WithInvocationRunOptions(agent.RunOptions{
+			ModelName: "model-x",
+			RequestID: requestID,
+			Resume:    true,
+		}),
+		agent.WithInvocationEventFilterKey(parentKey),
+		agent.WithInvocationSession(sess),
+	)
+	evt := event.NewResponseEvent(
+		parentInv.InvocationID,
+		"user",
+		&model.Response{
+			Done: false,
+			Choices: []model.Choice{
+				{
+					Index:   0,
+					Message: model.NewUserMessage(userInput),
+				},
+			},
+		},
+	)
+	agent.InjectIntoEvent(parentInv, evt)
+	sess.Events = []event.Event{*evt}
+
+	parentState := State{
+		StateKeyUserInput: userInput,
+		StateKeySession:   sess,
+	}
+	runtime := State{"x": 1}
+
+	ctx := agent.NewInvocationContext(context.Background(), parentInv)
+	childInv := buildAgentInvocationWithStateAndScope(
+		ctx,
+		parentState,
+		runtime,
+		&messageEchoAgent{name: "child"},
+		"",
+	)
+	require.Equal(t, requestID, childInv.RunOptions.RequestID)
+	require.Equal(t, "model-x", childInv.RunOptions.ModelName)
+	require.True(t, childInv.RunOptions.Resume)
+	require.Equal(t, map[string]any(runtime), childInv.RunOptions.RuntimeState)
+	require.Equal(t, userInput, childInv.Message.Content)
+	require.Equal(t, "child", childInv.AgentName)
+
+	require.NotEmpty(t, childInv.GetEventFilterKey())
+}
+
 func TestOptionBranches_EmptyPoliciesAndCallbacks(t *testing.T) {
 	sg := NewStateGraph(NewStateSchema())
 	// WithRetryPolicy with no policies should not crash or modify
@@ -1311,6 +1670,44 @@ func newRunner(respID string) *llmRunner {
 	}
 }
 
+type streamRecordingModel struct {
+	lastStream bool
+}
+
+type testSubAgentProvider struct {
+	sub agent.Agent
+}
+
+func (p *testSubAgentProvider) FindSubAgent(name string) agent.Agent {
+	if p.sub == nil {
+		return nil
+	}
+	if name == p.sub.Info().Name {
+		return p.sub
+	}
+	return nil
+}
+
+func (m *streamRecordingModel) GenerateContent(
+	ctx context.Context,
+	req *model.Request,
+) (<-chan *model.Response, error) {
+	m.lastStream = req.GenerationConfig.Stream
+	ch := make(chan *model.Response, 1)
+	ch <- &model.Response{
+		Done: true,
+		Choices: []model.Choice{{
+			Message: model.NewAssistantMessage("ok"),
+		}},
+	}
+	close(ch)
+	return ch, nil
+}
+
+func (m *streamRecordingModel) Info() model.Info {
+	return model.Info{Name: "stream-recording"}
+}
+
 func TestLLMRunnerSetsLastResponseID(t *testing.T) {
 	ctx, span := trace.Tracer.Start(context.Background(), "test")
 	defer span.End()
@@ -1323,7 +1720,13 @@ func TestLLMRunnerSetsLastResponseID(t *testing.T) {
 		{
 			name: "one-shot",
 			run: func(r *llmRunner) (State, error) {
-				res, err := r.executeOneShotStage(ctx, State{}, []model.Message{model.NewUserMessage("hi")}, span)
+				res, err := r.executeOneShotStage(
+					ctx,
+					State{},
+					[]model.Message{model.NewUserMessage("hi")},
+					span,
+					nil,
+				)
 				require.NoError(t, err)
 				return res.(State), nil
 			},
@@ -1357,6 +1760,123 @@ func TestLLMRunnerSetsLastResponseID(t *testing.T) {
 			require.Equal(t, tt.expect, state[StateKeyLastResponseID])
 		})
 	}
+}
+
+func TestLLMRunner_OverridesStreamFromRunOptions(t *testing.T) {
+	ctx, span := trace.Tracer.Start(context.Background(), "test")
+	defer span.End()
+
+	rm := &streamRecordingModel{}
+	runner := &llmRunner{
+		llmModel:         rm,
+		generationConfig: model.GenerationConfig{Stream: true},
+	}
+
+	stream := false
+	inv := agent.NewInvocation(
+		agent.WithInvocationRunOptions(agent.RunOptions{Stream: &stream}),
+	)
+	ctx = agent.NewInvocationContext(ctx, inv)
+
+	_, err := runner.executeModel(
+		ctx,
+		State{},
+		[]model.Message{model.NewUserMessage("hi")},
+		span,
+		"",
+	)
+	require.NoError(t, err)
+	require.False(t, rm.lastStream)
+}
+
+func TestAgentNodeFunc_OverridesStreamFromRunOptions(t *testing.T) {
+	const (
+		testInvocationID = "inv-1"
+		testNodeID       = "node-1"
+		testAgentName    = "agent-1"
+	)
+	target := &dummyAgent{name: testAgentName}
+	provider := &testSubAgentProvider{sub: target}
+
+	stream := false
+	parentInv := agent.NewInvocation(
+		agent.WithInvocationID(testInvocationID),
+		agent.WithInvocationRunOptions(agent.RunOptions{Stream: &stream}),
+	)
+	ctx := agent.NewInvocationContext(context.Background(), parentInv)
+
+	eventCh := make(chan *event.Event, 8)
+	exec := &ExecutionContext{
+		InvocationID: testInvocationID,
+		EventChan:    eventCh,
+	}
+	state := State{
+		StateKeyExecContext:   exec,
+		StateKeyCurrentNodeID: testNodeID,
+		StateKeyParentAgent:   provider,
+		StateKeyUserInput:     "hi",
+	}
+
+	nodeFn := NewAgentNodeFunc(testAgentName)
+	_, err := nodeFn(ctx, state)
+	require.NoError(t, err)
+}
+
+func TestLLMRunner_OneShotMessagesByNode_TakesPrecedence(t *testing.T) {
+	ctx, span := trace.Tracer.Start(context.Background(), "test")
+	defer span.End()
+
+	runner := newRunner("resp")
+	runner.nodeID = "llm1"
+
+	state := State{
+		StateKeyOneShotMessagesByNode: map[string][]model.Message{
+			"llm1": {model.NewUserMessage("by-node")},
+		},
+		StateKeyOneShotMessages: []model.Message{
+			model.NewUserMessage("global"),
+		},
+	}
+
+	res, err := runner.execute(ctx, state, span)
+	require.NoError(t, err)
+
+	out := res.(State)
+	_, hasGlobalClear := out[StateKeyOneShotMessages]
+	require.False(t, hasGlobalClear)
+
+	byNode, ok := out[StateKeyOneShotMessagesByNode].(map[string][]model.Message)
+	require.True(t, ok)
+	_, exists := byNode["llm1"]
+	require.True(t, exists)
+	require.Len(t, byNode["llm1"], 0)
+}
+
+func TestLLMRunner_OneShotMessagesByNode_FallsBackToGlobal(t *testing.T) {
+	ctx, span := trace.Tracer.Start(context.Background(), "test")
+	defer span.End()
+
+	runner := newRunner("resp")
+	runner.nodeID = "llm1"
+
+	state := State{
+		StateKeyOneShotMessagesByNode: map[string][]model.Message{
+			"llm2": {model.NewUserMessage("by-node-other")},
+		},
+		StateKeyOneShotMessages: []model.Message{
+			model.NewUserMessage("global"),
+		},
+	}
+
+	res, err := runner.execute(ctx, state, span)
+	require.NoError(t, err)
+
+	out := res.(State)
+	_, hasByNodeClear := out[StateKeyOneShotMessagesByNode]
+	require.False(t, hasByNodeClear)
+
+	_, hasGlobalClear := out[StateKeyOneShotMessages]
+	require.True(t, hasGlobalClear)
 }
 
 func TestExecuteSingleToolCallPropagatesResponseID(t *testing.T) {
@@ -1471,7 +1991,8 @@ func (s *countingToolSet) Close() error { return nil }
 func (s *countingToolSet) Name() string { return s.name }
 
 type recordingModel struct {
-	lastTools map[string]tool.Tool
+	lastTools    map[string]tool.Tool
+	lastMessages []model.Message
 }
 
 func (m *recordingModel) GenerateContent(
@@ -1479,6 +2000,11 @@ func (m *recordingModel) GenerateContent(
 	req *model.Request,
 ) (<-chan *model.Response, error) {
 	m.lastTools = req.Tools
+	if len(req.Messages) == 0 {
+		m.lastMessages = nil
+	} else {
+		m.lastMessages = append([]model.Message(nil), req.Messages...)
+	}
 	ch := make(chan *model.Response, 1)
 	ch <- &model.Response{
 		Done: true,
@@ -1555,6 +2081,50 @@ func TestAddLLMNode_RefreshToolSetsOnRun(t *testing.T) {
 	require.NotEmpty(t, secondTools)
 
 	require.Equal(t, 2, ts.calls)
+}
+
+func TestAddLLMNode_PlaceholderInvocationState(t *testing.T) {
+	const (
+		nodeID        = "llm"
+		userInput     = "hi"
+		invocationID  = "inv"
+		agentName     = "agent"
+		invStateKey   = "case"
+		invStateValue = "case-1"
+		instruction   = "Case: {invocation:case}"
+		wantSystem    = "Case: " + invStateValue
+	)
+
+	schema := MessagesStateSchema()
+	rm := &recordingModel{}
+	sg := NewStateGraph(schema)
+	sg.AddLLMNode(nodeID, rm, instruction, nil)
+
+	g, err := sg.
+		SetEntryPoint(nodeID).
+		SetFinishPoint(nodeID).
+		Compile()
+	require.NoError(t, err)
+
+	exec, err := NewExecutor(g)
+	require.NoError(t, err)
+
+	inv := agent.NewInvocation(agent.WithInvocationID(invocationID))
+	inv.AgentName = agentName
+	inv.SetState(invStateKey, invStateValue)
+
+	eventCh, err := exec.Execute(
+		context.Background(),
+		State{StateKeyUserInput: userInput},
+		inv,
+	)
+	require.NoError(t, err)
+	for range eventCh {
+	}
+
+	require.NotEmpty(t, rm.lastMessages)
+	require.Equal(t, model.RoleSystem, rm.lastMessages[0].Role)
+	require.Equal(t, wantSystem, rm.lastMessages[0].Content)
 }
 
 func TestNewToolsNodeFunc_StaticToolSets(t *testing.T) {
@@ -1636,4 +2206,299 @@ func TestNewToolsNodeFunc_RefreshToolSetsOnRun(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, 2, ts.calls)
+}
+
+type latestCheckpointAgent struct {
+	name string
+	exec *Executor
+}
+
+func (a *latestCheckpointAgent) Info() agent.Info {
+	return agent.Info{Name: a.name}
+}
+
+func (a *latestCheckpointAgent) Tools() []tool.Tool { return nil }
+
+func (a *latestCheckpointAgent) SubAgents() []agent.Agent { return nil }
+
+func (a *latestCheckpointAgent) FindSubAgent(_ string) agent.Agent {
+	return nil
+}
+
+func (a *latestCheckpointAgent) Executor() *Executor { return a.exec }
+
+func (a *latestCheckpointAgent) Run(
+	_ context.Context,
+	_ *agent.Invocation,
+) (<-chan *event.Event, error) {
+	ch := make(chan *event.Event)
+	close(ch)
+	return ch, nil
+}
+
+func TestStateStringOr(t *testing.T) {
+	const (
+		key      = "k"
+		fallback = "fb"
+		value    = "v"
+	)
+
+	require.Equal(t, fallback, stateStringOr(nil, key, fallback))
+	require.Equal(
+		t,
+		fallback,
+		stateStringOr(State{key: testEmptyString}, key, fallback),
+	)
+	require.Equal(t, value, stateStringOr(State{key: value}, key, fallback))
+}
+
+func TestResumeCommandForSubgraph(t *testing.T) {
+	const (
+		taskID      = "task"
+		otherTaskID = "other"
+		resumeValue = "ok"
+	)
+
+	require.Nil(t, resumeCommandForSubgraph(nil, taskID))
+
+	cmd := resumeCommandForSubgraph(
+		State{ResumeChannel: resumeValue},
+		taskID,
+	)
+	require.NotNil(t, cmd)
+	require.Equal(t, resumeValue, cmd.Resume)
+
+	stateMap := map[string]any{
+		taskID:      resumeValue,
+		otherTaskID: resumeValue,
+	}
+	cmd = resumeCommandForSubgraph(
+		State{StateKeyResumeMap: stateMap},
+		taskID,
+	)
+	require.NotNil(t, cmd)
+	require.Equal(t, map[string]any{taskID: resumeValue}, cmd.ResumeMap)
+
+	cmd = resumeCommandForSubgraph(
+		State{StateKeyResumeMap: stateMap},
+		testEmptyString,
+	)
+	require.NotNil(t, cmd)
+	require.Equal(t, stateMap, cmd.ResumeMap)
+	stateMap["new"] = "x"
+	_, ok := cmd.ResumeMap["new"]
+	require.False(t, ok)
+
+	cmd = resumeCommandForSubgraph(
+		State{StateKeyResumeMap: map[string]any{otherTaskID: "x"}},
+		taskID,
+	)
+	require.Nil(t, cmd)
+}
+
+func TestExtractPregelInterrupt(t *testing.T) {
+	const (
+		invocationID = "inv"
+		author       = "a"
+		nodeID       = "n"
+		interruptKey = "k"
+		interruptVal = "prompt"
+	)
+
+	_, ok := extractPregelInterrupt(nil)
+	require.False(t, ok)
+
+	e := event.New(invocationID, author, event.WithObject("other"))
+	_, ok = extractPregelInterrupt(e)
+	require.False(t, ok)
+
+	e = event.New(
+		invocationID,
+		author,
+		event.WithObject(ObjectTypeGraphPregelStep),
+	)
+	_, ok = extractPregelInterrupt(e)
+	require.False(t, ok)
+
+	e = event.New(
+		invocationID,
+		author,
+		event.WithObject(ObjectTypeGraphPregelStep),
+		event.WithStateDelta(map[string][]byte{}),
+	)
+	_, ok = extractPregelInterrupt(e)
+	require.False(t, ok)
+
+	e = event.New(
+		invocationID,
+		author,
+		event.WithObject(ObjectTypeGraphPregelStep),
+		event.WithStateDelta(map[string][]byte{
+			MetadataKeyPregel: []byte("{"),
+		}),
+	)
+	_, ok = extractPregelInterrupt(e)
+	require.False(t, ok)
+
+	meta := PregelStepMetadata{
+		NodeID:         nodeID,
+		InterruptValue: interruptVal,
+	}
+	b, err := json.Marshal(meta)
+	require.NoError(t, err)
+	e = event.New(
+		invocationID,
+		author,
+		event.WithObject(ObjectTypeGraphPregelStep),
+		event.WithStateDelta(map[string][]byte{
+			MetadataKeyPregel: b,
+		}),
+	)
+	intr, ok := extractPregelInterrupt(e)
+	require.True(t, ok)
+	require.NotNil(t, intr)
+	require.Equal(t, nodeID, intr.NodeID)
+	require.Equal(t, nodeID, intr.TaskID)
+	require.Equal(t, nodeID, intr.Key)
+	require.Equal(t, interruptVal, intr.Value)
+
+	meta = PregelStepMetadata{
+		NodeID:         nodeID,
+		InterruptKey:   interruptKey,
+		InterruptValue: interruptVal,
+	}
+	b, err = json.Marshal(meta)
+	require.NoError(t, err)
+	e = event.New(
+		invocationID,
+		author,
+		event.WithObject(ObjectTypeGraphPregelStep),
+		event.WithStateDelta(map[string][]byte{
+			MetadataKeyPregel: b,
+		}),
+	)
+	intr, ok = extractPregelInterrupt(e)
+	require.True(t, ok)
+	require.NotNil(t, intr)
+	require.Equal(t, nodeID, intr.NodeID)
+	require.Equal(t, interruptKey, intr.TaskID)
+	require.Equal(t, interruptKey, intr.Key)
+	require.Equal(t, interruptVal, intr.Value)
+
+	meta = PregelStepMetadata{
+		NodeID:         testEmptyString,
+		InterruptValue: interruptVal,
+	}
+	b, err = json.Marshal(meta)
+	require.NoError(t, err)
+	e = event.New(
+		invocationID,
+		author,
+		event.WithObject(ObjectTypeGraphPregelStep),
+		event.WithStateDelta(map[string][]byte{
+			MetadataKeyPregel: b,
+		}),
+	)
+	_, ok = extractPregelInterrupt(e)
+	require.False(t, ok)
+
+	meta = PregelStepMetadata{NodeID: nodeID}
+	b, err = json.Marshal(meta)
+	require.NoError(t, err)
+	e = event.New(
+		invocationID,
+		author,
+		event.WithObject(ObjectTypeGraphPregelStep),
+		event.WithStateDelta(map[string][]byte{
+			MetadataKeyPregel: b,
+		}),
+	)
+	_, ok = extractPregelInterrupt(e)
+	require.False(t, ok)
+}
+
+func TestLatestInterruptedCheckpointID(t *testing.T) {
+	ctx := context.Background()
+
+	targetAgent := &inspectAgent{name: "no_exec"}
+	id, err := latestInterruptedCheckpointID(ctx, targetAgent, "ln", "ns")
+	require.NoError(t, err)
+	require.Equal(t, testEmptyString, id)
+
+	targetAgent2 := &latestCheckpointAgent{name: "nil_exec"}
+	id, err = latestInterruptedCheckpointID(ctx, targetAgent2, "ln", "ns")
+	require.NoError(t, err)
+	require.Equal(t, testEmptyString, id)
+
+	execWithNilCM := &Executor{
+		checkpointManager: nil,
+	}
+	targetAgent3 := &latestCheckpointAgent{
+		name: "nil_cm",
+		exec: execWithNilCM,
+	}
+	id, err = latestInterruptedCheckpointID(ctx, targetAgent3, "ln", "ns")
+	require.NoError(t, err)
+	require.Equal(t, testEmptyString, id)
+
+	execWithBrokenCM := &Executor{
+		checkpointManager: &CheckpointManager{},
+	}
+	targetAgent4 := &latestCheckpointAgent{
+		name: "err_latest",
+		exec: execWithBrokenCM,
+	}
+	_, err = latestInterruptedCheckpointID(ctx, targetAgent4, "ln", "ns")
+	require.Error(t, err)
+
+	saver := newSubgraphTestSaver()
+	graphSchema := NewStateSchema()
+	g, err := NewStateGraph(graphSchema).
+		AddNode("n", func(_ context.Context, s State) (any, error) {
+			return s, nil
+		}).
+		SetEntryPoint("n").
+		SetFinishPoint("n").
+		Compile()
+	require.NoError(t, err)
+	exec, err := NewExecutor(g, WithCheckpointSaver(saver))
+	require.NoError(t, err)
+	targetAgent5 := &latestCheckpointAgent{
+		name: "with_saver",
+		exec: exec,
+	}
+
+	id, err = latestInterruptedCheckpointID(ctx, targetAgent5, "ln", "ns")
+	require.NoError(t, err)
+	require.Equal(t, testEmptyString, id)
+
+	cfg := CreateCheckpointConfig("ln", "ck1", "ns")
+	_, err = saver.Put(ctx, PutRequest{
+		Config: cfg,
+		Checkpoint: &Checkpoint{
+			ID:            "ck1",
+			ChannelValues: map[string]any{},
+		},
+		Metadata: NewCheckpointMetadata("test", 0),
+	})
+	require.NoError(t, err)
+	id, err = latestInterruptedCheckpointID(ctx, targetAgent5, "ln", "ns")
+	require.NoError(t, err)
+	require.Equal(t, testEmptyString, id)
+
+	cfg = CreateCheckpointConfig("ln", "ck2", "ns")
+	_, err = saver.Put(ctx, PutRequest{
+		Config: cfg,
+		Checkpoint: &Checkpoint{
+			ID: "ck2",
+			InterruptState: &InterruptState{
+				NodeID: "n",
+			},
+		},
+		Metadata: NewCheckpointMetadata("test", 1),
+	})
+	require.NoError(t, err)
+	id, err = latestInterruptedCheckpointID(ctx, targetAgent5, "ln", "ns")
+	require.NoError(t, err)
+	require.Equal(t, "ck2", id)
 }

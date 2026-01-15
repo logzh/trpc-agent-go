@@ -47,17 +47,19 @@ func defaultCodeExecutor() codeexecutor.CodeExecutor {
 
 // LLMAgent is an agent that uses an LLM to generate responses.
 type LLMAgent struct {
-	name          string
-	mu            sync.RWMutex
-	model         model.Model
-	models        map[string]model.Model // Registered models for switching
-	description   string
-	instruction   string
-	systemPrompt  string
-	genConfig     model.GenerationConfig
-	flow          flow.Flow
-	tools         []tool.Tool     // All tools (user tools + framework tools)
-	userToolNames map[string]bool // Names of tools explicitly registered
+	name                    string
+	mu                      sync.RWMutex
+	model                   model.Model
+	models                  map[string]model.Model // Registered models for switching
+	description             string
+	instruction             string
+	systemPrompt            string
+	modelInstructions       map[string]string
+	modelGlobalInstructions map[string]string
+	genConfig               model.GenerationConfig
+	flow                    flow.Flow
+	tools                   []tool.Tool     // All tools (user tools + framework tools)
+	userToolNames           map[string]bool // Names of tools explicitly registered
 	// via WithTools and WithToolSets.
 	codeExecutor         codeexecutor.CodeExecutor
 	planner              planner.Planner
@@ -102,12 +104,16 @@ func New(name string, opts ...Option) *LLMAgent {
 
 	// Construct the agent first so request processors can access dynamic getters.
 	a := &LLMAgent{
-		name:                 name,
-		model:                initialModel,
-		models:               models,
-		description:          options.Description,
-		instruction:          options.Instruction,
-		systemPrompt:         options.GlobalInstruction,
+		name:              name,
+		model:             initialModel,
+		models:            models,
+		description:       options.Description,
+		instruction:       options.Instruction,
+		systemPrompt:      options.GlobalInstruction,
+		modelInstructions: cloneStringMap(options.ModelInstructions),
+		modelGlobalInstructions: cloneStringMap(
+			options.ModelGlobalInstructions,
+		),
 		genConfig:            options.GenerationConfig,
 		codeExecutor:         options.codeExecutor,
 		tools:                tools,
@@ -152,11 +158,12 @@ func New(name string, opts ...Option) *LLMAgent {
 	}
 	responseProcessors = append(responseProcessors, toolcallProcessor)
 
-	// Add transfer response processor if sub-agents are configured.
-	if len(options.SubAgents) > 0 {
-		transferResponseProcessor := processor.NewTransferResponseProcessor(options.EndInvocationAfterTransfer)
-		responseProcessors = append(responseProcessors, transferResponseProcessor)
-	}
+	// Always install the transfer processor so dynamic sub-agent updates
+	// (for example, via SubAgentSetter) can enable transfer_to_agent later.
+	transferResponseProcessor := processor.NewTransferResponseProcessor(
+		options.EndInvocationAfterTransfer,
+	)
+	responseProcessors = append(responseProcessors, transferResponseProcessor)
 
 	// Create flow with the provided processors and options.
 	flowOpts := llmflow.Options{
@@ -191,6 +198,8 @@ func buildRequestProcessorsWithAgent(a *LLMAgent, options *Options) []flow.Reque
 
 	// 3. Instruction processor - adds instruction content and system prompt.
 	if options.Instruction != "" || options.GlobalInstruction != "" ||
+		len(options.ModelInstructions) > 0 ||
+		len(options.ModelGlobalInstructions) > 0 ||
 		(options.StructuredOutput != nil && options.StructuredOutput.JSONSchema != nil) {
 		instructionOpts := []processor.InstructionRequestProcessorOption{
 			processor.WithOutputSchema(options.OutputSchema),
@@ -201,14 +210,17 @@ func buildRequestProcessorsWithAgent(a *LLMAgent, options *Options) []flow.Reque
 				processor.WithStructuredOutputSchema(options.StructuredOutput.JSONSchema.Schema),
 			)
 		}
-		// Always wire dynamic getters so instructions can be updated at runtime.
 		instructionOpts = append(instructionOpts,
-			processor.WithInstructionGetter(func() string { return a.getInstruction() }),
-			processor.WithSystemPromptGetter(func() string { return a.getSystemPrompt() }),
+			processor.WithInstructionResolver(
+				a.instructionForInvocation,
+			),
+			processor.WithSystemPromptResolver(
+				a.systemPromptForInvocation,
+			),
 		)
 		instructionProcessor := processor.NewInstructionRequestProcessor(
-			"", // static value unused when getters are present
-			"", // static value unused when getters are present
+			"", // static value unused when resolver is present
+			"", // static value unused when resolver is present
 			instructionOpts...,
 		)
 		requestProcessors = append(requestProcessors, instructionProcessor)
@@ -224,7 +236,52 @@ func buildRequestProcessorsWithAgent(a *LLMAgent, options *Options) []flow.Reque
 		requestProcessors = append(requestProcessors, identityProcessor)
 	}
 
-	// 5. Time processor - adds current time information if enabled.
+	// 5. Skills processor - injects skill overview and loaded contents
+	// when a skills repository is configured. This ensures the model
+	// sees available skills (names/descriptions) and any loaded
+	// SKILL.md/doc texts before deciding on tool calls.
+	if options.skillsRepository != nil {
+		var skillsOpts []processor.SkillsRequestProcessorOption
+		if options.skillsToolingGuidance != nil {
+			skillsOpts = append(
+				skillsOpts,
+				processor.WithSkillsToolingGuidance(
+					*options.skillsToolingGuidance,
+				),
+			)
+		}
+		skillsProcessor := processor.NewSkillsRequestProcessor(
+			options.skillsRepository,
+			skillsOpts...,
+		)
+		requestProcessors = append(requestProcessors, skillsProcessor)
+	}
+
+	// 6. Content processor - appends conversation/context history.
+	contentOpts := []processor.ContentOption{
+		processor.WithAddContextPrefix(options.AddContextPrefix),
+		processor.WithAddSessionSummary(options.AddSessionSummary),
+		processor.WithMaxHistoryRuns(options.MaxHistoryRuns),
+		processor.WithPreserveSameBranch(options.PreserveSameBranch),
+		processor.WithTimelineFilterMode(options.messageTimelineFilterMode),
+		processor.WithBranchFilterMode(options.messageBranchFilterMode),
+		processor.WithPreloadMemory(options.PreloadMemory),
+	}
+	if options.ReasoningContentMode != "" {
+		contentOpts = append(contentOpts,
+			processor.WithReasoningContentMode(options.ReasoningContentMode))
+	}
+	if options.summaryFormatter != nil {
+		contentOpts = append(contentOpts,
+			processor.WithSummaryFormatter(options.summaryFormatter))
+	}
+	contentProcessor := processor.NewContentRequestProcessor(contentOpts...)
+	requestProcessors = append(requestProcessors, contentProcessor)
+
+	// 7. Time processor - adds current time information if enabled.
+	// Moved after content processor to avoid invalidating system message cache.
+	// Time information changes frequently, so placing it last allows previous
+	// stable content (instructions, identity, skills, history) to be cached.
 	if options.AddCurrentTime {
 		timeProcessor := processor.NewTimeRequestProcessor(
 			processor.WithAddCurrentTime(true),
@@ -233,28 +290,6 @@ func buildRequestProcessorsWithAgent(a *LLMAgent, options *Options) []flow.Reque
 		)
 		requestProcessors = append(requestProcessors, timeProcessor)
 	}
-
-	// 6. Skills processor - injects skill overview and loaded contents
-	// when a skills repository is configured. This ensures the model
-	// sees available skills (names/descriptions) and any loaded
-	// SKILL.md/doc texts before deciding on tool calls.
-	if options.SkillsRepository != nil {
-		skillsProcessor := processor.NewSkillsRequestProcessor(
-			options.SkillsRepository,
-		)
-		requestProcessors = append(requestProcessors, skillsProcessor)
-	}
-
-	// 7. Content processor - appends conversation/context history.
-	contentProcessor := processor.NewContentRequestProcessor(
-		processor.WithAddContextPrefix(options.AddContextPrefix),
-		processor.WithAddSessionSummary(options.AddSessionSummary),
-		processor.WithMaxHistoryRuns(options.MaxHistoryRuns),
-		processor.WithPreserveSameBranch(options.PreserveSameBranch),
-		processor.WithTimelineFilterMode(options.messageTimelineFilterMode),
-		processor.WithBranchFilterMode(options.messageBranchFilterMode),
-	)
-	requestProcessors = append(requestProcessors, contentProcessor)
 
 	return requestProcessors
 }
@@ -377,21 +412,39 @@ func registerTools(options *Options) ([]tool.Tool, map[string]bool) {
 	}
 
 	// Add skill tools when skills are enabled.
-	if options.SkillsRepository != nil {
+	if options.skillsRepository != nil {
 		allTools = append(allTools,
-			toolskill.NewLoadTool(options.SkillsRepository))
+			toolskill.NewLoadTool(options.skillsRepository))
 		// Specialized doc tools for clarity and control.
 		allTools = append(allTools,
-			toolskill.NewSelectDocsTool(options.SkillsRepository))
+			toolskill.NewSelectDocsTool(options.skillsRepository))
 		allTools = append(allTools,
-			toolskill.NewListDocsTool(options.SkillsRepository))
+			toolskill.NewListDocsTool(options.skillsRepository))
 		// Provide executor to skill_run, fallback to local.
 		exec := options.codeExecutor
 		if exec == nil {
 			exec = defaultCodeExecutor()
 		}
-		allTools = append(allTools,
-			toolskill.NewRunTool(options.SkillsRepository, exec))
+		runOpts := make(
+			[]func(*toolskill.RunTool), 0, 2,
+		)
+		if len(options.skillRunAllowedCommands) > 0 {
+			runOpts = append(runOpts,
+				toolskill.WithAllowedCommands(
+					options.skillRunAllowedCommands...,
+				),
+			)
+		}
+		if len(options.skillRunDeniedCommands) > 0 {
+			runOpts = append(runOpts,
+				toolskill.WithDeniedCommands(
+					options.skillRunDeniedCommands...,
+				),
+			)
+		}
+		allTools = append(allTools, toolskill.NewRunTool(
+			options.skillsRepository, exec, runOpts...,
+		))
 	}
 
 	return allTools, userToolNames
@@ -402,8 +455,34 @@ func registerTools(options *Options) ([]tool.Tool, map[string]bool) {
 func (a *LLMAgent) Run(ctx context.Context, invocation *agent.Invocation) (e <-chan *event.Event, err error) {
 	a.setupInvocation(invocation)
 
-	ctx, span := trace.Tracer.Start(ctx, fmt.Sprintf("%s %s", itelemetry.OperationInvokeAgent, a.name))
-	itelemetry.TraceBeforeInvokeAgent(span, invocation, a.description, a.systemPrompt+a.instruction, &a.genConfig)
+	ctx, span := trace.Tracer.Start(
+		ctx,
+		fmt.Sprintf(
+			"%s %s",
+			itelemetry.OperationInvokeAgent,
+			a.name,
+		),
+	)
+	effectiveGenConfig := a.genConfig
+	if invocation.RunOptions.Stream != nil {
+		effectiveGenConfig.Stream = *invocation.RunOptions.Stream
+	}
+
+	promptText := a.systemPromptForInvocation(invocation) +
+		a.instructionForInvocation(invocation)
+	itelemetry.TraceBeforeInvokeAgent(
+		span,
+		invocation,
+		a.description,
+		promptText,
+		&effectiveGenConfig,
+	)
+	tracker := itelemetry.NewInvokeAgentTracker(
+		ctx,
+		invocation,
+		effectiveGenConfig.Stream,
+		&err,
+	)
 
 	ctx, flowEventChan, err := a.executeAgentFlow(ctx, invocation)
 	if err != nil {
@@ -420,7 +499,7 @@ func (a *LLMAgent) Run(ctx context.Context, invocation *agent.Invocation) (e <-c
 		return nil, err
 	}
 
-	return a.wrapEventChannel(ctx, invocation, flowEventChan, span), nil
+	return a.wrapEventChannelWithTelemetry(ctx, invocation, flowEventChan, span, tracker), nil
 }
 
 // executeAgentFlow executes the agent flow with before agent callbacks.
@@ -498,25 +577,37 @@ func (a *LLMAgent) setupInvocation(invocation *agent.Invocation) {
 	// Propagate structured output configuration into invocation and request path.
 	invocation.StructuredOutputType = a.structuredOutputType
 	invocation.StructuredOutput = a.structuredOutput
+
+	// Propagate per-agent safety limits into the invocation. These limits are
+	// evaluated by the Invocation helpers (IncLLMCallCount / IncToolIteration)
+	// and enforced at the flow layer. When the values are <= 0, the helpers
+	// treat them as "no limit", preserving existing behavior.
+	invocation.MaxLLMCalls = a.option.MaxLLMCalls
+	invocation.MaxToolIterations = a.option.MaxToolIterations
 }
 
 // wrapEventChannel wraps the event channel to apply after agent callbacks.
-func (a *LLMAgent) wrapEventChannel(
+func (a *LLMAgent) wrapEventChannelWithTelemetry(
 	ctx context.Context,
 	invocation *agent.Invocation,
 	originalChan <-chan *event.Event,
 	span sdktrace.Span,
+	tracker *itelemetry.InvokeAgentTracker,
 ) <-chan *event.Event {
 	// Create a new channel with the same capacity as the original channel
 	wrappedChan := make(chan *event.Event, cap(originalChan))
 
-	go func() {
+	runCtx := agent.CloneContext(ctx)
+	go func(ctx context.Context) {
 		var fullRespEvent *event.Event
+		var responseErrorType string
 		tokenUsage := &itelemetry.TokenUsage{}
 		defer func() {
 			if fullRespEvent != nil {
-				itelemetry.TraceAfterInvokeAgent(span, fullRespEvent, tokenUsage)
+				itelemetry.TraceAfterInvokeAgent(span, fullRespEvent, tokenUsage, tracker.FirstTokenTimeDuration())
 			}
+			tracker.SetResponseErrorType(responseErrorType)
+			tracker.RecordMetrics()()
 			span.End()
 			close(wrappedChan)
 		}()
@@ -524,13 +615,13 @@ func (a *LLMAgent) wrapEventChannel(
 		// Forward all events from the original channel
 		for evt := range originalChan {
 			if evt != nil && evt.Response != nil {
-
-				if evt.Response.Usage != nil {
-					tokenUsage.PromptTokens = evt.Response.Usage.PromptTokens
-					tokenUsage.CompletionTokens = evt.Response.Usage.CompletionTokens
-					tokenUsage.TotalTokens = evt.Response.Usage.TotalTokens
-				}
+				tracker.TrackResponse(evt.Response)
 				if !evt.Response.IsPartial {
+					if evt.Response.Usage != nil {
+						tokenUsage.PromptTokens += evt.Response.Usage.PromptTokens
+						tokenUsage.CompletionTokens += evt.Response.Usage.CompletionTokens
+						tokenUsage.TotalTokens += evt.Response.Usage.TotalTokens
+					}
 					fullRespEvent = evt
 				}
 
@@ -543,6 +634,7 @@ func (a *LLMAgent) wrapEventChannel(
 		// Collect error from the final response event.
 		var agentErr error
 		if fullRespEvent != nil && fullRespEvent.Response != nil && fullRespEvent.Response.Error != nil {
+			responseErrorType = fullRespEvent.Response.Error.Type
 			agentErr = fmt.Errorf("%s: %s", fullRespEvent.Response.Error.Type, fullRespEvent.Response.Error.Message)
 		}
 
@@ -566,6 +658,7 @@ func (a *LLMAgent) wrapEventChannel(
 					agent.ErrorTypeAgentCallbackError,
 					err.Error(),
 				)
+				responseErrorType = agent.ErrorTypeAgentCallbackError
 			} else if result != nil && result.CustomResponse != nil {
 				// Create an event from the custom response.
 				evt = event.NewResponseEvent(invocation.InvocationID, invocation.AgentName, result.CustomResponse)
@@ -576,7 +669,7 @@ func (a *LLMAgent) wrapEventChannel(
 
 			agent.EmitEvent(ctx, invocation, wrappedChan, evt)
 		}
-	}()
+	}(runCtx)
 
 	return wrappedChan
 }
@@ -907,6 +1000,25 @@ func (a *LLMAgent) SetGlobalInstruction(systemPrompt string) {
 	a.mu.Unlock()
 }
 
+// SetModelInstructions updates the model-specific instruction overrides.
+// Key: model.Info().Name, Value: instruction text.
+func (a *LLMAgent) SetModelInstructions(instructions map[string]string) {
+	copied := cloneStringMap(instructions)
+	a.mu.Lock()
+	a.modelInstructions = copied
+	a.mu.Unlock()
+}
+
+// SetModelGlobalInstructions updates the model-specific system prompt
+// overrides.
+// Key: model.Info().Name, Value: system prompt text.
+func (a *LLMAgent) SetModelGlobalInstructions(prompts map[string]string) {
+	copied := cloneStringMap(prompts)
+	a.mu.Lock()
+	a.modelGlobalInstructions = copied
+	a.mu.Unlock()
+}
+
 // getInstruction returns the current instruction with read lock.
 func (a *LLMAgent) getInstruction() string {
 	a.mu.RLock()
@@ -918,5 +1030,39 @@ func (a *LLMAgent) getInstruction() string {
 func (a *LLMAgent) getSystemPrompt() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
+	return a.systemPrompt
+}
+
+func (a *LLMAgent) instructionForInvocation(inv *agent.Invocation) string {
+	modelName := ""
+	if inv != nil && inv.Model != nil {
+		modelName = inv.Model.Info().Name
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if modelName != "" {
+		if ins, ok := a.modelInstructions[modelName]; ok {
+			return ins
+		}
+	}
+	return a.instruction
+}
+
+func (a *LLMAgent) systemPromptForInvocation(inv *agent.Invocation) string {
+	modelName := ""
+	if inv != nil && inv.Model != nil {
+		modelName = inv.Model.Info().Name
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if modelName != "" {
+		if prompt, ok := a.modelGlobalInstructions[modelName]; ok {
+			return prompt
+		}
+	}
 	return a.systemPrompt
 }

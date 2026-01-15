@@ -95,7 +95,10 @@ type Response struct {
     // Timestamp.
     Timestamp time.Time `json:"timestamp"`
     
-    // Indicates whether the entire conversation is complete.
+    // Indicates whether this response stream is complete.
+    //
+    // Note: Done=true does not necessarily mean the whole workflow ended.
+    // For graph workflows, use Runner completion events as the end signal.
     Done bool `json:"done"`
     
     // Whether it's a partial response.
@@ -231,6 +234,15 @@ This typically appears as a handoff notice: "Transferring control to agent: <nam
  - Filter by `Tag`: hide events whose `Event.Tag` contains the `transfer` tag. The framework adds this tag to delegation-related events (including transfer tool results), so filtering by tag avoids breaking ToolCall/ToolResult alignment.
 
  Tags are appended using a semicolon delimiter (`;`). Use `event.WithTag(tag)` when creating custom events; multiple tags are stored as `tag1;tag2;...`.
+
+### Code Execution Event Tags
+
+For code execution related events, use `Event.Tag` to distinguish between code and execution results:
+
+- **Code Execution Event**: `Response.Object == "postprocessing.code_execution"` and `Event.ContainsTag(event.TagCodeExecution)`
+- **Execution Result Event**: `Response.Object == "postprocessing.code_execution"` and `Event.ContainsTag(event.TagCodeExecutionResult)`
+
+The related constants are defined in the `trpc.group/trpc-go/trpc-agent-go/event` package.
 
 #### Helper: Detect Runner Completion
 

@@ -19,11 +19,14 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
+	"trpc.group/trpc-go/trpc-agent-go/agent/graphagent"
 	artifactinmemory "trpc.group/trpc-go/trpc-agent-go/artifact/inmemory"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/graph"
+	"trpc.group/trpc-go/trpc-agent-go/internal/state/flush"
 	memoryinmemory "trpc.group/trpc-go/trpc-agent-go/memory/inmemory"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/plugin"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
@@ -86,6 +89,33 @@ func (m *mockAgent) Tools() []tool.Tool {
 	return []tool.Tool{}
 }
 
+type staticModel struct {
+	name    string
+	content string
+}
+
+const staticModelResponseIDPrefix = "static-model-response-"
+
+func (m *staticModel) GenerateContent(
+	_ context.Context,
+	_ *model.Request,
+) (<-chan *model.Response, error) {
+	ch := make(chan *model.Response, 1)
+	ch <- &model.Response{
+		ID:        staticModelResponseIDPrefix + m.name,
+		Done:      true,
+		IsPartial: false,
+		Choices: []model.Choice{{
+			Index:   0,
+			Message: model.NewAssistantMessage(m.content),
+		}},
+	}
+	close(ch)
+	return ch, nil
+}
+
+func (m *staticModel) Info() model.Info { return model.Info{Name: m.name} }
+
 func TestRunner_SessionIntegration(t *testing.T) {
 	// Create an in-memory session service.
 	sessionService := sessioninmemory.NewSessionService()
@@ -141,6 +171,183 @@ func TestRunner_SessionIntegration(t *testing.T) {
 	agentEvent := sess.Events[1]
 	assert.Equal(t, "test-agent", agentEvent.Author)
 	assert.Contains(t, agentEvent.Response.Choices[0].Message.Content, "Hello, world!")
+}
+
+type testPlugin struct {
+	name string
+	reg  func(r *plugin.Registry)
+}
+
+func (p *testPlugin) Name() string { return p.name }
+
+func (p *testPlugin) Register(r *plugin.Registry) {
+	if p.reg != nil {
+		p.reg(r)
+	}
+}
+
+func TestRunner_WithPlugins_AppliesHooks(t *testing.T) {
+	beforeCalled := false
+	const tagged = "tagged"
+
+	p := &testPlugin{
+		name: "p",
+		reg: func(r *plugin.Registry) {
+			r.BeforeAgent(func(
+				ctx context.Context,
+				args *agent.BeforeAgentArgs,
+			) (*agent.BeforeAgentResult, error) {
+				beforeCalled = true
+				return nil, nil
+			})
+			r.OnEvent(func(
+				ctx context.Context,
+				inv *agent.Invocation,
+				e *event.Event,
+			) (*event.Event, error) {
+				if e != nil {
+					e.Tag = tagged
+				}
+				return nil, nil
+			})
+		},
+	}
+
+	sessionService := sessioninmemory.NewSessionService()
+	ag := &mockAgent{name: "test-agent"}
+	r := NewRunner(
+		"test-app",
+		ag,
+		WithSessionService(sessionService),
+		WithPlugins(p),
+	)
+
+	ch, err := r.Run(
+		context.Background(),
+		"u",
+		"s",
+		model.NewUserMessage("hi"),
+	)
+	require.NoError(t, err)
+
+	var events []*event.Event
+	for evt := range ch {
+		events = append(events, evt)
+	}
+
+	require.True(t, beforeCalled)
+	require.NotEmpty(t, events)
+	for _, evt := range events {
+		require.Equal(t, tagged, evt.Tag)
+	}
+}
+
+func TestRunner_applyEventPlugins_ReplacesEventAndCopiesFields(t *testing.T) {
+	const (
+		reqID    = "req"
+		invID    = "inv"
+		parentID = "parent"
+		branch   = "branch"
+		filter   = "filter"
+		tag      = "tag"
+	)
+	p := &testPlugin{
+		name: "p",
+		reg: func(r *plugin.Registry) {
+			r.OnEvent(func(
+				ctx context.Context,
+				inv *agent.Invocation,
+				e *event.Event,
+			) (*event.Event, error) {
+				updated := &event.Event{
+					Tag:    tag,
+					Author: "plugin",
+				}
+				return updated, nil
+			})
+		},
+	}
+
+	ag := &mockAgent{name: "test-agent"}
+	run := NewRunner("test-app", ag, WithPlugins(p)).(*runner)
+
+	inv := &agent.Invocation{Plugins: plugin.MustNewManager(p)}
+	orig := &event.Event{
+		Response:           &model.Response{Done: true},
+		RequestID:          reqID,
+		InvocationID:       invID,
+		ParentInvocationID: parentID,
+		Branch:             branch,
+		FilterKey:          filter,
+		Author:             "a",
+	}
+
+	out := run.applyEventPlugins(context.Background(), inv, orig)
+	require.NotNil(t, out)
+	require.Equal(t, tag, out.Tag)
+	require.Equal(t, reqID, out.RequestID)
+	require.Equal(t, invID, out.InvocationID)
+	require.Equal(t, parentID, out.ParentInvocationID)
+	require.Equal(t, branch, out.Branch)
+	require.Equal(t, filter, out.FilterKey)
+}
+
+func TestRunner_applyEventPlugins_ErrorKeepsOriginal(t *testing.T) {
+	p := &testPlugin{
+		name: "p",
+		reg: func(r *plugin.Registry) {
+			r.OnEvent(func(
+				ctx context.Context,
+				inv *agent.Invocation,
+				e *event.Event,
+			) (*event.Event, error) {
+				return nil, errors.New("boom")
+			})
+		},
+	}
+
+	ag := &mockAgent{name: "test-agent"}
+	run := NewRunner("test-app", ag, WithPlugins(p)).(*runner)
+
+	inv := &agent.Invocation{Plugins: plugin.MustNewManager(p)}
+	orig := &event.Event{Response: &model.Response{Done: true}}
+	out := run.applyEventPlugins(context.Background(), inv, orig)
+	require.Same(t, orig, out)
+}
+
+type closePlugin struct {
+	name     string
+	closed   bool
+	closeErr error
+}
+
+func (p *closePlugin) Name() string { return p.name }
+
+func (p *closePlugin) Register(r *plugin.Registry) {}
+
+func (p *closePlugin) Close(ctx context.Context) error {
+	p.closed = true
+	return p.closeErr
+}
+
+func TestRunner_Close_ClosesPlugins(t *testing.T) {
+	p := &closePlugin{name: "p"}
+	ag := &mockAgent{name: "test-agent"}
+	run := NewRunner("test-app", ag, WithPlugins(p)).(*runner)
+
+	err := run.Close()
+	require.NoError(t, err)
+	require.True(t, p.closed)
+}
+
+func TestRunner_Close_PropagatesPluginCloseError(t *testing.T) {
+	p := &closePlugin{name: "p", closeErr: errors.New("boom")}
+	ag := &mockAgent{name: "test-agent"}
+	run := NewRunner("test-app", ag, WithPlugins(p)).(*runner)
+
+	err := run.Close()
+	require.Error(t, err)
+	require.True(t, p.closed)
 }
 
 func TestRunner_SessionCreateIfMissing(t *testing.T) {
@@ -353,6 +560,55 @@ func TestRunner_InvocationInjection(t *testing.T) {
 	assert.Contains(t, agentEvent.Response.Choices[0].Message.Content, "Invocation found in context with ID:")
 }
 
+func TestRunner_Run_WithAgentNameRegistry(t *testing.T) {
+	sessionService := sessioninmemory.NewSessionService()
+	defaultAgent := &mockAgent{name: "default-agent"}
+	altAgent := &mockAgent{name: "alt-agent"}
+	r := NewRunner("test-app", defaultAgent,
+		WithSessionService(sessionService),
+		WithAgent("alt", altAgent),
+	)
+
+	ctx := context.Background()
+	msg := model.NewUserMessage("hello")
+	ch, err := r.Run(ctx, "user", "session", msg, agent.WithAgentByName("alt"))
+	require.NoError(t, err)
+
+	var events []*event.Event
+	for e := range ch {
+		events = append(events, e)
+	}
+	require.Len(t, events, 2)
+	assert.Equal(t, "alt-agent", events[0].Author)
+	assert.Contains(t, events[0].Response.Choices[0].Message.Content, "hello")
+}
+
+func TestRunner_Run_WithAgentInstanceOverride(t *testing.T) {
+	sessionService := sessioninmemory.NewSessionService()
+	defaultAgent := &mockAgent{name: "default-agent"}
+	override := &mockAgent{name: "override-agent"}
+	r := NewRunner("test-app", defaultAgent, WithSessionService(sessionService))
+
+	ctx := context.Background()
+	msg := model.NewUserMessage("hi")
+	ch, err := r.Run(ctx, "user", "session", msg, agent.WithAgent(override))
+	require.NoError(t, err)
+
+	var events []*event.Event
+	for e := range ch {
+		events = append(events, e)
+	}
+	require.Len(t, events, 2)
+	assert.Equal(t, "override-agent", events[0].Author)
+}
+
+func TestRunner_Run_WithAgentNameNotFound(t *testing.T) {
+	r := NewRunner("test-app", &mockAgent{name: "default"}, WithSessionService(sessioninmemory.NewSessionService()))
+	ch, err := r.Run(context.Background(), "user", "session", model.NewUserMessage("hi"), agent.WithAgentByName("missing"))
+	require.Error(t, err)
+	require.Nil(t, ch)
+}
+
 // invocationVerificationAgent is a simple mock agent that verifies invocation is present in context.
 type invocationVerificationAgent struct {
 	name string
@@ -526,6 +782,244 @@ func TestRunner_GraphCompletionPropagation(t *testing.T) {
 		"Final message content should match")
 }
 
+func TestRunner_GraphCompletion_DedupFinalChoices(t *testing.T) {
+	const (
+		appName       = "test-app"
+		userID        = "user"
+		sessionID     = "session"
+		agentName     = "dedup-agent"
+		finalMsg      = "final"
+		stateDeltaKey = "k"
+		stateDeltaVal = "v"
+	)
+
+	sessionService := sessioninmemory.NewSessionService()
+	ag := &dedupGraphCompletionAgent{
+		name:          agentName,
+		assistantText: finalMsg,
+		stateKey:      stateDeltaKey,
+		stateVal:      stateDeltaVal,
+	}
+	r := NewRunner(appName, ag, WithSessionService(sessionService))
+
+	ch, err := r.Run(
+		context.Background(),
+		userID,
+		sessionID,
+		model.NewUserMessage(""),
+		agent.WithGraphEmitFinalModelResponses(true),
+	)
+	require.NoError(t, err)
+
+	var completion *event.Event
+	for e := range ch {
+		if e.Object == model.ObjectTypeRunnerCompletion {
+			completion = e
+		}
+	}
+	require.NotNil(t, completion)
+	require.NotNil(t, completion.StateDelta)
+	require.Equal(t, stateDeltaVal,
+		string(completion.StateDelta[stateDeltaKey]))
+	require.Empty(t, completion.Response.Choices)
+}
+
+func TestRunner_StreamMode_FiltersEvents(t *testing.T) {
+	const (
+		appName   = "stream-mode-app"
+		userID    = "user"
+		sessionID = "session"
+		agentName = "stream-mode-agent"
+	)
+
+	sessionService := sessioninmemory.NewSessionService()
+	ag := &streamModeMockAgent{name: agentName}
+	r := NewRunner(appName, ag, WithSessionService(sessionService))
+
+	tests := []struct {
+		name     string
+		opts     []agent.RunOption
+		allowed  map[string]bool
+		required map[string]bool
+	}{
+		{
+			name: "messages",
+			opts: []agent.RunOption{
+				agent.WithStreamMode(agent.StreamModeMessages),
+			},
+			allowed: map[string]bool{
+				model.ObjectTypeChatCompletionChunk: true,
+				model.ObjectTypeChatCompletion:      true,
+				model.ObjectTypeRunnerCompletion:    true,
+			},
+			required: map[string]bool{
+				model.ObjectTypeChatCompletionChunk: true,
+				model.ObjectTypeRunnerCompletion:    true,
+			},
+		},
+		{
+			name: "updates",
+			opts: []agent.RunOption{
+				agent.WithStreamMode(agent.StreamModeUpdates),
+			},
+			allowed: map[string]bool{
+				graph.ObjectTypeGraphStateUpdate:   true,
+				graph.ObjectTypeGraphChannelUpdate: true,
+				graph.ObjectTypeGraphExecution:     true,
+				model.ObjectTypeStateUpdate:        true,
+				model.ObjectTypeRunnerCompletion:   true,
+			},
+			required: map[string]bool{
+				graph.ObjectTypeGraphStateUpdate: true,
+				model.ObjectTypeRunnerCompletion: true,
+			},
+		},
+		{
+			name: "checkpoints",
+			opts: []agent.RunOption{
+				agent.WithStreamMode(agent.StreamModeCheckpoints),
+			},
+			allowed: map[string]bool{
+				graph.ObjectTypeGraphCheckpointCommitted: true,
+				model.ObjectTypeRunnerCompletion:         true,
+			},
+			required: map[string]bool{
+				graph.ObjectTypeGraphCheckpointCommitted: true,
+				model.ObjectTypeRunnerCompletion:         true,
+			},
+		},
+		{
+			name: "tasks",
+			opts: []agent.RunOption{
+				agent.WithStreamMode(agent.StreamModeTasks),
+			},
+			allowed: map[string]bool{
+				graph.ObjectTypeGraphNodeStart:    true,
+				graph.ObjectTypeGraphNodeComplete: true,
+				graph.ObjectTypeGraphPregelStep:   true,
+				model.ObjectTypeRunnerCompletion:  true,
+			},
+			required: map[string]bool{
+				graph.ObjectTypeGraphNodeStart:   true,
+				model.ObjectTypeRunnerCompletion: true,
+			},
+		},
+		{
+			name: "custom",
+			opts: []agent.RunOption{
+				agent.WithStreamMode(agent.StreamModeCustom),
+			},
+			allowed: map[string]bool{
+				graph.ObjectTypeGraphNodeCustom:  true,
+				model.ObjectTypeRunnerCompletion: true,
+			},
+			required: map[string]bool{
+				graph.ObjectTypeGraphNodeCustom:  true,
+				model.ObjectTypeRunnerCompletion: true,
+			},
+		},
+		{
+			name: "debug",
+			opts: []agent.RunOption{
+				agent.WithStreamMode(agent.StreamModeDebug),
+			},
+			allowed: map[string]bool{
+				graph.ObjectTypeGraphNodeStart:           true,
+				graph.ObjectTypeGraphNodeComplete:        true,
+				graph.ObjectTypeGraphCheckpointCommitted: true,
+				graph.ObjectTypeGraphPregelStep:          true,
+				model.ObjectTypeRunnerCompletion:         true,
+			},
+			required: map[string]bool{
+				graph.ObjectTypeGraphNodeStart:           true,
+				graph.ObjectTypeGraphCheckpointCommitted: true,
+				model.ObjectTypeRunnerCompletion:         true,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ch, err := r.Run(
+				context.Background(),
+				userID,
+				sessionID,
+				model.NewUserMessage("hi"),
+				tt.opts...,
+			)
+			require.NoError(t, err)
+
+			seen := make(map[string]bool)
+			for e := range ch {
+				require.NotNil(t, e)
+				seen[e.Object] = true
+				if !tt.allowed[e.Object] {
+					t.Fatalf("unexpected event object: %q", e.Object)
+				}
+			}
+
+			for obj := range tt.required {
+				require.True(t, seen[obj], "missing %q", obj)
+			}
+		})
+	}
+}
+
+type streamModeMockAgent struct {
+	name string
+}
+
+func (m *streamModeMockAgent) Info() agent.Info {
+	return agent.Info{Name: m.name}
+}
+
+func (m *streamModeMockAgent) Tools() []tool.Tool {
+	return nil
+}
+
+func (m *streamModeMockAgent) SubAgents() []agent.Agent {
+	return nil
+}
+
+func (m *streamModeMockAgent) FindSubAgent(name string) agent.Agent {
+	return nil
+}
+
+func (m *streamModeMockAgent) Run(
+	ctx context.Context,
+	invocation *agent.Invocation,
+) (<-chan *event.Event, error) {
+	ch := make(chan *event.Event, 8)
+	go func() {
+		defer close(ch)
+		ch <- event.New(invocation.InvocationID, m.name,
+			event.WithObject(graph.ObjectTypeGraphNodeStart))
+		ch <- event.New(invocation.InvocationID, m.name,
+			event.WithObject(graph.ObjectTypeGraphStateUpdate))
+		ch <- event.New(invocation.InvocationID, m.name,
+			event.WithObject(graph.ObjectTypeGraphCheckpointCommitted))
+		ch <- event.New(invocation.InvocationID, m.name,
+			event.WithObject(graph.ObjectTypeGraphNodeCustom))
+		ch <- event.NewResponseEvent(invocation.InvocationID, m.name,
+			&model.Response{
+				Object: model.ObjectTypeChatCompletionChunk,
+				Done:   false,
+				Choices: []model.Choice{{
+					Index: 0,
+					Delta: model.Message{
+						Role:    model.RoleAssistant,
+						Content: "hi",
+					},
+				}},
+			})
+		ch <- event.New(invocation.InvocationID, m.name,
+			event.WithObject(graph.ObjectTypeGraphPregelStep))
+		ch <- event.New(invocation.InvocationID, m.name,
+			event.WithObject(graph.ObjectTypeGraphNodeComplete))
+	}()
+	return ch, nil
+}
+
 // graphCompletionMockAgent emits a graph completion event with state delta
 // and choices.
 type graphCompletionMockAgent struct {
@@ -586,6 +1080,89 @@ func (m *graphCompletionMockAgent) Run(
 
 func (m *graphCompletionMockAgent) Tools() []tool.Tool {
 	return []tool.Tool{}
+}
+
+// dedupGraphCompletionAgent emits an assistant message followed by a graph
+// completion event with the same assistant content, so runner completion
+// should not echo the final choices.
+type dedupGraphCompletionAgent struct {
+	name          string
+	assistantText string
+	stateKey      string
+	stateVal      string
+}
+
+func (m *dedupGraphCompletionAgent) Info() agent.Info {
+	return agent.Info{
+		Name:        m.name,
+		Description: "Mock agent for dedup final choices",
+	}
+}
+
+func (m *dedupGraphCompletionAgent) SubAgents() []agent.Agent { return nil }
+
+func (m *dedupGraphCompletionAgent) FindSubAgent(name string) agent.Agent {
+	return nil
+}
+
+func (m *dedupGraphCompletionAgent) Tools() []tool.Tool { return nil }
+
+func (m *dedupGraphCompletionAgent) Run(
+	ctx context.Context,
+	invocation *agent.Invocation,
+) (<-chan *event.Event, error) {
+	const (
+		assistantEventID = "assistant-event-id"
+		graphEventID     = "graph-event-id"
+	)
+
+	eventCh := make(chan *event.Event, 2)
+
+	assistantEvent := &event.Event{
+		Response: &model.Response{
+			ID:     assistantEventID,
+			Object: model.ObjectTypeChatCompletion,
+			Done:   true,
+			Choices: []model.Choice{{
+				Index: 0,
+				Message: model.Message{
+					Role:    model.RoleAssistant,
+					Content: m.assistantText,
+				},
+			}},
+		},
+		InvocationID: invocation.InvocationID,
+		Author:       m.name,
+		ID:           assistantEventID,
+		Timestamp:    time.Now(),
+	}
+
+	graphCompletionEvent := &event.Event{
+		Response: &model.Response{
+			ID:     graphEventID,
+			Object: graph.ObjectTypeGraphExecution,
+			Done:   true,
+			Choices: []model.Choice{{
+				Index:   0,
+				Message: model.NewAssistantMessage(m.assistantText),
+			}},
+		},
+		StateDelta: map[string][]byte{
+			m.stateKey: []byte(m.stateVal),
+			graph.StateKeyLastResponseID: []byte(
+				"\"" + assistantEventID + "\"",
+			),
+		},
+		InvocationID: invocation.InvocationID,
+		Author:       m.name,
+		ID:           graphEventID,
+		Timestamp:    time.Now(),
+	}
+
+	eventCh <- assistantEvent
+	eventCh <- graphCompletionEvent
+	close(eventCh)
+	return eventCh, nil
 }
 
 // failingAgent returns an error from Run to cover error path in Runner.Run.
@@ -804,14 +1381,481 @@ func TestEmitRunnerCompletion_AppendErrorStillEmits(t *testing.T) {
 	// Even though append failed internally, the completion event is still emitted.
 }
 
+func TestGraphCompletionNotPersistedAsMessage(t *testing.T) {
+	const (
+		appName   = "app"
+		userID    = "u"
+		sessionID = "s"
+		userMsg   = "hi"
+		stateKey  = "k"
+		stateVal  = "v"
+	)
+
+	svc := sessioninmemory.NewSessionService()
+	ag := &graphDoneAgent{
+		name:        "g",
+		delta:       map[string][]byte{stateKey: []byte(stateVal)},
+		withChoices: true,
+	}
+	r := NewRunner(appName, ag, WithSessionService(svc))
+
+	ch, err := r.Run(
+		context.Background(),
+		userID,
+		sessionID,
+		model.NewUserMessage(userMsg),
+	)
+	require.NoError(t, err)
+	for range ch {
+	}
+
+	sess, err := svc.GetSession(
+		context.Background(),
+		session.Key{
+			AppName:   appName,
+			UserID:    userID,
+			SessionID: sessionID,
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, sess.Events, 2)
+	require.True(t, sess.Events[0].IsUserMessage())
+	require.Equal(t, model.ObjectTypeRunnerCompletion,
+		sess.Events[1].Object)
+}
+
+func TestRunner_GraphAgent_LegacyRunnerCompletionIncludesFinalResponse(t *testing.T) {
+	schema := graph.MessagesStateSchema()
+	sg := graph.NewStateGraph(schema)
+	sg.AddLLMNode(
+		"n1",
+		&staticModel{name: "m1", content: "first"},
+		"i1",
+		nil,
+	)
+	sg.AddLLMNode(
+		"n2",
+		&staticModel{name: "m2", content: "second"},
+		"i2",
+		nil,
+	)
+	sg.AddEdge("n1", "n2")
+	compiled := sg.SetEntryPoint("n1").SetFinishPoint("n2").MustCompile()
+
+	ga, err := graphagent.New("ga", compiled)
+	require.NoError(t, err)
+
+	svc := sessioninmemory.NewSessionService()
+	r := NewRunner("app", ga, WithSessionService(svc))
+
+	ch, err := r.Run(
+		context.Background(),
+		"u",
+		"s",
+		model.NewUserMessage("hi"),
+	)
+	require.NoError(t, err)
+
+	var last *event.Event
+	for e := range ch {
+		last = e
+	}
+	require.NotNil(t, last)
+	require.True(t, last.IsRunnerCompletion())
+	require.Len(t, last.Response.Choices, 1)
+	require.Equal(t, model.RoleAssistant,
+		last.Response.Choices[0].Message.Role)
+	require.Equal(t, "second",
+		last.Response.Choices[0].Message.Content)
+
+	sess, err := svc.GetSession(context.Background(), session.Key{
+		AppName:   "app",
+		UserID:    "u",
+		SessionID: "s",
+	})
+	require.NoError(t, err)
+	require.Len(t, sess.Events, 2)
+	require.True(t, sess.Events[0].IsUserMessage())
+	require.Equal(t, model.ObjectTypeRunnerCompletion,
+		sess.Events[1].Object)
+	require.Len(t, sess.Events[1].Choices, 1)
+	require.Equal(t, model.RoleAssistant,
+		sess.Events[1].Choices[0].Message.Role)
+	require.Equal(t, "second",
+		sess.Events[1].Choices[0].Message.Content)
+}
+
+func TestRunner_GraphAgentPersistsLLMDoneResponses(t *testing.T) {
+	schema := graph.MessagesStateSchema()
+	sg := graph.NewStateGraph(schema)
+	sg.AddLLMNode(
+		"n1",
+		&staticModel{name: "m1", content: "first"},
+		"i1",
+		nil,
+	)
+	sg.AddLLMNode(
+		"n2",
+		&staticModel{name: "m2", content: "second"},
+		"i2",
+		nil,
+	)
+	sg.AddEdge("n1", "n2")
+	compiled := sg.SetEntryPoint("n1").SetFinishPoint("n2").MustCompile()
+
+	ga, err := graphagent.New("ga", compiled)
+	require.NoError(t, err)
+
+	svc := sessioninmemory.NewSessionService()
+	r := NewRunner("app", ga, WithSessionService(svc))
+
+	ch, err := r.Run(
+		context.Background(),
+		"u",
+		"s",
+		model.NewUserMessage("hi"),
+		agent.WithGraphEmitFinalModelResponses(true),
+	)
+	require.NoError(t, err)
+
+	var last *event.Event
+	for e := range ch {
+		last = e
+	}
+	require.NotNil(t, last)
+	require.True(t, last.IsRunnerCompletion())
+	require.Empty(t, last.Response.Choices)
+
+	sess, err := svc.GetSession(context.Background(), session.Key{
+		AppName:   "app",
+		UserID:    "u",
+		SessionID: "s",
+	})
+	require.NoError(t, err)
+	require.Len(t, sess.Events, 3)
+	require.True(t, sess.Events[0].IsUserMessage())
+
+	require.Equal(t, model.RoleAssistant,
+		sess.Events[1].Choices[0].Message.Role)
+	require.Equal(t, "first",
+		sess.Events[1].Choices[0].Message.Content)
+
+	require.Equal(t, model.RoleAssistant,
+		sess.Events[2].Choices[0].Message.Role)
+	require.Equal(t, "second",
+		sess.Events[2].Choices[0].Message.Content)
+}
+
 func TestPropagateGraphCompletion_NilStateValue(t *testing.T) {
 	// Call propagateGraphCompletion directly to cover the nil-value copy branch.
 	rr := NewRunner("app", &noOpAgent{name: "a"}).(*runner)
 	ev := event.NewResponseEvent("inv", "app", &model.Response{ID: "rc", Object: model.ObjectTypeRunnerCompletion, Done: true})
 	delta := map[string][]byte{"nil": nil}
-	rr.propagateGraphCompletion(ev, delta, nil)
+	rr.propagateGraphCompletion(ev, delta, nil, false)
 	require.Contains(t, ev.StateDelta, "nil")
 	require.Nil(t, ev.StateDelta["nil"]) // explicit nil copy branch covered
+}
+
+func TestShouldEchoFinalChoicesInCompletion_Cases(t *testing.T) {
+	const (
+		appName        = "app"
+		agentName      = "a"
+		content        = "content"
+		responseID     = "response-id"
+		responseIDJSON = "\"response-id\""
+	)
+
+	rr := NewRunner(appName, &noOpAgent{name: agentName}).(*runner)
+
+	t.Run("nil loop", func(t *testing.T) {
+		require.True(t, rr.shouldEchoFinalChoicesInCompletion(nil))
+	})
+
+	t.Run("no final choices", func(t *testing.T) {
+		loop := &eventLoopContext{finalChoices: nil}
+		require.False(t, rr.shouldEchoFinalChoicesInCompletion(loop))
+	})
+
+	t.Run("legacy always includes", func(t *testing.T) {
+		invocation := agent.NewInvocation(agent.WithInvocationRunOptions(
+			agent.RunOptions{},
+		))
+		loop := &eventLoopContext{
+			invocation: invocation,
+			finalChoices: []model.Choice{{
+				Index:   0,
+				Message: model.NewAssistantMessage(content),
+			}},
+			finalStateDelta: map[string][]byte{
+				graph.StateKeyLastResponseID: []byte(responseIDJSON),
+			},
+			emittedAssistantResponseIDs: map[string]struct{}{
+				responseID: {},
+			},
+		}
+		require.True(t, rr.shouldEchoFinalChoicesInCompletion(loop))
+	})
+
+	t.Run("new mode missing final id includes", func(t *testing.T) {
+		invocation := agent.NewInvocation(agent.WithInvocationRunOptions(
+			agent.RunOptions{GraphEmitFinalModelResponses: true},
+		))
+		loop := &eventLoopContext{
+			invocation: invocation,
+			finalChoices: []model.Choice{{
+				Index:   0,
+				Message: model.NewAssistantMessage(content),
+			}},
+		}
+		require.True(t, rr.shouldEchoFinalChoicesInCompletion(loop))
+	})
+
+	t.Run("new mode duplicate id excluded", func(t *testing.T) {
+		invocation := agent.NewInvocation(agent.WithInvocationRunOptions(
+			agent.RunOptions{GraphEmitFinalModelResponses: true},
+		))
+		loop := &eventLoopContext{
+			invocation: invocation,
+			finalChoices: []model.Choice{{
+				Index:   0,
+				Message: model.NewAssistantMessage(content),
+			}},
+			finalStateDelta: map[string][]byte{
+				graph.StateKeyLastResponseID: []byte(responseIDJSON),
+			},
+			emittedAssistantResponseIDs: map[string]struct{}{
+				responseID: {},
+			},
+		}
+		require.False(t, rr.shouldEchoFinalChoicesInCompletion(loop))
+	})
+
+	t.Run("new mode id not seen includes", func(t *testing.T) {
+		invocation := agent.NewInvocation(agent.WithInvocationRunOptions(
+			agent.RunOptions{GraphEmitFinalModelResponses: true},
+		))
+		loop := &eventLoopContext{
+			invocation: invocation,
+			finalChoices: []model.Choice{{
+				Index:   0,
+				Message: model.NewAssistantMessage(content),
+			}},
+			finalStateDelta: map[string][]byte{
+				graph.StateKeyLastResponseID: []byte(responseIDJSON),
+			},
+		}
+		require.True(t, rr.shouldEchoFinalChoicesInCompletion(loop))
+	})
+}
+
+func TestRecordEmittedAssistantResponseID_Cases(t *testing.T) {
+	const (
+		appName        = "app"
+		agentName      = "a"
+		invocationID   = "inv"
+		author         = "author"
+		content        = "content"
+		deltaContent   = "delta"
+		stateEventID   = "state-event-id"
+		graphEventID   = "graph-event-id"
+		partialEvent   = "partial-event-id"
+		invalidEvent   = "invalid-event-id"
+		userEvent      = "user-event-id"
+		deltaOnlyEvent = "delta-only-event-id"
+	)
+
+	rr := NewRunner(appName, &noOpAgent{name: agentName}).(*runner)
+	enabledInvocation := agent.NewInvocation(agent.WithInvocationRunOptions(
+		agent.RunOptions{GraphEmitFinalModelResponses: true},
+	))
+
+	t.Run("nil loop", func(t *testing.T) {
+		rsp := &model.Response{
+			ID:     stateEventID,
+			Object: model.ObjectTypeChatCompletion,
+			Done:   true,
+			Choices: []model.Choice{{
+				Index:   0,
+				Message: model.NewAssistantMessage(content),
+			}},
+		}
+		e := event.NewResponseEvent(invocationID, author, rsp)
+		rr.recordEmittedAssistantResponseID(nil, e)
+	})
+
+	t.Run("nil event", func(t *testing.T) {
+		loop := &eventLoopContext{invocation: enabledInvocation}
+		rr.recordEmittedAssistantResponseID(loop, nil)
+	})
+
+	t.Run("nil response", func(t *testing.T) {
+		loop := &eventLoopContext{invocation: enabledInvocation}
+		rr.recordEmittedAssistantResponseID(loop, &event.Event{})
+	})
+
+	t.Run("nil invocation", func(t *testing.T) {
+		loop := &eventLoopContext{}
+		rsp := &model.Response{
+			ID:     stateEventID,
+			Object: model.ObjectTypeChatCompletion,
+			Done:   true,
+			Choices: []model.Choice{{
+				Index:   0,
+				Message: model.NewAssistantMessage(content),
+			}},
+		}
+		e := event.NewResponseEvent(invocationID, author, rsp)
+		rr.recordEmittedAssistantResponseID(loop, e)
+		require.Nil(t, loop.emittedAssistantResponseIDs)
+	})
+
+	t.Run("skips when flag disabled", func(t *testing.T) {
+		loop := &eventLoopContext{invocation: agent.NewInvocation()}
+		rsp := &model.Response{
+			ID:     stateEventID,
+			Object: model.ObjectTypeChatCompletion,
+			Done:   true,
+			Choices: []model.Choice{{
+				Index:   0,
+				Message: model.NewAssistantMessage(content),
+			}},
+		}
+		e := event.NewResponseEvent(invocationID, author, rsp)
+		rr.recordEmittedAssistantResponseID(loop, e)
+		require.Nil(t, loop.emittedAssistantResponseIDs)
+	})
+
+	t.Run("skips empty response id", func(t *testing.T) {
+		loop := &eventLoopContext{invocation: enabledInvocation}
+		rsp := &model.Response{
+			Object: model.ObjectTypeChatCompletion,
+			Done:   true,
+			Choices: []model.Choice{{
+				Index:   0,
+				Message: model.NewAssistantMessage(content),
+			}},
+		}
+		e := event.NewResponseEvent(invocationID, author, rsp)
+		rr.recordEmittedAssistantResponseID(loop, e)
+		require.Nil(t, loop.emittedAssistantResponseIDs)
+	})
+
+	t.Run("records assistant message", func(t *testing.T) {
+		loop := &eventLoopContext{invocation: enabledInvocation}
+		rsp := &model.Response{
+			ID:     stateEventID,
+			Object: model.ObjectTypeChatCompletion,
+			Done:   true,
+			Choices: []model.Choice{{
+				Index:   0,
+				Message: model.NewAssistantMessage(content),
+			}},
+		}
+		e := event.NewResponseEvent(invocationID, author, rsp)
+		rr.recordEmittedAssistantResponseID(loop, e)
+		_, ok := loop.emittedAssistantResponseIDs[stateEventID]
+		require.True(t, ok)
+	})
+
+	t.Run("skips graph completion", func(t *testing.T) {
+		loop := &eventLoopContext{
+			invocation: enabledInvocation,
+			emittedAssistantResponseIDs: map[string]struct{}{
+				stateEventID: {},
+			},
+		}
+		rsp := &model.Response{
+			ID:     graphEventID,
+			Object: graph.ObjectTypeGraphExecution,
+			Done:   true,
+			Choices: []model.Choice{{
+				Index:   0,
+				Message: model.NewAssistantMessage(content),
+			}},
+		}
+		e := event.NewResponseEvent(invocationID, author, rsp)
+		rr.recordEmittedAssistantResponseID(loop, e)
+		require.Len(t, loop.emittedAssistantResponseIDs, 1)
+	})
+
+	t.Run("skips partial response", func(t *testing.T) {
+		loop := &eventLoopContext{invocation: enabledInvocation}
+		rsp := &model.Response{
+			ID:        partialEvent,
+			Object:    model.ObjectTypeChatCompletionChunk,
+			Done:      false,
+			IsPartial: true,
+			Choices: []model.Choice{{
+				Index:   0,
+				Message: model.NewAssistantMessage(content),
+			}},
+		}
+		e := event.NewResponseEvent(invocationID, author, rsp)
+		rr.recordEmittedAssistantResponseID(loop, e)
+		require.Empty(t, loop.emittedAssistantResponseIDs)
+	})
+
+	t.Run("skips invalid content", func(t *testing.T) {
+		loop := &eventLoopContext{invocation: enabledInvocation}
+		rsp := &model.Response{
+			ID:     invalidEvent,
+			Object: model.ObjectTypeChatCompletion,
+			Done:   true,
+			Choices: []model.Choice{{
+				Index: 0,
+				Message: model.Message{
+					Role: model.RoleAssistant,
+				},
+			}},
+		}
+		e := event.NewResponseEvent(invocationID, author, rsp)
+		rr.recordEmittedAssistantResponseID(loop, e)
+		require.Empty(t, loop.emittedAssistantResponseIDs)
+	})
+
+	t.Run("skips non assistant role", func(t *testing.T) {
+		loop := &eventLoopContext{
+			invocation: enabledInvocation,
+		}
+		rsp := &model.Response{
+			ID:     userEvent,
+			Object: model.ObjectTypeChatCompletion,
+			Done:   true,
+			Choices: []model.Choice{{
+				Index: 0,
+				Message: model.Message{
+					Role:    model.RoleUser,
+					Content: content,
+				},
+			}},
+		}
+		e := event.NewResponseEvent(invocationID, author, rsp)
+		rr.recordEmittedAssistantResponseID(loop, e)
+		require.Empty(t, loop.emittedAssistantResponseIDs)
+	})
+
+	t.Run("skips empty message content when delta used", func(t *testing.T) {
+		loop := &eventLoopContext{
+			invocation: enabledInvocation,
+		}
+		rsp := &model.Response{
+			ID:     deltaOnlyEvent,
+			Object: model.ObjectTypeChatCompletionChunk,
+			Done:   false,
+			Choices: []model.Choice{{
+				Index: 0,
+				Message: model.Message{
+					Role: model.RoleAssistant,
+				},
+				Delta: model.Message{
+					Content: deltaContent,
+				},
+			}},
+		}
+		e := event.NewResponseEvent(invocationID, author, rsp)
+		rr.recordEmittedAssistantResponseID(loop, e)
+		require.Empty(t, loop.emittedAssistantResponseIDs)
+	})
 }
 
 func TestProcessAgentEvents_NotifyCompletion(t *testing.T) {
@@ -894,6 +1938,58 @@ func (m *oneEventAgent) Run(ctx context.Context, inv *agent.Invocation) (<-chan 
 	return ch, nil
 }
 
+type tickCtxAgent struct {
+	name     string
+	interval time.Duration
+}
+
+func (m *tickCtxAgent) Info() agent.Info { return agent.Info{Name: m.name} }
+
+func (m *tickCtxAgent) SubAgents() []agent.Agent { return nil }
+
+func (m *tickCtxAgent) FindSubAgent(name string) agent.Agent { return nil }
+
+func (m *tickCtxAgent) Tools() []tool.Tool { return nil }
+
+func (m *tickCtxAgent) Run(
+	ctx context.Context,
+	inv *agent.Invocation,
+) (<-chan *event.Event, error) {
+	const tickContent = "tick"
+	ch := make(chan *event.Event, 1)
+	go func() {
+		defer close(ch)
+		ticker := time.NewTicker(m.interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				evt := event.NewResponseEvent(
+					inv.InvocationID,
+					m.name,
+					&model.Response{
+						Done: false,
+						Choices: []model.Choice{{
+							Index: 0,
+							Message: model.NewAssistantMessage(
+								tickContent,
+							),
+						}},
+					},
+				)
+				select {
+				case <-ctx.Done():
+					return
+				case ch <- evt:
+				}
+			}
+		}
+	}()
+	return ch, nil
+}
+
 func TestProcessAgentEvents_EmitEventContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel before running; EmitEvent should take ctx.Done() branch
@@ -908,6 +2004,196 @@ func TestProcessAgentEvents_EmitEventContextCanceled(t *testing.T) {
 	require.Equal(t, 0, got)
 }
 
+func TestRunner_Run_DetachedCancelKeepsDeadline(t *testing.T) {
+	const (
+		timeout  = 80 * time.Millisecond
+		maxWait  = 500 * time.Millisecond
+		interval = 10 * time.Millisecond
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	cancel()
+
+	r := NewRunner(
+		"app",
+		&tickCtxAgent{name: "t", interval: interval},
+		WithSessionService(sessioninmemory.NewSessionService()),
+	)
+	ch, err := r.Run(
+		ctx,
+		"u",
+		"s",
+		model.NewUserMessage(""),
+		agent.WithDetachedCancel(true),
+	)
+	require.NoError(t, err)
+
+	deadline := time.After(maxWait)
+	var events int
+	for {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				require.Greater(t, events, 0)
+				return
+			}
+			events++
+		case <-deadline:
+			t.Fatal("run did not finish in time")
+		}
+	}
+}
+
+func TestRunner_Run_MaxRunDuration(t *testing.T) {
+	const (
+		parentTimeout = time.Second
+		maxRun        = 50 * time.Millisecond
+		maxWait       = 500 * time.Millisecond
+		interval      = 10 * time.Millisecond
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), parentTimeout)
+	defer cancel()
+
+	r := NewRunner(
+		"app",
+		&tickCtxAgent{name: "t", interval: interval},
+		WithSessionService(sessioninmemory.NewSessionService()),
+	)
+	ch, err := r.Run(
+		ctx,
+		"u",
+		"s",
+		model.NewUserMessage(""),
+		agent.WithMaxRunDuration(maxRun),
+	)
+	require.NoError(t, err)
+
+	deadline := time.After(maxWait)
+	select {
+	case <-deadline:
+		t.Fatal("run did not finish in time")
+	case <-drainChannel(ch):
+	}
+}
+
+func TestRunner_ManagedRunner_CancelAndStatus(t *testing.T) {
+	const (
+		requestID = "req-cancel-1"
+		maxWait   = 500 * time.Millisecond
+		interval  = 10 * time.Millisecond
+	)
+
+	r := NewRunner(
+		"app",
+		&tickCtxAgent{name: "t", interval: interval},
+		WithSessionService(sessioninmemory.NewSessionService()),
+	)
+	mr, ok := r.(ManagedRunner)
+	require.True(t, ok)
+
+	ctx := context.Background()
+	ch, err := r.Run(
+		ctx,
+		"u",
+		"s",
+		model.NewUserMessage(""),
+		agent.WithRequestID(requestID),
+		agent.WithDetachedCancel(true),
+	)
+	require.NoError(t, err)
+
+	select {
+	case <-time.After(maxWait):
+		t.Fatal("did not receive first event")
+	case _, ok := <-ch:
+		require.True(t, ok)
+	}
+
+	status, ok := mr.RunStatus(requestID)
+	require.True(t, ok)
+	require.Equal(t, requestID, status.RequestID)
+	require.NotEmpty(t, status.InvocationID)
+	require.GreaterOrEqual(t, status.EventCount, 1)
+	require.False(t, status.LastEventAt.IsZero())
+
+	require.True(t, mr.Cancel(requestID))
+
+	select {
+	case <-time.After(maxWait):
+		t.Fatal("run did not finish after cancel")
+	case <-drainChannel(ch):
+	}
+
+	_, ok = mr.RunStatus(requestID)
+	require.False(t, ok)
+	require.False(t, mr.Cancel(requestID))
+}
+
+func TestRunner_Close_CancelsRunningRuns(t *testing.T) {
+	const (
+		requestID = "req-close-1"
+		maxWait   = 500 * time.Millisecond
+		interval  = 10 * time.Millisecond
+	)
+
+	r := NewRunner(
+		"app",
+		&tickCtxAgent{name: "t", interval: interval},
+		WithSessionService(sessioninmemory.NewSessionService()),
+	)
+	mr, ok := r.(ManagedRunner)
+	require.True(t, ok)
+
+	ch, err := r.Run(
+		context.Background(),
+		"u",
+		"s",
+		model.NewUserMessage(""),
+		agent.WithRequestID(requestID),
+	)
+	require.NoError(t, err)
+
+	select {
+	case <-time.After(maxWait):
+		t.Fatal("did not receive first event")
+	case _, ok := <-ch:
+		require.True(t, ok)
+	}
+
+	require.NoError(t, r.Close())
+
+	select {
+	case <-time.After(maxWait):
+		t.Fatal("run did not finish after close")
+	case <-drainChannel(ch):
+	}
+
+	_, ok = mr.RunStatus(requestID)
+	require.False(t, ok)
+}
+
+func TestRunner_registerRun_ValidatesInput(t *testing.T) {
+	rr := NewRunner("app", &noOpAgent{name: "a"}).(*runner)
+
+	_, err := rr.registerRun("", RunStatus{}, func() {})
+	require.Error(t, err)
+
+	_, err = rr.registerRun("run", RunStatus{}, nil)
+	require.Error(t, err)
+}
+
+func TestRunner_registerRun_DuplicateRunID(t *testing.T) {
+	rr := NewRunner("app", &noOpAgent{name: "a"}).(*runner)
+
+	handle, err := rr.registerRun("run", RunStatus{}, func() {})
+	require.NoError(t, err)
+	require.NotNil(t, handle)
+
+	_, err = rr.registerRun("run", RunStatus{}, func() {})
+	require.Error(t, err)
+}
+
 func TestProcessAgentEvents_EmitEventErrorBranch_Direct(t *testing.T) {
 	// Call processAgentEvents directly to deterministically exercise the emit error branch.
 	rr := NewRunner("app", &noOpAgent{name: "a"}, WithSessionService(sessioninmemory.NewSessionService())).(*runner)
@@ -917,7 +2203,9 @@ func TestProcessAgentEvents_EmitEventErrorBranch_Direct(t *testing.T) {
 	sess, _ := rr.sessionService.CreateSession(context.Background(), session.Key{AppName: "app", UserID: "u", SessionID: "s"}, session.StateMap{})
 
 	agentCh := make(chan *event.Event)
-	processed := rr.processAgentEvents(ctx, sess, inv, agentCh)
+	flushCh := make(chan *flush.FlushRequest)
+	// No Attach needed because processAgentEvents will attach using this channel.
+	processed := rr.processAgentEvents(ctx, sess, inv, agentCh, flushCh, nil)
 	// Send one event, then close agentCh
 	go func() {
 		agentCh <- &event.Event{Response: &model.Response{Done: true, Choices: []model.Choice{{Index: 0, Message: model.NewAssistantMessage("x")}}}}
@@ -933,11 +2221,63 @@ func TestProcessAgentEvents_EmitEventErrorBranch_Direct(t *testing.T) {
 	require.Equal(t, 0, n)
 }
 
+func drainChannel(ch <-chan *event.Event) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		for range ch {
+		}
+		close(done)
+	}()
+	return done
+}
+
 func TestShouldAppendUserMessage_Cases(t *testing.T) {
 	// message role is not user -> should append
 	require.True(t, shouldAppendUserMessage(model.NewAssistantMessage("a"), []model.Message{model.NewUserMessage("u")}))
 	// seed has no user -> should append
 	require.True(t, shouldAppendUserMessage(model.NewUserMessage("u"), []model.Message{model.NewSystemMessage("s"), model.NewAssistantMessage("a")}))
+}
+
+func TestFinalResponseIDFromStateDelta_Cases(t *testing.T) {
+	const (
+		unknownKey     = "other"
+		unknownValue   = "\"x\""
+		invalidJSON    = "{"
+		responseID     = "resp-123"
+		responseIDJSON = "\"resp-123\""
+	)
+
+	t.Run("nil delta", func(t *testing.T) {
+		require.Equal(t, "", finalResponseIDFromStateDelta(nil))
+	})
+
+	t.Run("missing key", func(t *testing.T) {
+		delta := map[string][]byte{
+			unknownKey: []byte(unknownValue),
+		}
+		require.Equal(t, "", finalResponseIDFromStateDelta(delta))
+	})
+
+	t.Run("empty value", func(t *testing.T) {
+		delta := map[string][]byte{
+			graph.StateKeyLastResponseID: nil,
+		}
+		require.Equal(t, "", finalResponseIDFromStateDelta(delta))
+	})
+
+	t.Run("invalid json", func(t *testing.T) {
+		delta := map[string][]byte{
+			graph.StateKeyLastResponseID: []byte(invalidJSON),
+		}
+		require.Equal(t, "", finalResponseIDFromStateDelta(delta))
+	})
+
+	t.Run("valid json", func(t *testing.T) {
+		delta := map[string][]byte{
+			graph.StateKeyLastResponseID: []byte(responseIDJSON),
+		}
+		require.Equal(t, responseID, finalResponseIDFromStateDelta(delta))
+	})
 }
 
 func TestRunner_Close_OwnedSessionService(t *testing.T) {
@@ -1003,7 +2343,8 @@ func TestRunner_Close_SessionServiceError(t *testing.T) {
 	// fails on Close.
 	r := &runner{
 		appName:             "test-app",
-		agent:               mockAgent,
+		defaultAgentName:    mockAgent.name,
+		agents:              map[string]agent.Agent{mockAgent.name: mockAgent},
 		sessionService:      errorSessionService,
 		ownedSessionService: true, // Mark as owned to trigger Close in runner.Close().
 	}
@@ -1021,4 +2362,149 @@ func TestRunner_Close_SessionServiceError(t *testing.T) {
 	err = r.Close()
 	require.NoError(t, err)
 	assert.Equal(t, 1, errorSessionService.closeCalled, "Close should only be called once")
+}
+
+func TestHandleFlushRequest_ProcessesEventAndClosesAck(t *testing.T) {
+	r := NewRunner("app", &noOpAgent{name: "a"}, WithSessionService(sessioninmemory.NewSessionService())).(*runner)
+	ctx := context.Background()
+
+	agentCh := make(chan *event.Event, 1)
+	agentCh <- &event.Event{Response: &model.Response{Done: true, Choices: []model.Choice{{Index: 0, Message: model.NewAssistantMessage("ok")}}}}
+
+	loop := &eventLoopContext{
+		sess:             session.NewSession("app", "u", "s"),
+		invocation:       agent.NewInvocation(),
+		agentEventCh:     agentCh,
+		processedEventCh: make(chan *event.Event, 1),
+	}
+	req := &flush.FlushRequest{ACK: make(chan struct{})}
+
+	err := r.handleFlushRequest(ctx, loop, req)
+	require.NoError(t, err)
+
+	select {
+	case ev := <-loop.processedEventCh:
+		require.NotNil(t, ev)
+	default:
+		require.Fail(t, "expected processed event")
+	}
+	_, ok := <-req.ACK
+	require.False(t, ok)
+}
+
+func TestHandleFlushRequest_AgentChannelClosed(t *testing.T) {
+	r := NewRunner("app", &noOpAgent{name: "a"}, WithSessionService(sessioninmemory.NewSessionService())).(*runner)
+	agentCh := make(chan *event.Event)
+	close(agentCh)
+
+	loop := &eventLoopContext{
+		sess:             session.NewSession("app", "u", "s"),
+		invocation:       agent.NewInvocation(),
+		agentEventCh:     agentCh,
+		processedEventCh: make(chan *event.Event, 1),
+	}
+	req := &flush.FlushRequest{ACK: make(chan struct{})}
+
+	err := r.handleFlushRequest(context.Background(), loop, req)
+	require.NoError(t, err)
+	_, ok := <-req.ACK
+	require.False(t, ok)
+}
+
+func TestHandleFlushRequest_ContextCancelled(t *testing.T) {
+	r := NewRunner("app", &noOpAgent{name: "a"}, WithSessionService(sessioninmemory.NewSessionService())).(*runner)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	loop := &eventLoopContext{
+		sess:             session.NewSession("app", "u", "s"),
+		invocation:       agent.NewInvocation(),
+		agentEventCh:     nil,
+		processedEventCh: make(chan *event.Event, 1),
+	}
+	req := &flush.FlushRequest{ACK: make(chan struct{})}
+
+	err := r.handleFlushRequest(ctx, loop, req)
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.Canceled)
+	_, ok := <-req.ACK
+	require.False(t, ok)
+}
+
+func TestHandleFlushRequest_ProcessSingleAgentEventError(t *testing.T) {
+	r := NewRunner("app", &noOpAgent{name: "a"}, WithSessionService(sessioninmemory.NewSessionService())).(*runner)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	agentCh := make(chan *event.Event, 1)
+	agentCh <- &event.Event{Response: &model.Response{Done: true, Choices: []model.Choice{{Index: 0, Message: model.NewAssistantMessage("err")}}}}
+	close(agentCh)
+
+	loop := &eventLoopContext{
+		sess:             session.NewSession("app", "u", "s"),
+		invocation:       agent.NewInvocation(),
+		agentEventCh:     agentCh,
+		processedEventCh: make(chan *event.Event),
+	}
+	req := &flush.FlushRequest{ACK: make(chan struct{})}
+
+	time.AfterFunc(10*time.Millisecond, cancel)
+	err := r.handleFlushRequest(ctx, loop, req)
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.Canceled)
+	_, ok := <-req.ACK
+	require.False(t, ok)
+}
+
+func TestRunEventLoop_FlushNilAndChannelClosed(t *testing.T) {
+	r := NewRunner("app", &noOpAgent{name: "a"}, WithSessionService(sessioninmemory.NewSessionService())).(*runner)
+
+	flushCh := make(chan *flush.FlushRequest, 1)
+	agentCh := make(chan *event.Event)
+	loop := &eventLoopContext{
+		sess:             session.NewSession("app", "u", "s"),
+		invocation:       agent.NewInvocation(),
+		agentEventCh:     agentCh,
+		flushChan:        flushCh,
+		processedEventCh: make(chan *event.Event, 1),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		r.runEventLoop(context.Background(), loop)
+		close(done)
+	}()
+
+	flushCh <- nil
+	close(flushCh)
+	time.Sleep(20 * time.Millisecond)
+	close(agentCh)
+	<-done
+}
+
+func TestRunEventLoop_HandleFlushRequestError(t *testing.T) {
+	r := NewRunner("app", &noOpAgent{name: "a"}, WithSessionService(sessioninmemory.NewSessionService())).(*runner)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	agentCh := make(chan *event.Event, 1)
+	agentCh <- &event.Event{Response: &model.Response{Done: true, Choices: []model.Choice{{Index: 0, Message: model.NewAssistantMessage("x")}}}}
+	close(agentCh)
+
+	loop := &eventLoopContext{
+		sess:             session.NewSession("app", "u", "s"),
+		invocation:       agent.NewInvocation(),
+		agentEventCh:     agentCh,
+		flushChan:        make(chan *flush.FlushRequest, 1),
+		processedEventCh: make(chan *event.Event),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		r.runEventLoop(ctx, loop)
+		close(done)
+	}()
+
+	time.AfterFunc(20*time.Millisecond, cancel)
+	loop.flushChan <- &flush.FlushRequest{ACK: make(chan struct{})}
+
+	<-done
 }

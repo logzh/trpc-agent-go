@@ -54,6 +54,9 @@ type Embedder struct {
 	client        *api.Client
 	truncate      *bool
 	dimensions    int
+
+	serverAddress *string // for telemetry
+	serverPort    *int    // for telemetry
 }
 
 // Option represents a functional option for configuring the Embedder.
@@ -170,6 +173,9 @@ func New(opts ...Option) *Embedder {
 	if n, err := strconv.ParseInt(port, 10, 32); err != nil || n > 65535 || n < 0 {
 		port = defaultPort
 	}
+	n, _ := strconv.ParseInt(port, 10, 32)
+	portInt := int(n)
+	e.serverAddress, e.serverPort = &host, &portInt
 
 	baseURL := &url.URL{
 		Scheme: scheme,
@@ -189,13 +195,13 @@ func (e *Embedder) GetEmbedding(ctx context.Context, text string) ([]float64, er
 		return nil, err
 	}
 	if len(response.Embeddings) == 0 {
-		log.Warn("received empty embedding response from Ollaama API")
+		log.WarnContext(ctx, "received empty embedding response from Ollama API")
 		return []float64{}, nil
 	}
 
 	embedding := response.Embeddings[0]
 	if len(embedding) == 0 {
-		log.Warn("received empty embedding vector from Ollaama API")
+		log.WarnContext(ctx, "received empty embedding vector from Ollama API")
 		return []float64{}, nil
 	}
 	return embedding, nil
@@ -210,13 +216,13 @@ func (e *Embedder) GetEmbeddingWithUsage(ctx context.Context, text string) ([]fl
 	}
 
 	if len(response.Embeddings) == 0 {
-		log.Warn("received empty embedding response from Ollama API")
+		log.WarnContext(ctx, "received empty embedding response from Ollama API")
 		return []float64{}, nil, nil
 	}
 
 	embedding := response.Embeddings[0]
 	if len(embedding) == 0 {
-		log.Warn("received empty embedding vector from Ollama API")
+		log.WarnContext(ctx, "received empty embedding vector from Ollama API")
 		return []float64{}, nil, nil
 	}
 
@@ -246,8 +252,19 @@ func (e *Embedder) response(ctx context.Context, text string) (rsp *embedRespons
 		return nil, fmt.Errorf("text cannot be empty")
 	}
 	ctx, span := trace.Tracer.Start(ctx, fmt.Sprintf("%s %s", itelemetry.OperationEmbeddings, e.model))
+	embeddingAttributes := &itelemetry.EmbeddingAttributes{
+		RequestModel:  e.model,
+		Dimensions:    e.dimensions,
+		ServerAddress: e.serverAddress,
+		ServerPort:    e.serverPort,
+	}
 	defer func() {
-		itelemetry.TraceEmbedding(span, "", e.model, nil, err)
+		embeddingAttributes.Error = err
+		if rsp != nil && rsp.PromptEvalCount > 0 {
+			inputTokens := int64(rsp.PromptEvalCount)
+			embeddingAttributes.InputToken = &inputTokens
+		}
+		itelemetry.TraceEmbedding(span, embeddingAttributes)
 		span.End()
 	}()
 	if e.useEmbeddings {

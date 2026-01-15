@@ -15,6 +15,7 @@ Highlights:
 - Built‑in node types wrap LLM, Tools, and Agent to reduce boilerplate.
 - Streaming events, checkpoints, and interrupts for observability and recovery.
 - Node‑level retry/backoff with exponential delay and jitter, plus executor‑level defaults and rich retry metadata in events.
+- Node event emitter (EventEmitter) for emitting custom events, progress updates, and streaming text from within NodeFunc.
 
 ## Quick Start
 
@@ -157,11 +158,14 @@ The Graph package provides some built-in state keys, mainly for internal system 
 - `StateKeyUserInput`: User input (one-shot, cleared after consumption, persisted by LLM nodes)
 - `StateKeyOneShotMessages`: One-shot messages (complete override for current round, cleared after consumption)
 - `StateKeyLastResponse`: Last response (used to set final output, Executor reads this value as result)
+- `StateKeyLastToolResponse`: Last tool output (JSON string, set by Tools nodes)
+- `StateKeyLastResponseID`: Last response identifier (ID) (set by LLM nodes; may
+  be empty when `StateKeyLastResponse` is produced by a non-model node)
 - `StateKeyMessages`: Message history (durable, supports append + MessageOp patch operations)
-- `StateKeyNodeResponses`: Per-node responses map. Key is node ID, value is the
-  node's final textual response. Use `StateKeyLastResponse` for the final
-  serial output; when multiple parallel nodes converge, read each node's
-  output from `StateKeyNodeResponses`.
+- `StateKeyNodeResponses`: Per-node outputs map. Key is node ID, value is the
+  node's final output. For LLM and Agent nodes this is the final textual
+  response; for Tools nodes this is a JSON array string of tool outputs (each
+  item contains `tool_id`, `tool_name`, and `output`).
 - `StateKeyMetadata`: Metadata (general metadata storage available to users)
 
 **System Internal Keys** (users should not use directly):
@@ -205,8 +209,13 @@ Nodes communicate exclusively through the shared state. Each node returns a stat
 
   - `user_input`: One‑shot input for the next LLM/Agent node. Cleared after consumption.
   - `one_shot_messages`: Full message override for the next LLM call. Cleared after consumption.
+  - `one_shot_messages_by_node`: Targeted one‑shot override for a specific
+    node ID (map[nodeID][]Message). Cleared per entry after consumption.
   - `messages`: Durable conversation history (LLM/Tools append here). Supports MessageOp patches.
   - `last_response`: The last textual assistant response.
+  - `last_response_id`: The identifier (ID) of the last model response that
+    produced `last_response` (may be empty when `last_response` is set by a
+    non-model node).
   - `node_responses`: Map[nodeID]any — per‑node final textual response. Use `last_response` for the most recent.
 
 - Function node
@@ -216,10 +225,12 @@ Nodes communicate exclusively through the shared state. Each node returns a stat
 
 - LLM node
 
-  - Input priority: `one_shot_messages` → `user_input` → `messages`
+  - Input priority: `one_shot_messages_by_node[<node_id>]` →
+    `one_shot_messages` → `user_input` → `messages`
   - Output:
     - Appends assistant message to `messages`
     - Sets `last_response`
+    - Sets `last_response_id`
     - Sets `node_responses[<llm_node_id>]`
 
 - Tools node
@@ -238,13 +249,93 @@ Nodes communicate exclusively through the shared state. Each node returns a stat
 Recommended patterns
 
 - Add your own keys in the schema (e.g., `parsed_time`, `final_payload`) and write/read them in function nodes.
-- To feed structured hints into an LLM node, write `one_shot_messages` in the previous node (e.g., prepend a system message with parsed context).
+- To feed structured hints into an LLM node, write `one_shot_messages` in the
+  previous node (e.g., prepend a system message with parsed context).
+- Parallel branches: avoid writing `one_shot_messages` from multiple branches.
+  Prefer `one_shot_messages_by_node` so each LLM node consumes only its own
+  one‑shot input.
 - To consume an upstream node's text, read `last_response` immediately downstream or fetch from `node_responses[that_node_id]` later.
+
+One-shot messages scoped by node ID:
+
+```go
+import (
+    "context"
+
+    "trpc.group/trpc-go/trpc-agent-go/graph"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+)
+
+const (
+    llm1NodeID = "llm1"
+    llm2NodeID = "llm2"
+)
+
+func prepForLLM1(ctx context.Context, state graph.State) (any, error) {
+    msgs := []model.Message{
+        model.NewUserMessage("question for llm1"),
+    }
+    return graph.SetOneShotMessagesForNode(llm1NodeID, msgs), nil
+}
+
+func prepForLLM2(ctx context.Context, state graph.State) (any, error) {
+    msgs := []model.Message{
+        model.NewUserMessage("question for llm2"),
+    }
+    return graph.SetOneShotMessagesForNode(llm2NodeID, msgs), nil
+}
+```
+
+Preparing one-shot inputs for multiple nodes in a single upstream node:
+
+In Go, a `map` assignment overwrites by key. Since
+`SetOneShotMessagesForNode(...)` writes the same top-level key
+(`one_shot_messages_by_node`) every time, you should avoid calling it multiple
+times and then “merging” the returned `graph.State` values with plain
+`result[k] = v` assignments (the last write wins).
+
+Instead, build one `map[nodeID][]model.Message` and write it once:
+
+```go
+func preprocess(ctx context.Context, state graph.State) (any, error) {
+    byNode := map[string][]model.Message{
+        llm1NodeID: {
+            model.NewSystemMessage("You are llm1."),
+            model.NewUserMessage("question for llm1"),
+        },
+        llm2NodeID: {
+            model.NewSystemMessage("You are llm2."),
+            model.NewUserMessage("question for llm2"),
+        },
+    }
+    return graph.SetOneShotMessagesByNode(byNode), nil
+}
+```
+
+Alternative (no helpers): write a raw state delta map (handy if you also need
+to update other keys in the same node):
+
+```go
+func preprocess(ctx context.Context, state graph.State) (any, error) {
+    // byNode := ...
+    return graph.State{
+        graph.StateKeyOneShotMessagesByNode: byNode,
+    }, nil
+}
+```
+
+Notes:
+
+- `llm1NodeID` / `llm2NodeID` must match the IDs you pass to `AddLLMNode`.
+- Each LLM node consumes `one_shot_messages_by_node[its_id]` once, and clears
+  only its own entry.
 
 See examples:
 
 - `examples/graph/io_conventions` — Function + LLM + Agent I/O
 - `examples/graph/io_conventions_tools` — Adds a Tools node path and shows how to capture tool JSON
+- `examples/graph/oneshot_by_node` — One-shot inputs scoped by LLM node ID
+- `examples/graph/oneshot_by_node_preprocess` — One upstream node prepares one-shot inputs for multiple LLM nodes
 - `examples/graph/retry` — Node-level retry/backoff demonstration
 
 #### Constant references (import and keys)
@@ -256,9 +347,19 @@ See examples:
 
   - `user_input` → `graph.StateKeyUserInput`
   - `one_shot_messages` → `graph.StateKeyOneShotMessages`
+  - `one_shot_messages_by_node` → `graph.StateKeyOneShotMessagesByNode`
   - `messages` → `graph.StateKeyMessages`
   - `last_response` → `graph.StateKeyLastResponse`
+  - `last_response_id` → `graph.StateKeyLastResponseID`
   - `node_responses` → `graph.StateKeyNodeResponses`
+
+- One-shot helpers
+
+  - `SetOneShotMessagesForNode(nodeID, msgs)` → per-node one-shot update
+  - `SetOneShotMessagesByNode(byNode)` → multi-node one-shot update
+  - `ClearOneShotMessagesForNode(nodeID)` → clear one node entry
+  - `ClearOneShotMessagesByNode()` → clear the entire map
+  - `GetOneShotMessagesForNode(state, nodeID)` → read one node entry
 
 - Other useful keys
   - `session` → `graph.StateKeySession`
@@ -301,6 +402,133 @@ if b, ok := event.StateDelta[graph.MetadataKeyModel]; ok {
     _ = json.Unmarshal(b, &md)
 }
 ```
+
+#### Node Event Emitter (EventEmitter)
+
+During NodeFunc execution, nodes can proactively emit custom events to the outside through `EventEmitter`, for real-time delivery of progress, intermediate results, or custom business data.
+
+**Getting EventEmitter**
+
+```go
+func myNode(ctx context.Context, state graph.State) (any, error) {
+    // Get EventEmitter from State
+    emitter := graph.GetEventEmitterWithContext(ctx, state)
+    // Or use a custom context
+    // emitter := graph.GetEventEmitter(state)
+    
+    // Use emitter to emit events...
+    return state, nil
+}
+```
+
+**EventEmitter Interface**
+
+```go
+type EventEmitter interface {
+    // Emit sends any event
+    Emit(evt *event.Event) error
+    // EmitCustom emits a custom event
+    EmitCustom(eventType string, payload any) error
+    // EmitProgress emits a progress event (progress: 0-100)
+    EmitProgress(progress float64, message string) error
+    // EmitText emits a streaming text event
+    EmitText(text string) error
+    // Context returns the associated context
+    Context() context.Context
+}
+```
+
+**Usage Examples**
+
+```go
+func dataProcessNode(ctx context.Context, state graph.State) (any, error) {
+    emitter := graph.GetEventEmitter(state)
+    
+    // 1. Emit custom event
+    emitter.EmitCustom("data.loaded", map[string]any{
+        "recordCount": 1000,
+        "source":      "database",
+    })
+    
+    // 2. Emit progress events
+    total := 100
+    for i := 0; i < total; i++ {
+        processItem(i)
+        progress := float64(i+1) / float64(total) * 100
+        emitter.EmitProgress(progress, fmt.Sprintf("Processing %d/%d", i+1, total))
+    }
+    
+    // 3. Emit streaming text
+    emitter.EmitText("Processing complete.\n")
+    emitter.EmitText("Results: 100 items processed successfully.")
+    
+    return state, nil
+}
+```
+
+**Event Flow Diagram**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant NF as NodeFunc
+    participant EE as EventEmitter
+    participant EC as EventChan
+    participant EX as Executor
+    participant TR as AGUI Translator
+    participant FE as Frontend Client
+
+    Note over NF,FE: Event Emission Phase
+    NF->>EE: GetEventEmitter(state)
+    EE-->>NF: Return EventEmitter instance
+    
+    alt Emit Custom Event
+        NF->>EE: EmitCustom(eventType, payload)
+    else Emit Progress Event
+        NF->>EE: EmitProgress(progress, message)
+    else Emit Text Event
+        NF->>EE: EmitText(text)
+    end
+    
+    Note over EE: Build NodeCustomEventMetadata
+    EE->>EE: Inject NodeID, InvocationID, Timestamp
+    EE->>EC: Send Event to channel
+    
+    Note over EC,FE: Event Consumption Phase
+    EC->>EX: Executor receives event
+    EX->>TR: Pass event to Translator
+    
+    alt Custom Event
+        TR->>TR: Convert to AG-UI CustomEvent
+    else Progress Event
+        TR->>TR: Convert to AG-UI CustomEvent (with progress info)
+    else Text Event (in message context)
+        TR->>TR: Convert to TextMessageContentEvent
+    else Text Event (not in message context)
+        TR->>TR: Convert to AG-UI CustomEvent
+    end
+    
+    TR->>FE: SSE push AG-UI event
+    FE->>FE: Process and update UI
+```
+
+**AGUI Event Conversion**
+
+When using AGUI Server, events emitted by nodes are automatically converted to AG-UI protocol events:
+
+| Node Event Type | AG-UI Event Type | Description |
+|-----------------|------------------|-------------|
+| Custom | CustomEvent | Custom event, payload in `value` field |
+| Progress | CustomEvent | Progress event with `progress` and `message` |
+| Text (in message context) | TextMessageContentEvent | Streaming text appended to current message |
+| Text (not in message context) | CustomEvent | Contains `nodeId` and `content` fields |
+
+**Notes**
+
+- **Thread Safety**: EventEmitter is thread-safe and can be used in concurrent environments
+- **Graceful Degradation**: If State has no valid ExecutionContext or EventChan, `GetEventEmitter` returns a no-op emitter that silently succeeds for all operations
+- **Error Handling**: Event emission failures do not interrupt node execution; it's recommended to only log warnings
+- **Custom Event Metadata**: `_node_custom_metadata` → `graph.MetadataKeyNodeCustom` (struct `graph.NodeCustomEventMetadata`)
 
 ### 1. Creating GraphAgent and Runner
 
@@ -445,7 +673,11 @@ func processNodeFunc(ctx context.Context, state graph.State) (any, error) {
 
 LLM nodes implement a fixed three-stage input rule without extra configuration:
 
-1. OneShot first: If `one_shot_messages` exists, use it as the input for this round.
+1. OneShot first:
+   - If `one_shot_messages_by_node[<node_id>]` exists, use it as the input for
+     this round.
+   - Otherwise, if `one_shot_messages` exists, use it as the input for this
+     round.
 2. UserInput next: Otherwise, if `user_input` exists, persist once to history.
 3. History default: Otherwise, use durable `messages` as input.
 
@@ -466,9 +698,45 @@ Please provide structured analysis results.`,
 Important notes:
 
 - System prompt is only used for this round and is not persisted to state.
-- One-shot keys (`user_input` / `one_shot_messages`) are automatically cleared after successful execution.
+- One-shot keys (`user_input` / `one_shot_messages` / `one_shot_messages_by_node`)
+  are automatically cleared after successful execution.
+- Parallel branches: if multiple branches need different one-shot inputs for
+  different LLM nodes in the same step, write `one_shot_messages_by_node`
+  instead of `one_shot_messages`. If one upstream node prepares inputs for
+  multiple LLM nodes, prefer `graph.SetOneShotMessagesByNode(...)` to write all
+  entries at once.
 - All state updates are atomic.
 - GraphAgent/Runner only sets `user_input` and no longer pre-populates `messages` with a user message. This allows any pre-LLM node to modify `user_input` and have it take effect in the same round.
+- When Graph runs sub-agents, it preserves the parent run's `RequestID`
+  (request identifier) so the current user input is included exactly once,
+  even when it already exists in session history.
+
+#### Event emission (streaming vs final)
+
+When the Large Language Model (LLM) is called with streaming enabled, a single
+model call can produce multiple events:
+
+- Streaming chunks: incremental text in `choice.Delta.Content`
+- A final message: full text in `choice.Message.Content`
+
+In graph workflows there are also two different "done" concepts:
+
+- Model done: a single model call finishes (typically `Response.Done=true`)
+- Workflow done: the whole graph run ends (use `event.IsRunnerCompletion()`)
+
+By default, graph LLM nodes only emit the streaming chunks. They do not emit
+the final `Done=true` assistant message event. This keeps intermediate node
+outputs from being treated as normal assistant replies (for example, being
+persisted into the Session by Runner).
+
+If you want graph LLM nodes to also emit the final `Done=true` assistant
+message events, enable `agent.WithGraphEmitFinalModelResponses(true)` when
+running via Runner. See `runner.md` for details and examples.
+
+Tip: if you are using Runner and you mainly care about streaming Large Language
+Model (LLM) messages, you can enable `agent.WithStreamMode(...)` (see
+"Event Monitoring"). When `agent.StreamModeMessages` is selected, graph LLM
+nodes enable final model responses automatically for that run.
 
 #### Three input paradigms
 
@@ -476,6 +744,11 @@ Important notes:
 
   - When present, only the provided `[]model.Message` is used for this round, typically including a full system prompt and user prompt. Automatically cleared afterwards.
   - Use case: a dedicated pre-node constructs the full prompt and must fully override input.
+  - Parallel branches: when multiple branches prepare one-shot inputs for
+    different LLM nodes, prefer `StateKeyOneShotMessagesByNode` to avoid
+    clobbering a shared global key.
+  - If a single node prepares one-shot inputs for multiple LLM nodes, use
+    `graph.SetOneShotMessagesByNode(...)` to write them in one return value.
 
 - UserInput (`StateKeyUserInput`):
 
@@ -508,6 +781,45 @@ stateGraph.
     SetFinishPoint("ask")
 ```
 
+#### Using RemoveAllMessages to Clear Message History
+
+When chaining multiple LLM nodes, `MessageReducer` accumulates messages. If each
+LLM node requires an isolated message context (without inheriting the previous
+node's conversation history), use `RemoveAllMessages` to clear previous messages:
+
+```go
+// In the prompt preparation node, clear messages before setting new UserInput.
+func preparePromptNode(ctx context.Context, state graph.State) (any, error) {
+    userMessage := buildUserMessage(...)
+    return graph.State{
+        // Key: Clear previous messages first to avoid accumulation.
+        graph.StateKeyMessages:  graph.RemoveAllMessages{},
+        graph.StateKeyUserInput: userMessage,
+    }, nil
+}
+```
+
+**Use cases**:
+
+- Multiple independent LLM nodes within the same Graph, where each node doesn't
+  need the previous node's conversation history
+- Loop structures where each iteration requires a fresh message context
+- Scenarios requiring complete message list reconstruction
+
+**Notes**:
+
+- `RemoveAllMessages{}` is a special `MessageOp` that `MessageReducer` recognizes
+  and uses to clear the message list
+- Must set `RemoveAllMessages{}` **before** setting `StateKeyUserInput`
+- `WithSubgraphIsolatedMessages(true)` only works for `AddSubgraphNode` (agent
+  nodes), not for `AddLLMNode`; use `RemoveAllMessages` to isolate messages
+  between LLM nodes
+- For agent nodes, `WithSubgraphIsolatedMessages(true)` disables seeding
+  session history into the sub‑agent’s request. This also hides tool call
+  results, so it breaks multi‑turn tool calling. Use it only for single‑turn
+  sub‑agents; otherwise, isolate via sub‑agent message filtering (see “Agent
+  nodes: isolation vs multi‑turn tool calls”).
+
 ### 3. GraphAgent Configuration Options
 
 GraphAgent supports various configuration options:
@@ -524,6 +836,8 @@ graphAgent, err := graphagent.New(
     graphagent.WithChannelBufferSize(1024),            // Tune event buffer size
     graphagent.WithCheckpointSaver(memorySaver),       // Persist checkpoints if needed
     graphagent.WithSubAgents([]agent.Agent{subAgent}), // Register sub-agents by name
+    graphagent.WithAddSessionSummary(true),            // Inject session summary as system message
+    graphagent.WithMaxHistoryRuns(5),                  // Truncate history when summaries are off
     // Set the filter mode for messages passed to the model. The final messages passed to the model must satisfy both WithMessageTimelineFilterMode and WithMessageBranchFilterMode conditions.
     // Timeline dimension filter conditions
     // Default: graphagent.TimelineFilterAll
@@ -540,6 +854,14 @@ graphAgent, err := graphagent.New(
     //  - graphagent.BranchFilterModePrefix: Filters messages by prefix matching Event.FilterKey with Invocation.eventFilterKey. Use this when you want to pass messages generated by the current agent and related upstream/downstream agents to the model.
     //  - graphagent.BranchFilterModeExact: Filters messages where Event.FilterKey == Invocation.eventFilterKey. Use this when the current agent interacts with the model and only needs to use messages generated by the current agent.
     graphagent.WithMessageBranchFilterMode(graphagent.BranchFilterModeAll),
+    // Reasoning content mode (for DeepSeek thinking mode)
+    // Default: graphagent.ReasoningContentModeDiscardPreviousTurns
+    // Options:
+    //  - graphagent.ReasoningContentModeDiscardPreviousTurns: Discard reasoning_content
+    //    from previous request turns (default, recommended).
+    //  - graphagent.ReasoningContentModeKeepAll: Keep all reasoning_content in history.
+    //  - graphagent.ReasoningContentModeDiscardAll: Discard all reasoning_content.
+    graphagent.WithReasoningContentMode(graphagent.ReasoningContentModeDiscardPreviousTurns),
     graphagent.WithAgentCallbacks(&agent.Callbacks{
         // Agent-level callbacks.
     }),
@@ -548,6 +870,86 @@ graphAgent, err := graphagent.New(
 
 > Model/tool callbacks are configured per node, e.g. `AddLLMNode(..., graph.WithModelCallbacks(...))`
 > or `AddToolsNode(..., graph.WithToolCallbacks(...))`.
+
+Session summary notes:
+
+- `WithAddSessionSummary(true)` takes effect only when `Session.Summaries` contains a summary for the invocation’s filter key. Summaries are typically produced by SessionService + SessionSummarizer, and Runner will auto‑enqueue summarization after persisting events.
+- GraphAgent reads summaries only; it does not generate them. If you bypass Runner, call `sessionService.CreateSessionSummary` or `EnqueueSummaryJob` after appending events.
+- Summary injection works only when `TimelineFilterMode` is `TimelineFilterAll`.
+
+#### Summary Format Customization
+
+By default, session summaries are formatted with context tags and a note about preferring current conversation information. You can customize the summary format using `WithSummaryFormatter` to better match your specific use cases or model requirements.
+
+**Default Format:**
+
+```
+Here is a brief summary of your previous interactions:
+
+<summary_of_previous_interactions>
+[summary content]
+</summary_of_previous_interactions>
+
+Note: this information is from previous interactions and may be outdated. You should ALWAYS prefer information from this conversation over the past summary.
+```
+
+**Custom Format Example:**
+
+```go
+// Custom formatter with simplified format
+ga := graphagent.New(
+    "my-graph",
+    graphagent.WithInitialState(initialState),
+    graphagent.WithAddSessionSummary(true),
+    graphagent.WithSummaryFormatter(func(summary string) string {
+        return fmt.Sprintf("## Previous Context\n\n%s", summary)
+    }),
+)
+```
+
+**Use Cases:**
+
+- **Simplified Format**: Reduce token usage by using concise headings and minimal context notes
+- **Language Localization**: Translate context notes to target language (e.g., Chinese, Japanese)
+- **Role-Specific Formatting**: Different formats for different agent roles
+- **Model Optimization**: Tailor format for specific model preferences
+
+**Important Notes:**
+
+- The formatter function receives raw summary text from the session and returns the formatted string
+- Custom formatters should ensure that the summary is clearly distinguishable from other messages
+- The default format is designed to be compatible with most models and use cases
+- When `WithAddSessionSummary(false)` is used, the formatter is never invoked
+
+#### Concurrency considerations
+
+When using Graph + GraphAgent in a concurrent environment (for example, serving many requests from a single long‑lived process), keep the following in mind:
+
+- CheckpointSaver and Cache implementations must be concurrency‑safe  
+  The `CheckpointSaver` and `Cache` interfaces are intentionally storage‑agnostic. A single `Executor`/`GraphAgent` instance may call their methods from multiple goroutines when several invocations run in parallel. If you provide your own implementations, ensure:
+  - All exported methods (`Get`/`GetTuple`/`List`/`Put`/`PutWrites`/`PutFull`/`DeleteLineage` for `CheckpointSaver`, and `Get`/`Set`/`Clear` for `Cache`) are safe for concurrent use.
+  - Internal maps, connection pools, or in‑memory buffers are properly synchronized.
+
+- NodeFunc, tools, and callbacks should treat state as per‑invocation, not global  
+  Each node receives an isolated copy of graph state for the current task. This copy is safe to mutate inside the node, but it is not safe to:
+  - Store references to that state (or its internal maps/slices) in global variables and modify them from other goroutines later.
+  - Access `StateKeyExecContext` (`*graph.ExecutionContext`) and bypass its internal locks when reading/writing `execCtx.State` or `execCtx.pendingTasks`.
+  If you need shared mutable state across nodes or invocations, protect it with your own synchronization (for example, `sync.Mutex` or `sync.RWMutex`) or use external services (such as databases or caches).
+
+- Do not share a single *agent.Invocation across goroutines  
+  The framework expects each `Run` call (GraphAgent, Runner, or other Agent types) to operate on its own `*agent.Invocation`. Reusing the same `*agent.Invocation` instance in multiple goroutines and calling `Run` concurrently can cause data races on fields like `Branch`, `RunOptions`, or callback state. Prefer:
+  - Creating a fresh `*agent.Invocation` per request, or
+  - Cloning from a parent invocation using `invocation.Clone(...)` when you need linkage.
+
+- Parallel tools require tool implementations to be safe for concurrent use  
+  Tools in a `Tools` node can be executed in parallel when `WithEnableParallelTools(true)` is used on that node:
+  - The framework guarantees that the `tools` map is only read during execution.
+  - It also guarantees that the shared graph state passed to tools is only read; updates are written back by nodes, not by tools.
+  However, each `tool.Tool` implementation and its `tool.Callbacks` may be invoked from multiple goroutines at the same time. Make sure:
+  - Tool implementations do not mutate shared global state without proper locking.
+  - Any internal caches, HTTP clients, or client pools inside tools are safe for concurrent use.
+
+These constraints are especially important in long‑running services where a single `Graph`/`Executor`/`GraphAgent` instance is reused for many invocations.
 
 Once sub-agents are registered you can delegate within the graph via agent nodes:
 
@@ -563,6 +965,56 @@ stateGraph.AddAgentNode("assistant",
 
 > The agent node uses its ID for the lookup, so keep `AddAgentNode("assistant")`
 > aligned with `subAgent.Info().Name == "assistant"`.
+
+#### Agent nodes: isolation vs multi‑turn tool calls
+
+Tool calling is usually multi‑turn within a single run: the model returns a
+tool call, the framework executes the tool, then the next model request must
+include the tool result (a `role=tool` message) so the model can continue.
+
+`WithSubgraphIsolatedMessages(true)` is a **strong isolation switch**: it
+prevents the sub‑agent from reading any session history when building the next
+model request (internally it sets `include_contents="none"` for the sub‑agent).
+This makes the sub‑agent “black‑box” (it only sees the current `user_input`),
+but it also means the sub‑agent will not see tool results, so it cannot do
+multi‑turn tool calling.
+
+If a sub‑agent needs tools **and** needs to continue after tools return:
+
+- Do **not** enable `WithSubgraphIsolatedMessages(true)` on that agent node.
+- Instead, keep session seeding enabled and isolate the sub‑agent by filtering
+  its message history to only its own invocation. For `LLMAgent`, use:
+  `llmagent.WithMessageFilterMode(llmagent.IsolatedInvocation)`.
+
+Symptoms of the misconfiguration:
+
+- The second model request looks the same as the first one (tool results never
+  appear in the prompt).
+- The agent repeats the first tool call or loops because it never “sees” the
+  tool output.
+
+#### Agent nodes: checkpoints and nested interrupts
+
+If a sub-agent is a GraphAgent (a graph-based agent) and checkpointing is
+enabled (via a `CheckpointSaver`), the child graph also needs its own checkpoint
+namespace. Otherwise, the child graph can accidentally resume from a checkpoint
+that belongs to the parent graph.
+
+Default behavior for agent nodes that invoke a GraphAgent:
+
+- The child GraphAgent runs under the child checkpoint namespace (the sub-agent
+  name), even though the runtime state is cloned from the parent.
+- The parent checkpoint identifier (ID) is not forwarded to the child unless
+  you explicitly set it via a subgraph input mapper.
+
+Nested Human-in-the-Loop (HITL) interrupt/resume:
+
+- If the child GraphAgent calls `graph.Interrupt`, the parent graph also
+  interrupts and checkpoints.
+- Resume from the parent checkpoint as usual; the agent node resumes the child
+  checkpoint automatically.
+
+Runnable example: `examples/graph/nested_interrupt`.
 
 ### 4. Conditional Routing
 
@@ -713,13 +1165,15 @@ Tool-call pairing and second entry into LLM:
 
 LLM nodes support placeholder injection in their `instruction` string (same rules as LLMAgent). Both native `{key}` and Mustache `{{key}}` syntaxes are accepted (Mustache is normalized to the native form automatically):
 
-- `{key}` / `{{key}}` → replaced by `session.State["key"]`
+- `{key}` / `{{key}}` → Replaced with the string value corresponding to the key `key` in the session state (write via `sess.SetState("key", ...)` or SessionService).
 - `{key?}` / `{{key?}}` → optional; missing values become empty
 - `{user:subkey}`, `{app:subkey}`, `{temp:subkey}` (and their Mustache forms) → access user/app/temp scopes (session services merge app/user state into session with these prefixes)
+- `{invocation:subkey}` / `{{invocation:subkey}}` → replaced with `invocation.state["subkey"]` (set via `invocation.SetState("subkey", v)`)
 
 Notes:
 
 - GraphAgent writes the current `*session.Session` into graph state under `StateKeySession`; the LLM node reads values from there
+- `{invocation:*}` values are read from the current `*agent.Invocation` for this run
 - Unprefixed keys (e.g., `research_topics`) must be present directly in `session.State`
 
 Example:
@@ -738,7 +1192,8 @@ See the runnable example: `examples/graph/placeholder`.
 
 Injecting retrieval output and user input
 
-- Upstream nodes can place ephemeral values into the session's `temp:` namespace so the LLM instruction can read them with placeholders.
+- Upstream nodes can place temporary values into the session's `temp:`
+  namespace so the LLM instruction can read them with placeholders.
 - Pattern:
 
 ```go
@@ -749,9 +1204,8 @@ sg.AddNode("retrieve", func(ctx context.Context, s graph.State) (any, error) {
     var input string
     if v, ok := s[graph.StateKeyUserInput].(string); ok { input = v }
     if sess, _ := s[graph.StateKeySession].(*session.Session); sess != nil {
-        if sess.State == nil { sess.State = make(session.StateMap) }
-        sess.State[session.StateTempPrefix+"retrieved_context"] = []byte(retrieved)
-        sess.State[session.StateTempPrefix+"user_input"] = []byte(input)
+        sess.SetState(session.StateTempPrefix+"retrieved_context", []byte(retrieved))
+        sess.SetState(session.StateTempPrefix+"user_input", []byte(input))
     }
     return graph.State{}, nil
 })
@@ -766,8 +1220,11 @@ Example: `examples/graph/retrieval_placeholder`.
 
 Best practices for placeholders and session state
 
-- Ephemeral vs persistent: write per‑turn values to `temp:*` on `session.State` (session state). Persistent configuration should go through `SessionService` with `user:*`/`app:*`.
-- Why direct write is OK: LLM nodes expand placeholders from the session object present in graph state; see [graph/state_graph.go](https://github.com/trpc-group/trpc-agent-go/blob/main/graph/state_graph.go). GraphAgent puts the session into state; see [agent/graphagent/graph_agent.go](https://github.com/trpc-group/trpc-agent-go/blob/main/agent/graphagent/graph_agent.go).
+- Session-scoped vs persistent: write temporary values used to build
+  prompts to `temp:*` on session state (often overwritten each turn via
+  `sess.SetState`). Persistent configuration should go through
+  `SessionService` with `user:*`/`app:*`.
+- Why `SetState` is recommended: LLM nodes expand placeholders from the session object present in graph state; using `sess.SetState` avoids unsafe concurrent map access.
 - Service guardrails: the in‑memory service intentionally disallows writing `temp:*` (and `app:*` via user updater); see [session/inmemory/service.go](https://github.com/trpc-group/trpc-agent-go/blob/main/session/inmemory/service.go).
 - Concurrency: when multiple branches run in parallel, avoid multiple nodes mutating the same `session.State` keys. Prefer composing in a single node before the LLM, or store intermediate values in graph state then write once to `temp:*`.
 - Observability: if you want parts of the prompt to appear in completion events, also store a compact summary in graph state (e.g., under `metadata`). The final event serializes non‑internal final state; see [graph/events.go](https://github.com/trpc-group/trpc-agent-go/blob/main/graph/events.go).
@@ -1157,6 +1614,7 @@ schema := graph.MessagesStateSchema()
 
 // Additional one-shot/system keys (use as needed):
 // - graph.StateKeyOneShotMessages ("one_shot_messages")  One-shot override of this turn's input ([]model.Message)
+// - graph.StateKeyOneShotMessagesByNode ("one_shot_messages_by_node")  One-shot override scoped by node ID (map[string][]model.Message)
 // - graph.StateKeySession         ("session")            Session object (internal)
 // - graph.StateKeyExecContext     ("exec_context")       Execution context (events etc., internal)
 ```
@@ -1240,7 +1698,11 @@ const (
 model := openai.New(llmModelName)
 sg.AddLLMNode(llmNodeAssistant, model, llmSystemPrompt, tools)
 
-// Inputs (priority): graph.StateKeyOneShotMessages > graph.StateKeyUserInput > graph.StateKeyMessages
+// Inputs (priority):
+// graph.StateKeyOneShotMessagesByNode[<node_id>] >
+// graph.StateKeyOneShotMessages >
+// graph.StateKeyUserInput >
+// graph.StateKeyMessages
 // Outputs: graph.StateKeyLastResponse, graph.StateKeyMessages (atomic), graph.StateKeyNodeResponses (includes this node's output for aggregation)
 ```
 
@@ -1553,9 +2015,17 @@ sg.AddToolsNode(nodeTools, tools)
 // For parallelism, use multiple nodes + parallel edges
 // Pairing rule: walk the messages from the tail to the most recent assistant(tool_calls)
 // message; stop at a new user to ensure pairing with the current tool call round.
+// Output: appends tool messages to graph.StateKeyMessages, sets
+// graph.StateKeyLastToolResponse, and sets
+// graph.StateKeyNodeResponses[nodeTools] to a JSON array string.
 ```
 
 #### Reading Tool Results into State
+
+Tools nodes already expose their outputs via:
+
+- `graph.StateKeyLastToolResponse`: JSON string of the last tool output in this node run
+- `graph.StateKeyNodeResponses[<tools_node_id>]`: JSON array string of all tool outputs from this node run
 
 After a tools node, add a function node to collect tool outputs from `graph.StateKeyMessages` and write a structured result into state:
 
@@ -1680,6 +2150,36 @@ sg.AddEdge(nodeSplit, nodeBranch1)
 sg.AddEdge(nodeSplit, nodeBranch2)  // branch1 and branch2 execute in parallel
 ```
 
+#### Join edges (wait-all fan-in)
+
+When multiple upstream branches run in parallel, a normal `AddEdge(from, to)`
+triggers `to` whenever **any** upstream node updates its edge channel. That can
+make `to` execute multiple times.
+
+If you need classic “wait for all branches, then run once” fan-in semantics,
+use `AddJoinEdge`:
+
+```go
+const (
+    nodeSplit = "split"
+    nodeA     = "branch_a"
+    nodeB     = "branch_b"
+    nodeJoin  = "join"
+)
+
+sg.AddEdge(nodeSplit, nodeA)
+sg.AddEdge(nodeSplit, nodeB)
+
+// Wait for both A and B to complete before running join.
+sg.AddJoinEdge([]string{nodeA, nodeB}, nodeJoin)
+```
+
+`AddJoinEdge` creates an internal barrier channel and triggers `nodeJoin` only
+after every `from` node has reported completion. The barrier resets after it
+triggers, so the same join can be reached again in loops.
+
+Reference example: `examples/graph/join_edge`.
+
 Tip: setting entry and finish points implicitly connects to virtual Start/End nodes:
 
 - `SetEntryPoint("first")` is equivalent to Start → first.
@@ -1687,6 +2187,187 @@ Tip: setting entry and finish points implicitly connects to virtual Start/End no
   There's no need to add these two edges explicitly.
 
 Constants: `graph.Start == "__start__"`, `graph.End == "__end__"`.
+
+### Message Visibility Options
+The Agent can dynamically manage the visibility of messages generated by other Agents and historical session messages based on different scenarios. This is configurable through relevant options.
+When interacting with the model, only the visible content is passed as input.
+
+TIPS:
+- Messages from different sessionIDs are never visible to each other under any circumstances. The following control strategies only apply to messages sharing the same sessionID.
+- Invocation.Message always visible regardless of the configuration.
+- The related configuration only controls the initial value of State[graph.StateKeyMessages].
+- The messages generated by the Agent node have a filterKey corresponding to the subAgent name. As a result, when using IsolatedRequestor IsolatedInvocationfor filtering, these messages are not visible to the current graphAgent.
+- When the option is not configured, the default value is FullContext.
+
+Config:
+- `llmagent.WithMessageFilterMode(MessageFilterMode)`:
+  - `FullContext`: Includes historical messages and messages generated in the current request, filtered by prefix matching with the filterKey.
+  - `RequestContext`: Only includes messages generated in the current request, filtered by prefix matching with the filterKey.
+  - `IsolatedRequest`: Only includes messages generated in the current request, filtered by exact matching with the filterKey.
+  - `IsolatedInvocation`: Only includes messages generated in the current Invocation context, filtered by exact matching with the filterKey.
+
+Recommended Usage Examples (These examples are simplified configurations based on advanced usage):
+
+Example 1: Message Visibility Control for graphAgent
+```go
+subgraphAgentA := graphagent.New(
+    "subgraphA", subgraph,
+    // All messages generated by parentAgent, subgraphAgentA, and subgraphAgentB (including messages from task1 and task2) are visible (includes historical messages from the same sessionID)
+    graphagent.WithMessageFilterMode(graphagent.FullContext),
+    // All messages generated during the current runner.Run by parentAgent, subgraphAgentA, and subgraphAgentB (including messages from task1 and task2) are visible (excludes historical messages from previous sessions)
+    graphagent.WithMessageFilterMode(graphagent.RequestContext),
+    // Only messages generated by subgraphAgentA during the current runner.Run are visible (excludes its own historical messages)
+    graphagent.WithMessageFilterMode(graphagent.IsolatedRequest),
+    // Only messages generated during the current invocation of subgraphAgentA are visible (in this example, subgraphAgentA executes only once, making it equivalent to graphagent.IsolatedRequest)
+    graphagent.WithMessageFilterMode(graphagent.IsolatedInvocation),
+)
+
+subgraphAgentB := graphagent.New(
+    "subgraphB", subgraph,
+    // All messages generated by parentAgent, subgraphAgentA, and subgraphAgentB (including messages from task1 and task2) are visible (includes historical messages from the same sessionID)
+    graphagent.WithMessageFilterMode(graphagent.FullContext),
+    // All messages generated during the current runner.Run by parentAgent, subgraphAgentA, and subgraphAgentB (including messages from task1 and task2) are visible (excludes historical messages from previous sessions)
+    graphagent.WithMessageFilterMode(graphagent.RequestContext),
+    // Only messages generated by subgraphAgentB (including messages from task1 and task2) during the current runner.Run are visible (excludes its own historical messages)
+    graphagent.WithMessageFilterMode(graphagent.IsolatedRequest),
+    // Only messages generated during the current invocation of subgraphAgentB are visible, excluding historical messages (messages generated during task1 and task2 executions are not visible to each other).
+    graphagent.WithMessageFilterMode(graphagent.IsolatedInvocation),
+)
+
+sg.AddAgentNode("subgraphA")
+sg.AddNode("fanout", func(ctx context.Context, state graph.State) (any, error) {
+    return []*graph.Command{
+        {
+            GoTo: "subgraph",
+            Update: graph.State{
+                "task": "task 1"
+            },
+        },
+        {
+            GoTo: "subgraph",
+            Update: graph.State{
+                "task": "task 2"
+            },
+        },
+    }, nil
+})
+sg.AddAgentNode("subgraphB")
+sg.AddEdge("subgraphA", "fanout")
+sg.SetEntryPoint(subgraphA)
+graph, err := sg.Compile()
+if err != nil {
+    log.Fatalf("Failed to Compile state graph, err: %w", err)
+}
+parentAgent := graphagent.New(
+    "subgraph", graph,
+    // subagent
+    graphagent.WithSubAgents(subgraphAgent)
+)
+```
+
+Example 2: Message Visibility Control for LLM Agent node
+```go
+taskagentA := llmagent.New(
+  "coordinator",
+  llmagent.WithModel(modelInstance),
+  // Makes all messages generated by taskagentA and taskagentB visible (including historical session messages under the same sessionID)
+  llmagent.WithMessageFilterMode(llmagent.FullContext),
+  // Makes all messages generated during the current runner.Run of taskagentA and taskagentB visible (excluding historical session messages)
+  llmagent.WithMessageFilterMode(llmagent.RequestContext),
+  // Only makes messages generated during the current runner.Run of taskagentA visible (excluding its own historical session messages)
+  llmagent.WithMessageFilterMode(llmagent.IsolatedRequest),
+  // Agent execution order: taskagentA-invocation1 -> taskagentB-invocation2 -> taskagentA-invocation3 (current execution phase)
+  // Only makes messages generated during the current taskagentA-invocation3 phase visible (excluding its own historical session messages and messages generated during taskagentA-invocation1)
+  llmagent.WithMessageFilterMode(llmagent.IsolatedInvocation),
+)
+
+taskagentB := llmagent.New(
+  "coordinator",
+  llmagent.WithModel(modelInstance),
+  // Makes all messages generated by taskagentA and taskagentB visible (including historical session messages under the same sessionID)
+  llmagent.WithMessageFilterMode(llmagent.FullContext),
+  // Makes all messages generated during the current runner.Run of taskagentA and taskagentB visible (excluding historical session messages)
+  llmagent.WithMessageFilterMode(llmagent.RequestContext),
+  // Only makes messages generated during the current runner.Run of taskagentB visible (excluding its own historical session messages)
+  llmagent.WithMessageFilterMode(llmagent.IsolatedRequest),
+  // Agent execution order: taskagentA-invocation1 -> taskagentB-invocation2 -> taskagentA-invocation3 -> taskagentB-invocation4 (current execution phase)
+  // Only makes messages generated during the current taskagentB-invocation4 phase visible (excluding its own historical session messages and messages generated during taskagentB-invocation2)
+  llmagent.WithMessageFilterMode(llmagent.IsolatedInvocation),
+)
+
+// Cyclically execute taskagentA and taskagentB
+cycleAgent := cycleagent.New(
+  "coordinator",
+  llmagent.WithModel(modelInstance),
+  llmagent.WithSubAgents([]agent.Agent{taskagentA, taskagentB}),
+  llmagent.WithMessageFilterMode(llmagent.FullContext)
+)
+
+sg.AddAgentNode("taskagentA")
+// Execute multiple tasks in parallel at the same time
+sg.AddNode("fanout", func(ctx context.Context, state graph.State) (any, error) {
+    return []*graph.Command{
+        {
+            GoTo: "taskB",
+            Update: graph.State{
+                "task": "task 1"
+            },
+        },
+        {
+            GoTo: "taskB",
+            Update: graph.State{
+                "task": "task 2"
+            },
+        },
+    }, nil
+})
+// You can set the message filter mode of taskagentB to llmagent.IsolatedInvocation to isolate contextual conversation information between multiple tasks.
+sg.AddNode("taskB", func(ctx context.Context, state graph.State) (any, error){
+    task := state["task-id"]
+    inv, _ := agent.InvocationFromContext(ctx)
+    inv.Message = model.NewUserMessage(task)
+    chan, err := taskagentB.Run(ctx, inv)
+    // do any thing
+})
+```
+
+Advanced Usage Examples:
+You can independently control the visibility of historical messages and messages generated by other Agents for the current agent using WithMessageTimelineFilterModeand WithMessageBranchFilterMode.
+When the current agent interacts with the model, only messages satisfying both conditions are input to the model. (invocation.Messageis always visible in any scenario.)
+- `WithMessageTimelineFilterMode`: Controls visibility from a temporal dimension
+  - `TimelineFilterAll`: Includes historical messages and messages generated in the current request.
+  - `TimelineFilterCurrentRequest`: Only includes messages generated in the current request (one runner.Runcounts as one request).
+  - `TimelineFilterCurrentInvocation`: Only includes messages generated in the current invocation context.
+- `WithMessageBranchFilterMode`: Controls visibility from a branch dimension (used to manage visibility of messages generated by other agents).
+  - `BranchFilterModePrefix`: Uses prefix matching between Event.FilterKeyand Invocation.eventFilterKey.
+  - `BranchFilterModeAll`: Includes messages from all agents.
+  - `BranchFilterModeExact`: Only includes messages generated by the current agent.
+
+```go
+llmAgent := llmagent.New(
+    "demo-agent",                      // Agent name
+    llmagent.WithModel(modelInstance), // Set the model
+    llmagent.WithDescription("A helpful AI assistant for demonstrations"),              // Set description
+    llmagent.WithInstruction("Be helpful, concise, and informative in your responses"), // Set instruction
+    llmagent.WithGenerationConfig(genConfig),                                           // Set generation parameters
+
+    // Set the message filtering mode for input to the model. The final messages passed to the model must satisfy both WithMessageTimelineFilterMode and WithMessageBranchFilterMode conditions.
+    // Temporal dimension filtering condition
+    // Default: llmagent.TimelineFilterAll
+    // Options:
+    //  - llmagent.TimelineFilterAll: Includes historical messages and messages generated in the current request.
+    //  - llmagent.TimelineFilterCurrentRequest: Only includes messages generated in the current request.
+    //  - llmagent.TimelineFilterCurrentInvocation: Only includes messages generated in the current invocation context.
+    llmagent.WithMessageTimelineFilterMode(llmagent.TimelineFilterAll),
+    // Branch dimension filtering condition
+    // Default: llmagent.BranchFilterModePrefix
+    // Options:
+    //  - llmagent.BranchFilterModeAll: Includes messages from all agents. Use this when the current agent needs to sync valid content messages generated by all agents to the model during interaction.
+    //  - llmagent.BranchFilterModePrefix: Filters messages by prefix matching Event.FilterKey with Invocation.eventFilterKey. Use this when you want to pass messages generated by the current agent and related upstream/downstream agents to the model.
+    //  - llmagent.BranchFilterModeExact: Filters messages where Event.FilterKey exactly matches Invocation.eventFilterKey. Use this when the current agent only needs to use messages generated by itself during model interaction.
+    llmagent.WithMessageBranchFilterMode(llmagent.BranchFilterModeAll),
+)
+```
 
 ### Command Mode (Dynamic Routing / Fan‑out)
 
@@ -2093,7 +2774,8 @@ sg.AddAgentNode("orchestrator",
         }
         return nil, nil
     }),
-    // Optional: isolate child sub‑agent from session contents
+    // Optional: isolate child sub‑agent from session contents.
+    // Use only when the sub‑agent is single‑turn (no multi‑turn tool calls).
     graph.WithSubgraphIsolatedMessages(true),
 )
 ```
@@ -2104,7 +2786,9 @@ sg.AddAgentNode("orchestrator",
 // Declarative option that automatically maps last_response → user_input
 sg.AddAgentNode("orchestrator",
     graph.WithSubgraphInputFromLastResponse(),
-    graph.WithSubgraphIsolatedMessages(true), // optional: isolate for true "pass only results"
+    // Optional: isolate for true "pass only results".
+    // Use only when the sub‑agent is single‑turn (no multi‑turn tool calls).
+    graph.WithSubgraphIsolatedMessages(true),
 )
 ```
 
@@ -2195,7 +2879,10 @@ Graph state is a `map[string]any` with runtime validation provided by `StateSche
 
 #### Common State Keys
 
-- User‑visible: `graph.StateKeyUserInput`, `graph.StateKeyOneShotMessages`, `graph.StateKeyMessages`, `graph.StateKeyLastResponse`, `graph.StateKeyNodeResponses`, `graph.StateKeyMetadata`
+- User‑visible: `graph.StateKeyUserInput`, `graph.StateKeyOneShotMessages`,
+  `graph.StateKeyOneShotMessagesByNode`, `graph.StateKeyMessages`,
+  `graph.StateKeyLastResponse`, `graph.StateKeyLastToolResponse`,
+  `graph.StateKeyNodeResponses`, `graph.StateKeyMetadata`
 - Internal: `session`, `exec_context`, `tool_callbacks`, `model_callbacks`, `agent_callbacks`, `current_node_id`, `parent_agent`
 - Command/Resume: `__command__`, `__resume_map__`
 
@@ -2347,12 +3034,17 @@ Nodes communicate only via the shared `State`. Each node returns a state delta t
 
 - LLM nodes
 
-  - Input priority: `graph.StateKeyOneShotMessages` → `graph.StateKeyUserInput` → `graph.StateKeyMessages`
+  - Input priority:
+    `graph.StateKeyOneShotMessagesByNode[<node_id>]` →
+    `graph.StateKeyOneShotMessages` →
+    `graph.StateKeyUserInput` →
+    `graph.StateKeyMessages`
   - Output: append to `graph.StateKeyMessages` atomically, set `graph.StateKeyLastResponse`, set `graph.StateKeyNodeResponses[<llm_node_id>]`
 
 - Tools nodes
 
   - Read the latest assistant message with `tool_calls` for the current round and append tool responses to `graph.StateKeyMessages`
+  - Output: set `graph.StateKeyLastToolResponse`, set `graph.StateKeyNodeResponses[<tools_node_id>]` (JSON array string)
   - Multiple tools execute in the order returned by the LLM
 
 - Agent nodes
@@ -2391,7 +3083,7 @@ Good practice:
 - Execution
   - `graphagent.New(name, compiledGraph, ...opts)` → `runner.NewRunner(app, agent)` → `Run(...)`
 
-See examples under `examples/graph` for end‑to‑end patterns (basic/parallel/multi‑turn/interrupts/tools/placeholder).
+See examples under `examples/graph` for end‑to‑end patterns (basic/parallel/multi‑turn/interrupts, nested interrupts/tools/placeholder).
 
 ## Visualization (DOT/Image)
 
@@ -2463,6 +3155,7 @@ graphAgent, _ := graphagent.New("workflow", g,
 eventCh, err := r.Run(ctx, userID, sessionID,
     model.NewUserMessage("resume"),
     agent.WithRuntimeState(map[string]any{
+        graph.CfgKeyLineageID:    lineageID,
         graph.CfgKeyCheckpointID: "ckpt-123",
     }),
 )
@@ -2479,6 +3172,7 @@ graphAgent, _ := graphagent.New("workflow", g,
 eventCh, err := r.Run(ctx, userID, sessionID,
     model.NewUserMessage("resume"),
     agent.WithRuntimeState(map[string]any{
+        graph.CfgKeyLineageID:    lineageID,
         graph.CfgKeyCheckpointID: "ckpt-123",
     }),
 )
@@ -2561,6 +3255,7 @@ sg.AddNode(nodeReview, func(ctx context.Context, s graph.State) (any, error) {
 eventCh, err := r.Run(ctx, userID, sessionID,
     model.NewUserMessage("resume"),
     agent.WithRuntimeState(map[string]any{
+        graph.CfgKeyLineageID:    lineageID,
         graph.CfgKeyCheckpointID: checkpointID,
         graph.StateKeyResumeMap: map[string]any{
             "review_key": "approved",
@@ -2568,6 +3263,58 @@ eventCh, err := r.Run(ctx, userID, sessionID,
     }),
 )
 ```
+
+#### Nested graphs (child GraphAgent interrupts)
+
+If your parent graph delegates to a child GraphAgent via an agent node
+(`AddAgentNode` / `AddSubgraphNode`), the child graph can interrupt with
+`graph.Interrupt` and the parent graph will also interrupt.
+
+Resume from the parent checkpoint the same way as a non-nested interrupt.
+When the agent node runs again, it will resume the child checkpoint
+automatically.
+
+Runnable example: `examples/graph/nested_interrupt`.
+
+It supports multi-level nesting via the `-depth` flag.
+
+Key idea: `graph.Interrupt(ctx, state, key, prompt)` uses `key` as the routing
+key for `ResumeMap`. When you resume, the map key must match that `key`.
+
+You will see two different identifiers:
+
+- Node Identifier (Node ID): where the current graph paused (in nested graphs,
+  this is often the parent agent node).
+- Task Identifier (Task ID): the interrupt key used for `ResumeMap` routing.
+  For `graph.Interrupt`, Task ID equals the `key` argument.
+
+To resume without hard-coding the key, read the Task ID from the interrupted
+checkpoint and use it as the `ResumeMap` key:
+
+```go
+// cm is a graph.CheckpointManager. If you're using GraphAgent, you can get it
+// from ga.Executor().CheckpointManager().
+latest, err := cm.Latest(ctx, lineageID, namespace)
+if err != nil || latest == nil || latest.Checkpoint == nil {
+    // handle error
+}
+taskID := latest.Checkpoint.InterruptState.TaskID
+
+cmd := graph.NewResumeCommand().
+    AddResumeValue(taskID, "approved")
+
+eventCh, err := r.Run(ctx, userID, sessionID,
+    model.NewUserMessage("resume"),
+    agent.WithRuntimeState(map[string]any{
+        graph.CfgKeyLineageID:    lineageID,
+        graph.CfgKeyCheckpointID: latest.Checkpoint.ID,
+        graph.StateKeyCommand:    cmd,
+    }),
+)
+```
+
+This works the same for multi-level nesting: resume from the parent checkpoint
+and the framework will resume each child checkpoint automatically.
 
 Helpers:
 
@@ -2659,6 +3406,44 @@ for ev := range eventCh {
     }
 }
 ```
+
+#### StreamMode
+
+Runner can filter the event stream before it reaches your application code.
+This is useful when you only want a subset of events (for example, only model
+tokens for user interface streaming).
+
+Use `agent.WithStreamMode(...)`:
+
+```go
+eventCh, err := r.Run(ctx, userID, sessionID, message,
+    agent.WithStreamMode(
+        agent.StreamModeMessages,
+        agent.StreamModeCustom,
+    ),
+)
+```
+
+Supported modes (graph workflows):
+
+- `messages`: model output events (for example, `chat.completion.chunk`)
+- `updates`: `graph.state.update` / `graph.channel.update` / `graph.execution`
+- `checkpoints`: `graph.checkpoint.*`
+- `tasks`: task lifecycle events (`graph.node.*`, `graph.pregel.*`)
+- `debug`: same as `checkpoints` + `tasks`
+- `custom`: node-emitted events (`graph.node.custom`)
+
+Notes:
+
+- When `agent.StreamModeMessages` is selected, graph-based Large Language Model
+  (LLM) nodes enable final model response events automatically for that run.
+  To override it, call `agent.WithGraphEmitFinalModelResponses(false)` after
+  `agent.WithStreamMode(...)`.
+- StreamMode only affects what Runner forwards to your `eventCh`. Runner still
+  processes and persists events internally.
+- For graph workflows, some event types (for example, `graph.checkpoint.*`)
+  are emitted only when their corresponding mode is selected.
+- Runner always emits a final `runner.completion` event.
 
 #### Event Metadata (StateDelta)
 
@@ -2824,7 +3609,7 @@ graphAgent, _ := graphagent.New("workflow", g,
 
 **Q6: Resume did not continue where expected**
 
-- Pass `agent.WithRuntimeState(map[string]any{ graph.CfgKeyCheckpointID: "..." })`.
+- Pass `agent.WithRuntimeState(map[string]any{ graph.CfgKeyLineageID: "...", graph.CfgKeyCheckpointID: "..." })`.
 - Provide `ResumeMap` for HITL continuation when needed. A plain "resume" message is not added to `graph.StateKeyUserInput`.
 
 **Q7: State conflicts in parallel**
@@ -2848,6 +3633,24 @@ graphAgent, _ := graphagent.New("workflow", g,
   sg.AddToolsConditionalEdges("ask", "tools", "fallback")
   ```
 - **Execution timing**: When `AddToolsConditionalEdges` detects `tool_calls` in the LLM response, it routes to `AddToolsNode`, which executes the actual tool calls.
+
+**Q9: Messages are duplicated in req.Messages when chaining multiple LLM nodes**
+
+- **Symptom**: The same user input appears multiple times in `req.Messages`.
+- **Root cause**: When using `MessagesStateSchema()`, `MessageReducer` accumulates messages. Each LLM node execution appends a new user message if `StateKeyUserInput` is not empty. When there are loops (e.g., tool call loops) or multiple LLM nodes chained together, messages keep accumulating.
+- **Solution**: Use `RemoveAllMessages` to clear previous messages before setting a new `StateKeyUserInput`:
+  ```go
+  // In the prepare prompt node
+  func preparePromptNode(ctx context.Context, state graph.State) (any, error) {
+      userMessage := buildUserMessage(...)
+      return graph.State{
+          // Key: Clear previous messages to avoid accumulation
+          graph.StateKeyMessages:  graph.RemoveAllMessages{},
+          graph.StateKeyUserInput: userMessage,
+      }, nil
+  }
+  ```
+- **Note**: `WithSubgraphIsolatedMessages(true)` only works for `AddSubgraphNode`, not for `AddLLMNode`.
 
 ## Real‑World Example
 
@@ -2948,5 +3751,5 @@ This guide introduced the core usage of the `graph` package and GraphAgent: decl
   - I/O conventions: `io_conventions`, `io_conventions_tools`
   - Parallel/fan‑out: `parallel`, `fanout`, `diamond`
   - Placeholders: `placeholder`
-  - Checkpoints/interrupts: `checkpoint`, `interrupt`
+  - Checkpoints/interrupts: `checkpoint`, `interrupt`, `nested_interrupt`
 - Further reading: `graph/state_graph.go`, `graph/executor.go`, `agent/graphagent`

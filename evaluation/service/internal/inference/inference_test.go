@@ -16,7 +16,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"google.golang.org/genai"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/evalset"
 	"trpc.group/trpc-go/trpc-agent-go/event"
@@ -26,12 +25,19 @@ import (
 type fakeRunner struct {
 	events []*event.Event
 	runErr error
+
+	lastInjectedContextMessages []model.Message
 }
 
 func (f *fakeRunner) Run(ctx context.Context, userID string, sessionID string, message model.Message, runOpts ...agent.RunOption) (<-chan *event.Event, error) {
 	if f.runErr != nil {
 		return nil, f.runErr
 	}
+	var opts agent.RunOptions
+	for _, opt := range runOpts {
+		opt(&opts)
+	}
+	f.lastInjectedContextMessages = opts.InjectedContextMessages
 	ch := make(chan *event.Event, len(f.events))
 	for _, evt := range f.events {
 		ch <- evt
@@ -81,11 +87,9 @@ func TestInferenceSuccess(t *testing.T) {
 	input := []*evalset.Invocation{
 		{
 			InvocationID: "input",
-			UserContent: &genai.Content{
-				Role: "user",
-				Parts: []*genai.Part{
-					{Text: "question"},
-				},
+			UserContent: &model.Message{
+				Role:    model.RoleUser,
+				Content: "question",
 			},
 		},
 	}
@@ -93,46 +97,52 @@ func TestInferenceSuccess(t *testing.T) {
 		UserID: "user-1",
 	}
 
-	results, err := Inference(context.Background(), r, input, session, "session-1")
+	systemMsg := model.NewSystemMessage("You are a helpful assistant.")
+	contextMessages := []*model.Message{&systemMsg}
+	results, err := Inference(context.Background(), r, input, session, "session-1", contextMessages)
 	assert.NoError(t, err)
 	assert.Len(t, results, 1)
 	assert.Equal(t, "generated-inv", results[0].InvocationID)
 	assert.Equal(t, input[0].UserContent, results[0].UserContent)
 	assert.NotNil(t, results[0].FinalResponse)
-	assert.Equal(t, "answer", results[0].FinalResponse.Parts[0].Text)
-	assert.Len(t, results[0].IntermediateData.ToolUses, 1)
-	assert.Equal(t, "lookup", results[0].IntermediateData.ToolUses[0].Name)
-	assert.Equal(t, "bar", results[0].IntermediateData.ToolUses[0].Args["foo"])
+	assert.Equal(t, "answer", results[0].FinalResponse.Content)
+	assert.Len(t, results[0].Tools, 1)
+	assert.Equal(t, "lookup", results[0].Tools[0].Name)
+	assert.Equal(t, map[string]any{"foo": "bar"}, results[0].Tools[0].Arguments)
+	assert.Equal(t, []model.Message{*contextMessages[0]}, r.lastInjectedContextMessages)
 }
 
 func TestInferenceValidation(t *testing.T) {
 
-	_, err := Inference(context.Background(), &fakeRunner{}, nil, &evalset.SessionInput{}, "session")
+	_, err := Inference(context.Background(), &fakeRunner{}, nil, &evalset.SessionInput{}, "session", nil)
 	assert.Error(t, err)
 
 	_, err = Inference(context.Background(), &fakeRunner{}, []*evalset.Invocation{
 		{
 			InvocationID: "inv",
-			UserContent: &genai.Content{
-				Role:  "user",
-				Parts: []*genai.Part{{Text: "question"}},
-			},
+			UserContent:  &model.Message{Role: model.RoleUser, Content: "question"},
 		},
-	}, nil, "session")
+	}, nil, "session", nil)
 	assert.Error(t, err)
 
 	input := []*evalset.Invocation{
 		{
 			InvocationID: "input",
-			UserContent: &genai.Content{
-				Role: "user",
-				Parts: []*genai.Part{
-					{Text: "question"},
-				},
-			},
+			UserContent:  &model.Message{Role: model.RoleUser, Content: "question"},
 		},
 	}
-	_, err = Inference(context.Background(), &fakeRunner{runErr: errors.New("boom")}, input, &evalset.SessionInput{UserID: "user"}, "session")
+	_, err = Inference(context.Background(), &fakeRunner{runErr: errors.New("boom")}, input, &evalset.SessionInput{UserID: "user"}, "session", nil)
+	assert.Error(t, err)
+}
+
+func TestInferenceRejectsNilContextMessage(t *testing.T) {
+	input := []*evalset.Invocation{
+		{
+			InvocationID: "input",
+			UserContent:  &model.Message{Role: model.RoleUser, Content: "question"},
+		},
+	}
+	_, err := Inference(context.Background(), &fakeRunner{}, input, &evalset.SessionInput{UserID: "user"}, "session", []*model.Message{nil})
 	assert.Error(t, err)
 }
 
@@ -141,22 +151,25 @@ func TestInferencePerInvocationErrors(t *testing.T) {
 	ctx := context.Background()
 	session := &evalset.SessionInput{UserID: "user"}
 
-	_, err := inferenceInvocation(ctx, &fakeRunner{}, "session", session, &evalset.Invocation{})
+	_, err := inferenceInvocation(ctx, &fakeRunner{}, "session", session, &evalset.Invocation{}, nil)
 	assert.Error(t, err)
 
-	_, err = inferenceInvocation(ctx, &fakeRunner{}, "session", session, &evalset.Invocation{
+	result, err := inferenceInvocation(ctx, &fakeRunner{}, "session", session, &evalset.Invocation{
 		InvocationID: "inv",
-		UserContent:  &genai.Content{},
-	})
-	assert.Error(t, err)
+		UserContent:  &model.Message{},
+	}, nil)
+	assert.NoError(t, err)
+	assert.Nil(t, result.FinalResponse)
 
-	_, err = inferenceInvocation(ctx, &fakeRunner{}, "session", session, &evalset.Invocation{
+	result, err = inferenceInvocation(ctx, &fakeRunner{}, "session", session, &evalset.Invocation{
 		InvocationID: "inv",
-		UserContent: &genai.Content{
-			Parts: []*genai.Part{{Text: ""}},
+		UserContent: &model.Message{
+			Role:         model.RoleUser,
+			ContentParts: []model.ContentPart{{Text: ptr("")}},
 		},
-	})
-	assert.Error(t, err)
+	}, nil)
+	assert.NoError(t, err)
+	assert.Nil(t, result.FinalResponse)
 
 	errorEvent := &event.Event{
 		Response: &model.Response{
@@ -165,75 +178,25 @@ func TestInferencePerInvocationErrors(t *testing.T) {
 	}
 	_, err = inferenceInvocation(ctx, &fakeRunner{events: []*event.Event{errorEvent}}, "session", session, &evalset.Invocation{
 		InvocationID: "inv",
-		UserContent: &genai.Content{
-			Parts: []*genai.Part{{Text: "ok"}},
+		UserContent: &model.Message{
+			Role:    model.RoleUser,
+			Content: "ok",
 		},
-	})
+	}, nil)
 	assert.Error(t, err)
 
 	_, err = inferenceInvocation(ctx, &fakeRunner{runErr: errors.New("boom")}, "session", session, &evalset.Invocation{
 		InvocationID: "inv",
-		UserContent: &genai.Content{
-			Parts: []*genai.Part{{Text: "ok"}},
+		UserContent: &model.Message{
+			Role:    model.RoleUser,
+			Content: "ok",
 		},
-	})
+	}, nil)
 	assert.Error(t, err)
 
 	// Ensure session input validation executed in parent function.
-	_, err = Inference(ctx, &fakeRunner{}, []*evalset.Invocation{}, nil, "session")
+	_, err = Inference(ctx, &fakeRunner{}, []*evalset.Invocation{}, nil, "session", nil)
 	assert.Error(t, err)
-}
-
-func TestConvertContentToMessageErrors(t *testing.T) {
-
-	_, err := convertContentToMessage(nil)
-	assert.Error(t, err)
-	_, err = convertContentToMessage(&genai.Content{})
-	assert.Error(t, err)
-	_, err = convertContentToMessage(&genai.Content{
-		Parts: []*genai.Part{{Text: ""}},
-	})
-	assert.Error(t, err)
-}
-
-func TestConvertMessageToContentErrors(t *testing.T) {
-
-	_, err := convertMessageToContent(nil)
-	assert.Error(t, err)
-	_, err = convertMessageToContent(&model.Message{})
-	assert.Error(t, err)
-}
-
-func TestConvertToolCallsToFunctionCalls(t *testing.T) {
-
-	_, err := convertToolCallsToFunctionCalls(nil)
-	assert.Error(t, err)
-
-	_, err = convertToolCallsToFunctionCalls(&model.ToolCall{Function: model.FunctionDefinitionParam{}})
-	assert.Error(t, err)
-
-	invalid := &model.ToolCall{
-		Function: model.FunctionDefinitionParam{
-			Name:      "tool",
-			Arguments: []byte("{"),
-		},
-	}
-	_, err = convertToolCallsToFunctionCalls(invalid)
-	assert.Error(t, err)
-
-	args, err := json.Marshal(map[string]any{"key": "value"})
-	assert.NoError(t, err)
-	call := &model.ToolCall{
-		ID: "call",
-		Function: model.FunctionDefinitionParam{
-			Name:      "tool",
-			Arguments: args,
-		},
-	}
-	result, err := convertToolCallsToFunctionCalls(call)
-	assert.NoError(t, err)
-	assert.Equal(t, "tool", result.Name)
-	assert.Equal(t, "value", result.Args["key"])
 }
 
 func TestConvertToolCallResponse(t *testing.T) {
@@ -259,14 +222,68 @@ func TestConvertToolCallResponse(t *testing.T) {
 			},
 		},
 	}
-	result, err := convertToolCallResponse(ev)
+	result, err := convertTools(ev)
 	assert.NoError(t, err)
 	assert.Len(t, result, 1)
 	assert.Equal(t, "tool", result[0].Name)
-	assert.Equal(t, float64(1), result[0].Args["count"])
+	assert.Equal(t, map[string]any{"count": float64(1)}, result[0].Arguments)
 }
 
-func TestConvertToolResultResponse(t *testing.T) {
+func TestConvertToolCallResponseArrayArguments(t *testing.T) {
+	args, err := json.Marshal([]any{1, 2})
+	assert.NoError(t, err)
+	ev := &event.Event{
+		Response: &model.Response{
+			Choices: []model.Choice{
+				{
+					Message: model.Message{
+						ToolCalls: []model.ToolCall{
+							{
+								ID: "call-1",
+								Function: model.FunctionDefinitionParam{
+									Name:      "tool",
+									Arguments: args,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	result, err := convertTools(ev)
+	assert.NoError(t, err)
+	assert.Len(t, result, 1)
+	assert.Equal(t, []any{float64(1), float64(2)}, result[0].Arguments)
+}
+
+func TestConvertToolCallResponseInvalidJSONArguments(t *testing.T) {
+	ev := &event.Event{
+		Response: &model.Response{
+			Choices: []model.Choice{
+				{
+					Message: model.Message{
+						ToolCalls: []model.ToolCall{
+							{
+								ID: "call-1",
+								Function: model.FunctionDefinitionParam{
+									Name:      "tool",
+									Arguments: []byte("a=1"),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	result, err := convertTools(ev)
+	assert.NoError(t, err)
+	assert.Len(t, result, 1)
+	assert.Equal(t, "a=1", result[0].Arguments)
+}
+
+func TestMergeToolResultResponse(t *testing.T) {
 	ev := &event.Event{
 		Response: &model.Response{
 			Choices: []model.Choice{
@@ -280,39 +297,95 @@ func TestConvertToolResultResponse(t *testing.T) {
 			},
 		},
 	}
-	result, err := convertToolResultResponse(ev)
+	tools := []*evalset.Tool{
+		{ID: "call-1", Name: "tool"},
+	}
+	idx := map[string]int{"call-1": 0}
+	err := mergeToolResultResponse(ev, idx, tools)
 	assert.NoError(t, err)
-	assert.Len(t, result, 1)
-	assert.Equal(t, "call-1", result[0].ID)
-	assert.Equal(t, "tool", result[0].Name)
-	assert.Equal(t, float64(42), result[0].Response["result"])
+	assert.Equal(t, map[string]any{"result": float64(42)}, tools[0].Result)
 }
 
-func TestConvertToolResultResponseSkipEmptyID(t *testing.T) {
+func TestMergeToolResultResponseMissingID(t *testing.T) {
 	ev := &event.Event{
 		Response: &model.Response{
 			Choices: []model.Choice{
-				{Message: model.Message{Content: "{}", ToolID: ""}},
-				{Message: model.Message{Content: `{"ok":true}`, ToolID: "id-1", ToolName: "t"}},
+				{
+					Message: model.Message{
+						ToolID:   "missing",
+						ToolName: "tool",
+						Content:  `{}`,
+					},
+				},
 			},
 		},
 	}
-	result, err := convertToolResultResponse(ev)
-	assert.NoError(t, err)
-	assert.Len(t, result, 1)
-	assert.Equal(t, "id-1", result[0].ID)
-	assert.Equal(t, "t", result[0].Name)
-	assert.Equal(t, true, result[0].Response["ok"])
-}
-
-func TestConvertToolResultResponseInvalidJSON(t *testing.T) {
-	ev := &event.Event{
-		Response: &model.Response{
-			Choices: []model.Choice{
-				{Message: model.Message{Content: "{", ToolID: "bad"}},
-			},
-		},
-	}
-	_, err := convertToolResultResponse(ev)
+	tools := []*evalset.Tool{{ID: "call-1", Name: "tool"}}
+	idx := map[string]int{"call-1": 0}
+	err := mergeToolResultResponse(ev, idx, tools)
 	assert.Error(t, err)
+}
+
+func TestMergeToolResultResponseInvalidJSON(t *testing.T) {
+	ev := &event.Event{
+		Response: &model.Response{
+			Choices: []model.Choice{
+				{
+					Message: model.Message{
+						ToolID:  "call-1",
+						Content: "{",
+					},
+				},
+			},
+		},
+	}
+	tools := []*evalset.Tool{{ID: "call-1"}}
+	idx := map[string]int{"call-1": 0}
+	err := mergeToolResultResponse(ev, idx, tools)
+	assert.NoError(t, err)
+	assert.Equal(t, "{", tools[0].Result)
+}
+
+func TestMergeToolResultResponseStringContent(t *testing.T) {
+	ev := &event.Event{
+		Response: &model.Response{
+			Choices: []model.Choice{
+				{
+					Message: model.Message{
+						ToolID:  "call-1",
+						Content: "tool execution failed",
+					},
+				},
+			},
+		},
+	}
+	tools := []*evalset.Tool{{ID: "call-1"}}
+	idx := map[string]int{"call-1": 0}
+	err := mergeToolResultResponse(ev, idx, tools)
+	assert.NoError(t, err)
+	assert.Equal(t, "tool execution failed", tools[0].Result)
+}
+
+func TestMergeToolResultResponseArrayContent(t *testing.T) {
+	ev := &event.Event{
+		Response: &model.Response{
+			Choices: []model.Choice{
+				{
+					Message: model.Message{
+						ToolID:  "call-1",
+						Content: `[1,2]`,
+					},
+				},
+			},
+		},
+	}
+	tools := []*evalset.Tool{{ID: "call-1"}}
+	idx := map[string]int{"call-1": 0}
+	err := mergeToolResultResponse(ev, idx, tools)
+	assert.NoError(t, err)
+	assert.Equal(t, []any{float64(1), float64(2)}, tools[0].Result)
+}
+
+func ptr[T any](v T) *T {
+	return &v
 }

@@ -8,20 +8,21 @@ replace (
 	trpc.group/trpc-go/trpc-agent-go => ../../
 	trpc.group/trpc-go/trpc-agent-go/model/anthropic => ../../model/anthropic
 	trpc.group/trpc-go/trpc-agent-go/model/gemini => ../../model/gemini
+	trpc.group/trpc-go/trpc-agent-go/model/hunyuan => ../../model/hunyuan
 	trpc.group/trpc-go/trpc-agent-go/model/ollama => ../../model/ollama
 	trpc.group/trpc-go/trpc-agent-go/model/provider => ../../model/provider
 )
 
 require (
 	trpc.group/trpc-go/trpc-agent-go v0.6.0
-	trpc.group/trpc-go/trpc-agent-go/model/provider v0.0.0-20251201063627-880416fa9808
+	trpc.group/trpc-go/trpc-agent-go/model/provider v0.8.0
 )
 
 require (
 	cloud.google.com/go v0.123.0 // indirect
 	cloud.google.com/go/auth v0.17.0 // indirect
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
-	github.com/anthropics/anthropic-sdk-go v1.16.0 // indirect
+	github.com/anthropics/anthropic-sdk-go v1.19.0 // indirect
 	github.com/bmatcuk/doublestar/v4 v4.9.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
@@ -64,8 +65,8 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251124214823-79d6a2a48846 // indirect
 	google.golang.org/grpc v1.77.0 // indirect
 	google.golang.org/protobuf v1.36.10 // indirect
-	trpc.group/trpc-go/trpc-a2a-go v0.2.5-0.20251023030722-7f02b57fd14a // indirect
+	trpc.group/trpc-go/trpc-a2a-go v0.2.5 // indirect
 	trpc.group/trpc-go/trpc-agent-go/model/anthropic v0.0.0-20251126064502-c8c2594d2519 // indirect
-	trpc.group/trpc-go/trpc-agent-go/model/gemini v0.0.0-20251203120347-0b4d62cb115d // indirect
-	trpc.group/trpc-go/trpc-agent-go/model/ollama v0.0.0-20251201063627-880416fa9808 // indirect
+	trpc.group/trpc-go/trpc-agent-go/model/gemini v0.8.1-0.20251222024650-ea147adf3d21 // indirect
+	trpc.group/trpc-go/trpc-agent-go/model/ollama v0.8.0 // indirect
 )

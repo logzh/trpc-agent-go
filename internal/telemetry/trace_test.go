@@ -26,6 +26,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
+	semconvtrace "trpc.group/trpc-go/trpc-agent-go/telemetry/semconv/trace"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
@@ -69,15 +70,25 @@ func newStubSpan() *stubSpan {
 // recordingSpan captures attributes and status for assertions.
 type recordingSpan struct {
 	trace.Span
-	attrs  []attribute.KeyValue
-	status codes.Code
+	attrs          []attribute.KeyValue
+	status         codes.Code
+	statusDesc     string
+	recordedErrors []error
 }
 
 func (s *recordingSpan) SetAttributes(kv ...attribute.KeyValue) {
 	s.attrs = append(s.attrs, kv...)
 	s.Span.SetAttributes(kv...)
 }
-func (s *recordingSpan) SetStatus(c codes.Code, msg string) { s.status = c; s.Span.SetStatus(c, msg) }
+func (s *recordingSpan) SetStatus(c codes.Code, msg string) {
+	s.status = c
+	s.statusDesc = msg
+	s.Span.SetStatus(c, msg)
+}
+func (s *recordingSpan) RecordError(err error, opts ...trace.EventOption) {
+	s.recordedErrors = append(s.recordedErrors, err)
+	s.Span.RecordError(err, opts...)
+}
 func newRecordingSpan() *recordingSpan {
 	_, sp := trace.NewNoopTracerProvider().Tracer("test").Start(context.Background(), "op")
 	return &recordingSpan{Span: sp}
@@ -105,6 +116,88 @@ func hasAttr(attrs []attribute.KeyValue, key string, want any) bool {
 		}
 	}
 	return false
+}
+
+func TestNewWorkflowSpanName(t *testing.T) {
+	require.Equal(t, "workflow myflow", NewWorkflowSpanName("myflow"))
+}
+
+func TestTraceWorkflow(t *testing.T) {
+	t.Run("basic attributes", func(t *testing.T) {
+		span := newRecordingSpan()
+		wf := &Workflow{Name: "myflow", ID: "wf-123"}
+
+		TraceWorkflow(span, wf)
+
+		if !hasAttr(span.attrs, KeyGenAIOperationName, OperationWorkflow) {
+			t.Fatalf("missing operation name attribute")
+		}
+		if !hasAttr(span.attrs, KeyGenAIWorkflowName, "myflow") {
+			t.Fatalf("missing workflow name attribute")
+		}
+		if !hasAttr(span.attrs, KeyGenAIWorkflowID, "wf-123") {
+			t.Fatalf("missing workflow id attribute")
+		}
+	})
+
+	t.Run("request/response json success", func(t *testing.T) {
+		type payload struct {
+			A string `json:"a"`
+		}
+		span := newRecordingSpan()
+		wf := &Workflow{
+			Name:     "myflow",
+			ID:       "wf-123",
+			Request:  payload{A: "req"},
+			Response: payload{A: "rsp"},
+		}
+
+		TraceWorkflow(span, wf)
+
+		require.True(t, hasAttr(span.attrs, KeyGenAIWorkflowRequest, `{"a":"req"}`))
+		require.True(t, hasAttr(span.attrs, KeyGenAIWorkflowResponse, `{"a":"rsp"}`))
+		require.NotEqual(t, codes.Error, span.status, "did not expect error status")
+	})
+
+	t.Run("request/response json marshal error", func(t *testing.T) {
+		span := newRecordingSpan()
+		wf := &Workflow{
+			Name:     "myflow",
+			ID:       "wf-123",
+			Request:  make(chan int), // not json serializable
+			Response: make(chan int), // not json serializable
+		}
+
+		TraceWorkflow(span, wf)
+
+		var gotReq, gotRsp string
+		for _, kv := range span.attrs {
+			if string(kv.Key) == KeyGenAIWorkflowRequest {
+				gotReq = kv.Value.AsString()
+			}
+			if string(kv.Key) == KeyGenAIWorkflowResponse {
+				gotRsp = kv.Value.AsString()
+			}
+		}
+		require.Contains(t, gotReq, "<not json serializable:")
+		require.Contains(t, gotReq, "unsupported type")
+		require.Contains(t, gotRsp, "<not json serializable>:")
+		require.Contains(t, gotRsp, "unsupported type")
+	})
+
+	t.Run("error sets status and records error", func(t *testing.T) {
+		span := newRecordingSpan()
+		wfErr := errors.New("boom")
+		wf := &Workflow{Name: "myflow", ID: "wf-123", Error: wfErr}
+
+		TraceWorkflow(span, wf)
+
+		require.True(t, hasAttr(span.attrs, KeyErrorType, ValueDefaultErrorType))
+		require.Equal(t, codes.Error, span.status)
+		require.Equal(t, "boom", span.statusDesc)
+		require.Len(t, span.recordedErrors, 1)
+		require.Equal(t, wfErr, span.recordedErrors[0])
+	})
 }
 
 func TestTraceFunctions_NoPanics(t *testing.T) {
@@ -157,7 +250,7 @@ func TestTraceBeforeAfter_Tool_Merged_Chat_Embedding(t *testing.T) {
 	rsp := &model.Response{ID: "rid", Model: "m-1", Usage: &model.Usage{PromptTokens: 1, CompletionTokens: 2}, Choices: []model.Choice{{FinishReason: &stop}, {}}, Error: &model.ResponseError{Message: "oops", Type: "api_error"}}
 	evt := event.New("eid", "alpha", event.WithResponse(rsp))
 	s2 := newRecordingSpan()
-	TraceAfterInvokeAgent(s2, evt, nil)
+	TraceAfterInvokeAgent(s2, evt, nil, 0)
 	if s2.status != codes.Error {
 		t.Fatalf("expected error status")
 	}
@@ -188,17 +281,76 @@ func TestTraceBeforeAfter_Tool_Merged_Chat_Embedding(t *testing.T) {
 	}
 
 	// Embedding paths
+	dims := 1536
+	embReq := "hello"
+	embRsp := "[0.1,0.2]"
+	encFormat := "floats"
+	srvAddr := "localhost"
+	srvPort := 8080
 	s6 := newRecordingSpan()
-	TraceEmbedding(s6, "floats", "text-emb", nil, nil)
+	TraceEmbedding(s6, &EmbeddingAttributes{
+		RequestEncodingFormat: &encFormat,
+		RequestModel:          "text-emb",
+		Dimensions:            dims,
+		Request:               &embReq,
+		Response:              &embRsp,
+		ServerAddress:         &srvAddr,
+		ServerPort:            &srvPort,
+	})
 	if !hasAttr(s6.attrs, KeyGenAIRequestModel, "text-emb") {
 		t.Fatalf("missing model")
 	}
+	if !hasAttr(s6.attrs, semconvtrace.KeyGenAIRequestEncodingFormats, []string{"floats"}) {
+		t.Fatalf("missing encoding format")
+	}
+	if !hasAttr(s6.attrs, semconvtrace.KeyGenAIEmbeddingsDimensionCount, int64(dims)) {
+		t.Fatalf("missing dimensions")
+	}
+	if !hasAttr(s6.attrs, semconvtrace.KeyGenAIEmbeddingsRequest, embReq) {
+		t.Fatalf("missing embedding request")
+	}
+	if !hasAttr(s6.attrs, semconvtrace.KeyGenAIEmbeddingsResponse, embRsp) {
+		t.Fatalf("missing embedding response")
+	}
+	if !hasAttr(s6.attrs, semconvtrace.KeyServerAddress, srvAddr) {
+		t.Fatalf("missing server address")
+	}
+	if !hasAttr(s6.attrs, semconvtrace.KeyServerPort, int64(srvPort)) {
+		t.Fatalf("missing server port")
+	}
 	tok := int64(10)
 	s7 := newRecordingSpan()
-	TraceEmbedding(s7, "floats", "text-emb", &tok, errors.New("bad"))
+	TraceEmbedding(s7, &EmbeddingAttributes{
+		RequestEncodingFormat: &encFormat,
+		RequestModel:          "text-emb",
+		Dimensions:            dims,
+		InputToken:            &tok,
+		Error:                 errors.New("bad"),
+	})
 	if s7.status != codes.Error {
 		t.Fatalf("embedding expected error status")
 	}
+	if !hasAttr(s7.attrs, KeyGenAIUsageInputTokens, tok) {
+		t.Fatalf("missing input token")
+	}
+	if !hasAttr(s7.attrs, KeyErrorType, ValueDefaultErrorType) {
+		t.Fatalf("missing error type")
+	}
+	if !hasAttr(s7.attrs, KeyErrorMessage, "bad") {
+		t.Fatalf("missing error message")
+	}
+}
+
+func TestTraceBeforeInvokeAgent_WithSpanAttributes(t *testing.T) {
+	inv := &agent.Invocation{
+		AgentName:    "alpha",
+		InvocationID: "inv-span",
+		Session:      &session.Session{ID: "sess-span", UserID: "user-span"},
+		RunOptions:   agent.RunOptions{SpanAttributes: []attribute.KeyValue{attribute.String("custom.attr", "v1")}},
+	}
+	span := newRecordingSpan()
+	TraceBeforeInvokeAgent(span, inv, "desc", "inst", nil)
+	require.True(t, hasAttr(span.attrs, "custom.attr", "v1"), "custom span attribute should be applied")
 }
 
 func TestNewChatSpanName(t *testing.T) {
@@ -405,7 +557,7 @@ func TestTraceAfterInvokeAgent_NilPaths(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			span := newRecordingSpan()
-			TraceAfterInvokeAgent(span, tt.rspEvent, tt.tokenUsage)
+			TraceAfterInvokeAgent(span, tt.rspEvent, tt.tokenUsage, 0)
 
 			if tt.tokenUsage != nil && tt.rspEvent != nil && tt.rspEvent.Response != nil {
 				require.True(t, hasAttr(span.attrs, KeyGenAIUsageInputTokens, int64(tt.tokenUsage.PromptTokens)))
@@ -540,6 +692,44 @@ func TestBuildRequestAttributes(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildRequestAttributes_ToolDefinitions(t *testing.T) {
+	req := &model.Request{
+		Messages: []model.Message{{Role: model.RoleUser, Content: "test"}},
+		Tools: map[string]tool.Tool{
+			"alpha": testTool{decl: &tool.Declaration{Name: "alpha", Description: "first"}},
+			"beta":  testTool{decl: &tool.Declaration{Name: "beta", Description: "second"}},
+			"skip":  nil, // ensure nil entries are ignored
+		},
+	}
+
+	attrs := buildRequestAttributes(req)
+	require.NotNil(t, attrs)
+
+	var toolAttr *attribute.KeyValue
+	for i := range attrs {
+		if string(attrs[i].Key) == KeyGenAIRequestToolDefinitions {
+			toolAttr = &attrs[i]
+			break
+		}
+	}
+	require.NotNil(t, toolAttr, "expected tool definitions attribute")
+
+	var defs []tool.Declaration
+	require.NoError(t, json.Unmarshal([]byte(toolAttr.Value.AsString()), &defs))
+	require.Len(t, defs, 2)
+
+	names := map[string]struct{}{}
+	for _, d := range defs {
+		names[d.Name] = struct{}{}
+	}
+	require.Contains(t, names, "alpha")
+	require.Contains(t, names, "beta")
+}
+
+type testTool struct{ decl *tool.Declaration }
+
+func (t testTool) Declaration() *tool.Declaration { return t.decl }
 
 func TestBuildResponseAttributes(t *testing.T) {
 	tests := []struct {

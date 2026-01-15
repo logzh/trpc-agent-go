@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,6 +30,9 @@ import (
 
 const (
 	testSkillName = "echoer"
+
+	skillsOverviewHeader        = "Available skills:"
+	skillsToolingGuidanceHeader = "Tooling and workspace guidance:"
 )
 
 // createTestSkill makes a minimal skill folder with SKILL.md.
@@ -188,6 +192,131 @@ func TestLLMAgent_SkillRun_UsesInjectedExecutor(t *testing.T) {
 	_, err = tl.(tool.CallableTool).Call(context.Background(), b)
 	require.NoError(t, err)
 	require.True(t, se.ran)
+}
+
+func TestLLMAgent_SkillRun_AllowedCommands_Enforced(t *testing.T) {
+	root := createTestSkill(t)
+	repo, err := skill.NewFSRepository(root)
+	require.NoError(t, err)
+
+	a := New(
+		"tester",
+		WithSkills(repo),
+		WithSkillRunAllowedCommands("echo"),
+	)
+	tl := findTool(a.Tools(), "skill_run")
+	require.NotNil(t, tl)
+
+	allowArgs := map[string]any{
+		"skill": testSkillName, "command": "echo ok",
+	}
+	allowB, err := json.Marshal(allowArgs)
+	require.NoError(t, err)
+	_, err = tl.(tool.CallableTool).Call(context.Background(), allowB)
+	require.NoError(t, err)
+
+	blockArgs := map[string]any{
+		"skill": testSkillName, "command": "ls",
+	}
+	blockB, err := json.Marshal(blockArgs)
+	require.NoError(t, err)
+	_, err = tl.(tool.CallableTool).Call(context.Background(), blockB)
+	require.Error(t, err)
+}
+
+func TestLLMAgent_WithSkillsToolingGuidance_Disabled(t *testing.T) {
+	root := createTestSkill(t)
+	repo, err := skill.NewFSRepository(root)
+	require.NoError(t, err)
+
+	makeReq := func(opts *Options) *model.Request {
+		t.Helper()
+		procs := buildRequestProcessors("tester", opts)
+		inv := &agent.Invocation{
+			InvocationID: "inv1",
+			AgentName:    "tester",
+			Message:      model.NewUserMessage("u"),
+			Session:      &session.Session{},
+		}
+		req := &model.Request{}
+		for _, p := range procs {
+			p.ProcessRequest(context.Background(), inv, req, nil)
+		}
+		return req
+	}
+
+	{
+		opts := &Options{}
+		WithSkills(repo)(opts)
+		req := makeReq(opts)
+		var sys string
+		for _, msg := range req.Messages {
+			if msg.Role != model.RoleSystem {
+				continue
+			}
+			if strings.Contains(msg.Content, skillsOverviewHeader) {
+				sys = msg.Content
+				break
+			}
+		}
+		require.NotEmpty(t, sys)
+		require.Contains(t, sys, skillsToolingGuidanceHeader)
+	}
+
+	{
+		opts := &Options{}
+		WithSkills(repo)(opts)
+		WithSkillsToolingGuidance("")(opts)
+		req := makeReq(opts)
+		var sys string
+		for _, msg := range req.Messages {
+			if msg.Role != model.RoleSystem {
+				continue
+			}
+			if strings.Contains(msg.Content, skillsOverviewHeader) {
+				sys = msg.Content
+				break
+			}
+		}
+		require.NotEmpty(t, sys)
+		require.NotContains(t, sys, skillsToolingGuidanceHeader)
+	}
+}
+
+func TestLLMAgent_SkillRun_DeniedCommands_Enforced(t *testing.T) {
+	root := createTestSkill(t)
+	repo, err := skill.NewFSRepository(root)
+	require.NoError(t, err)
+
+	a := New(
+		"tester",
+		WithSkills(repo),
+		WithSkillRunDeniedCommands("echo"),
+	)
+	tl := findTool(a.Tools(), "skill_run")
+	require.NotNil(t, tl)
+
+	blockArgs := map[string]any{
+		"skill": testSkillName, "command": "echo ok",
+	}
+	blockB, err := json.Marshal(blockArgs)
+	require.NoError(t, err)
+	_, err = tl.(tool.CallableTool).Call(context.Background(), blockB)
+	require.Error(t, err)
+
+	allowArgs := map[string]any{
+		"skill": testSkillName, "command": "ls",
+	}
+	allowB, err := json.Marshal(allowArgs)
+	require.NoError(t, err)
+	res, err := tl.(tool.CallableTool).Call(context.Background(), allowB)
+	require.NoError(t, err)
+
+	jb, err := json.Marshal(res)
+	require.NoError(t, err)
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(jb, &m))
+	require.Equal(t, float64(0), m["exit_code"])
 }
 
 // captureModel records the last request passed to GenerateContent.

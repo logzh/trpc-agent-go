@@ -2,7 +2,7 @@
 
 ## Overview
 
-Runner provides the interface to run Agents, responsible for session management and event stream processing. The core responsibilities of Runner are: obtain or create sessions, generate an Invocation ID, call Agent.Run, process the returned event stream, and append non-partial response events to the session.
+Runner provides the interface to run Agents, responsible for session management and event stream processing. The core responsibilities of Runner are: obtain or create sessions, generate an Invocation ID, call the Agent (via `agent.RunWithPlugins`), process the returned event stream, and append non-partial response events to the session.
 
 ### 🎯 Key Features
 
@@ -11,6 +11,7 @@ Runner provides the interface to run Agents, responsible for session management 
 - **🆔 ID Generation**: Automatically generate Invocation IDs and event IDs.
 - **📊 Observability Integration**: Integrates telemetry/trace to automatically record spans.
 - **✅ Completion Event**: Generates a runner-completion event after the Agent event stream ends.
+- **🔌 Plugins**: Register once on a Runner to apply global hooks across agent, tool, and model lifecycles.
 
 ## Architecture
 
@@ -19,7 +20,7 @@ Runner provides the interface to run Agents, responsible for session management 
 │       Runner        │  - Session management.
 └─────────┬───────────┘  - Event stream processing.
           │
-          │ r.agent.Run(ctx, invocation)
+          │ agent.RunWithPlugins(ctx, invocation, r.agent)
           │
 ┌─────────▼───────────┐
 │       Agent         │  - Receives Invocation.
@@ -154,6 +155,30 @@ r := runner.NewRunner("my-app", agent,
 )
 ```
 
+### 🔌 Plugins
+
+Runner plugins are global, runner-scoped hooks. Register plugins once and they
+will apply automatically to all agents, tools, and model calls executed by that
+Runner.
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/plugin"
+
+r := runner.NewRunner("my-app", a,
+    runner.WithPlugins(
+        plugin.NewLogging(),
+        plugin.NewGlobalInstruction("You must follow security policies."),
+    ),
+)
+defer r.Close()
+```
+
+Notes:
+
+- Plugin names must be unique per Runner.
+- Plugins run in the order they are registered.
+- If a plugin implements `plugin.Closer`, Runner will call it in `Close()`.
+
 ### Run Conversation
 
 ```go
@@ -161,12 +186,69 @@ r := runner.NewRunner("my-app", agent,
 eventChan, err := r.Run(ctx, userID, sessionID, message, options...)
 ```
 
+#### Request ID (requestID) and Run Control
+
+Each call to `Runner.Run` is a **run**. If you want to cancel a run or query
+its status, you need a request identifier (requestID).
+
+You can provide your own requestID (recommended) via `agent.WithRequestID`
+(for example, a Universally Unique Identifier (UUID)). Runner injects it into
+every emitted `event.Event` (`event.RequestID`).
+
+```go
+requestID := "req-123"
+
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    message,
+    agent.WithRequestID(requestID),
+)
+if err != nil {
+    panic(err)
+}
+
+managed := r.(runner.ManagedRunner)
+status, ok := managed.RunStatus(requestID)
+_ = status
+_ = ok
+
+// Cancel the run by requestID.
+managed.Cancel(requestID)
+```
+
+#### Detached Cancellation (background execution)
+
+In Go, `context.Context` (often named `ctx`) carries both cancellation and a
+deadline. By default, Runner stops when `ctx` is cancelled.
+
+If you want the run to continue after a parent cancellation, enable detached
+cancellation and use a timeout to bound the total runtime:
+
+```go
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    message,
+    agent.WithRequestID(requestID),
+    agent.WithDetachedCancel(true),
+    agent.WithMaxRunDuration(30*time.Second),
+)
+```
+
+Runner enforces the earlier of:
+
+- the parent context deadline (if any)
+- `MaxRunDuration` (if set)
+
 #### Resume Interrupted Runs (tools-first resume)
 
 In long-running conversations, users may interrupt the agent while it is still
 in a tool-calling phase (for example, the last message in the session is an
 assistant message with `tool_calls`, but no tool result has been written yet).
-When you later reuse the same `sessionID`, you can ask the Runner to *resume*
+When you later reuse the same `sessionID`, you can ask the Runner to _resume_
 from that point instead of asking the model to repeat the tool calls:
 
 ```go
@@ -267,6 +349,106 @@ for e := range eventChan {
 This keeps application code simple and consistent across Agent types while still
 preserving detailed graph events for advanced use.
 
+#### 🔁 Option: Emit Final Graph LLM Responses
+
+Graph-based agents (for example, GraphAgent) can call a Large Language Model
+(LLM) many times inside a single run. Each model call can produce a stream of
+events:
+
+- Partial chunks: `IsPartial=true`, `Done=false`, incremental text in
+  `choice.Delta.Content`
+- Final message: `IsPartial=false`, `Done=true`, full text in
+  `choice.Message.Content`
+
+By default, graph LLM nodes only emit the partial chunks. This avoids treating
+intermediate node outputs as normal assistant replies (for example, persisting
+them into the Session by Runner or showing them to end users).
+
+To opt into the newer behavior (emit the final `Done=true` assistant message
+events from graph LLM nodes), enable this RunOption:
+
+```go
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    message,
+    agent.WithGraphEmitFinalModelResponses(true),
+)
+```
+
+Behavior summary:
+
+First, one key idea: this option controls whether each graph Large Language
+Model (LLM) node emits an extra final `Done=true` assistant message event. It
+does not mean the Runner completion event will always have (or not have)
+`Response.Choices`.
+
+Assume your graph is `llm1 -> llm2 -> llm3`, and `llm3` produces the final
+answer:
+
+- Case 1: `agent.WithGraphEmitFinalModelResponses(false)` (default)
+  - `llm1/llm2/llm3`: emit only partial chunks (`Done=false`), no final
+    `Done=true` assistant message events.
+  - Runner completion event: to keep the “read only the last event” pattern
+    working, Runner echoes `llm3`’s final output into completion
+    `Response.Choices` (when the graph provides final choices). The final text
+    is also always available via `StateDelta[graph.StateKeyLastResponse]`.
+- Case 2: `agent.WithGraphEmitFinalModelResponses(true)`
+  - `llm1/llm2/llm3`: in addition to partial chunks, each node emits a final
+    `Done=true` assistant message event (so intermediate nodes may now produce
+    complete assistant messages, and Runner may persist those non-partial events
+    into the Session).
+  - Runner completion event: to avoid duplicating the final message, Runner
+    deduplicates by response identifier (ID). When it can confirm the final
+    message already appeared earlier, it omits the echo, so completion
+    `Response.Choices` may be empty. The final text should still be read from
+    `StateDelta[graph.StateKeyLastResponse]`.
+
+Recommendation: for GraphAgent workflows, always read the final output from the
+Runner completion event’s `StateDelta` (for example,
+`graph.StateKeyLastResponse`). Treat `Response.Choices` on the completion event
+as optional when this option is enabled.
+
+#### 🎛️ Option: StreamMode
+
+Runner can filter the event stream before it reaches your application code.
+This provides a single, run-level switch to select which categories of events
+are forwarded to your `eventChan`.
+
+Use `agent.WithStreamMode(...)`:
+
+```go
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    message,
+    agent.WithStreamMode(agent.StreamModeMessages),
+)
+```
+
+Supported modes (graph workflows):
+
+- `messages`: model output events (for example, `chat.completion.chunk`)
+- `updates`: `graph.state.update` / `graph.channel.update` / `graph.execution`
+- `checkpoints`: `graph.checkpoint.*`
+- `tasks`: task lifecycle events (`graph.node.*`, `graph.pregel.*`)
+- `debug`: same as `checkpoints` + `tasks`
+- `custom`: node-emitted events (`graph.node.custom`)
+
+Notes:
+
+- When `agent.StreamModeMessages` is selected, graph-based Large Language Model
+  (LLM) nodes enable final model response events automatically for that run.
+  To override it, call `agent.WithGraphEmitFinalModelResponses(false)` after
+  `agent.WithStreamMode(...)`.
+- StreamMode only affects what Runner forwards to your `eventChan`. Runner still
+  processes and persists events internally.
+- For graph workflows, some event types (for example, `graph.checkpoint.*`)
+  are emitted only when their corresponding mode is selected.
+- Runner always emits a final `runner.completion` event.
+
 ## 💾 Session Management
 
 ### In-memory Session (Default)
@@ -318,6 +500,38 @@ agent := llmagent.New("assistant",
 // Execute Agent with Runner.
 r := runner.NewRunner("my-app", agent)
 ```
+
+### Switch Agents Per Request
+
+Runner can register multiple optional agents at construction time and pick one per Run:
+
+```go
+reader := llmagent.New("agent1", llmagent.WithModel(model))
+writer := llmagent.New("agent2", llmagent.WithModel(model))
+
+r := runner.NewRunner("my-app", reader, // Use reader as the default agent.
+    runner.WithAgent("writer", writer), // Register an optional agent by name.
+)
+
+// Use the default reader agent.
+ch, err := r.Run(ctx, userID, sessionID, msg)
+
+// Pick the writer agent by name.
+ch, err = r.Run(ctx, userID, sessionID, msg, agent.WithAgentByName("writer"))
+
+// Override with an instance directly (no pre-registration needed).
+custom := llmagent.New("custom", llmagent.WithModel(model))
+ch, err = r.Run(ctx, userID, sessionID, msg, agent.WithAgent(custom))
+```
+
+- `runner.NewRunner("my-app", agent)`: Set the default agent when creating the Runner.
+- `runner.WithAgent("agentName", agent)`: Pre-register an agent by name so later requests can switch via name.
+- `agent.WithAgentByName("agentName")`: Choose a registered agent by name for a single request without changing the default.
+- `agent.WithAgent(agent)`: Provide an agent instance directly for a single request; highest priority and no pre-registration needed.
+
+Agent selection priority: `agent.WithAgent` > `agent.WithAgentByName` > default agent set at construction. 
+
+The selected agent name is used as the event author and is recorded via `appid.RegisterRunner` for observability.
 
 ### Generation Configuration
 
@@ -512,6 +726,45 @@ for event := range eventChan {
 }
 ```
 
+### Stopping a Run Safely
+
+- **Cancel the context**: Wrap `runner.Run` with `context.WithCancel`.
+  Call `cancel()` when turn count or token budget is hit. `llmflow`
+  treats `context.Canceled` as graceful exit and closes the agent event
+  channel, so the runner loop finishes cleanly without blocking writers.
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+eventCh, err := r.Run(ctx, userID, sessionID, message)
+if err != nil {
+    return err
+}
+
+turns := 0
+for evt := range eventCh {
+    if evt.Error != nil {
+        log.Printf("event error: %s", evt.Error.Message)
+        continue
+    }
+    // ... handle evt ...
+    if evt.IsFinalResponse() {
+        break
+    }
+    turns++
+    if turns >= maxTurns {
+        cancel() // stop further model/tool calls.
+    }
+}
+```
+
+- **Emit a stop event**: Inside custom processors or tools, return `agent.NewStopError("reason")`. `llmflow` converts it into a
+  `stop_agent_error` event and stops the flow. Still pair with context cancel for hard cutoffs.
+
+- **Avoid breaking the runner loop directly**: Breaking the event-loop reader leaves the agent goroutine running and can block on channel
+  writes. Prefer context cancellation or `StopError`.
+
 ### Resource Management
 
 #### 🔒 Closing Runner (Important)
@@ -553,7 +806,7 @@ sessionService := redis.NewService(redis.WithRedisClientURL("redis://localhost:6
 defer sessionService.Close()  // YOU are responsible for closing it
 
 // Runner uses but doesn't own this session service
-r := runner.NewRunner("my-app", agent, 
+r := runner.NewRunner("my-app", agent,
 	runner.WithSessionService(sessionService))
 defer r.Close()  // This will NOT close sessionService (you provided it) (trpc-agent-go >= v0.5.0)
 
@@ -585,12 +838,12 @@ func (s *Service) Stop() error {
 	if err := s.runner.Close(); err != nil {
 		return err
 	}
-	
+
 	// If you provided your own session service, close it here
 	if s.sessionService != nil {
 		return s.sessionService.Close()
 	}
-	
+
 	return nil
 }
 ```

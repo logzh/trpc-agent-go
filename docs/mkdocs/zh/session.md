@@ -4,6 +4,12 @@
 
 tRPC-Agent-Go 框架提供了强大的会话（Session）管理功能，用于维护 Agent 与用户交互过程中的对话历史和上下文信息。通过自动持久化对话记录、智能摘要压缩和灵活的存储后端，会话管理为构建有状态的智能 Agent 提供了完整的基础设施。
 
+### 定位
+
+Session 用于管理当前会话的上下文，隔离维度为 `<appName, userID, SessionID>`，保存这一段对话里的用户消息、Agent 回复、工具调用结果以及基于这些内容生成的简要摘要，用于支撑多轮问答场景。
+
+在同一条对话中，它让多轮问答之间能够自然承接，避免用户在每一轮都重新描述同一个问题或提供相同参数。
+
 ### 🎯 核心特性
 
 - **上下文管理**：自动加载历史对话，实现真正的多轮对话
@@ -21,7 +27,7 @@ tRPC-Agent-Go 框架提供了强大的会话（Session）管理功能，用于�
 
 tRPC-Agent-Go 的会话管理通过 `runner.WithSessionService` 集成到 Runner 中，Runner 会自动处理会话的创建、加载、更新和持久化。
 
-**支持的存储后端：** 内存（Memory）、Redis、PostgreSQL、MySQL
+**支持的存储后端：** 内存（Memory）、Redis、PostgreSQL、MySQL、ClickHouse
 
 **默认行为：** 如果不配置 `runner.WithSessionService`，Runner 会默认使用内存存储（Memory），数据在进程重启后会丢失。
 
@@ -223,23 +229,104 @@ r := runner.NewRunner("my-agent", llmAgent,
     runner.WithSessionService(sessionService))
 ```
 
+#### 摘要前后置 Hook
+
+可以通过 Hook 调整摘要输入或输出：
+
+```go
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithPreSummaryHook(func(ctx *summary.PreSummaryHookContext) error {
+        // 可在摘要前修改 ctx.Text 或 ctx.Events
+        return nil
+    }),
+    summary.WithPostSummaryHook(func(ctx *summary.PostSummaryHookContext) error {
+        // 可在摘要返回前修改 ctx.Summary
+        return nil
+    }),
+    summary.WithSummaryHookAbortOnError(true), // Hook 报错时中断（可选）。
+)
+```
+
+说明：
+
+- Pre-hook 主要修改 `ctx.Text`，也可调整 `ctx.Events`；Post-hook 可修改 `ctx.Summary`。
+- 默认忽略 Hook 错误，需中断时使用 `WithSummaryHookAbortOnError(true)`。
+
 **上下文注入机制：**
 
-启用摘要后，框架会将摘要作为系统消息前置到 LLM 输入，同时包含摘要时间点之后的所有增量事件，保证完整上下文：
+启用摘要后，框架会将摘要作为独立的系统消息插入到第一个现有系统消息之后，同时包含摘要时间点之后的所有增量事件，保证完整上下文：
 
 ```
+When AddSessionSummary = true:
 ┌─────────────────────────────────────────┐
-│ System Prompt                           │
+│ Existing System Message (optional)      │ ← 如果存在
 ├─────────────────────────────────────────┤
-│ Session Summary (system message)        │ ← Compressed history
+│ Session Summary (system message)        │ ← 插入到第一个系统消息之后
 ├─────────────────────────────────────────┤
 │ Event 1 (after summary)                 │ ┐
 │ Event 2                                 │ │
-│ Event 3                                 │ │ New events
-│ ...                                     │ │ (fully retained)
+│ Event 3                                 │ │ 摘要后的所有增量事件
+│ ...                                     │ │ （完整保留）
+│ Event N (current message)               │ ┘
+└─────────────────────────────────────────┘
+
+When AddSessionSummary = false:
+┌─────────────────────────────────────────┐
+│ System Prompt                           │
+├─────────────────────────────────────────┤
+│ Event N-k+1                             │ ┐
+│ Event N-k+2                             │ │ 最近 k 轮对话
+│ ...                                     │ │ （当 MaxHistoryRuns=k 时）
 │ Event N (current message)               │ ┘
 └─────────────────────────────────────────┘
 ```
+
+#### 摘要格式自定义
+
+默认情况下，会话摘要会以包含上下文标签和关于优先考虑当前对话信息的提示进行格式化：
+
+**默认格式：**
+
+```
+Here is a brief summary of your previous interactions:
+
+<summary_of_previous_interactions>
+[摘要内容]
+</summary_of_previous_interactions>
+
+Note: this information is from previous interactions and may be outdated. You should ALWAYS prefer information from this conversation over the past summary.
+```
+
+您可以使用 `WithSummaryFormatter`（在 `llmagent` 和 `graphagent` 中可用）来自定义摘要格式，以更好地匹配您的特定使用场景或模型需求。
+
+**自定义格式示例：**
+
+```go
+// 使用简化格式的自定义格式化器
+agent := llmagent.New(
+    "my-agent",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithAddSessionSummary(true),
+    llmagent.WithSummaryFormatter(func(summary string) string {
+        return fmt.Sprintf("## Previous Context\n\n%s", summary)
+    }),
+)
+```
+
+**使用场景：**
+
+- **简化格式**：使用简洁的标题和最少的上下文提示来减少 token 消耗
+- **语言本地化**：将上下文提示翻译为目标语言（例如：中文、日语）
+- **角色特定格式**：为不同的 Agent 角色提供不同的格式（助手、研究员、程序员）
+- **模型优化**：根据特定模型的偏好调整格式（某些模型对特定的提示结构响应更好）
+
+**重要注意事项：**
+
+- 格式化函数接收来自会话的原始摘要文本并返回格式化后的字符串
+- 自定义格式化器应确保摘要可与其他消息清楚地区分开
+- 默认格式设计为与大多数模型和使用场景兼容
+- 当使用 `WithAddSessionSummary(false)` 时，格式化器**不会生效**
 
 **重要提示：** 启用 `WithAddSessionSummary(true)` 时，`WithMaxHistoryRuns` 参数将被忽略，摘要后的所有事件都会完整保留。
 
@@ -304,14 +391,15 @@ sessionService := inmemory.NewSessionService(
 
 ## 存储后端对比
 
-tRPC-Agent-Go 提供四种会话存储后端，满足不同场景需求：
+tRPC-Agent-Go 提供五种会话存储后端，满足不同场景需求：
 
-| 存储类型   | 适用场景           | 优势                              | 劣势                     |
-| ---------- | ------------------ | --------------------------------- | ------------------------ |
-| 内存存储   | 开发测试、小规模   | 简单快速、无需外部依赖            | 数据不持久、不支持分布式 |
-| Redis 存储 | 生产环境、分布式   | 高性能、支持分布式、自动过期      | 需要 Redis 服务          |
-| PostgreSQL | 生产环境、复杂查询 | 关系型数据库、支持复杂查询、JSONB | 相对较重、需要数据库     |
-| MySQL      | 生产环境、复杂查询 | 广泛使用、支持复杂查询、JSON      | 相对较重、需要数据库     |
+| 存储类型   | 适用场景           |
+| ---------- | ------------------ |
+| 内存存储   | 开发测试、小规模   |
+| Redis 存储 | 生产环境、分布式   |
+| PostgreSQL | 生产环境、复杂查询 |
+| MySQL      | 生产环境、复杂查询 |
+| ClickHouse | 生产环境、海量日志 |
 
 ## 内存存储（Memory）
 
@@ -327,7 +415,6 @@ tRPC-Agent-Go 提供四种会话存储后端，满足不同场景需求：
 - **`WithSummarizer(s summary.SessionSummarizer)`**：注入会话摘要器。
 - **`WithAsyncSummaryNum(num int)`**：设置摘要处理 worker 数量。默认值为 3。
 - **`WithSummaryQueueSize(size int)`**：设置摘要任务队列大小。默认值为 100。
-- **`WithSummaryJobTimeout(timeout time.Duration)`**：设置单个摘要任务超时时间。默认值为 30 秒。
 - **`WithSummaryJobTimeout(timeout time.Duration)`**：设置单个摘要任务超时时间。默认值为 30 秒。
 
 ### 基础配置示例
@@ -495,13 +582,24 @@ summary:{appName}:{userID}:{sessionID}:{filterKey} -> String (JSON)
 
 **连接配置：**
 
+方式一：
+
+- **`WithPostgresClientDSN(dsn string)`**：PostgreSQL DSN。 示例：`postgres://user:password@localhost:5432/dbname`
+
+方式二：
+
 - **`WithHost(host string)`**：PostgreSQL 服务器地址。默认值为 `localhost`。
 - **`WithPort(port int)`**：PostgreSQL 服务器端口。默认值为 `5432`。
 - **`WithUser(user string)`**：数据库用户名。默认值为 `postgres`。
 - **`WithPassword(password string)`**：数据库密码。默认值为空字符串。
 - **`WithDatabase(database string)`**：数据库名称。默认值为 `postgres`。
 - **`WithSSLMode(sslMode string)`**：SSL 模式。默认值为 `disable`。可选值：`disable`、`require`、`verify-ca`、`verify-full`。
-- **`WithInstanceName(name string)`**：使用预配置的 PostgreSQL 实例。
+
+方式三：
+
+- **`WithPostgresInstance(name string)`**：使用预配置的 PostgreSQL 实例。
+
+优先级：方式一 > 方式二 > 方式三
 
 **会话配置：**
 
@@ -516,7 +614,6 @@ summary:{appName}:{userID}:{sessionID}:{filterKey} -> String (JSON)
 
 - **`WithEnableAsyncPersist(enable bool)`**：启用异步持久化。默认值为 `false`。
 - **`WithAsyncPersisterNum(num int)`**：异步持久化 worker 数量。默认值为 10。
-
 
 **摘要配置：**
 
@@ -538,24 +635,13 @@ import "trpc.group/trpc-go/trpc-agent-go/session/postgres"
 
 // 默认配置（最简）
 sessionService, err := postgres.NewService(
-    postgres.WithHost("localhost"),
-    postgres.WithPassword("your-password"),
+    postgres.WithPostgresClientDSN("postgres://user:password@localhost:5432/mydb?sslmode=disable"),
 )
-// 效果：
-// - 连接 localhost:5432，数据库 postgres
-// - 每个会话最多 1000 个事件
-// - 数据永不过期
-// - 2 个异步持久化 worker
+
 
 // 生产环境完整配置
 sessionService, err := postgres.NewService(
-    // 连接配置
-    postgres.WithHost("localhost"),
-    postgres.WithPort(5432),
-    postgres.WithUser("postgres"),
-    postgres.WithPassword("your-password"),
-    postgres.WithDatabase("trpc_sessions"),
-    postgres.WithSSLMode("require"),
+    postgres.WithPostgresClientDSN("postgres://user:password@localhost:5432/trpc_sessions?sslmode=require"),
 
     // 会话配置
     postgres.WithSessionEventLimit(1000),
@@ -581,23 +667,19 @@ sessionService, err := postgres.NewService(
 
 ```go
 import (
-    "trpc.group/trpc-go/trpc-agent-go/storage"
-    "trpc.group/trpc-go/trpc-agent-go/session/postgres"
+    "trpc.group/trpc-go/trpc-agent-go/storage/postgres"
+    sessionpg "trpc.group/trpc-go/trpc-agent-go/session/postgres"
 )
 
 // 注册 PostgreSQL 实例
-storage.RegisterPostgresInstance("my-postgres-instance",
-    storage.WithPostgresHost("localhost"),
-    storage.WithPostgresPort(5432),
-    storage.WithPostgresUser("postgres"),
-    storage.WithPostgresPassword("your-password"),
-    storage.WithPostgresDatabase("trpc_sessions"),
+postgres.RegisterPostgresInstance("my-postgres-instance",
+    postgres.WithClientConnString("postgres://user:password@localhost:5432/trpc_sessions?sslmode=disable"),
 )
 
 // 在会话服务中使用
-sessionService, err := postgres.NewService(
-    postgres.WithInstanceName("my-postgres-instance"),
-    postgres.WithSessionEventLimit(500),
+sessionService, err := sessionpg.NewService(
+    sessionpg.WithPostgresInstance("my-postgres-instance"),
+    sessionpg.WithSessionEventLimit(500),
 )
 ```
 
@@ -656,10 +738,10 @@ sessionService, err := postgres.NewService(
 
 **删除行为对比：**
 
-| 配置               | 删除操作                        | 查询行为                  | 数据恢复 |
-| ------------------ | ------------------------------- | ------------------------- | -------- |
-| `softDelete=true`  | `UPDATE SET deleted_at = NOW()` | 过滤 `deleted_at IS NULL` | 可恢复   |
-| `softDelete=false` | `DELETE FROM ...`               | 查询所有记录              | 不可恢复 |
+| 配置               | 删除操作                        | 查询行为                                                | 数据恢复 |
+| ------------------ | ------------------------------- | ------------------------------------------------------- | -------- |
+| `softDelete=true`  | `UPDATE SET deleted_at = NOW()` | 查询附带 `WHERE deleted_at IS NULL`，仅返回未软删除数据 | 可恢复   |
+| `softDelete=false` | `DELETE FROM ...`               | 查询所有记录                                            | 不可恢复 |
 
 **TTL 自动清理：**
 
@@ -675,7 +757,7 @@ sessionService, err := postgres.NewService(
 // 清理行为：
 // - softDelete=true：过期数据标记为 deleted_at = NOW()
 // - softDelete=false：过期数据被物理删除
-// - 查询时始终过滤 deleted_at IS NULL
+// - 查询时始终附加 `WHERE deleted_at IS NULL`，仅返回未软删除数据
 ```
 
 ### 配合摘要使用
@@ -696,95 +778,8 @@ sessionService, err := postgres.NewService(
 
 ### 存储结构
 
-PostgreSQL 使用关系型表结构，JSON 数据使用 JSONB 类型存储：
 
-```sql
--- 会话状态表
-CREATE TABLE session_states (
-    id BIGSERIAL PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    state JSONB,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    expires_at TIMESTAMP,
-    deleted_at TIMESTAMP
-);
-
--- 部分唯一索引（只对未删除记录生效）
-CREATE UNIQUE INDEX idx_session_states_unique_active
-ON session_states(app_name, user_id, session_id)
-WHERE deleted_at IS NULL;
-
--- 会话事件表
-CREATE TABLE session_events (
-    id BIGSERIAL PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    event JSONB NOT NULL,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    expires_at TIMESTAMP,
-    deleted_at TIMESTAMP
-);
-
--- 轨迹事件表
-CREATE TABLE session_track_events (
-    id BIGSERIAL PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    track VARCHAR(255) NOT NULL,
-    event JSONB NOT NULL,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    expires_at TIMESTAMP,
-    deleted_at TIMESTAMP
-);
-
--- 会话摘要表
-CREATE TABLE session_summaries (
-    id BIGSERIAL PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    filter_key VARCHAR(255) NOT NULL,
-    summary JSONB NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    expires_at TIMESTAMP,
-    deleted_at TIMESTAMP,
-    UNIQUE(app_name, user_id, session_id, filter_key)
-);
-
--- 应用状态表
-CREATE TABLE app_states (
-    id BIGSERIAL PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    key VARCHAR(255) NOT NULL,
-    value TEXT DEFAULT NULL,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    expires_at TIMESTAMP,
-    deleted_at TIMESTAMP,
-    UNIQUE(app_name, key)
-);
-
--- 用户状态表
-CREATE TABLE user_states (
-    id BIGSERIAL PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    key VARCHAR(255) NOT NULL,
-    value TEXT DEFAULT NULL,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    expires_at TIMESTAMP,
-    deleted_at TIMESTAMP,
-    UNIQUE(app_name, user_id, key)
-);
-```
+完整的表定义请参考 [session/postgres/schema.sql](https://github.com/trpc-group/trpc-agent-go/blob/main/session/postgres/schema.sql)
 
 ## MySQL 存储
 
@@ -811,7 +806,6 @@ CREATE TABLE user_states (
 - **`WithEnableAsyncPersist(enable bool)`**：启用异步持久化。默认值为 `false`。
 - **`WithAsyncPersisterNum(num int)`**：异步持久化 worker 数量。默认值为 10。
 
-
 **摘要配置：**
 
 - **`WithSummarizer(s summary.SessionSummarizer)`**：注入会话摘要器。
@@ -837,7 +831,7 @@ sessionService, err := mysql.NewService(
 // - 连接 localhost:3306，数据库 trpc_sessions
 // - 每个会话最多 1000 个事件
 // - 数据永不过期
-// - 2 个异步持久化 worker
+// - 默认 10 个异步持久化 worker（可通过 WithAsyncPersisterNum 调整）
 
 // 生产环境完整配置
 sessionService, err := mysql.NewService(
@@ -867,23 +861,19 @@ sessionService, err := mysql.NewService(
 
 ```go
 import (
-    "trpc.group/trpc-go/trpc-agent-go/storage"
-    "trpc.group/trpc-go/trpc-agent-go/session/mysql"
+    "trpc.group/trpc-go/trpc-agent-go/storage/mysql"
+    sessionmysql "trpc.group/trpc-go/trpc-agent-go/session/mysql"
 )
 
 // 注册 MySQL 实例
-storage.RegisterMySQLInstance("my-mysql-instance",
-    storage.WithMySQLHost("localhost"),
-    storage.WithMySQLPort(3306),
-    storage.WithMySQLUser("root"),
-    storage.WithMySQLPassword("your-password"),
-    storage.WithMySQLDatabase("trpc_sessions"),
+mysql.RegisterMySQLInstance("my-mysql-instance",
+    mysql.WithClientBuilderDSN("root:password@tcp(localhost:3306)/trpc_sessions?parseTime=true&charset=utf8mb4"),
 )
 
 // 在会话服务中使用
-sessionService, err := mysql.NewService(
-    mysql.WithInstanceName("my-mysql-instance"),
-    mysql.WithSessionEventLimit(500),
+sessionService, err := sessionmysql.NewService(
+    sessionmysql.WithMySQLInstance("my-mysql-instance"),
+    sessionmysql.WithSessionEventLimit(500),
 )
 ```
 
@@ -919,10 +909,10 @@ sessionService, err := mysql.NewService(
 
 **删除行为对比：**
 
-| 配置               | 删除操作                        | 查询行为                  | 数据恢复 |
-| ------------------ | ------------------------------- | ------------------------- | -------- |
-| `softDelete=true`  | `UPDATE SET deleted_at = NOW()` | 过滤 `deleted_at IS NULL` | 可恢复   |
-| `softDelete=false` | `DELETE FROM ...`               | 查询所有记录              | 不可恢复 |
+| 配置               | 删除操作                        | 查询行为                                                | 数据恢复 |
+| ------------------ | ------------------------------- | ------------------------------------------------------- | -------- |
+| `softDelete=true`  | `UPDATE SET deleted_at = NOW()` | 查询附带 `WHERE deleted_at IS NULL`，仅返回未软删除数据 | 可恢复   |
+| `softDelete=false` | `DELETE FROM ...`               | 查询所有记录                                            | 不可恢复 |
 
 **TTL 自动清理：**
 
@@ -938,7 +928,7 @@ sessionService, err := mysql.NewService(
 // 清理行为：
 // - softDelete=true：过期数据标记为 deleted_at = NOW()
 // - softDelete=false：过期数据被物理删除
-// - 查询时始终过滤 deleted_at IS NULL
+// - 查询时始终附加 `WHERE deleted_at IS NULL`，仅返回未软删除数据
 ```
 
 ### 配合摘要使用
@@ -958,86 +948,280 @@ sessionService, err := mysql.NewService(
 
 ### 存储结构
 
-MySQL 使用关系型表结构，JSON 数据使用 JSON 类型存储：
+
+完整的表定义请参考 [session/mysql/schema.sql](https://github.com/trpc-group/trpc-agent-go/blob/main/session/mysql/schema.sql)
+
+### 版本升级
+
+#### 旧版本数据迁移
+
+如果您的数据库是使用旧版本创建的，需要执行以下迁移步骤。
+
+**影响版本**：v1.2.0 之前的版本  
+**修复版本**：v1.2.0 及之后
+
+**问题背景**：早期版本的 `session_summaries` 表存在索引设计问题：
+
+- 最初版本使用包含 `deleted_at` 列的唯一索引，但 MySQL 中 `NULL != NULL`，导致多条 `deleted_at = NULL` 的记录无法触发唯一约束
+- 后续版本改为普通 lookup 索引（非唯一），同样无法防止重复数据
+
+这两种情况都可能导致重复数据产生。
+
+**旧版索引**（以下两种之一）：
+
+- `idx_*_session_summaries_unique_active(app_name, user_id, session_id, filter_key, deleted_at)` — 唯一索引但包含 deleted_at
+- `idx_*_session_summaries_lookup(app_name, user_id, session_id, deleted_at)` — 普通索引
+
+**新版索引**：`idx_*_session_summaries_unique_active(app_name, user_id, session_id, filter_key)` — 唯一索引，不包含 deleted_at
+
+**迁移步骤**：
+
+```sql
+-- ============================================================================
+-- 迁移脚本：修复 session_summaries 唯一索引问题
+-- 执行前请备份数据！
+-- ============================================================================
+
+-- Step 1: 查看当前索引，确认旧索引名称
+SHOW INDEX FROM session_summaries;
+
+-- Step 2: 清理重复数据（保留最新记录）
+-- 如果存在多条 deleted_at = NULL 的重复记录，保留 id 最大的那条。
+DELETE t1 FROM session_summaries t1
+INNER JOIN session_summaries t2
+WHERE t1.app_name = t2.app_name
+  AND t1.user_id = t2.user_id
+  AND t1.session_id = t2.session_id
+  AND t1.filter_key = t2.filter_key
+  AND t1.deleted_at IS NULL
+  AND t2.deleted_at IS NULL
+  AND t1.id < t2.id;
+
+-- Step 3: 硬删除软删除记录（summary 数据可再生，无需保留）
+-- 如果需要保留软删除记录，可跳过此步骤，但需要在 Step 5 之前手动处理冲突。
+DELETE FROM session_summaries WHERE deleted_at IS NOT NULL;
+
+-- Step 4: 删除旧索引（根据 Step 1 的结果选择正确的索引名）
+-- 注意：索引名称可能带有表前缀，请根据实际情况调整。
+-- 如果是 lookup 索引：
+DROP INDEX idx_session_summaries_lookup ON session_summaries;
+-- 如果是旧的 unique_active 索引（包含 deleted_at）：
+-- DROP INDEX idx_session_summaries_unique_active ON session_summaries;
+
+-- Step 5: 创建新的唯一索引（不包含 deleted_at）
+-- 注意：索引名称可能带有表前缀，请根据实际情况调整。
+CREATE UNIQUE INDEX idx_session_summaries_unique_active 
+ON session_summaries(app_name, user_id, session_id, filter_key);
+
+-- Step 6: 验证迁移结果
+SELECT COUNT(*) as duplicate_count FROM (
+    SELECT app_name, user_id, session_id, filter_key, COUNT(*) as cnt
+    FROM session_summaries
+    WHERE deleted_at IS NULL
+    GROUP BY app_name, user_id, session_id, filter_key
+    HAVING cnt > 1
+) t;
+-- 期望结果：duplicate_count = 0
+
+-- Step 7: 验证索引是否创建成功
+SHOW INDEX FROM session_summaries WHERE Key_name = 'idx_session_summaries_unique_active';
+-- 期望结果：显示新创建的唯一索引，且不包含 deleted_at 列
+```
+
+**注意事项**：
+
+1. 如果使用了 `WithTablePrefix("trpc_")` 配置，表名和索引名会带有前缀：
+   - 表名：`trpc_session_summaries`
+   - 旧索引名：`idx_trpc_session_summaries_lookup` 或 `idx_trpc_session_summaries_unique_active`
+   - 新索引名：`idx_trpc_session_summaries_unique_active`
+   - 请根据实际配置调整上述 SQL 中的表名和索引名。
+
+2. 新索引不包含 `deleted_at` 列，这意味着软删除的 summary 记录会阻止相同业务键的新记录插入。由于 summary 数据可再生，迁移时建议硬删除软删除记录（Step 3）。如果跳过此步骤，需手动处理冲突。
+
+
+## ClickHouse 存储
+
+适用于生产环境和海量数据场景，利用 ClickHouse 强大的写入吞吐量和数据压缩能力。
+
+### 配置选项
+
+**连接配置：**
+
+- **`WithClickHouseDSN(dsn string)`**：ClickHouse DSN 连接字符串（推荐）。
+  - 格式：`clickhouse://user:password@host:port/database?dial_timeout=10s`
+- **`WithClickHouseInstance(name string)`**：使用预配置的 ClickHouse 实例。
+- **`WithExtraOptions(opts ...any)`**：为 ClickHouse 客户端设置额外选项。
+
+**会话配置：**
+
+- **`WithSessionEventLimit(limit int)`**：每个会话最大事件数量。默认值为 1000。
+- **`WithSessionTTL(ttl time.Duration)`**：会话 TTL。默认值为 0（不过期）。
+- **`WithAppStateTTL(ttl time.Duration)`**：应用状态 TTL。默认值为 0（不过期）。
+- **`WithUserStateTTL(ttl time.Duration)`**：用户状态 TTL。默认值为 0（不过期）。
+- **`WithDeletedRetention(retention time.Duration)`**：软删除数据保留时间。默认值为 0（禁用应用层物理清理）。启用后将通过 `ALTER TABLE DELETE` 定期清理软删除数据，生产环境**不建议开启**，建议优先使用 ClickHouse 表级 TTL。
+- **`WithCleanupInterval(interval time.Duration)`**：清理任务间隔。
+
+**异步持久化配置：**
+
+- **`WithEnableAsyncPersist(enable bool)`**：启用异步持久化。默认值为 `false`。
+- **`WithAsyncPersisterNum(num int)`**：异步持久化 worker 数量。默认值为 10。
+- **`WithBatchSize(size int)`**：批量写入大小。默认值为 100。
+- **`WithBatchTimeout(timeout time.Duration)`**：批量写入超时。默认值为 100ms。
+
+**摘要配置：**
+
+- **`WithSummarizer(s summary.SessionSummarizer)`**：注入会话摘要器。
+- **`WithAsyncSummaryNum(num int)`**：摘要处理 worker 数量。默认值为 3。
+- **`WithSummaryQueueSize(size int)`**：摘要任务队列大小。默认值为 100。
+- **`WithSummaryJobTimeout(timeout time.Duration)`**：单个摘要任务超时时间。
+
+**Schema 配置：**
+
+- **`WithTablePrefix(prefix string)`**：表名前缀。
+- **`WithSkipDBInit(skip bool)`**：跳过自动建表。
+
+**Hook 配置：**
+
+- **`WithAppendEventHook(hooks ...session.AppendEventHook)`**：添加事件写入 Hook。
+- **`WithGetSessionHook(hooks ...session.GetSessionHook)`**：添加会话读取 Hook。
+
+### 基础配置示例
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/session/clickhouse"
+
+// 默认配置（最简）
+sessionService, err := clickhouse.NewService(
+    clickhouse.WithClickHouseDSN("clickhouse://default:password@localhost:9000/default"),
+)
+```
+
+### 配置复用
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/storage/clickhouse"
+    sessionch "trpc.group/trpc-go/trpc-agent-go/session/clickhouse"
+)
+
+// 注册 ClickHouse 实例
+clickhouse.RegisterClickHouseInstance("my-clickhouse",
+    clickhouse.WithClientBuilderDSN("clickhouse://localhost:9000/default"),
+)
+
+// 在会话服务中使用
+sessionService, err := sessionch.NewService(
+    sessionch.WithClickHouseInstance("my-clickhouse"),
+)
+```
+
+### 存储结构
+
+ClickHouse 实现使用了 `ReplacingMergeTree` 引擎来处理数据更新和去重。
+
+**关键特性：**
+
+1.  **ReplacingMergeTree**：利用 `updated_at` 字段，ClickHouse 会在后台自动合并相同主键的记录，保留最新版本。
+2.  **FINAL 查询**：所有读取操作都使用 `FINAL` 关键字（如 `SELECT ... FINAL`），确保在查询时合并所有数据部分，保证读取一致性。
+3.  **Soft Delete**：删除操作通过插入一条带有 `deleted_at` 时间戳的新记录实现。查询时过滤 `deleted_at IS NULL`。
 
 ```sql
 -- 会话状态表
-CREATE TABLE session_states (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    state JSON,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NULL,
-    deleted_at TIMESTAMP NULL,
-    UNIQUE KEY idx_session_states_unique (app_name, user_id, session_id, deleted_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS session_states (
+    app_name    String,
+    user_id     String,
+    session_id  String,
+    state       JSON COMMENT 'Session state in JSON format',
+    extra_data  JSON COMMENT 'Additional metadata',
+    created_at  DateTime64(6),
+    updated_at  DateTime64(6),
+    expires_at  Nullable(DateTime64(6)) COMMENT 'Expiration time (application-level)',
+    deleted_at  Nullable(DateTime64(6)) COMMENT 'Soft delete timestamp'
+) ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY (app_name, cityHash64(user_id) % 64)
+-- CRITICAL: Removed deleted_at from ORDER BY to allow ReplacingMergeTree to collapse deleted records
+ORDER BY (app_name, user_id, session_id)
+SETTINGS allow_nullable_key = 1
+COMMENT 'Session states table';
 
 -- 会话事件表
-CREATE TABLE session_events (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    event JSON NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NULL,
-    deleted_at TIMESTAMP NULL,
-    KEY idx_session_events (app_name, user_id, session_id, deleted_at, created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS session_events (
+    app_name    String,
+    user_id     String,
+    session_id  String,
+    event_id    String,
+    event       JSON COMMENT 'Event data in JSON format',
+    extra_data  JSON COMMENT 'Additional metadata',
+    created_at  DateTime64(6),
+    updated_at  DateTime64(6),
+    expires_at  Nullable(DateTime64(6)) COMMENT 'Reserved for future use',
+    deleted_at  Nullable(DateTime64(6)) COMMENT 'Soft delete timestamp'
+) ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY (app_name, cityHash64(user_id) % 64)
+-- CRITICAL: Removed deleted_at from ORDER BY to allow ReplacingMergeTree to collapse deleted records
+ORDER BY (app_name, user_id, session_id, event_id)
+SETTINGS allow_nullable_key = 1
+COMMENT 'Session events table';
 
 -- 会话摘要表
-CREATE TABLE session_summaries (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    filter_key VARCHAR(255) NOT NULL,
-    summary JSON NOT NULL,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NULL,
-    deleted_at TIMESTAMP NULL,
-    UNIQUE KEY idx_session_summaries_unique (app_name, user_id, session_id, filter_key, deleted_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS session_summaries (
+    app_name    String,
+    user_id     String,
+    session_id  String,
+    filter_key  String COMMENT 'Filter key for multiple summaries per session',
+    summary     JSON COMMENT 'Summary data in JSON format',
+    created_at  DateTime64(6),
+    updated_at  DateTime64(6),
+    expires_at  Nullable(DateTime64(6)) COMMENT 'Reserved for future use',
+    deleted_at  Nullable(DateTime64(6)) COMMENT 'Soft delete timestamp'
+) ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY (app_name, cityHash64(user_id) % 64)
+-- CRITICAL: Removed deleted_at from ORDER BY to allow ReplacingMergeTree to collapse deleted records
+ORDER BY (app_name, user_id, session_id, filter_key)
+SETTINGS allow_nullable_key = 1
+COMMENT 'Session summaries table';
 
 -- 应用状态表
-CREATE TABLE app_states (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    `key` VARCHAR(255) NOT NULL,
-    value TEXT DEFAULT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NULL,
-    deleted_at TIMESTAMP NULL,
-    UNIQUE KEY idx_app_states_unique (app_name, `key`, deleted_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS app_states (
+    app_name    String,
+    key         String COMMENT 'State key',
+    value       String COMMENT 'State value',
+    updated_at  DateTime64(6),
+    expires_at  Nullable(DateTime64(6)) COMMENT 'Expiration time (application-level)',
+    deleted_at  Nullable(DateTime64(6)) COMMENT 'Soft delete timestamp'
+) ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY app_name
+-- CRITICAL: Removed deleted_at from ORDER BY to allow ReplacingMergeTree to collapse deleted records
+ORDER BY (app_name, key)
+SETTINGS allow_nullable_key = 1
+COMMENT 'Application states table';
 
 -- 用户状态表
-CREATE TABLE user_states (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    `key` VARCHAR(255) NOT NULL,
-    value TEXT DEFAULT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NULL,
-    deleted_at TIMESTAMP NULL,
-    UNIQUE KEY idx_user_states_unique (app_name, user_id, `key`, deleted_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS user_states (
+    app_name    String,
+    user_id     String,
+    key         String COMMENT 'State key',
+    value       String COMMENT 'State value',
+    updated_at  DateTime64(6),
+    expires_at  Nullable(DateTime64(6)) COMMENT 'Expiration time (application-level)',
+    deleted_at  Nullable(DateTime64(6)) COMMENT 'Soft delete timestamp'
+) ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY (app_name, cityHash64(user_id) % 64)
+-- CRITICAL: Removed deleted_at from ORDER BY to allow ReplacingMergeTree to collapse deleted records
+ORDER BY (app_name, user_id, key)
+SETTINGS allow_nullable_key = 1
+COMMENT 'User states table';
 ```
 
-**MySQL 与 PostgreSQL 的关键差异：**
-
-- MySQL 不支持 `WHERE deleted_at IS NULL` 的 partial index，需要将 `deleted_at` 包含在唯一索引中
-- MySQL 使用 `JSON` 类型而非 `JSONB`（功能类似，但存储格式不同）
-- MySQL 使用 `ON DUPLICATE KEY UPDATE` 语法实现 UPSERT
-
 ## 高级用法
+
+### Hook 能力（Append/Get）
+
+- **AppendEventHook**：事件写入前的拦截/修改/终止。可用于内容安全、审计打标（如写入 `violation=<word>`），或直接阻断存储。关于 filterKey 的赋值请见下文“会话摘要 / FilterKey 与 AppendEventHook”。
+- **GetSessionHook**：会话读取后的拦截/修改/过滤。可用来剔除带特定标签的事件，或动态补充返回的 Session 状态。
+- **责任链执行**：Hook 通过 `next()` 形成链式调用，可提前返回以短路后续逻辑，错误会向上传递。
+- **跨后端一致**：内存、Redis、MySQL、PostgreSQL 实现已统一接入 Hook，构造服务时注入 Hook 切片即可。
+- **示例**：见 `examples/session/hook`（[代码](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/session/hook)）
 
 ### 直接使用 Session Service API
 
@@ -1089,6 +1273,154 @@ sess, err := sessionService.GetSession(ctx, key,
     session.WithEventTime(time.Now().Add(-1*time.Hour)))
 ```
 
+#### 直接追加事件到会话
+
+在某些场景下，您可能需要直接将事件追加到会话中，而不调用模型。这在以下场景中很有用：
+
+- 从外部源预加载对话历史
+- 在首次用户查询前插入系统消息或上下文
+- 将用户操作或元数据记录为事件
+- 以编程方式构建对话上下文
+
+**重要提示**：Event 既可以表示用户请求，也可以表示模型响应。当您使用 `Runner.Run()` 时，框架会自动为用户消息和助手回复创建事件。
+
+**示例：追加用户消息**
+
+```go
+import (
+    "context"
+    "github.com/google/uuid"
+    "trpc.group/trpc-go/trpc-agent-go/event"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/session"
+)
+
+// 获取或创建会话
+sessionKey := session.Key{
+    AppName:   "my-agent",
+    UserID:    "user123",
+    SessionID: "session-123",
+}
+sess, err := sessionService.GetSession(ctx, sessionKey)
+if err != nil {
+    return err
+}
+if sess == nil {
+    sess, err = sessionService.CreateSession(ctx, sessionKey, session.StateMap{})
+    if err != nil {
+        return err
+    }
+}
+
+// 创建用户消息
+message := model.NewUserMessage("你好，我正在学习 Go 编程。")
+
+// 创建事件，必填字段：
+// - invocationID: 唯一标识符（必填）
+// - author: 事件作者，用户消息使用 "user"（必填）
+// - response: *model.Response，包含 Choices 和 Message（必填）
+invocationID := uuid.New().String()
+evt := event.NewResponseEvent(
+    invocationID, // 必填：唯一调用标识符
+    "user",       // 必填：事件作者
+    &model.Response{
+        Done: false, // 推荐：非最终事件设为 false
+        Choices: []model.Choice{
+            {
+                Index:   0,       // 必填：选择索引
+                Message: message, // 必填：包含 Content 或 ContentParts 的消息
+            },
+        },
+    },
+)
+evt.RequestID = uuid.New().String() // 可选：用于追踪
+
+// 追加事件到会话
+if err := sessionService.AppendEvent(ctx, sess, evt); err != nil {
+    return fmt.Errorf("append event failed: %w", err)
+}
+```
+
+**示例：追加系统消息**
+
+```go
+systemMessage := model.Message{
+    Role:    model.RoleSystem,
+    Content: "你是一个专门帮助 Go 编程的助手。",
+}
+
+evt := event.NewResponseEvent(
+    uuid.New().String(),
+    "system", // 系统消息的作者
+    &model.Response{
+        Done:    false,
+        Choices: []model.Choice{{Index: 0, Message: systemMessage}},
+    },
+)
+
+if err := sessionService.AppendEvent(ctx, sess, evt); err != nil {
+    return err
+}
+```
+
+**示例：追加助手消息**
+
+```go
+assistantMessage := model.Message{
+    Role:    model.RoleAssistant,
+    Content: "Go 是一种静态类型、编译型的编程语言。",
+}
+
+evt := event.NewResponseEvent(
+    uuid.New().String(),
+    "assistant", // 助手消息的作者（或使用 agent 名称）
+    &model.Response{
+        Done:    false,
+        Choices: []model.Choice{{Index: 0, Message: assistantMessage}},
+    },
+)
+
+if err := sessionService.AppendEvent(ctx, sess, evt); err != nil {
+    return err
+}
+```
+
+**Event 必填字段**
+
+使用 `event.NewResponseEvent()` 创建事件时，以下字段是必填的：
+
+1. **函数参数**：
+   - `invocationID` (string): 唯一标识符，通常使用 `uuid.New().String()`
+   - `author` (string): 事件作者（`"user"`、`"system"` 或 agent 名称）
+   - `response` (*model.Response): 包含 Choices 的响应对象
+
+2. **Response 字段**：
+   - `Choices` ([]model.Choice): 至少包含一个 Choice，包含 `Index` 和 `Message`
+   - `Message`: 必须包含 `Content` 或 `ContentParts`
+
+3. **自动生成字段**（由 `event.NewResponseEvent()` 自动设置）：
+   - `ID`: 自动生成的 UUID
+   - `Timestamp`: 自动设置为当前时间
+   - `Version`: 自动设置为 `CurrentVersion`
+
+4. **持久化要求**：
+   - `Response != nil`
+   - `!IsPartial`（或包含 `StateDelta`）
+   - `IsValidContent()` 返回 `true`
+
+**与 Runner 配合使用**
+
+当您后续使用 `Runner.Run()` 处理同一会话时：
+
+1. Runner 会自动加载会话（包括所有已追加的事件）
+2. 将会话事件转换为消息
+3. 将所有消息（已追加的 + 当前的）包含在对话上下文中
+4. 一起发送给模型
+
+所有已追加的事件都会成为对话历史的一部分，并在后续交互中可供模型使用。
+
+**示例**：见 `examples/session/appendevent`（[代码](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/session/appendevent)）
+
 ## 会话摘要
 
 ### 概述
@@ -1125,8 +1457,8 @@ summaryModel := openai.New("gpt-4", openai.WithAPIKey("your-api-key"))
 summarizer := summary.NewSummarizer(
     summaryModel,
     summary.WithChecksAny(                     // 任一条件满足即触发
-        summary.CheckEventThreshold(20),       // 超过 20 个事件后触发
-        summary.CheckTokenThreshold(4000),     // 超过 4000 个 token 后触发
+        summary.CheckEventThreshold(20),       // 自上次摘要后新增 20 个事件后触发
+        summary.CheckTokenThreshold(4000),     // 自上次摘要后新增 4000 个 token 后触发
         summary.CheckTimeThreshold(5*time.Minute), // 5 分钟无活动后触发
     ),
     summary.WithMaxSummaryWords(200),          // 限制摘要在 200 字以内
@@ -1175,6 +1507,13 @@ sessionService, err := mysql.NewService(
     mysql.WithSummarizer(summarizer),
     mysql.WithAsyncSummaryNum(2),           // 2个异步 worker
     mysql.WithSummaryQueueSize(100),        // 队列大小 100
+)
+
+// ClickHouse 存储
+sessionService, err := clickhouse.NewService(
+    clickhouse.WithClickHouseDSN("clickhouse://default:password@localhost:9000/default"),
+    clickhouse.WithSummarizer(summarizer),
+    clickhouse.WithAsyncSummaryNum(2),
 )
 ```
 
@@ -1302,7 +1641,7 @@ llmagent.WithAddSessionSummary(true)
 
 **工作方式：**
 
-- 摘要作为系统消息自动前置到 LLM 输入
+- 会话摘要作为独立的系统消息插入到第一个现有系统消息之后（如果没有系统消息则前置添加）
 - 包含摘要时间点之后的**所有增量事件**（不截断）
 - 保证完整上下文：浓缩历史 + 完整新对话
 - **`WithMaxHistoryRuns` 参数被忽略**
@@ -1370,8 +1709,8 @@ llmagent.WithMaxHistoryRuns(10)  // 限制历史轮次
 
 **触发条件：**
 
-- **`WithEventThreshold(eventCount int)`**：当事件数量超过阈值时触发摘要。示例：`WithEventThreshold(20)` 在超过 20 个事件后触发。
-- **`WithTokenThreshold(tokenCount int)`**：当总 token 数量超过阈值时触发摘要。示例：`WithTokenThreshold(4000)` 在超过 4000 个 token 后触发。
+- **`WithEventThreshold(eventCount int)`**：当自上次摘要后的事件数量超过阈值时触发摘要。示例：`WithEventThreshold(20)` 在自上次摘要后新增 20 个事件后触发。
+- **`WithTokenThreshold(tokenCount int)`**：当自上次摘要后的 token 数量超过阈值时触发摘要。示例：`WithTokenThreshold(4000)` 在自上次摘要后新增 4000 个 token 后触发。
 - **`WithTimeThreshold(interval time.Duration)`**：当自上次事件后经过的时间超过间隔时触发摘要。示例：`WithTimeThreshold(5*time.Minute)` 在 5 分钟无活动后触发。
 
 **组合条件：**
@@ -1397,6 +1736,7 @@ llmagent.WithMaxHistoryRuns(10)  // 限制历史轮次
 
 - **`WithMaxSummaryWords(maxWords int)`**：限制摘要的最大字数。该限制会包含在提示词中以指导模型生成。示例：`WithMaxSummaryWords(150)` 请求在 150 字以内的摘要。
 - **`WithPrompt(prompt string)`**：提供自定义摘要提示词。提示词必须包含占位符 `{conversation_text}`，它会被对话内容替换。可选包含 `{max_summary_words}` 用于字数限制指令。
+- **`WithSkipRecent(skipFunc SkipRecentFunc)`**：通过自定义函数在摘要时跳过**最近**事件。函数接收所有事件并返回应跳过的尾部事件数量，返回 0 表示不跳过。适合避免总结最近、可能不完整的对话，或实现基于时间/内容的跳过策略。
 
 **自定义提示词示例：**
 
@@ -1412,9 +1752,52 @@ customPrompt := `分析以下对话并提供简洁的摘要，重点关注关键
 
 summarizer := summary.NewSummarizer(
     summaryModel,
-    summary.WithPrompt(customPrompt),
-    summary.WithMaxSummaryWords(100),
+    summary.WithPrompt(customPrompt), // 自定义 Prompt
+    summary.WithMaxSummaryWords(100), // 注入 Prompt 里面的 {max_summary_words}
     summary.WithEventThreshold(15),
+)
+
+// 跳过固定数量（兼容旧用法）
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithSkipRecent(func(_ []event.Event) int { return 2 }), // 跳过最后 2 条
+    summary.WithEventThreshold(10),
+)
+
+// 跳过最近 5 分钟内的消息（时间窗口）
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithSkipRecent(func(events []event.Event) int {
+        cutoff := time.Now().Add(-5 * time.Minute)
+        skip := 0
+        for i := len(events) - 1; i >= 0; i-- {
+            if events[i].Timestamp.After(cutoff) {
+                skip++
+            } else {
+                break
+            }
+        }
+        return skip
+    }),
+    summary.WithEventThreshold(10),
+)
+
+// 仅跳过末尾的工具调用消息
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithSkipRecent(func(events []event.Event) int {
+        skip := 0
+        for i := len(events) - 1; i >= 0; i-- {
+            if events[i].Response != nil && len(events[i].Response.Choices) > 0 &&
+                events[i].Response.Choices[0].Message.Role == model.RoleTool {
+                skip++
+            } else {
+                break
+            }
+        }
+        return skip
+    }),
+    summary.WithEventThreshold(10),
 )
 ```
 
@@ -1462,11 +1845,28 @@ err := sessionService.EnqueueSummaryJob(
 从会话中获取最新的摘要文本：
 
 ```go
+// 获取全量会话摘要（默认行为）
 summaryText, found := sessionService.GetSessionSummaryText(ctx, sess)
 if found {
     fmt.Printf("摘要：%s\n", summaryText)
 }
+
+// 获取特定 filter key 的摘要
+userSummary, found := sessionService.GetSessionSummaryText(
+    ctx, sess, session.WithSummaryFilterKey("user-messages"),
+)
+if found {
+    fmt.Printf("用户消息摘要：%s\n", userSummary)
+}
 ```
+
+**Filter Key 支持：**
+
+`GetSessionSummaryText` 方法支持可选的 `WithSummaryFilterKey` 选项，用于获取特定事件过滤器的摘要：
+
+- 不提供选项时，返回全量会话摘要（`SummaryFilterKeyAllContents`）
+- 提供特定 filter key 但未找到时，回退到全量会话摘要
+- 如果都不存在，兜底返回任意可用的摘要
 
 ### 工作原理
 
@@ -1474,7 +1874,7 @@ if found {
 
 2. **增量摘要**：新事件与先前的摘要（作为系统事件前置）组合，生成一个既包含旧上下文又包含新信息的更新摘要。
 
-3. **触发条件评估**：在生成摘要之前，摘要器会评估配置的触发条件（事件计数、token 计数、时间阈值）。如果条件未满足且 `force=false`，则跳过摘要。
+3. **触发条件评估**：在生成摘要之前，摘要器会评估配置的触发条件（基于自上次摘要后的增量事件计数、token 计数、时间阈值）。如果条件未满足且 `force=false`，则跳过摘要。
 
 4. **异步 Worker**：摘要任务使用基于哈希的分发策略分配到多个 worker goroutine。这确保同一会话的任务按顺序处理，而不同会话可以并行处理。
 
@@ -1493,6 +1893,80 @@ if found {
 5. **平衡字数限制**：设置 `WithMaxSummaryWords` 以在保留上下文和减少 token 使用之间取得平衡。典型值范围为 100-300 字。
 
 6. **测试触发条件**：尝试不同的 `WithChecksAny` 和 `WithChecksAll` 组合，找到摘要频率和成本之间的最佳平衡。
+
+### 按事件类型生成摘要
+
+在实际应用中，你可能希望为不同类型的事件生成独立的摘要。例如：
+
+- **用户消息摘要**：总结用户的需求和问题
+- **工具调用摘要**：记录使用了哪些工具和结果
+- **系统事件摘要**：跟踪系统状态变化
+
+要实现这个功能，需要为事件设置 `FilterKey` 字段来标识事件类型。
+
+#### 使用 AppendEventHook 设置 FilterKey
+
+推荐使用 `AppendEventHook` 在事件写入前自动设置 `FilterKey`：
+
+```go
+sessionService := inmemory.NewSessionService(
+    inmemory.WithAppendEventHook(func(ctx *session.AppendEventContext, next func() error) error {
+        // 根据事件作者自动分类
+        prefix := "my-app/"  // 必须添加 appName 前缀
+        switch ctx.Event.Author {
+        case "user":
+            ctx.Event.FilterKey = prefix + "user-messages"
+        case "tool":
+            ctx.Event.FilterKey = prefix + "tool-calls"
+        default:
+            ctx.Event.FilterKey = prefix + "misc"
+        }
+        return next()
+    }),
+)
+```
+
+设置好 FilterKey 后，就可以为不同类型的事件生成独立摘要：
+
+```go
+// 为用户消息生成摘要
+err := sessionService.CreateSessionSummary(ctx, sess, "my-app/user-messages", false)
+
+// 为工具调用生成摘要
+err := sessionService.CreateSessionSummary(ctx, sess, "my-app/tool-calls", false)
+
+// 获取特定类型的摘要
+userSummary, found := sessionService.GetSessionSummaryText(
+    ctx, sess, session.WithSummaryFilterKey("my-app/user-messages"))
+```
+
+#### FilterKey 前缀规范
+
+**⚠️ 重要：FilterKey 必须添加 `appName + "/"` 前缀。**
+
+**原因：** Runner 在过滤事件时使用 `appName + "/"` 作为过滤前缀，如果 FilterKey 没有这个前缀，事件会被过滤掉，导致：
+
+- LLM 看不到历史对话，可能重复触发工具调用
+- 摘要内容不完整，丢失重要上下文
+
+**示例：**
+
+```go
+// ✅ 正确：带 appName 前缀
+evt.FilterKey = "my-app/user-messages"
+
+// ❌ 错误：没有前缀，事件会被过滤
+evt.FilterKey = "user-messages"
+```
+
+**技术细节：** 框架使用前缀匹配机制（`strings.HasPrefix`）来判断事件是否应该被包含在上下文中。详见 `ContentRequestProcessor` 的过滤逻辑。
+
+#### 完整示例
+
+参考以下示例查看完整的 FilterKey 使用场景：
+
+- [examples/session/hook](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/session/hook) - Hook 基础用法
+- [examples/summary/filterkey](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/summary/filterkey) - 按 FilterKey 生成摘要
 
 ### 性能考虑
 

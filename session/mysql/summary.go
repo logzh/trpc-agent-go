@@ -13,13 +13,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
-	"trpc.group/trpc-go/trpc-agent-go/internal/session/summary"
-	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/session"
+	isummary "trpc.group/trpc-go/trpc-agent-go/session/internal/summary"
 )
 
 // CreateSessionSummary is the internal implementation that returns the summary.
@@ -34,41 +32,48 @@ func (s *Service) CreateSessionSummary(
 	}
 
 	if sess == nil {
-		return errors.New("nil session")
+		return session.ErrNilSession
 	}
+
 	key := session.Key{AppName: sess.AppName, UserID: sess.UserID, SessionID: sess.ID}
 	if err := key.CheckSessionKey(); err != nil {
 		return fmt.Errorf("check session key failed: %w", err)
 	}
 
-	updated, err := summary.SummarizeSession(ctx, s.opts.summarizer, sess, filterKey, force)
-	if err != nil {
-		return fmt.Errorf("summarize and persist failed: %w", err)
+	updated, err := isummary.SummarizeSession(ctx, s.opts.summarizer, sess, filterKey, force)
+	if err != nil || !updated {
+		return err
 	}
-	if !updated {
+
+	// Persist to MySQL using INSERT ... ON DUPLICATE KEY UPDATE for atomic upsert.
+	// This ensures no duplicate records can be created even under concurrent writes.
+	sess.SummariesMu.RLock()
+	sum := sess.Summaries[filterKey]
+	sess.SummariesMu.RUnlock()
+
+	if sum == nil {
 		return nil
 	}
 
-	// Persist only the updated filterKey summary with atomic set-if-newer to avoid late-write override.
-	sess.SummariesMu.RLock()
-	summary := sess.Summaries[filterKey]
-	sess.SummariesMu.RUnlock()
-	summaryBytes, err := json.Marshal(summary)
+	summaryBytes, err := json.Marshal(sum)
 	if err != nil {
 		return fmt.Errorf("marshal summary failed: %w", err)
 	}
 
-	var expiresAt *time.Time
-	if s.sessionTTL > 0 {
-		t := summary.UpdatedAt.Add(s.sessionTTL)
-		expiresAt = &t
-	}
-
+	// Note: expires_at is set to NULL - summaries are bound to session
+	// lifecycle and will be deleted when session is deleted or expires.
 	_, err = s.mysqlClient.Exec(ctx,
-		fmt.Sprintf(`REPLACE INTO %s (app_name, user_id, session_id, filter_key, summary, updated_at, expires_at, deleted_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`, s.tableSessionSummaries),
-		key.AppName, key.UserID, key.SessionID, filterKey, summaryBytes, summary.UpdatedAt, expiresAt)
-
+		fmt.Sprintf(
+			`INSERT INTO %s (app_name, user_id, session_id, filter_key, summary, updated_at, expires_at, deleted_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+			ON DUPLICATE KEY UPDATE
+				summary = VALUES(summary),
+				updated_at = VALUES(updated_at),
+				expires_at = VALUES(expires_at),
+				deleted_at = NULL`,
+			s.tableSessionSummaries,
+		),
+		key.AppName, key.UserID, key.SessionID, filterKey, summaryBytes, sum.UpdatedAt, nil)
 	if err != nil {
 		return fmt.Errorf("upsert summary failed: %w", err)
 	}
@@ -83,84 +88,51 @@ func (s *Service) EnqueueSummaryJob(ctx context.Context, sess *session.Session, 
 	}
 
 	if sess == nil {
-		return errors.New("nil session")
+		return session.ErrNilSession
 	}
+
 	key := session.Key{AppName: sess.AppName, UserID: sess.UserID, SessionID: sess.ID}
 	if err := key.CheckSessionKey(); err != nil {
 		return fmt.Errorf("check session key failed: %w", err)
 	}
 
-	// If async workers are not initialized, fall back to synchronous processing.
-	if len(s.summaryJobChans) == 0 {
-		return s.CreateSessionSummary(ctx, sess, filterKey, force)
+	if s.asyncWorker != nil {
+		return s.asyncWorker.EnqueueJob(ctx, sess, filterKey, force)
 	}
 
-	// Create summary job.
-	job := &summaryJob{
-		filterKey: filterKey,
-		force:     force,
-		session:   sess,
-	}
-
-	// Try to enqueue the job asynchronously.
-	if s.tryEnqueueJob(ctx, job) {
-		return nil // Successfully enqueued.
-	}
-
-	// If async enqueue failed, fall back to synchronous processing.
-	return s.CreateSessionSummary(ctx, sess, filterKey, force)
-}
-
-// tryEnqueueJob attempts to enqueue a summary job to the appropriate channel.
-// Returns true if successful, false if the job should be processed synchronously.
-// Note: This method assumes channels are already initialized. Callers should check
-// len(s.summaryJobChans) > 0 before calling this method.
-func (s *Service) tryEnqueueJob(ctx context.Context, job *summaryJob) bool {
-	// Select a channel using hash distribution.
-	index := job.session.Hash % len(s.summaryJobChans)
-
-	// Use a defer-recover pattern to handle potential panic from sending to closed channel.
-	defer func() {
-		if r := recover(); r != nil {
-			log.Warnf("summary job channel may be closed, falling back to synchronous processing: %v", r)
-		}
-	}()
-
-	select {
-	case s.summaryJobChans[index] <- job:
-		return true // Successfully enqueued.
-	case <-ctx.Done():
-		log.Debugf("summary job channel context cancelled, falling back to synchronous processing, error: %v", ctx.Err())
-		return false // Context cancelled.
-	default:
-		// Queue is full, fall back to synchronous processing.
-		log.Warnf("summary job queue is full, falling back to synchronous processing")
-		return false
-	}
+	// Fallback to synchronous processing.
+	return isummary.CreateSessionSummaryWithCascade(ctx, sess, filterKey, force, s.CreateSessionSummary)
 }
 
 // GetSessionSummaryText gets the summary text for a session.
+// When no options are provided, returns the full-session summary (SummaryFilterKeyAllContents).
+// Use session.WithSummaryFilterKey to specify a different filter key.
 func (s *Service) GetSessionSummaryText(
 	ctx context.Context,
 	sess *session.Session,
+	opts ...session.SummaryOption,
 ) (string, bool) {
+	// Check session validity.
 	if sess == nil {
 		return "", false
 	}
+
 	key := session.Key{AppName: sess.AppName, UserID: sess.UserID, SessionID: sess.ID}
 	if err := key.CheckSessionKey(); err != nil {
 		return "", false
 	}
-	// Prefer local in-memory session summaries when available.
-	if len(sess.Summaries) > 0 {
-		if text, ok := pickSummaryText(sess.Summaries); ok {
-			return text, true
-		}
+
+	// Try in-memory summaries first.
+	if text, ok := isummary.GetSummaryTextFromSession(sess, opts...); ok {
+		return text, true
 	}
-	// Use empty filterKey to get the default summary
+
+	// Query database with specified filterKey.
+	filterKey := isummary.GetFilterKeyFromOptions(opts...)
+
 	var summaryText string
 	err := s.mysqlClient.Query(ctx, func(rows *sql.Rows) error {
-		// rows.Next() is already called by the Query loop
+		// rows.Next() is already called by the Query loop.
 		var summaryBytes []byte
 		if err := rows.Scan(&summaryBytes); err != nil {
 			return err
@@ -174,80 +146,43 @@ func (s *Service) GetSessionSummaryText(
 	}, fmt.Sprintf(`SELECT summary FROM %s
 		WHERE app_name = ? AND user_id = ? AND session_id = ? AND filter_key = ?
 		AND (expires_at IS NULL OR expires_at > ?)
+		AND updated_at >= ?
 		AND deleted_at IS NULL`, s.tableSessionSummaries),
-		key.AppName, key.UserID, key.SessionID, session.SummaryFilterKeyAllContents, time.Now())
+		key.AppName, key.UserID, key.SessionID, filterKey, time.Now(), sess.CreatedAt)
 
 	if err != nil {
 		return "", false
 	}
 
-	if summaryText == "" {
-		return "", false
+	if summaryText != "" {
+		return summaryText, true
 	}
 
-	return summaryText, true
-}
-
-// pickSummaryText picks a non-empty summary string with preference for the
-// all-contents key "" (empty filterKey). No special handling for "root".
-func pickSummaryText(summaries map[string]*session.Summary) (string, bool) {
-	if summaries == nil {
-		return "", false
-	}
-	// Prefer full-summary stored under empty filterKey.
-	if sum, ok := summaries[session.SummaryFilterKeyAllContents]; ok && sum != nil && sum.Summary != "" {
-		return sum.Summary, true
-	}
-	for _, s := range summaries {
-		if s != nil && s.Summary != "" {
-			return s.Summary, true
-		}
-	}
-	return "", false
-}
-
-// startAsyncSummaryWorker starts worker goroutines for async summary generation.
-func (s *Service) startAsyncSummaryWorker() {
-	summaryNum := s.opts.asyncSummaryNum
-	// Init summary job chan.
-	s.summaryJobChans = make([]chan *summaryJob, summaryNum)
-	for i := 0; i < summaryNum; i++ {
-		s.summaryJobChans[i] = make(chan *summaryJob, s.opts.summaryQueueSize)
-	}
-
-	s.summaryWg.Add(summaryNum)
-	for _, summaryJobChan := range s.summaryJobChans {
-		go func(summaryJobChan chan *summaryJob) {
-			defer s.summaryWg.Done()
-			for job := range summaryJobChan {
-				s.processSummaryJob(job)
-				// After branch summary, cascade a full-session summary by
-				// reusing the same processing path to keep logic unified.
-				if job.filterKey != session.SummaryFilterKeyAllContents {
-					job.filterKey = session.SummaryFilterKeyAllContents
-					s.processSummaryJob(job)
-				}
+	// If requested filterKey not found, try fallback to full-session summary.
+	if filterKey != session.SummaryFilterKeyAllContents {
+		err = s.mysqlClient.Query(ctx, func(rows *sql.Rows) error {
+			// rows.Next() is already called by the Query loop.
+			var summaryBytes []byte
+			if err := rows.Scan(&summaryBytes); err != nil {
+				return err
 			}
-		}(summaryJobChan)
-	}
-}
+			var sum session.Summary
+			if err := json.Unmarshal(summaryBytes, &sum); err != nil {
+				return fmt.Errorf("unmarshal summary failed: %w", err)
+			}
+			summaryText = sum.Summary
+			return nil
+		}, fmt.Sprintf(`SELECT summary FROM %s
+			WHERE app_name = ? AND user_id = ? AND session_id = ? AND filter_key = ?
+			AND (expires_at IS NULL OR expires_at > ?)
+			AND updated_at >= ?
+			AND deleted_at IS NULL`, s.tableSessionSummaries),
+			key.AppName, key.UserID, key.SessionID, session.SummaryFilterKeyAllContents, time.Now(), sess.CreatedAt)
 
-func (s *Service) processSummaryJob(job *summaryJob) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Errorf("panic in summary worker: %v", r)
+		if err == nil && summaryText != "" {
+			return summaryText, true
 		}
-	}()
-
-	// Create a fresh context with timeout for this job.
-	ctx := context.Background()
-	if s.opts.summaryJobTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, s.opts.summaryJobTimeout)
-		defer cancel()
 	}
 
-	if err := s.CreateSessionSummary(ctx, job.session, job.filterKey, job.force); err != nil {
-		log.Warnf("summary worker failed to create session summary: %v", err)
-	}
+	return "", false
 }

@@ -11,6 +11,7 @@ package llmagent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/model/openai"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
+	transfertool "trpc.group/trpc-go/trpc-agent-go/tool/transfer"
 )
 
 const (
@@ -39,6 +41,22 @@ const (
 	testSubAgentNameOne      = "sub1"
 	testSubAgentNameTwo      = "sub2"
 	testSubAgentNotFoundName = "notfound"
+	testTransferMessage      = "hi"
+	testToolCallTypeFunction = "function"
+	testToolCallID           = "call-1"
+	testTransferResponseID   = "r-transfer"
+	testTransferModelName    = "mock-model"
+	testTransferUserMessage  = "go"
+	testTransferInvocationID = "inv-transfer"
+	testTransferSessionID    = "s"
+
+	testModelPromptModelName        = "model-prompt-model"
+	testModelPromptOtherModelName   = "model-prompt-other-model"
+	testModelPromptInvocationID     = "inv-model-prompt"
+	testModelPromptDefaultIns       = "default instruction"
+	testModelPromptMappedIns        = "mapped instruction"
+	testModelPromptDefaultSysPrompt = "default system prompt"
+	testModelPromptMappedSysPrompt  = "mapped system prompt"
 )
 
 func newDummyModel() model.Model {
@@ -119,6 +137,79 @@ func TestLLMAgent_SetSubAgents(t *testing.T) {
 	found := agt.FindSubAgent(testSubAgentNameTwo)
 	require.NotNil(t, found)
 	require.Equal(t, testSubAgentNameTwo, found.Info().Name)
+}
+
+type transferTargetAgent struct {
+	name string
+	ran  bool
+}
+
+func (t *transferTargetAgent) Info() agent.Info {
+	return agent.Info{Name: t.name}
+}
+
+func (t *transferTargetAgent) Tools() []tool.Tool { return nil }
+
+func (t *transferTargetAgent) SubAgents() []agent.Agent { return nil }
+
+func (t *transferTargetAgent) FindSubAgent(string) agent.Agent { return nil }
+
+func (t *transferTargetAgent) Run(
+	ctx context.Context,
+	inv *agent.Invocation,
+) (<-chan *event.Event, error) {
+	_ = ctx
+	_ = inv
+	t.ran = true
+	ch := make(chan *event.Event)
+	close(ch)
+	return ch, nil
+}
+
+func TestLLMAgent_Transfer_WorksAfterSetSubAgents(t *testing.T) {
+	sub := &transferTargetAgent{name: testSimpleSubAgentName}
+
+	args, err := json.Marshal(transfertool.Request{
+		AgentName: sub.Info().Name,
+		Message:   testTransferMessage,
+	})
+	require.NoError(t, err)
+
+	mockModel := &mockModelWithResponse{
+		response: &model.Response{
+			ID:    testTransferResponseID,
+			Model: testTransferModelName,
+			Choices: []model.Choice{{
+				Index: 0,
+				Message: model.Message{
+					Role: model.RoleAssistant,
+					ToolCalls: []model.ToolCall{{
+						Type: testToolCallTypeFunction,
+						ID:   testToolCallID,
+						Function: model.FunctionDefinitionParam{
+							Name:      transfertool.TransferToolName,
+							Arguments: args,
+						},
+					}},
+				},
+			}},
+		},
+	}
+
+	agt := New(testSubAgentsMainName, WithModel(mockModel))
+	agt.SetSubAgents([]agent.Agent{sub})
+
+	inv := &agent.Invocation{
+		Message:      model.NewUserMessage(testTransferUserMessage),
+		InvocationID: testTransferInvocationID,
+		Session:      &session.Session{ID: testTransferSessionID},
+	}
+	ctx := agent.NewInvocationContext(context.Background(), inv)
+	evCh, err := agt.Run(ctx, inv)
+	require.NoError(t, err)
+	for range evCh {
+	}
+	require.True(t, sub.ran)
 }
 
 // TestLLMAgent_SubAgentsReturnsCopy ensures that callers cannot mutate
@@ -683,6 +774,23 @@ func TestLLMAgent_New_WithOutputSchema_InvalidCombos(t *testing.T) {
 	})
 }
 
+func TestLLMAgent_New_WithStructuredOutputJSONSchema_AllowsTools(t *testing.T) {
+	schema := map[string]any{
+		"type":       "object",
+		"properties": map[string]any{},
+	}
+
+	require.NotPanics(t, func() {
+		simpleTool := dummyTool{decl: &tool.Declaration{Name: "test"}}
+		toolset := dummyToolSet{name: "test-toolset"}
+		_ = New("test",
+			WithStructuredOutputJSONSchema("test_schema", schema, true, ""),
+			WithTools([]tool.Tool{simpleTool}),
+			WithToolSets([]tool.ToolSet{toolset}),
+		)
+	})
+}
+
 // TestLLMAgent_InvocationContextAccess verifies that LLMAgent can access invocation
 // from context when called through runner (after removing duplicate injection).
 func TestLLMAgent_InvocationContextAccess(t *testing.T) {
@@ -869,6 +977,18 @@ func TestLLMAgent_OptionsWithStructuredOutputJSON(t *testing.T) {
 	require.Equal(t, "test description", opts.StructuredOutput.JSONSchema.Description)
 }
 
+func TestLLMAgent_OptionsWithStructuredOutputJSONSchema(t *testing.T) {
+	schema := map[string]any{"type": "object"}
+	opts := &Options{}
+	WithStructuredOutputJSONSchema("", schema, true, "test description")(opts)
+	require.NotNil(t, opts.StructuredOutput)
+	require.Equal(t, model.StructuredOutputJSONSchema, opts.StructuredOutput.Type)
+	require.NotNil(t, opts.StructuredOutput.JSONSchema)
+	require.Equal(t, "output", opts.StructuredOutput.JSONSchema.Name)
+	require.True(t, opts.StructuredOutput.JSONSchema.Strict)
+	require.Equal(t, "test description", opts.StructuredOutput.JSONSchema.Description)
+}
+
 // TestLLMAgent_OptionsWithAddCurrentTime tests WithAddCurrentTime option.
 func TestLLMAgent_OptionsWithAddCurrentTime(t *testing.T) {
 	opts := &Options{}
@@ -943,6 +1063,194 @@ func TestLLMAgent_SetGlobalInstruction(t *testing.T) {
 
 	agt.SetGlobalInstruction("updated global")
 	require.Equal(t, "updated global", agt.getSystemPrompt())
+}
+
+func TestLLMAgent_ModelInstructions(t *testing.T) {
+	mdl := openai.New(testModelPromptModelName)
+	agt := New(
+		"test-agent",
+		WithModel(mdl),
+		WithInstruction(testModelPromptDefaultIns),
+		WithModelInstructions(map[string]string{
+			testModelPromptModelName: testModelPromptMappedIns,
+		}),
+	)
+
+	reqProcs := buildRequestProcessorsWithAgent(agt, &agt.option)
+	var instrProc *processor.InstructionRequestProcessor
+	for _, rp := range reqProcs {
+		if p, ok := rp.(*processor.InstructionRequestProcessor); ok {
+			instrProc = p
+			break
+		}
+	}
+	require.NotNil(t, instrProc)
+
+	inv := &agent.Invocation{
+		InvocationID: testModelPromptInvocationID,
+	}
+	agt.setupInvocation(inv)
+
+	req := &model.Request{
+		Messages: []model.Message{},
+	}
+	eventCh := make(chan *event.Event, 10)
+	instrProc.ProcessRequest(context.Background(), inv, req, eventCh)
+
+	require.NotEmpty(t, req.Messages)
+	require.Contains(t, req.Messages[0].Content, testModelPromptMappedIns)
+	require.NotContains(
+		t,
+		req.Messages[0].Content,
+		testModelPromptDefaultIns,
+	)
+}
+
+func TestLLMAgent_ModelGlobalInstructions(t *testing.T) {
+	mdl := openai.New(testModelPromptModelName)
+	agt := New(
+		"test-agent",
+		WithModel(mdl),
+		WithInstruction(testModelPromptDefaultIns),
+		WithGlobalInstruction(testModelPromptDefaultSysPrompt),
+		WithModelInstructions(map[string]string{
+			testModelPromptModelName: testModelPromptMappedIns,
+		}),
+		WithModelGlobalInstructions(map[string]string{
+			testModelPromptModelName: testModelPromptMappedSysPrompt,
+		}),
+	)
+
+	reqProcs := buildRequestProcessorsWithAgent(agt, &agt.option)
+	var instrProc *processor.InstructionRequestProcessor
+	for _, rp := range reqProcs {
+		if p, ok := rp.(*processor.InstructionRequestProcessor); ok {
+			instrProc = p
+			break
+		}
+	}
+	require.NotNil(t, instrProc)
+
+	inv := &agent.Invocation{
+		InvocationID: testModelPromptInvocationID,
+	}
+	agt.setupInvocation(inv)
+
+	req := &model.Request{
+		Messages: []model.Message{},
+	}
+	eventCh := make(chan *event.Event, 10)
+	instrProc.ProcessRequest(context.Background(), inv, req, eventCh)
+
+	require.NotEmpty(t, req.Messages)
+	require.Contains(
+		t,
+		req.Messages[0].Content,
+		testModelPromptMappedSysPrompt,
+	)
+	require.Contains(
+		t,
+		req.Messages[0].Content,
+		testModelPromptMappedIns,
+	)
+	require.NotContains(
+		t,
+		req.Messages[0].Content,
+		testModelPromptDefaultSysPrompt,
+	)
+	require.NotContains(
+		t,
+		req.Messages[0].Content,
+		testModelPromptDefaultIns,
+	)
+}
+
+func TestLLMAgent_ModelInstructions_FallbackToDefault(t *testing.T) {
+	mdl := openai.New(testModelPromptModelName)
+	agt := New(
+		"test-agent",
+		WithModel(mdl),
+		WithInstruction(testModelPromptDefaultIns),
+		WithModelInstructions(map[string]string{
+			testModelPromptOtherModelName: testModelPromptMappedIns,
+		}),
+	)
+
+	reqProcs := buildRequestProcessorsWithAgent(agt, &agt.option)
+	var instrProc *processor.InstructionRequestProcessor
+	for _, rp := range reqProcs {
+		if p, ok := rp.(*processor.InstructionRequestProcessor); ok {
+			instrProc = p
+			break
+		}
+	}
+	require.NotNil(t, instrProc)
+
+	inv := &agent.Invocation{
+		InvocationID: testModelPromptInvocationID,
+	}
+	agt.setupInvocation(inv)
+
+	req := &model.Request{
+		Messages: []model.Message{},
+	}
+	eventCh := make(chan *event.Event, 10)
+	instrProc.ProcessRequest(context.Background(), inv, req, eventCh)
+
+	require.NotEmpty(t, req.Messages)
+	require.Contains(t, req.Messages[0].Content, testModelPromptDefaultIns)
+	require.NotContains(
+		t,
+		req.Messages[0].Content,
+		testModelPromptMappedIns,
+	)
+}
+
+func TestLLMAgent_SetModelInstructions(t *testing.T) {
+	mdl := openai.New(testModelPromptModelName)
+	agt := New(
+		"test-agent",
+		WithModel(mdl),
+		WithInstruction(testModelPromptDefaultIns),
+	)
+
+	reqProcs := buildRequestProcessorsWithAgent(agt, &agt.option)
+	var instrProc *processor.InstructionRequestProcessor
+	for _, rp := range reqProcs {
+		if p, ok := rp.(*processor.InstructionRequestProcessor); ok {
+			instrProc = p
+			break
+		}
+	}
+	require.NotNil(t, instrProc)
+
+	inv := &agent.Invocation{
+		InvocationID: testModelPromptInvocationID,
+	}
+	agt.setupInvocation(inv)
+
+	req := &model.Request{
+		Messages: []model.Message{},
+	}
+	eventCh := make(chan *event.Event, 10)
+	instrProc.ProcessRequest(context.Background(), inv, req, eventCh)
+	require.NotEmpty(t, req.Messages)
+	require.Contains(t, req.Messages[0].Content, testModelPromptDefaultIns)
+
+	agt.SetModelInstructions(map[string]string{
+		testModelPromptModelName: testModelPromptMappedIns,
+	})
+	req2 := &model.Request{
+		Messages: []model.Message{},
+	}
+	instrProc.ProcessRequest(context.Background(), inv, req2, eventCh)
+	require.NotEmpty(t, req2.Messages)
+	require.Contains(t, req2.Messages[0].Content, testModelPromptMappedIns)
+	require.NotContains(
+		t,
+		req2.Messages[0].Content,
+		testModelPromptDefaultIns,
+	)
 }
 
 // TestHaveCustomResponseError tests the Error method of haveCustomResponseError.
@@ -1479,6 +1787,47 @@ func TestLLMAgent_RunWithModel_Priority(t *testing.T) {
 
 	llmAgent.setupInvocation(inv)
 	require.Equal(t, modelFromWithModel, inv.Model)
+}
+
+// TestLLMAgent_SetupInvocation_PropagatesMaxLimits verifies that per-agent
+// safety limits (MaxLLMCalls / MaxToolIterations) are copied into each
+// Invocation during setupInvocation. When the agent is created without limits,
+// the invocation should see zero values, which are treated as "no limit" by
+// the Invocation helpers.
+func TestLLMAgent_SetupInvocation_PropagatesMaxLimits(t *testing.T) {
+	// Agent configured with explicit limits.
+	llmWithLimits := New(
+		"limits-agent",
+		WithModel(newDummyModel()),
+		WithMaxLLMCalls(3),
+		WithMaxToolIterations(5),
+	)
+
+	invWithLimits := &agent.Invocation{
+		InvocationID: "inv-with-limits",
+		AgentName:    "limits-agent",
+		Message:      model.NewUserMessage("hello"),
+	}
+
+	llmWithLimits.setupInvocation(invWithLimits)
+	require.Equal(t, 3, invWithLimits.MaxLLMCalls)
+	require.Equal(t, 5, invWithLimits.MaxToolIterations)
+
+	// Agent without limits should leave invocation limits at zero.
+	llmNoLimits := New(
+		"no-limits-agent",
+		WithModel(newDummyModel()),
+	)
+
+	invNoLimits := &agent.Invocation{
+		InvocationID: "inv-no-limits",
+		AgentName:    "no-limits-agent",
+		Message:      model.NewUserMessage("hello"),
+	}
+
+	llmNoLimits.setupInvocation(invNoLimits)
+	require.Equal(t, 0, invNoLimits.MaxLLMCalls)
+	require.Equal(t, 0, invNoLimits.MaxToolIterations)
 }
 
 func TestLLMAgent_MessageFilterMode(t *testing.T) {

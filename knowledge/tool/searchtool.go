@@ -129,7 +129,7 @@ func NewKnowledgeSearchTool(kb knowledge.Knowledge, opts ...Option) tool.Tool {
 		var runnerFilter map[string]any
 		var runnerConditionedFilter *searchfilter.UniversalFilterCondition
 		if !ok {
-			log.Debugf("knowledge search tool: no invocation found in context")
+			log.DebugfContext(ctx, "knowledge search tool: no invocation found in context")
 		} else {
 			runnerFilter = invocation.RunOptions.KnowledgeFilter
 			runnerConditionedFilter = invocation.RunOptions.KnowledgeConditionedFilter
@@ -210,7 +210,7 @@ func NewAgenticFilterSearchTool(
 		var runnerFilter map[string]any
 		var runnerConditionedFilter *searchfilter.UniversalFilterCondition
 		if !ok {
-			log.Debugf("knowledge search tool: no invocation found in context")
+			log.DebugfContext(ctx, "knowledge search tool: no invocation found in context")
 		} else {
 			runnerFilter = invocation.RunOptions.KnowledgeFilter
 			runnerConditionedFilter = invocation.RunOptions.KnowledgeConditionedFilter
@@ -343,8 +343,11 @@ func filterMetadata(metadata map[string]any) map[string]any {
 	}
 	filtered := make(map[string]any)
 	for k, v := range metadata {
-		// Skip internal metadata keys with trpc_agent_go_ prefix, except for MetaChunkIndex and MetaMarkdownHeaderPath
-		if !strings.HasPrefix(k, source.MetaPrefix) || k == source.MetaChunkIndex || k == source.MetaMarkdownHeaderPath {
+		if !strings.HasPrefix(k, source.MetaPrefix) ||
+			k == source.MetaChunkIndex ||
+			k == source.MetaMarkdownHeaderPath ||
+			k == source.MetadataDenseScore ||
+			k == source.MetadataSparseScore {
 			filtered[k] = v
 		}
 	}
@@ -365,21 +368,19 @@ func generateAgenticFilterPrompt(agenticFilterInfo map[string][]any) string {
 
 	var b strings.Builder
 
-	fmt.Fprintf(&b, `You are a helpful assistant that can search for relevant information in the knowledge base. Available metadata filters: %s.
+	fmt.Fprintf(&b, `You are a helpful assistant that can search for relevant information in the knowledge base. Available filters: %s.
 
 Filter Usage:
 - Query: Can be empty when using only metadata filters
 - Filter: Use "filter" field with standard operators (lowercase): eq, ne, gt, gte, lt, lte, in, not in, like, not like, between, and, or
+- Field names: Use the EXACT field names from available filters. Some fields have "metadata." prefix (for document metadata), some don't (for system/custom fields). Always use the field name exactly as shown.
 
 Filter Examples (use double quotes for JSON):
-- Single: {"field": "category", "operator": "eq", "value": "documentation"}
-- OR: {"operator": "or", "value": [{"field": "type", "operator": "eq", "value": "golang"}, {"field": "type", "operator": "eq", "value": "llm"}]}
-- AND: {"operator": "and", "value": [{"field": "category", "operator": "eq", "value": "doc"}, {"field": "topic", "operator": "eq", "value": "programming"}]}
-- IN: {"field": "type", "operator": "in", "value": ["golang", "llm", "wiki"]}
-- NOT IN: {"field": "status", "operator": "not in", "value": ["archived", "deleted"]}
-- LIKE: {"field": "title", "operator": "like", "value": "%%tutorial%%"}
-- BETWEEN: {"field": "score", "operator": "between", "value": [0.5, 0.9]}
-- Nested: {"operator": "and", "value": [{"field": "category", "operator": "eq", "value": "doc"}, {"operator": "or", "value": [{"field": "topic", "operator": "eq", "value": "programming"}, {"field": "topic", "operator": "eq", "value": "ml"}]}]}
+- Single: {"field": "metadata.category", "operator": "eq", "value": "documentation"}
+- OR: {"operator": "or", "value": [{"field": "metadata.type", "operator": "eq", "value": "golang"}, {"field": "metadata.type", "operator": "eq", "value": "llm"}]}
+- AND: {"operator": "and", "value": [{"field": "metadata.category", "operator": "eq", "value": "doc"}, {"field": "metadata.topic", "operator": "eq", "value": "programming"}]}
+- IN: {"field": "metadata.type", "operator": "in", "value": ["golang", "llm", "wiki"]}
+- System field (no prefix): {"field": "id", "operator": "eq", "value": "doc-123"}
 
 Note: For logical operators (and/or), use "value" field to specify an array of sub-conditions.
 

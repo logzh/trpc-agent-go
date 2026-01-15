@@ -4,13 +4,19 @@
 
 tRPC-Agent-Go provides powerful session management capabilities to maintain conversation history and context information during Agent-user interactions. Through automatic persistence of conversation records, intelligent summary compression, and flexible storage backends, session management offers complete infrastructure for building stateful intelligent Agents.
 
+### Positioning
+
+A Session manages the context of the current conversation, with isolation dimensions `<appName, userID, SessionID>`. It stores user messages, Agent responses, tool call results, and brief summaries generated based on this content within the conversation, supporting multi-turn question-and-answer scenarios.
+
+Within the same conversation, it allows for seamless transitions between multiple turns of question-and-answer, preventing users from restating the same question or providing the same parameters in each turn.
+
 ### 🎯 Key Features
 
 - **Context Management**: Automatically load conversation history for true multi-turn dialogues
 - **Session Summary**: Automatically compress long conversation history using LLM while preserving key context and significantly reducing token consumption
 - **Event Limiting**: Control maximum number of events stored per session to prevent memory overflow
 - **TTL Management**: Support automatic expiration and cleanup of session data
-- **Multiple Storage Backends**: Support Memory, Redis, PostgreSQL, MySQL storage
+- **Multiple Storage Backends**: Support Memory, Redis, PostgreSQL, MySQL, ClickHouse storage
 - **Concurrency Safety**: Built-in read-write locks ensure safe concurrent access
 - **Automatic Management**: Automatically handle session creation, loading, and updates after Runner integration
 - **Soft Delete Support**: PostgreSQL/MySQL support soft delete with data recovery capability
@@ -21,7 +27,7 @@ tRPC-Agent-Go provides powerful session management capabilities to maintain conv
 
 tRPC-Agent-Go's session management integrates with Runner through `runner.WithSessionService`. Runner automatically handles session creation, loading, updates, and persistence.
 
-**Supported Storage Backends:** Memory, Redis, PostgreSQL, MySQL
+**Supported Storage Backends:** Memory, Redis, PostgreSQL, MySQL, ClickHouse
 
 **Default Behavior:** If `runner.WithSessionService` is not configured, Runner defaults to using memory storage (Memory), and data will be lost after process restarts.
 
@@ -51,8 +57,8 @@ func main() {
     summarizer := summary.NewSummarizer(
         llm, // Use same LLM model for summary generation
         summary.WithChecksAny(                         // Trigger when any condition is met
-            summary.CheckEventThreshold(20),           // Trigger when exceeds 20 events
-            summary.CheckTokenThreshold(4000),         // Trigger when exceeds 4000 tokens
+            summary.CheckEventThreshold(20),           // Trigger when 20+ new events since last summary
+            summary.CheckTokenThreshold(4000),         // Trigger when 4000+ new tokens since last summary
             summary.CheckTimeThreshold(5*time.Minute), // Trigger after 5 minutes of inactivity
         ),
         summary.WithMaxSummaryWords(200), // Limit summary to 200 words
@@ -197,8 +203,8 @@ import (
 summarizer := summary.NewSummarizer(
     summaryModel,
     summary.WithChecksAny(                         // Trigger when any condition is met
-        summary.CheckEventThreshold(20),           // Trigger when exceeds 20 events
-        summary.CheckTokenThreshold(4000),         // Trigger when exceeds 4000 tokens
+        summary.CheckEventThreshold(20),           // Trigger when 20+ new events since last summary
+        summary.CheckTokenThreshold(4000),         // Trigger when 4000+ new tokens since last summary
         summary.CheckTimeThreshold(5*time.Minute), // Trigger after 5 minutes of inactivity
     ),
     summary.WithMaxSummaryWords(200),              // Limit summary to 200 words
@@ -223,6 +229,31 @@ r := runner.NewRunner("my-agent", llmAgent,
     runner.WithSessionService(sessionService))
 ```
 
+#### Summary hooks (pre/post)
+
+You can inject hooks to tweak summary input or output:
+
+```go
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithPreSummaryHook(func(ctx *summary.PreSummaryHookContext) error {
+        // Optionally modify ctx.Text or ctx.Events before summarization.
+        return nil
+    }),
+    summary.WithPostSummaryHook(func(ctx *summary.PostSummaryHookContext) error {
+        // Optionally modify ctx.Summary before returning to caller.
+        return nil
+    }),
+    summary.WithSummaryHookAbortOnError(true), // Abort when hook returns error (optional).
+)
+```
+
+Notes:
+
+- Pre-hook can mutate `ctx.Text` (preferred) or `ctx.Events`; post-hook can mutate `ctx.Summary`.
+- Default behavior ignores hook errors; enable abort with
+  `WithSummaryHookAbortOnError(true)`.
+
 **Context Injection Mechanism:**
 
 After enabling summary, the framework prepends the summary as a system message to the LLM input, while including all incremental events after the summary timestamp to ensure complete context:
@@ -243,6 +274,52 @@ After enabling summary, the framework prepends the summary as a system message t
 │ Event N (current message)               │ ┘
 └─────────────────────────────────────────┘
 ```
+
+#### Summary Format Customization
+
+By default, session summaries are formatted with context tags and a note about preferring current conversation information:
+
+**Default Format:**
+
+```
+Here is a brief summary of your previous interactions:
+
+<summary_of_previous_interactions>
+[summary content]
+</summary_of_previous_interactions>
+
+Note: this information is from previous interactions and may be outdated. You should ALWAYS prefer information from this conversation over the past summary.
+```
+
+You can customize the summary format using `WithSummaryFormatter` (available in `llmagent` and `graphagent`) to better match your specific use cases or model requirements.
+
+**Custom Format Example:**
+
+```go
+// Custom formatter with simplified format
+agent := llmagent.New(
+    "my-agent",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithAddSessionSummary(true),
+    llmagent.WithSummaryFormatter(func(summary string) string {
+        return fmt.Sprintf("## Previous Context\n\n%s", summary)
+    }),
+)
+```
+
+**Use Cases:**
+
+- **Simplified Format**: Reduce token usage by using concise headings and minimal context notes
+- **Language Localization**: Translate context notes to target language (e.g., Chinese, Japanese)
+- **Role-Specific Formatting**: Different formats for different agent roles (assistant, researcher, coder)
+- **Model Optimization**: Tailor format for specific model preferences (some models respond better to certain prompt structures)
+
+**Important Notes:**
+
+- The formatter function receives the raw summary text from the session and returns the formatted string
+- Custom formatters should ensure the summary is clearly distinguishable from other messages
+- The default format is designed to be compatible with most models and use cases
+- When `WithAddSessionSummary(false)` is used, the formatter is **never invoked**
 
 **Important Note:** When `WithAddSessionSummary(true)` is enabled, the `WithMaxHistoryRuns` parameter is ignored, and all events after the summary are fully retained.
 
@@ -307,14 +384,15 @@ sessionService := inmemory.NewSessionService(
 
 ## Storage Backend Comparison
 
-tRPC-Agent-Go provides four session storage backends to meet different scenario requirements:
+tRPC-Agent-Go provides five session storage backends to meet different scenario requirements:
 
-| Storage Type | Use Case                         | Advantages                                             | Disadvantages                               |
-| ------------ | -------------------------------- | ------------------------------------------------------ | ------------------------------------------- |
-| Memory       | Development/testing, small-scale | Simple and fast, no external dependencies              | Data not persistent, no distributed support |
-| Redis        | Production, distributed          | High performance, distributed support, auto-expiration | Requires Redis service                      |
-| PostgreSQL   | Production, complex queries      | Relational database, supports complex queries, JSONB   | Relatively heavy, requires database         |
-| MySQL        | Production, complex queries      | Widely used, supports complex queries, JSON            | Relatively heavy, requires database         |
+| Storage Type | Use Case                         |
+| ------------ | -------------------------------- |
+| Memory       | Development/testing, small-scale |
+| Redis        | Production, distributed          |
+| PostgreSQL   | Production, complex queries      |
+| MySQL        | Production, complex queries      |
+| ClickHouse   | Production, massive logs         |
 
 ## Memory Storage
 
@@ -494,13 +572,18 @@ Suitable for production environments and applications requiring complex queries,
 
 **Connection Configuration:**
 
+- **`WithPostgresClientDSN(dsn string)`**: PostgreSQL DSN connection string (recommended). Supports two formats:
+  - Key-Value format: `host=localhost port=5432 user=postgres password=secret dbname=mydb sslmode=disable`
+  - URL format: `postgres://user:password@localhost:5432/dbname?sslmode=disable`
 - **`WithHost(host string)`**: PostgreSQL server address. Default is `localhost`.
 - **`WithPort(port int)`**: PostgreSQL server port. Default is `5432`.
 - **`WithUser(user string)`**: Database username. Default is `postgres`.
 - **`WithPassword(password string)`**: Database password. Default is empty string.
 - **`WithDatabase(database string)`**: Database name. Default is `postgres`.
 - **`WithSSLMode(sslMode string)`**: SSL mode. Default is `disable`. Options: `disable`, `require`, `verify-ca`, `verify-full`.
-- **`WithInstanceName(name string)`**: Use pre-configured PostgreSQL instance.
+- **`WithPostgresInstance(name string)`**: Use pre-configured PostgreSQL instance.
+
+> **Priority**: `WithPostgresClientDSN` > Direct connection settings (`WithHost`, etc.) > `WithPostgresInstance`
 
 **Session Configuration:**
 
@@ -534,26 +617,29 @@ Suitable for production environments and applications requiring complex queries,
 ```go
 import "trpc.group/trpc-go/trpc-agent-go/session/postgres"
 
-// Default configuration (minimal)
+// Using DSN connection (recommended)
 sessionService, err := postgres.NewService(
-    postgres.WithHost("localhost"),
-    postgres.WithPassword("your-password"),
+    postgres.WithPostgresClientDSN("postgres://user:password@localhost:5432/mydb?sslmode=disable"),
 )
-// Effect:
-// - Connect to localhost:5432, database postgres
-// - Each session max 1000 events
-// - Data never expires
-// - 2 async persistence workers
 
-// Complete production environment configuration
+// Or using Key-Value format DSN
 sessionService, err := postgres.NewService(
-    // Connection configuration
+    postgres.WithPostgresClientDSN("host=localhost port=5432 user=postgres password=secret dbname=mydb sslmode=disable"),
+)
+
+// Using individual configuration options (traditional way)
+sessionService, err := postgres.NewService(
     postgres.WithHost("localhost"),
     postgres.WithPort(5432),
     postgres.WithUser("postgres"),
     postgres.WithPassword("your-password"),
     postgres.WithDatabase("trpc_sessions"),
-    postgres.WithSSLMode("require"),
+)
+
+// Complete production environment configuration
+sessionService, err := postgres.NewService(
+    // Connection configuration (DSN recommended)
+    postgres.WithPostgresClientDSN("postgres://user:password@localhost:5432/trpc_sessions?sslmode=require"),
 
     // Session configuration
     postgres.WithSessionEventLimit(1000),
@@ -579,23 +665,19 @@ sessionService, err := postgres.NewService(
 
 ```go
 import (
-    "trpc.group/trpc-go/trpc-agent-go/storage"
-    "trpc.group/trpc-go/trpc-agent-go/session/postgres"
+    "trpc.group/trpc-go/trpc-agent-go/storage/postgres"
+    sessionpg "trpc.group/trpc-go/trpc-agent-go/session/postgres"
 )
 
 // Register PostgreSQL instance
-storage.RegisterPostgresInstance("my-postgres-instance",
-    storage.WithPostgresHost("localhost"),
-    storage.WithPostgresPort(5432),
-    storage.WithPostgresUser("postgres"),
-    storage.WithPostgresPassword("your-password"),
-    storage.WithPostgresDatabase("trpc_sessions"),
+postgres.RegisterPostgresInstance("my-postgres-instance",
+    postgres.WithClientConnString("postgres://user:password@localhost:5432/trpc_sessions?sslmode=disable"),
 )
 
 // Use in session service
-sessionService, err := postgres.NewService(
-    postgres.WithInstanceName("my-postgres-instance"),
-    postgres.WithSessionEventLimit(500),
+sessionService, err := sessionpg.NewService(
+    sessionpg.WithPostgresInstance("my-postgres-instance"),
+    sessionpg.WithSessionEventLimit(500),
 )
 ```
 
@@ -654,10 +736,10 @@ sessionService, err := postgres.NewService(
 
 **Delete Behavior Comparison:**
 
-| Configuration      | Delete Operation                | Query Behavior              | Data Recovery   |
-| ------------------ | ------------------------------- | --------------------------- | --------------- |
-| `softDelete=true`  | `UPDATE SET deleted_at = NOW()` | Filter `deleted_at IS NULL` | Recoverable     |
-| `softDelete=false` | `DELETE FROM ...`               | Query all records           | Not recoverable |
+| Configuration      | Delete Operation                | Query Behavior                                                                   | Data Recovery   |
+| ------------------ | ------------------------------- | -------------------------------------------------------------------------------- | --------------- |
+| `softDelete=true`  | `UPDATE SET deleted_at = NOW()` | Queries include `WHERE deleted_at IS NULL`, returning only non-soft-deleted rows | Recoverable     |
+| `softDelete=false` | `DELETE FROM ...`               | Query all records                                                                | Not recoverable |
 
 **TTL Auto Cleanup:**
 
@@ -673,7 +755,7 @@ sessionService, err := postgres.NewService(
 // Cleanup behavior:
 // - softDelete=true: Expired data marked as deleted_at = NOW()
 // - softDelete=false: Expired data physically deleted
-// - Queries always filter deleted_at IS NULL
+// - Queries always append `WHERE deleted_at IS NULL`, returning only non-soft-deleted rows.
 ```
 
 ### Use with Summary
@@ -694,95 +776,9 @@ sessionService, err := postgres.NewService(
 
 ### Storage Structure
 
-PostgreSQL uses relational table structure with JSON data stored using JSONB type:
+PostgreSQL uses relational table structure with JSON data stored using JSONB type.
 
-```sql
--- Session states table
-CREATE TABLE session_states (
-    id BIGSERIAL PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    state JSONB,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    expires_at TIMESTAMP,
-    deleted_at TIMESTAMP
-);
-
--- Partial unique index (only applies to non-deleted records)
-CREATE UNIQUE INDEX idx_session_states_unique_active
-ON session_states(app_name, user_id, session_id)
-WHERE deleted_at IS NULL;
-
--- Session events table
-CREATE TABLE session_events (
-    id BIGSERIAL PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    event JSONB NOT NULL,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    expires_at TIMESTAMP,
-    deleted_at TIMESTAMP
-);
-
--- Track events table.
-CREATE TABLE session_track_events (
-    id BIGSERIAL PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    track VARCHAR(255) NOT NULL,
-    event JSONB NOT NULL,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    expires_at TIMESTAMP,
-    deleted_at TIMESTAMP
-);
-
--- Session summaries table
-CREATE TABLE session_summaries (
-    id BIGSERIAL PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    filter_key VARCHAR(255) NOT NULL,
-    summary JSONB NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    expires_at TIMESTAMP,
-    deleted_at TIMESTAMP,
-    UNIQUE(app_name, user_id, session_id, filter_key)
-);
-
--- Application states table
-CREATE TABLE app_states (
-    id BIGSERIAL PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    key VARCHAR(255) NOT NULL,
-    value TEXT DEFAULT NULL,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    expires_at TIMESTAMP,
-    deleted_at TIMESTAMP,
-    UNIQUE(app_name, key)
-);
-
--- User states table
-CREATE TABLE user_states (
-    id BIGSERIAL PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    key VARCHAR(255) NOT NULL,
-    value TEXT DEFAULT NULL,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    expires_at TIMESTAMP,
-    deleted_at TIMESTAMP,
-    UNIQUE(app_name, user_id, key)
-);
-```
+For complete table definitions, see [session/postgres/schema.sql](https://github.com/trpc-group/trpc-agent-go/blob/main/session/postgres/schema.sql)
 
 ## MySQL Storage
 
@@ -834,7 +830,7 @@ sessionService, err := mysql.NewService(
 // - Connect to localhost:3306, database trpc_sessions
 // - Each session max 1000 events
 // - Data never expires
-// - 2 async persistence workers
+// - Default 10 async persistence workers (tunable via WithAsyncPersisterNum)
 
 // Complete production environment configuration
 sessionService, err := mysql.NewService(
@@ -864,23 +860,19 @@ sessionService, err := mysql.NewService(
 
 ```go
 import (
-    "trpc.group/trpc-go/trpc-agent-go/storage"
-    "trpc.group/trpc-go/trpc-agent-go/session/mysql"
+    "trpc.group/trpc-go/trpc-agent-go/storage/mysql"
+    sessionmysql "trpc.group/trpc-go/trpc-agent-go/session/mysql"
 )
 
 // Register MySQL instance
-storage.RegisterMySQLInstance("my-mysql-instance",
-    storage.WithMySQLHost("localhost"),
-    storage.WithMySQLPort(3306),
-    storage.WithMySQLUser("root"),
-    storage.WithMySQLPassword("your-password"),
-    storage.WithMySQLDatabase("trpc_sessions"),
+mysql.RegisterMySQLInstance("my-mysql-instance",
+    mysql.WithClientBuilderDSN("root:password@tcp(localhost:3306)/trpc_sessions?parseTime=true&charset=utf8mb4"),
 )
 
 // Use in session service
-sessionService, err := mysql.NewService(
-    mysql.WithInstanceName("my-mysql-instance"),
-    mysql.WithSessionEventLimit(500),
+sessionService, err := sessionmysql.NewService(
+    sessionmysql.WithMySQLInstance("my-mysql-instance"),
+    sessionmysql.WithSessionEventLimit(500),
 )
 ```
 
@@ -916,10 +908,10 @@ sessionService, err := mysql.NewService(
 
 **Delete Behavior Comparison:**
 
-| Configuration      | Delete Operation                | Query Behavior              | Data Recovery   |
-| ------------------ | ------------------------------- | --------------------------- | --------------- |
-| `softDelete=true`  | `UPDATE SET deleted_at = NOW()` | Filter `deleted_at IS NULL` | Recoverable     |
-| `softDelete=false` | `DELETE FROM ...`               | Query all records           | Not recoverable |
+| Configuration      | Delete Operation                | Query Behavior                                                                   | Data Recovery   |
+| ------------------ | ------------------------------- | -------------------------------------------------------------------------------- | --------------- |
+| `softDelete=true`  | `UPDATE SET deleted_at = NOW()` | Queries include `WHERE deleted_at IS NULL`, returning only non-soft-deleted rows | Recoverable     |
+| `softDelete=false` | `DELETE FROM ...`               | Query all records                                                                | Not recoverable |
 
 **TTL Auto Cleanup:**
 
@@ -935,7 +927,7 @@ sessionService, err := mysql.NewService(
 // Cleanup behavior:
 // - softDelete=true: Expired data marked as deleted_at = NOW()
 // - softDelete=false: Expired data physically deleted
-// - Queries always filter deleted_at IS NULL
+// - Queries always append `WHERE deleted_at IS NULL`, returning only non-soft-deleted rows.
 ```
 
 ### Use with Summary
@@ -955,86 +947,298 @@ sessionService, err := mysql.NewService(
 
 ### Storage Structure
 
-MySQL uses relational table structure with JSON data stored using JSON type:
+MySQL uses relational table structure with JSON data stored using JSON type.
+
+For complete table definitions, see [session/mysql/schema.sql](https://github.com/trpc-group/trpc-agent-go/blob/main/session/mysql/schema.sql)
+
+### Database Migration
+
+#### Migrating from Older Versions
+
+**Affected Versions**: v1.2.0 and earlier  
+**Fixed in Version**: v1.2.0 and later
+
+**Background**: Earlier versions of the `session_summaries` table had index design issues:
+
+- The earliest version used a unique index that included the `deleted_at` column. However, in MySQL `NULL != NULL`, which means multiple records with `deleted_at = NULL` would not trigger the unique constraint.
+- Later versions changed to a regular lookup index (non-unique), which also could not prevent duplicate data.
+
+Both situations could lead to duplicate data.
+
+**Old Index** (one of the following):
+
+- `idx_*_session_summaries_unique_active(app_name, user_id, session_id, filter_key, deleted_at)` — unique index but includes deleted_at
+- `idx_*_session_summaries_lookup(app_name, user_id, session_id, deleted_at)` — regular index
+
+**New Index**: `idx_*_session_summaries_unique_active(app_name, user_id, session_id, filter_key)` — unique index without deleted_at
+
+**Migration Steps**:
+
+```sql
+-- ============================================================================
+-- Migration Script: Fix session_summaries unique index issue
+-- Please backup your data before executing!
+-- ============================================================================
+
+-- Step 1: Check current indexes to confirm old index name
+SHOW INDEX FROM session_summaries;
+
+-- Step 2: Clean up duplicate data (keep the latest record)
+-- If there are multiple records with deleted_at = NULL, keep the one with the largest id.
+DELETE t1 FROM session_summaries t1
+INNER JOIN session_summaries t2
+WHERE t1.app_name = t2.app_name
+  AND t1.user_id = t2.user_id
+  AND t1.session_id = t2.session_id
+  AND t1.filter_key = t2.filter_key
+  AND t1.deleted_at IS NULL
+  AND t2.deleted_at IS NULL
+  AND t1.id < t2.id;
+
+-- Step 3: Hard delete soft-deleted records (summary data is regenerable)
+-- If you need to keep soft-deleted records, skip this step, but handle conflicts
+-- manually before Step 5.
+DELETE FROM session_summaries WHERE deleted_at IS NOT NULL;
+
+-- Step 4: Drop the old index (choose the correct index name based on Step 1 results)
+-- Note: Index name may have a table prefix, adjust according to your configuration.
+-- If it's a lookup index:
+DROP INDEX idx_session_summaries_lookup ON session_summaries;
+-- If it's an old unique_active index (includes deleted_at):
+-- DROP INDEX idx_session_summaries_unique_active ON session_summaries;
+
+-- Step 5: Create the new unique index (without deleted_at)
+-- Note: Index name may have a table prefix, adjust according to your configuration.
+CREATE UNIQUE INDEX idx_session_summaries_unique_active 
+ON session_summaries(app_name, user_id, session_id, filter_key);
+
+-- Step 6: Verify migration results
+SELECT COUNT(*) as duplicate_count FROM (
+    SELECT app_name, user_id, session_id, filter_key, COUNT(*) as cnt
+    FROM session_summaries
+    WHERE deleted_at IS NULL
+    GROUP BY app_name, user_id, session_id, filter_key
+    HAVING cnt > 1
+) t;
+-- Expected result: duplicate_count = 0
+
+-- Step 7: Verify the index was created successfully
+SHOW INDEX FROM session_summaries WHERE Key_name = 'idx_session_summaries_unique_active';
+-- Expected result: Shows the newly created unique index without deleted_at column
+```
+
+**Notes**:
+
+1. If you configured `WithTablePrefix("trpc_")`, table and index names will have a prefix:
+   - Table name: `trpc_session_summaries`
+   - Old index name: `idx_trpc_session_summaries_lookup` or `idx_trpc_session_summaries_unique_active`
+   - New index name: `idx_trpc_session_summaries_unique_active`
+   - Please adjust the table and index names in the SQL above according to your actual configuration.
+
+2. The new index does not include the `deleted_at` column, which means soft-deleted summary records will block new records with the same business key. Since summary data is regenerable, it is recommended to hard delete soft-deleted records during migration (Step 3). If you skip this step, you need to handle conflicts manually.
+
+
+
+## ClickHouse Storage
+
+Suitable for production environments and massive data scenarios, leveraging ClickHouse's powerful write throughput and data compression capabilities.
+
+### Configuration Options
+
+**Connection Configuration:**
+
+- **`WithClickHouseDSN(dsn string)`**: ClickHouse DSN connection string (recommended).
+  - Format: `clickhouse://user:password@host:port/database?dial_timeout=10s`
+- **`WithClickHouseInstance(name string)`**: Use pre-configured ClickHouse instance.
+- **`WithExtraOptions(opts ...any)`**: Set extra options for ClickHouse client.
+
+**Session Configuration:**
+
+- **`WithSessionEventLimit(limit int)`**: Maximum events per session. Default is 1000.
+- **`WithSessionTTL(ttl time.Duration)`**: Session TTL. Default is 0 (no expiration).
+- **`WithAppStateTTL(ttl time.Duration)`**: App state TTL. Default is 0 (no expiration).
+- **`WithUserStateTTL(ttl time.Duration)`**: User state TTL. Default is 0 (no expiration).
+- **`WithDeletedRetention(retention time.Duration)`**: Retention period for soft-deleted data. Default is 0 (disable application-level physical cleanup). When enabled, it will periodically clean up soft-deleted data via `ALTER TABLE DELETE`. **Not recommended** for production environments; prefer ClickHouse table-level TTL.
+- **`WithCleanupInterval(interval time.Duration)`**: Cleanup task interval.
+
+**Async Persistence Configuration:**
+
+- **`WithEnableAsyncPersist(enable bool)`**: Enable async persistence. Default is `false`.
+- **`WithAsyncPersisterNum(num int)`**: Number of async persistence workers. Default is 10.
+- **`WithBatchSize(size int)`**: Batch write size. Default is 100.
+- **`WithBatchTimeout(timeout time.Duration)`**: Batch write timeout. Default is 100ms.
+
+**Summary Configuration:**
+
+- **`WithSummarizer(s summary.SessionSummarizer)`**: Inject session summarizer.
+- **`WithAsyncSummaryNum(num int)`**: Number of summary processing workers. Default is 3.
+- **`WithSummaryQueueSize(size int)`**: Summary task queue size. Default is 100.
+- **`WithSummaryJobTimeout(timeout time.Duration)`**: Timeout for single summary task.
+
+**Schema Configuration:**
+
+- **`WithTablePrefix(prefix string)`**: Table name prefix.
+- **`WithSkipDBInit(skip bool)`**: Skip automatic table creation.
+
+**Hook Configuration:**
+
+- **`WithAppendEventHook(hooks ...session.AppendEventHook)`**: Add hooks for event appending.
+- **`WithGetSessionHook(hooks ...session.GetSessionHook)`**: Add hooks for session retrieval.
+
+### Basic Configuration Example
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/session/clickhouse"
+
+// Default configuration (minimal)
+sessionService, err := clickhouse.NewService(
+    clickhouse.WithClickHouseDSN("clickhouse://default:password@localhost:9000/default"),
+)
+
+// Complete configuration example
+sessionService, err := clickhouse.NewService(
+    clickhouse.WithClickHouseDSN("clickhouse://user:pass@ch-host:9000/sessions?dial_timeout=5s"),
+
+    // Session configuration
+    clickhouse.WithSessionEventLimit(2000),
+    clickhouse.WithSessionTTL(7*24*time.Hour), // Expires in 7 days
+
+    // Enable async persistence (recommended)
+    clickhouse.WithEnableAsyncPersist(true),
+    clickhouse.WithAsyncPersisterNum(20),
+    clickhouse.WithBatchSize(500),
+
+    // Automatic cleanup
+    clickhouse.WithCleanupInterval(1*time.Hour),
+)
+```
+
+### Configuration Reuse
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/storage/clickhouse"
+    sessionch "trpc.group/trpc-go/trpc-agent-go/session/clickhouse"
+)
+
+// Register ClickHouse instance
+clickhouse.RegisterClickHouseInstance("my-clickhouse",
+    clickhouse.WithClientBuilderDSN("clickhouse://localhost:9000/default"),
+)
+
+// Use in session service
+sessionService, err := sessionch.NewService(
+    sessionch.WithClickHouseInstance("my-clickhouse"),
+)
+```
+
+### Storage Structure
+
+ClickHouse implementation uses `ReplacingMergeTree` engine to handle data updates and deduplication.
+
+**Key Features:**
+
+1.  **ReplacingMergeTree**: Uses `updated_at` column as version for background deduplication, keeping the latest version.
+2.  **FINAL Query**: All read operations use `FINAL` keyword (e.g., `SELECT ... FINAL`) to ensure data consistency by merging parts at query time.
+3.  **Soft Delete**: Deletion is implemented by inserting a new record with `deleted_at` timestamp. Queries filter with `deleted_at IS NULL`.
 
 ```sql
 -- Session states table
-CREATE TABLE session_states (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    state JSON,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NULL,
-    deleted_at TIMESTAMP NULL,
-    UNIQUE KEY idx_session_states_unique (app_name, user_id, session_id, deleted_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS session_states (
+    app_name    String,
+    user_id     String,
+    session_id  String,
+    state       JSON COMMENT 'Session state in JSON format',
+    extra_data  JSON COMMENT 'Additional metadata',
+    created_at  DateTime64(6),
+    updated_at  DateTime64(6),
+    expires_at  Nullable(DateTime64(6)) COMMENT 'Expiration time (application-level)',
+    deleted_at  Nullable(DateTime64(6)) COMMENT 'Soft delete timestamp'
+) ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY (app_name, cityHash64(user_id) % 64)
+-- CRITICAL: Removed deleted_at from ORDER BY to allow ReplacingMergeTree to collapse deleted records
+ORDER BY (app_name, user_id, session_id)
+SETTINGS allow_nullable_key = 1
+COMMENT 'Session states table';
 
 -- Session events table
-CREATE TABLE session_events (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    event JSON NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NULL,
-    deleted_at TIMESTAMP NULL,
-    KEY idx_session_events (app_name, user_id, session_id, deleted_at, created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS session_events (
+    app_name    String,
+    user_id     String,
+    session_id  String,
+    event_id    String,
+    event       JSON COMMENT 'Event data in JSON format',
+    extra_data  JSON COMMENT 'Additional metadata',
+    created_at  DateTime64(6),
+    updated_at  DateTime64(6),
+    expires_at  Nullable(DateTime64(6)) COMMENT 'Reserved for future use',
+    deleted_at  Nullable(DateTime64(6)) COMMENT 'Soft delete timestamp'
+) ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY (app_name, cityHash64(user_id) % 64)
+-- CRITICAL: Removed deleted_at from ORDER BY to allow ReplacingMergeTree to collapse deleted records
+ORDER BY (app_name, user_id, session_id, event_id)
+SETTINGS allow_nullable_key = 1
+COMMENT 'Session events table';
 
 -- Session summaries table
-CREATE TABLE session_summaries (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    filter_key VARCHAR(255) NOT NULL,
-    summary JSON NOT NULL,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NULL,
-    deleted_at TIMESTAMP NULL,
-    UNIQUE KEY idx_session_summaries_unique (app_name, user_id, session_id, filter_key, deleted_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS session_summaries (
+    app_name    String,
+    user_id     String,
+    session_id  String,
+    filter_key  String COMMENT 'Filter key for multiple summaries per session',
+    summary     JSON COMMENT 'Summary data in JSON format',
+    created_at  DateTime64(6),
+    updated_at  DateTime64(6),
+    expires_at  Nullable(DateTime64(6)) COMMENT 'Reserved for future use',
+    deleted_at  Nullable(DateTime64(6)) COMMENT 'Soft delete timestamp'
+) ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY (app_name, cityHash64(user_id) % 64)
+-- CRITICAL: Removed deleted_at from ORDER BY to allow ReplacingMergeTree to collapse deleted records
+ORDER BY (app_name, user_id, session_id, filter_key)
+SETTINGS allow_nullable_key = 1
+COMMENT 'Session summaries table';
 
 -- Application states table
-CREATE TABLE app_states (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    `key` VARCHAR(255) NOT NULL,
-    value TEXT DEFAULT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NULL,
-    deleted_at TIMESTAMP NULL,
-    UNIQUE KEY idx_app_states_unique (app_name, `key`, deleted_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS app_states (
+    app_name    String,
+    key         String COMMENT 'State key',
+    value       String COMMENT 'State value',
+    updated_at  DateTime64(6),
+    expires_at  Nullable(DateTime64(6)) COMMENT 'Expiration time (application-level)',
+    deleted_at  Nullable(DateTime64(6)) COMMENT 'Soft delete timestamp'
+) ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY app_name
+-- CRITICAL: Removed deleted_at from ORDER BY to allow ReplacingMergeTree to collapse deleted records
+ORDER BY (app_name, key)
+SETTINGS allow_nullable_key = 1
+COMMENT 'Application states table';
 
 -- User states table
-CREATE TABLE user_states (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    `key` VARCHAR(255) NOT NULL,
-    value TEXT DEFAULT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NULL,
-    deleted_at TIMESTAMP NULL,
-    UNIQUE KEY idx_user_states_unique (app_name, user_id, `key`, deleted_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS user_states (
+    app_name    String,
+    user_id     String,
+    key         String COMMENT 'State key',
+    value       String COMMENT 'State value',
+    updated_at  DateTime64(6),
+    expires_at  Nullable(DateTime64(6)) COMMENT 'Expiration time (application-level)',
+    deleted_at  Nullable(DateTime64(6)) COMMENT 'Soft delete timestamp'
+) ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY (app_name, cityHash64(user_id) % 64)
+-- CRITICAL: Removed deleted_at from ORDER BY to allow ReplacingMergeTree to collapse deleted records
+ORDER BY (app_name, user_id, key)
+SETTINGS allow_nullable_key = 1
+COMMENT 'User states table';
 ```
 
-**Key Differences Between MySQL and PostgreSQL:**
-
-- MySQL doesn't support partial index with `WHERE deleted_at IS NULL`, requires including `deleted_at` in unique index
-- MySQL uses `JSON` type instead of `JSONB` (similar functionality, different storage format)
-- MySQL uses `ON DUPLICATE KEY UPDATE` syntax for UPSERT
-
 ## Advanced Usage
+
+### Hook Capabilities (Append/Get)
+
+- **AppendEventHook**: Intercept/modify/abort events before they are stored. Useful for content safety or auditing (e.g., tagging `violation=<word>`), or short-circuiting persistence. For filterKey usage, see the “Session Summarization / FilterKey with AppendEventHook” section below.
+- **GetSessionHook**: Intercept/modify/filter sessions after they are read. Useful for removing tagged events or dynamically augmenting the returned session state.
+- **Chain-of-responsibility**: Hooks call `next()` to continue; returning early short-circuits later hooks, and errors bubble up.
+- **Backend parity**: Memory, Redis, MySQL, and PostgreSQL share the same hook interface—inject hook slices when constructing the service.
+- **Example**: See `examples/session/hook` ([code](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/session/hook))
 
 ### Direct Use of Session Service API
 
@@ -1086,6 +1290,157 @@ sess, err := sessionService.GetSession(ctx, key,
     session.WithEventTime(time.Now().Add(-1*time.Hour)))
 ```
 
+#### Directly Append Events to Session
+
+In some scenarios, you may want to directly append events to a session without invoking the model. This is useful for:
+
+- Pre-loading conversation history from external sources
+- Inserting system messages or context before the first user query
+- Recording user actions or metadata as events
+- Building conversation context programmatically
+
+**Important**: An Event can represent both user requests and model responses. When you use `Runner.Run()`, the framework automatically creates events for both user messages and assistant responses.
+
+**Example: Append a User Message**
+
+```go
+import (
+    "context"
+    "github.com/google/uuid"
+    "trpc.group/trpc-go/trpc-agent-go/event"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/session"
+)
+
+// Get or create session
+sessionKey := session.Key{
+    AppName:   "my-agent",
+    UserID:    "user123",
+    SessionID: "session-123",
+}
+sess, err := sessionService.GetSession(ctx, sessionKey)
+if err != nil {
+    return err
+}
+if sess == nil {
+    sess, err = sessionService.CreateSession(ctx, sessionKey, session.StateMap{})
+    if err != nil {
+        return err
+    }
+}
+
+// Create a user message
+message := model.NewUserMessage("Hello, I'm learning Go programming.")
+
+// Create event with required fields:
+// - invocationID: Unique identifier (required)
+// - author: Event author, "user" for user messages (required)
+// - response: *model.Response with Choices containing Message (required)
+invocationID := uuid.New().String()
+evt := event.NewResponseEvent(
+    invocationID, // Required: unique invocation identifier
+    "user",       // Required: event author
+    &model.Response{
+        Done: false, // Recommended: false for non-final events
+        Choices: []model.Choice{
+            {
+                Index:   0,       // Required: choice index
+                Message: message, // Required: message with Content or ContentParts
+            },
+        },
+    },
+)
+evt.RequestID = uuid.New().String() // Optional: for tracking
+
+// Append event to session
+if err := sessionService.AppendEvent(ctx, sess, evt); err != nil {
+    return fmt.Errorf("append event failed: %w", err)
+}
+```
+
+**Example: Append a System Message**
+
+```go
+systemMessage := model.Message{
+    Role:    model.RoleSystem,
+    Content: "You are a helpful assistant specialized in Go programming.",
+}
+
+evt := event.NewResponseEvent(
+    uuid.New().String(),
+    "system", // Author for system messages
+    &model.Response{
+        Done:    false,
+        Choices: []model.Choice{{Index: 0, Message: systemMessage}},
+    },
+)
+
+if err := sessionService.AppendEvent(ctx, sess, evt); err != nil {
+    return err
+}
+```
+
+**Example: Append an Assistant Message**
+
+```go
+assistantMessage := model.Message{
+    Role:    model.RoleAssistant,
+    Content: "Go is a statically typed, compiled programming language.",
+}
+
+evt := event.NewResponseEvent(
+    uuid.New().String(),
+    "assistant", // Author for assistant messages (or use agent name)
+    &model.Response{
+        Done:    false,
+        Choices: []model.Choice{{Index: 0, Message: assistantMessage}},
+    },
+)
+
+if err := sessionService.AppendEvent(ctx, sess, evt); err != nil {
+    return err
+}
+```
+
+**Event Required Fields**
+
+When creating an event using `event.NewResponseEvent()`, the following fields are required:
+
+1. **Function Parameters**:
+
+   - `invocationID` (string): Unique identifier, typically `uuid.New().String()`
+   - `author` (string): Event author (`"user"`, `"system"`, or agent name)
+   - `response` (\*model.Response): Response object with Choices
+
+2. **Response Fields**:
+
+   - `Choices` ([]model.Choice): At least one Choice with `Index` and `Message`
+   - `Message`: Must have `Content` or `ContentParts`
+
+3. **Auto-generated Fields** (by `event.NewResponseEvent()`):
+
+   - `ID`: Auto-generated UUID
+   - `Timestamp`: Auto-set to current time
+   - `Version`: Auto-set to `CurrentVersion`
+
+4. **Persistence Requirements**:
+   - `Response != nil`
+   - `!IsPartial` (or has `StateDelta`)
+   - `IsValidContent()` returns `true`
+
+**How It Works with Runner**
+
+When you later use `Runner.Run()` with the same session:
+
+1. Runner automatically loads the session (including all appended events)
+2. Converts session events to messages
+3. Includes all messages (appended + current) in the conversation context
+4. Sends everything to the model together
+
+All appended events become part of the conversation history and are available to the model in subsequent interactions.
+
+**Example**: See `examples/session/appendevent` ([code](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/session/appendevent))
+
 ## Session Summarization
 
 ### Overview
@@ -1120,8 +1475,8 @@ summaryModel := openai.New("gpt-4", openai.WithAPIKey("your-api-key"))
 // Create summarizer with trigger conditions.
 summarizer := summary.NewSummarizer(
     summaryModel,
-    summary.WithEventThreshold(20),        // Trigger when exceeds 20 events.
-    summary.WithTokenThreshold(4000),      // Trigger when exceeds 4000 tokens.
+    summary.WithEventThreshold(20),        // Trigger when 20+ new events since last summary.
+    summary.WithTokenThreshold(4000),      // Trigger when 4000+ new tokens since last summary.
     summary.WithMaxSummaryWords(200),      // Limit summary to 200 words.
 )
 ```
@@ -1135,6 +1490,7 @@ import (
     "time"
     "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
     "trpc.group/trpc-go/trpc-agent-go/session/redis"
+    "trpc.group/trpc-go/trpc-agent-go/session/clickhouse"
 )
 
 // Option 1: In-memory session service with summarizer.
@@ -1151,6 +1507,13 @@ sessionService, err := redis.NewService(
     redis.WithSummarizer(summarizer),
     redis.WithAsyncSummaryNum(4),           // 4 async workers.
     redis.WithSummaryQueueSize(200),        // Queue size 200.
+)
+
+// Option 3: ClickHouse session service with summarizer.
+sessionService, err := clickhouse.NewService(
+    clickhouse.WithClickHouseDSN("clickhouse://default:password@localhost:9000/default"),
+    clickhouse.WithSummarizer(summarizer),
+    clickhouse.WithAsyncSummaryNum(2),
 )
 ```
 
@@ -1189,7 +1552,7 @@ The framework provides two distinct modes for managing conversation context sent
 
 **Mode 1: With Summary (`WithAddSessionSummary(true)`)**
 
-- The session summary is prepended as a system message.
+- The session summary is inserted as a separate system message after the first existing system message (or prepended if no system message exists).
 - **All incremental events** after the summary timestamp are included (no truncation).
 - This ensures complete context: condensed history (summary) + all new conversations since summarization.
 - `WithMaxHistoryRuns` is **ignored** in this mode.
@@ -1206,9 +1569,9 @@ The framework provides two distinct modes for managing conversation context sent
 ```
 When AddSessionSummary = true:
 ┌─────────────────────────────────────┐
-│ System Prompt                       │
+│ Existing System Message (optional)  │ ← If present
 ├─────────────────────────────────────┤
-│ Session Summary (system message)    │ ← Condensed history
+│ Session Summary (system message)    │ ← Inserted after first system message
 ├─────────────────────────────────────┤
 │ Event 1 (after summary timestamp)   │ ┐
 │ Event 2                             │ │ All incremental
@@ -1242,8 +1605,8 @@ Configure the summarizer behavior with the following options:
 
 **Trigger Conditions:**
 
-- **`WithEventThreshold(eventCount int)`**: Trigger summarization when the number of events exceeds the threshold. Example: `WithEventThreshold(20)` triggers when exceeds 20 events.
-- **`WithTokenThreshold(tokenCount int)`**: Trigger summarization when the total token count exceeds the threshold. Example: `WithTokenThreshold(4000)` triggers when exceeds 4000 tokens.
+- **`WithEventThreshold(eventCount int)`**: Trigger summarization when the number of new events since last summary exceeds the threshold. Example: `WithEventThreshold(20)` triggers when 20+ new events have occurred since last summary.
+- **`WithTokenThreshold(tokenCount int)`**: Trigger summarization when the new token count since last summary exceeds the threshold. Example: `WithTokenThreshold(4000)` triggers when 4000+ new tokens have been added since last summary.
 - **`WithTimeThreshold(interval time.Duration)`**: Trigger summarization when time elapsed since the last event exceeds the interval. Example: `WithTimeThreshold(5*time.Minute)` triggers after 5 minutes of inactivity.
 
 **Composite Conditions:**
@@ -1269,6 +1632,7 @@ Configure the summarizer behavior with the following options:
 
 - **`WithMaxSummaryWords(maxWords int)`**: Limit the summary to a maximum word count. The limit is included in the prompt to guide the model's generation. Example: `WithMaxSummaryWords(150)` requests summaries within 150 words.
 - **`WithPrompt(prompt string)`**: Provide a custom summarization prompt. The prompt must include the placeholder `{conversation_text}`, which will be replaced with the conversation content. Optionally include `{max_summary_words}` for word limit instructions.
+- **`WithSkipRecent(skipFunc SkipRecentFunc)`**: Skip the _most recent_ events during summarization using a custom function. The function receives all events and returns how many tail events to skip. Return 0 to skip none. Useful for avoiding summarizing very recent/incomplete conversations, or applying time/content-based skipping strategies.
 
 **Example with custom prompt:**
 
@@ -1285,9 +1649,52 @@ Summary:`
 
 summarizer := summary.NewSummarizer(
     summaryModel,
-    summary.WithPrompt(customPrompt),
-    summary.WithMaxSummaryWords(100),
+    summary.WithPrompt(customPrompt), // Custom Prompt
+    summary.WithMaxSummaryWords(100), // Inject into {max_summary_words}
     summary.WithEventThreshold(15),
+)
+
+// Skip a fixed number of recent events (compatible with old behavior)
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithSkipRecent(func(_ []event.Event) int { return 2 }), // skip last 2 events
+    summary.WithEventThreshold(10),
+)
+
+// Skip events from the last 5 minutes (time window)
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithSkipRecent(func(events []event.Event) int {
+        cutoff := time.Now().Add(-5 * time.Minute)
+        skip := 0
+        for i := len(events) - 1; i >= 0; i-- {
+            if events[i].Timestamp.After(cutoff) {
+                skip++
+            } else {
+                break
+            }
+        }
+        return skip
+    }),
+    summary.WithEventThreshold(10),
+)
+
+// Skip trailing tool-call messages only
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithSkipRecent(func(events []event.Event) int {
+        skip := 0
+        for i := len(events) - 1; i >= 0; i-- {
+            if events[i].Response != nil && len(events[i].Response.Choices) > 0 &&
+                events[i].Response.Choices[0].Message.Role == model.RoleTool {
+                skip++
+            } else {
+                break
+            }
+        }
+        return skip
+    }),
+    summary.WithEventThreshold(10),
 )
 ```
 
@@ -1373,11 +1780,28 @@ err := sessionService.CreateSessionSummary(
 Get the latest summary text from a session:
 
 ```go
+// Get the full-session summary (default behavior)
 summaryText, found := sessionService.GetSessionSummaryText(ctx, sess)
 if found {
     fmt.Printf("Summary: %s\n", summaryText)
 }
+
+// Get summary for a specific filter key
+userSummary, found := sessionService.GetSessionSummaryText(
+    ctx, sess, session.WithSummaryFilterKey("user-messages"),
+)
+if found {
+    fmt.Printf("User messages summary: %s\n", userSummary)
+}
 ```
+
+**Filter Key Support:**
+
+The `GetSessionSummaryText` method supports an optional `WithSummaryFilterKey` option to retrieve summaries for specific event filters:
+
+- When no option is provided, returns the full-session summary (`SummaryFilterKeyAllContents`)
+- When a specific filter key is provided but not found, falls back to the full-session summary
+- If neither exists, returns any available summary as a last resort
 
 ### How It Works
 
@@ -1385,7 +1809,7 @@ if found {
 
 2. **Delta Summarization**: New events are combined with the previous summary (prepended as a system event) to generate an updated summary that incorporates both old context and new information.
 
-3. **Trigger Evaluation**: Before generating a summary, the summarizer evaluates configured trigger conditions (event count, token count, time threshold). If conditions aren't met and `force=false`, summarization is skipped.
+3. **Trigger Evaluation**: Before generating a summary, the summarizer evaluates configured trigger conditions (based on incremental event count, token count, and time threshold since last summary). If conditions aren't met and `force=false`, summarization is skipped.
 
 4. **Async Workers**: Summary jobs are distributed across multiple worker goroutines using hash-based distribution. This ensures jobs for the same session are processed sequentially while different sessions can be processed in parallel.
 
@@ -1404,6 +1828,80 @@ if found {
 5. **Balance word limits**: Set `WithMaxSummaryWords` to balance between preserving context and reducing token usage. Typical values range from 100-300 words.
 
 6. **Test trigger conditions**: Experiment with different combinations of `WithChecksAny` and `WithChecksAll` to find the right balance between summary frequency and cost.
+
+### Summarizing by Event Type
+
+In real-world applications, you may want to generate separate summaries for different types of events. For example:
+
+- **User Message Summary**: Summarize user needs and questions
+- **Tool Call Summary**: Record which tools were used and their results
+- **System Event Summary**: Track system state changes
+
+To achieve this, you need to set the `FilterKey` field on events to identify their type.
+
+#### Setting FilterKey with AppendEventHook
+
+The recommended approach is to use `AppendEventHook` to automatically set `FilterKey` before events are persisted:
+
+```go
+sessionService := inmemory.NewSessionService(
+    inmemory.WithAppendEventHook(func(ctx *session.AppendEventContext, next func() error) error {
+        // Auto-categorize by event author
+        prefix := "my-app/"  // Must add appName prefix
+        switch ctx.Event.Author {
+        case "user":
+            ctx.Event.FilterKey = prefix + "user-messages"
+        case "tool":
+            ctx.Event.FilterKey = prefix + "tool-calls"
+        default:
+            ctx.Event.FilterKey = prefix + "misc"
+        }
+        return next()
+    }),
+)
+```
+
+Once FilterKey is set, you can generate independent summaries for different event types:
+
+```go
+// Generate summary for user messages
+err := sessionService.CreateSessionSummary(ctx, sess, "my-app/user-messages", false)
+
+// Generate summary for tool calls
+err := sessionService.CreateSessionSummary(ctx, sess, "my-app/tool-calls", false)
+
+// Retrieve summary for specific type
+userSummary, found := sessionService.GetSessionSummaryText(
+    ctx, sess, session.WithSummaryFilterKey("my-app/user-messages"))
+```
+
+#### FilterKey Prefix Convention
+
+**⚠️ Important: FilterKey must include the `appName + "/"` prefix.**
+
+**Why:** The Runner uses `appName + "/"` as the filter prefix when filtering events. If your FilterKey lacks this prefix, events will be filtered out, causing:
+
+- LLM cannot see conversation history, may repeatedly trigger tool calls
+- Summary content is incomplete, losing important context
+
+**Example:**
+
+```go
+// ✅ Correct: with appName prefix
+evt.FilterKey = "my-app/user-messages"
+
+// ❌ Wrong: no prefix, events will be filtered out
+evt.FilterKey = "user-messages"
+```
+
+**Technical Details:** The framework uses prefix matching (`strings.HasPrefix`) to determine which events should be included in the context. See `ContentRequestProcessor` filtering logic for details.
+
+#### Complete Examples
+
+See the following examples for complete FilterKey usage scenarios:
+
+- [examples/session/hook](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/session/hook) - Hook basics
+- [examples/summary/filterkey](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/summary/filterkey) - Summarizing by FilterKey
 
 ### Performance Considerations
 

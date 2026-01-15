@@ -43,15 +43,32 @@ func (p *PlanningRequestProcessor) ProcessRequest(
 	ch chan<- *event.Event,
 ) {
 	if req == nil {
-		log.Errorf("Planning request processor: request is nil")
+		log.ErrorfContext(
+			ctx,
+			"Planning request processor: request is nil",
+		)
 		return
 	}
 	if p.Planner == nil {
-		log.Debugf("Planning request processor: no planner configured")
+		log.DebugContext(
+			ctx,
+			"Planning request processor: no planner configured",
+		)
+		return
+	}
+	if invocation == nil {
+		log.DebugContext(
+			ctx,
+			"Planning request processor: invocation is nil",
+		)
 		return
 	}
 
-	log.Debugf("Planning request processor: processing request for agent %s", invocation.AgentName)
+	log.DebugfContext(
+		ctx,
+		"Planning request processor: processing request for agent %s",
+		invocation.AgentName,
+	)
 
 	// Apply thinking configuration for built-in planners.
 	if builtinPlanner, ok := p.Planner.(*builtin.Planner); ok {
@@ -67,22 +84,27 @@ func (p *PlanningRequestProcessor) ProcessRequest(
 		if !hasSystemMessage(req.Messages, planningInstruction) {
 			instructionMsg := model.NewSystemMessage(planningInstruction)
 			req.Messages = append([]model.Message{instructionMsg}, req.Messages...)
-			log.Debugf("Planning request processor: added planning instruction")
+			log.DebugContext(
+				ctx,
+				"Planning request processor: added planning instruction",
+			)
 		}
 	}
 
-	if invocation == nil {
-		return
-	}
-
-	log.Debugf("Planning request processor: sent preprocessing event")
+	log.DebugContext(
+		ctx,
+		"Planning request processor: sent preprocessing event",
+	)
 
 	if err := agent.EmitEvent(ctx, invocation, ch, event.New(
 		invocation.InvocationID,
 		invocation.AgentName,
 		event.WithObject(model.ObjectTypePreprocessingPlanning),
 	)); err != nil {
-		log.Debugf("Planning request processor: context cancelled")
+		log.DebugContext(
+			ctx,
+			"Planning request processor: context cancelled",
+		)
 	}
 }
 
@@ -100,14 +122,6 @@ func hasSystemMessage(messages []model.Message, content string) bool {
 		}
 	}
 	return false
-}
-
-// min returns the minimum of two integers.
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // PlanningResponseProcessor implements planning response processing logic.
@@ -136,31 +150,54 @@ func (p *PlanningResponseProcessor) ProcessResponse(
 		return
 	}
 	if p.Planner == nil {
-		log.Debugf("Planning response processor: no planner configured")
+		log.DebugContext(
+			ctx,
+			"Planning response processor: no planner configured",
+		)
 		return
 	}
 	if len(rsp.Choices) == 0 {
-		log.Debugf("Planning response processor: no choices in response")
+		log.DebugContext(
+			ctx,
+			"Planning response processor: no choices in response",
+		)
 		return
 	}
 
-	log.Debugf("Planning response processor: processing response for agent %s", invocation.AgentName)
+	log.DebugfContext(
+		ctx,
+		"Planning response processor: processing response for agent %s",
+		invocation.AgentName,
+	)
 
 	// Process the response using the planner.
 	processedResponse := p.Planner.ProcessPlanningResponse(ctx, invocation, rsp)
 	if processedResponse != nil {
 		// Update the original response with processed content.
 		*rsp = *processedResponse
-		log.Debugf("Planning response processor: processed response successfully")
+		log.DebugContext(
+			ctx,
+			"Planning response processor: processed response successfully",
+		)
 	}
 
-	log.Debugf("Planning response processor: sent postprocessing event")
+	log.DebugContext(
+		ctx,
+		"Planning response processor: sent postprocessing event",
+	)
 
-	if err := agent.EmitEvent(ctx, invocation, ch, event.New(
+	planningEvent := event.New(
 		invocation.InvocationID,
 		invocation.AgentName,
 		event.WithObject(model.ObjectTypePostprocessingPlanning),
-	)); err != nil {
-		log.Debugf("Planning response processor: context cancelled")
+	)
+	// Mark as partial response so it doesn't interfere with full response detection.
+	planningEvent.Response.IsPartial = true
+
+	if err := agent.EmitEvent(ctx, invocation, ch, planningEvent); err != nil {
+		log.DebugContext(
+			ctx,
+			"Planning response processor: context cancelled",
+		)
 	}
 }

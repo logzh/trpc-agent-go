@@ -135,7 +135,8 @@ func (a *ParallelAgent) startSubAgents(
 
 	for i, subAgent := range a.subAgents {
 		wg.Add(1)
-		go func(idx int, sa agent.Agent) {
+		runCtx := agent.CloneContext(ctx)
+		go func(ctx context.Context, idx int, sa agent.Agent) {
 			defer wg.Done()
 			// Recover from panics in sub-agent execution to prevent
 			// the whole service from crashing.
@@ -162,7 +163,11 @@ func (a *ParallelAgent) startSubAgents(
 			branchAgentCtx := agent.NewInvocationContext(ctx, branchInvocation)
 
 			// Run the sub-agent.
-			subEventChan, err := sa.Run(branchAgentCtx, branchInvocation)
+			subEventChan, err := agent.RunWithPlugins(
+				branchAgentCtx,
+				branchInvocation,
+				sa,
+			)
 			if err != nil {
 				// Send error event.
 				agent.EmitEvent(ctx, invocation, eventChan, event.NewErrorEvent(
@@ -175,7 +180,7 @@ func (a *ParallelAgent) startSubAgents(
 			}
 
 			eventChans[idx] = subEventChan
-		}(i, subAgent)
+		}(runCtx, i, subAgent)
 	}
 
 	// Wait for all sub-agents to start.
@@ -228,10 +233,11 @@ func (a *ParallelAgent) Run(
 ) (<-chan *event.Event, error) {
 	eventChan := make(chan *event.Event, a.channelBufferSize)
 
-	go func() {
+	runCtx := agent.CloneContext(ctx)
+	go func(ctx context.Context) {
 		defer close(eventChan)
 		a.executeParallelRun(ctx, invocation, eventChan)
-	}()
+	}(runCtx)
 
 	return eventChan, nil
 }
@@ -280,8 +286,9 @@ func (a *ParallelAgent) mergeEventStreams(
 			continue
 		}
 
+		runCtx := agent.CloneContext(ctx)
 		wg.Add(1)
-		go func(inputChan <-chan *event.Event) {
+		go func(ctx context.Context, inputChan <-chan *event.Event) {
 			defer wg.Done()
 			// Recover from potential panics during event merging.
 			defer func() {
@@ -301,7 +308,7 @@ func (a *ParallelAgent) mergeEventStreams(
 					return
 				}
 			}
-		}(ch)
+		}(runCtx, ch)
 	}
 
 	// Wait for all goroutines to finish.

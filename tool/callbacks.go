@@ -12,6 +12,20 @@ package tool
 
 import (
 	"context"
+	"fmt"
+	"runtime/debug"
+
+	"trpc.group/trpc-go/trpc-agent-go/log"
+)
+
+const (
+	callbackPanicErrFmt = "%s: %v"
+	callbackPanicLogFmt = "%s (tool_call_id: %s, tool: %s): " +
+		"%v\n%s"
+
+	beforeToolCallbackPanic         = "before tool callback panic"
+	afterToolCallbackPanic          = "after tool callback panic"
+	toolResultMessagesCallbackPanic = "tool result messages callback panic"
 )
 
 // BeforeToolCallback is called before a tool is executed.
@@ -42,6 +56,8 @@ type AfterToolCallback = func(
 
 // BeforeToolArgs contains all parameters for before tool callback.
 type BeforeToolArgs struct {
+	// ToolCallID is the ID of the tool call issued by the model.
+	ToolCallID string
 	// ToolName is the name of the tool.
 	ToolName string
 	// Declaration is the tool declaration.
@@ -75,6 +91,8 @@ type BeforeToolCallbackStructured = func(
 
 // AfterToolArgs contains all parameters for after tool callback.
 type AfterToolArgs struct {
+	// ToolCallID is the ID of the tool call issued by the model.
+	ToolCallID string
 	// ToolName is the name of the tool.
 	ToolName string
 	// Declaration is the tool declaration.
@@ -107,6 +125,45 @@ type AfterToolCallbackStructured = func(
 	args *AfterToolArgs,
 ) (*AfterToolResult, error)
 
+// ToolResultMessagesInput contains all parameters for generating messages from a tool result.
+type ToolResultMessagesInput struct {
+	// ToolName is the name of the tool.
+	ToolName string
+	// Declaration is the tool declaration.
+	Declaration *Declaration
+	// Arguments is the final tool arguments in JSON bytes (after before-tool callbacks).
+	Arguments []byte
+	// Result is the final tool execution result (after after-tool callbacks).
+	Result any
+	// ToolCallID is the ID of the tool call issued by the model.
+	ToolCallID string
+	// DefaultToolMessage is the default tool response message that the framework
+	// would send if no custom messages are provided by the callback.
+	// The concrete type is framework-specific (typically model.Message).
+	DefaultToolMessage any
+}
+
+// ToolResultMessagesFunc converts a tool execution result into one or more messages
+// to be sent back to the model.
+//
+// Behavior contract:
+//   - If the callback returns (nil, nil) or an empty slice, the framework will
+//     fall back to DefaultToolMessage.
+//   - If the callback returns non-empty messages, they will replace the default
+//     tool message. Callers are expected to return a value that the framework
+//     understands (typically []model.Message) and to include at least one
+//     RoleTool message whose ToolID matches ToolCallID to remain
+//     protocol-compatible.
+//
+// To avoid import cycles, the return type is any. When using llmagent with
+// the built-in OpenAI/Anthropic adapters, the recommended return type is
+// []model.Message (or a single model.Message), which will be type-asserted
+// by the framework.
+type ToolResultMessagesFunc = func(
+	ctx context.Context,
+	in *ToolResultMessagesInput,
+) (any, error)
+
 // Callbacks holds callbacks for tool operations.
 // Internally stores the new structured callback types.
 type Callbacks struct {
@@ -114,6 +171,10 @@ type Callbacks struct {
 	BeforeTool []BeforeToolCallbackStructured
 	// AfterTool is a list of callbacks called after the tool is executed.
 	AfterTool []AfterToolCallbackStructured
+	// ToolResultMessages is an optional callback that can convert a tool
+	// execution result into one or more messages to be sent back to the model.
+	// When set, it is invoked after the tool and AfterTool callbacks have run.
+	ToolResultMessages ToolResultMessagesFunc
 	// continueOnError controls whether to continue executing callbacks when an error occurs.
 	// Default: false (stop on first error)
 	continueOnError bool
@@ -146,6 +207,40 @@ func NewCallbacks(opts ...CallbacksOption) *Callbacks {
 		opt(c)
 	}
 	return c
+}
+
+// RegisterToolResultMessages registers a ToolResultMessages callback.
+// The callback will be invoked once per tool execution, after the tool has
+// completed and after all AfterTool callbacks have run.
+func (c *Callbacks) RegisterToolResultMessages(cb ToolResultMessagesFunc) *Callbacks {
+	c.ToolResultMessages = cb
+	return c
+}
+
+// RunToolResultMessages runs the ToolResultMessages callback (if set) with panic
+// recovery, returning an error when the callback panics.
+func (c *Callbacks) RunToolResultMessages(
+	ctx context.Context,
+	in *ToolResultMessagesInput,
+) (result any, err error) {
+	if c == nil || c.ToolResultMessages == nil {
+		return nil, nil
+	}
+
+	toolCallID := ""
+	toolName := ""
+	if in != nil {
+		toolCallID = in.ToolCallID
+		toolName = in.ToolName
+	}
+	defer recoverToolCallbackPanic(
+		ctx,
+		toolResultMessagesCallbackPanic,
+		toolCallID,
+		toolName,
+		&err,
+	)
+	return c.ToolResultMessages(ctx, in)
 }
 
 // RegisterBeforeTool registers a before tool callback.
@@ -262,6 +357,52 @@ func (c *Callbacks) finalizeBeforeToolResult(
 	return lastResult, nil
 }
 
+func recoverToolCallbackPanic(
+	ctx context.Context,
+	stage string,
+	toolCallID string,
+	toolName string,
+	errp *error,
+) {
+	recovered := recover()
+	if recovered == nil {
+		return
+	}
+
+	stack := debug.Stack()
+	log.ErrorfContext(
+		ctx,
+		callbackPanicLogFmt,
+		stage,
+		toolCallID,
+		toolName,
+		recovered,
+		string(stack),
+	)
+	*errp = fmt.Errorf(callbackPanicErrFmt, stage, recovered)
+}
+
+func (c *Callbacks) runBeforeToolCallback(
+	ctx context.Context,
+	cb BeforeToolCallbackStructured,
+	args *BeforeToolArgs,
+) (result *BeforeToolResult, err error) {
+	toolCallID := ""
+	toolName := ""
+	if args != nil {
+		toolCallID = args.ToolCallID
+		toolName = args.ToolName
+	}
+	defer recoverToolCallbackPanic(
+		ctx,
+		beforeToolCallbackPanic,
+		toolCallID,
+		toolName,
+		&err,
+	)
+	return cb(ctx, args)
+}
+
 // RunBeforeTool runs all before tool callbacks in order.
 // This method uses the new structured callback interface.
 // If a callback returns a non-nil Context in the result, it will be used for subsequent callbacks.
@@ -273,7 +414,7 @@ func (c *Callbacks) RunBeforeTool(
 	var firstErr error
 
 	for _, cb := range c.BeforeTool {
-		result, err := cb(ctx, args)
+		result, err := c.runBeforeToolCallback(ctx, cb, args)
 
 		if c.handleCallbackError(err, &firstErr) {
 			return nil, err
@@ -340,6 +481,27 @@ func (c *Callbacks) finalizeAfterToolResult(
 	return lastResult, nil
 }
 
+func (c *Callbacks) runAfterToolCallback(
+	ctx context.Context,
+	cb AfterToolCallbackStructured,
+	args *AfterToolArgs,
+) (result *AfterToolResult, err error) {
+	toolCallID := ""
+	toolName := ""
+	if args != nil {
+		toolCallID = args.ToolCallID
+		toolName = args.ToolName
+	}
+	defer recoverToolCallbackPanic(
+		ctx,
+		afterToolCallbackPanic,
+		toolCallID,
+		toolName,
+		&err,
+	)
+	return cb(ctx, args)
+}
+
 // RunAfterTool runs all after tool callbacks in order.
 // This method uses the new structured callback interface.
 // If a callback returns a non-nil Context in the result, it will be used for subsequent callbacks.
@@ -351,7 +513,7 @@ func (c *Callbacks) RunAfterTool(
 	var firstErr error
 
 	for _, cb := range c.AfterTool {
-		result, err := cb(ctx, args)
+		result, err := c.runAfterToolCallback(ctx, cb, args)
 
 		if c.handleCallbackError(err, &firstErr) {
 			return nil, err

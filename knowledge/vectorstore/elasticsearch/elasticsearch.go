@@ -88,7 +88,7 @@ func New(opts ...Option) (*VectorStore, error) {
 	vs := &VectorStore{
 		client:          client,
 		option:          option,
-		filterConverter: &esConverter{},
+		filterConverter: &esConverter{metadataFieldName: option.metadataFieldName},
 	}
 
 	// Ensure index exists with proper mapping.
@@ -345,14 +345,24 @@ func (vs *VectorStore) Search(ctx context.Context, query *vectorstore.SearchQuer
 		searchQuery, err = vs.buildVectorSearchQuery(query)
 	case vectorstore.SearchModeKeyword:
 		if !vs.option.enableTSVector {
-			log.Infof("elasticsearch: keyword search is not supported when enableTSVector is disabled, use vector search instead")
+			log.InfofContext(
+				ctx,
+				"elasticsearch: keyword search is not supported "+
+					"when enableTSVector is disabled, use vector "+
+					"search instead",
+			)
 			searchQuery, err = vs.buildVectorSearchQuery(query)
 		} else {
 			searchQuery, err = vs.buildKeywordSearchQuery(query)
 		}
 	case vectorstore.SearchModeHybrid:
 		if !vs.option.enableTSVector {
-			log.Infof("elasticsearch: hybrid search is not supported when enableTSVector is disabled, use vector search instead")
+			log.InfofContext(
+				ctx,
+				"elasticsearch: hybrid search is not supported "+
+					"when enableTSVector is disabled, use vector "+
+					"search instead",
+			)
 			searchQuery, err = vs.buildVectorSearchQuery(query)
 		} else {
 			searchQuery, err = vs.buildHybridSearchQuery(query)
@@ -477,6 +487,12 @@ func (vs *VectorStore) DeleteByFilter(ctx context.Context, opts ...vectorstore.D
 	return vs.deleteByFilter(ctx, config)
 }
 
+// UpdateByFilter updates documents matching the filter with the specified field values.
+// Note: This method is not supported in elasticsearch implementation.
+func (vs *VectorStore) UpdateByFilter(ctx context.Context, opts ...vectorstore.UpdateByFilterOption) (int64, error) {
+	return 0, errors.New("elasticsearch: UpdateByFilter is not supported")
+}
+
 // GetMetadata retrieves metadata from the vector store.
 func (vs *VectorStore) GetMetadata(ctx context.Context, opts ...vectorstore.GetMetadataOption) (map[string]vectorstore.DocumentMetadata, error) {
 	config, err := vectorstore.ApplyGetMetadataOptions(opts...)
@@ -547,7 +563,11 @@ func (vs *VectorStore) deleteAll(ctx context.Context) error {
 		return fmt.Errorf("elasticsearch delete all documents: %w", err)
 	}
 
-	log.Infof("elasticsearch deleted all documents from index %s", vs.option.indexName)
+	log.InfofContext(
+		ctx,
+		"elasticsearch deleted all documents from index %s",
+		vs.option.indexName,
+	)
 	return nil
 }
 
@@ -589,7 +609,10 @@ func (vs *VectorStore) deleteByFilter(ctx context.Context, config *vectorstore.D
 		return fmt.Errorf("elasticsearch delete by filter: %w", err)
 	}
 
-	log.Infof("elasticsearch executed delete by filter query")
+	log.InfofContext(
+		ctx,
+		"elasticsearch executed delete by filter query",
+	)
 	return nil
 }
 
@@ -657,7 +680,11 @@ func (vs *VectorStore) queryMetadataBatch(
 
 		doc, _, err := vs.docBuilder(hit.Source_)
 		if err != nil {
-			log.Warnf("elasticsearch doc builder failed: %v", err)
+			log.WarnfContext(
+				ctx,
+				"elasticsearch doc builder failed: %v",
+				err,
+			)
 			continue // Skip invalid documents
 		}
 		if doc == nil || len(doc.Metadata) == 0 {

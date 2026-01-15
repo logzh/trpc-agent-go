@@ -21,8 +21,37 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
 
+func newTranslatorForTest(t *testing.T, opts ...Option) Translator {
+	t.Helper()
+
+	tr, err := New(context.Background(), "thread", "run", opts...)
+	assert.NoError(t, err)
+	if err != nil {
+		return nil
+	}
+	return tr
+}
+
+func newTranslatorImplForTest(t *testing.T, opts ...Option) *translator {
+	t.Helper()
+
+	tr := newTranslatorForTest(t, opts...)
+	if tr == nil {
+		return nil
+	}
+	impl, ok := tr.(*translator)
+	assert.True(t, ok)
+	if !ok {
+		return nil
+	}
+	return impl
+}
+
 func TestTranslateNilEvent(t *testing.T) {
-	translator := New(context.Background(), "thread", "run")
+	translator := newTranslatorForTest(t)
+	if translator == nil {
+		return
+	}
 
 	_, err := translator.Translate(context.Background(), nil)
 	assert.Error(t, err)
@@ -32,7 +61,10 @@ func TestTranslateNilEvent(t *testing.T) {
 }
 
 func TestTranslateErrorResponse(t *testing.T) {
-	translator := New(context.Background(), "thread", "run")
+	translator := newTranslatorForTest(t)
+	if translator == nil {
+		return
+	}
 	rsp := &model.Response{Error: &model.ResponseError{Message: "boom"}}
 
 	events, err := translator.Translate(context.Background(), &agentevent.Event{Response: rsp})
@@ -45,8 +77,10 @@ func TestTranslateErrorResponse(t *testing.T) {
 }
 
 func TestTextMessageEventStreamingAndCompletion(t *testing.T) {
-	translator, ok := New(context.Background(), "thread", "run").(*translator)
-	assert.True(t, ok)
+	translator := newTranslatorImplForTest(t)
+	if translator == nil {
+		return
+	}
 
 	firstChunk := &model.Response{
 		ID:     "msg-1",
@@ -78,8 +112,10 @@ func TestTextMessageEventStreamingAndCompletion(t *testing.T) {
 }
 
 func TestTextMessageEventStreamInterruptedByNewMessage(t *testing.T) {
-	translator, ok := New(context.Background(), "thread", "run").(*translator)
-	assert.True(t, ok)
+	translator := newTranslatorImplForTest(t)
+	if translator == nil {
+		return
+	}
 
 	firstChunk := &model.Response{
 		ID:     "msg-1",
@@ -121,8 +157,10 @@ func TestTextMessageEventStreamInterruptedByNewMessage(t *testing.T) {
 }
 
 func TestTextMessageEventStreamInterruptedByNewMessage_NonStream(t *testing.T) {
-	translator, ok := New(context.Background(), "thread", "run").(*translator)
-	assert.True(t, ok)
+	translator := newTranslatorImplForTest(t)
+	if translator == nil {
+		return
+	}
 
 	firstChunk := &model.Response{
 		ID:     "msg-1",
@@ -168,8 +206,10 @@ func TestTextMessageEventStreamInterruptedByNewMessage_NonStream(t *testing.T) {
 }
 
 func TestTextMessageEventNonStream(t *testing.T) {
-	translator, ok := New(context.Background(), "thread", "run").(*translator)
-	assert.True(t, ok)
+	translator := newTranslatorImplForTest(t)
+	if translator == nil {
+		return
+	}
 
 	nonStreamRsp := &model.Response{
 		ID:     "msg-1",
@@ -198,8 +238,10 @@ func TestTextMessageEventNonStream(t *testing.T) {
 }
 
 func TestTextMessageEventEmptyChatCompletionContent(t *testing.T) {
-	translator, ok := New(context.Background(), "thread", "run").(*translator)
-	assert.True(t, ok)
+	translator := newTranslatorImplForTest(t)
+	if translator == nil {
+		return
+	}
 	rsp := &model.Response{
 		ID:      "final-empty",
 		Object:  model.ObjectTypeChatCompletion,
@@ -214,8 +256,10 @@ func TestTextMessageEventEmptyChatCompletionContent(t *testing.T) {
 }
 
 func TestTextMessageEventEmptyChunkDoesNotChangeState(t *testing.T) {
-	translator, ok := New(context.Background(), "thread", "run").(*translator)
-	assert.True(t, ok)
+	translator := newTranslatorImplForTest(t)
+	if translator == nil {
+		return
+	}
 	rsp := &model.Response{
 		ID:     "chunk-empty",
 		Object: model.ObjectTypeChatCompletionChunk,
@@ -232,17 +276,90 @@ func TestTextMessageEventEmptyChunkDoesNotChangeState(t *testing.T) {
 }
 
 func TestTextMessageEventInvalidObject(t *testing.T) {
-	translator, ok := New(context.Background(), "thread", "run").(*translator)
-	assert.True(t, ok)
+	translator := newTranslatorImplForTest(t)
+	if translator == nil {
+		return
+	}
 	rsp := &model.Response{ID: "bad", Object: "unknown", Choices: []model.Choice{{}}}
 
 	_, err := translator.textMessageEvent(rsp)
 	assert.Error(t, err)
 }
 
-func TestGraphModelMetadataProducesText(t *testing.T) {
-	tr, ok := New(context.Background(), "thread", "run").(*translator)
+func TestTextMessageEventChunkFinishReasonEndsStream(t *testing.T) {
+	translator := newTranslatorImplForTest(t)
+	if translator == nil {
+		return
+	}
+
+	firstChunk := &model.Response{
+		ID:     "msg-1",
+		Object: model.ObjectTypeChatCompletionChunk,
+		Choices: []model.Choice{{
+			Delta: model.Message{Role: model.RoleAssistant, Content: "hi"},
+		}},
+	}
+	initialEvents, err := translator.textMessageEvent(firstChunk)
+	assert.NoError(t, err)
+	assert.Len(t, initialEvents, 2)
+	assert.True(t, translator.receivingMessage)
+
+	reason := "stop"
+	finishChunk := &model.Response{
+		ID:     "msg-1",
+		Object: model.ObjectTypeChatCompletionChunk,
+		Choices: []model.Choice{{
+			Delta:        model.Message{Role: model.RoleAssistant},
+			FinishReason: &reason,
+		}},
+	}
+	events, err := translator.textMessageEvent(finishChunk)
+	assert.NoError(t, err)
+	assert.Len(t, events, 1)
+	end, ok := events[0].(*aguievents.TextMessageEndEvent)
 	assert.True(t, ok)
+	assert.Equal(t, "msg-1", end.MessageID)
+	assert.False(t, translator.receivingMessage)
+}
+
+func TestTextMessageEventChunkWithContentAndFinishReason(t *testing.T) {
+	translator := newTranslatorImplForTest(t)
+	if translator == nil {
+		return
+	}
+
+	reason := "stop"
+	chunk := &model.Response{
+		ID:     "msg-finish",
+		Object: model.ObjectTypeChatCompletionChunk,
+		Choices: []model.Choice{{
+			Delta:        model.Message{Role: model.RoleAssistant, Content: "done"},
+			FinishReason: &reason,
+		}},
+	}
+	events, err := translator.textMessageEvent(chunk)
+	assert.NoError(t, err)
+	assert.Len(t, events, 3)
+
+	start, ok := events[0].(*aguievents.TextMessageStartEvent)
+	assert.True(t, ok)
+	assert.Equal(t, "msg-finish", start.MessageID)
+
+	content, ok := events[1].(*aguievents.TextMessageContentEvent)
+	assert.True(t, ok)
+	assert.Equal(t, "done", content.Delta)
+
+	end, ok := events[2].(*aguievents.TextMessageEndEvent)
+	assert.True(t, ok)
+	assert.Equal(t, "msg-finish", end.MessageID)
+	assert.False(t, translator.receivingMessage)
+}
+
+func TestGraphModelMetadataProducesText(t *testing.T) {
+	tr := newTranslatorImplForTest(t)
+	if tr == nil {
+		return
+	}
 
 	meta := graph.ModelExecutionMetadata{Output: "hello from graph", ResponseID: "resp-1"}
 	b, _ := json.Marshal(meta)
@@ -262,7 +379,10 @@ func TestGraphModelMetadataProducesText(t *testing.T) {
 }
 
 func TestGraphModelEventsDeduplicatedByResponseID(t *testing.T) {
-	tr := New(context.Background(), "thread", "run")
+	tr := newTranslatorForTest(t)
+	if tr == nil {
+		return
+	}
 
 	rsp := &model.Response{
 		ID:     "resp-1",
@@ -297,8 +417,10 @@ func TestGraphModelEventsDeduplicatedByResponseID(t *testing.T) {
 }
 
 func TestGraphToolMetadataStartCompleteAndSkipDuplicateToolResponse(t *testing.T) {
-	tr, ok := New(context.Background(), "thread", "run").(*translator)
-	assert.True(t, ok)
+	tr := newTranslatorImplForTest(t)
+	if tr == nil {
+		return
+	}
 
 	metaStart := graph.ToolExecutionMetadata{
 		ToolName: "calculator",
@@ -348,8 +470,10 @@ func TestGraphToolMetadataStartCompleteAndSkipDuplicateToolResponse(t *testing.T
 }
 
 func TestTextMessageEventEmptyResponse(t *testing.T) {
-	translator, ok := New(context.Background(), "thread", "run").(*translator)
-	assert.True(t, ok)
+	translator := newTranslatorImplForTest(t)
+	if translator == nil {
+		return
+	}
 	events, err := translator.textMessageEvent(nil)
 	assert.Empty(t, events)
 	assert.NoError(t, err)
@@ -359,8 +483,10 @@ func TestTextMessageEventEmptyResponse(t *testing.T) {
 }
 
 func TestToolCallAndResultEvents(t *testing.T) {
-	translator, ok := New(context.Background(), "thread", "run").(*translator)
-	assert.True(t, ok)
+	translator := newTranslatorImplForTest(t)
+	if translator == nil {
+		return
+	}
 	callRsp := &model.Response{
 		ID: "msg-tool",
 		Choices: []model.Choice{{
@@ -405,8 +531,10 @@ func TestToolCallAndResultEvents(t *testing.T) {
 }
 
 func TestToolResultEventDoesNotEmitEnd(t *testing.T) {
-	tr, ok := New(context.Background(), "thread", "run").(*translator)
-	assert.True(t, ok)
+	tr := newTranslatorImplForTest(t)
+	if tr == nil {
+		return
+	}
 	rsp := &model.Response{
 		Choices: []model.Choice{{
 			Message: model.Message{ToolID: "call-1", Content: "done"},
@@ -424,8 +552,10 @@ func TestToolResultEventDoesNotEmitEnd(t *testing.T) {
 }
 
 func TestTranslateToolCallResponseIncludesAllEvents(t *testing.T) {
-	translator, ok := New(context.Background(), "thread", "run").(*translator)
-	assert.True(t, ok)
+	translator := newTranslatorImplForTest(t)
+	if translator == nil {
+		return
+	}
 	rsp := &model.Response{
 		ID:     "msg-tool",
 		Object: model.ObjectTypeChatCompletion,
@@ -470,8 +600,10 @@ func TestTranslateToolCallResponseIncludesAllEvents(t *testing.T) {
 }
 
 func TestTranslateFullResponse(t *testing.T) {
-	translator, ok := New(context.Background(), "thread", "run").(*translator)
-	assert.True(t, ok)
+	translator := newTranslatorImplForTest(t)
+	if translator == nil {
+		return
+	}
 	rsp := &model.Response{
 		ID:     "final",
 		Object: model.ObjectTypeChatCompletion,
@@ -500,8 +632,10 @@ func TestTranslateFullResponse(t *testing.T) {
 }
 
 func TestTranslateRunCompletionResponse(t *testing.T) {
-	translator, ok := New(context.Background(), "thread", "run").(*translator)
-	assert.True(t, ok)
+	translator := newTranslatorImplForTest(t)
+	if translator == nil {
+		return
+	}
 	chunkRsp := &model.Response{
 		ID:     "msg-1",
 		Object: model.ObjectTypeChatCompletionChunk,
@@ -538,7 +672,10 @@ func TestTranslateRunCompletionResponse(t *testing.T) {
 }
 
 func TestTranslateToolResultResponse(t *testing.T) {
-	translator := New(context.Background(), "thread", "run")
+	translator := newTranslatorForTest(t)
+	if translator == nil {
+		return
+	}
 
 	_, err := translator.Translate(context.Background(), &agentevent.Event{Response: &model.Response{
 		ID:     "msg-1",
@@ -567,7 +704,10 @@ func TestTranslateToolResultResponse(t *testing.T) {
 }
 
 func TestTranslateSequentialEvents(t *testing.T) {
-	translator := New(context.Background(), "thread", "run")
+	translator := newTranslatorForTest(t)
+	if translator == nil {
+		return
+	}
 
 	chunkRsp := &model.Response{
 		ID:     "msg-1",
@@ -648,7 +788,10 @@ func TestFormatToolCallArguments(t *testing.T) {
 }
 
 func TestParallelToolCallResultEvents(t *testing.T) {
-	translator := New(context.Background(), "thread", "run")
+	translator := newTranslatorForTest(t)
+	if translator == nil {
+		return
+	}
 	toolResultRsp := &model.Response{
 		Choices: []model.Choice{
 			{
@@ -673,8 +816,10 @@ func TestParallelToolCallResultEvents(t *testing.T) {
 }
 
 func TestToolNilResponse(t *testing.T) {
-	translator, ok := New(context.Background(), "thread", "run").(*translator)
-	assert.True(t, ok)
+	translator := newTranslatorImplForTest(t)
+	if translator == nil {
+		return
+	}
 	events, err := translator.toolCallEvent(nil)
 	assert.Empty(t, events)
 	assert.NoError(t, err)
@@ -684,7 +829,10 @@ func TestToolNilResponse(t *testing.T) {
 }
 
 func TestGraphToolEventsDeduplicatedByToolID(t *testing.T) {
-	tr := New(context.Background(), "thread", "run")
+	tr := newTranslatorForTest(t)
+	if tr == nil {
+		return
+	}
 
 	toolCall := model.ToolCall{
 		ID: "call-1",
@@ -733,7 +881,10 @@ func TestGraphToolEventsDeduplicatedByToolID(t *testing.T) {
 }
 
 func TestTranslateSubagentGraph_Stream(t *testing.T) {
-	translator := New(context.Background(), "thread", "run")
+	translator := newTranslatorForTest(t)
+	if translator == nil {
+		return
+	}
 
 	const (
 		chatMessageID      = "chat-msg"
@@ -916,7 +1067,10 @@ func TestTranslateSubagentGraph_Stream(t *testing.T) {
 }
 
 func TestTranslateSubagentGraph_NonStream(t *testing.T) {
-	translator := New(context.Background(), "thread", "run")
+	translator := newTranslatorForTest(t)
+	if translator == nil {
+		return
+	}
 
 	const (
 		chatResponseID        = "c4ee0e1b-4cd2-4d82-b17f-c58a59c9670b"
@@ -1072,4 +1226,679 @@ func TestTranslateSubagentGraph_NonStream(t *testing.T) {
 	assert.Equal(t, 1, transferToolStarts)
 	assert.Equal(t, 1, calcToolStarts)
 	assert.Equal(t, 1, runFinished)
+}
+
+func TestGraphNodeStartEmitsActivityDelta(t *testing.T) {
+	tr := newTranslatorImplForTest(t, WithGraphNodeLifecycleActivityEnabled(true))
+	if tr == nil {
+		return
+	}
+
+	meta := graph.NodeExecutionMetadata{
+		NodeID:      "node-1",
+		NodeType:    graph.NodeTypeTool,
+		Phase:       graph.ExecutionPhaseStart,
+		StepNumber:  1,
+		Attempt:     1,
+		MaxAttempts: 3,
+	}
+	raw, err := json.Marshal(meta)
+	assert.NoError(t, err)
+
+	evt := &agentevent.Event{
+		ID:       "node-start-1",
+		Response: &model.Response{Choices: []model.Choice{{}}},
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyNode: raw,
+		},
+	}
+	events, err := tr.Translate(context.Background(), evt)
+	assert.NoError(t, err)
+	assert.Len(t, events, 1)
+
+	delta, ok := events[0].(*aguievents.ActivityDeltaEvent)
+	assert.True(t, ok)
+	assert.NotEmpty(t, delta.MessageID)
+	assert.Equal(t, graphNodeLifecycleActivityType, delta.ActivityType)
+	assert.Len(t, delta.Patch, 1)
+	assert.Equal(t, "add", delta.Patch[0].Op)
+	assert.Equal(t, graphNodePatchPath, delta.Patch[0].Path)
+	assert.Equal(t, graphNodePatchValue{NodeID: "node-1", Phase: "start"}, delta.Patch[0].Value)
+
+	meta2 := meta
+	meta2.NodeID = "node-2"
+	meta2.StepNumber = 2
+	raw2, err := json.Marshal(meta2)
+	assert.NoError(t, err)
+
+	evt2 := &agentevent.Event{
+		ID:       "node-start-2",
+		Response: &model.Response{Choices: []model.Choice{{}}},
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyNode: raw2,
+		},
+	}
+	events2, err := tr.Translate(context.Background(), evt2)
+	assert.NoError(t, err)
+	assert.Len(t, events2, 1)
+
+	delta2, ok := events2[0].(*aguievents.ActivityDeltaEvent)
+	assert.True(t, ok)
+	assert.NotEmpty(t, delta2.MessageID)
+	assert.NotEqual(t, delta.MessageID, delta2.MessageID)
+	assert.Len(t, delta2.Patch, 1)
+	assert.Equal(t, graphNodePatchPath, delta2.Patch[0].Path)
+	assert.Equal(t, graphNodePatchValue{NodeID: "node-2", Phase: "start"}, delta2.Patch[0].Value)
+}
+
+func TestGraphNodeStartDoesNotResetInterruptStateWhenEnabled(t *testing.T) {
+	tr := newTranslatorImplForTest(t,
+		WithGraphNodeLifecycleActivityEnabled(true),
+		WithGraphNodeInterruptActivityEnabled(true),
+	)
+	if tr == nil {
+		return
+	}
+
+	meta := graph.NodeExecutionMetadata{
+		NodeID:   "node-1",
+		NodeType: graph.NodeTypeFunction,
+		Phase:    graph.ExecutionPhaseStart,
+		Attempt:  1,
+	}
+	raw, err := json.Marshal(meta)
+	assert.NoError(t, err)
+
+	evt := &agentevent.Event{
+		ID:       "node-start-with-interrupt",
+		Response: &model.Response{Choices: []model.Choice{{}}},
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyNode: raw,
+		},
+	}
+	events, err := tr.Translate(context.Background(), evt)
+	assert.NoError(t, err)
+	assert.Len(t, events, 1)
+
+	delta, ok := events[0].(*aguievents.ActivityDeltaEvent)
+	assert.True(t, ok)
+	assert.Equal(t, graphNodeLifecycleActivityType, delta.ActivityType)
+	assert.Len(t, delta.Patch, 1)
+	assert.Equal(t, "add", delta.Patch[0].Op)
+	assert.Equal(t, graphNodePatchPath, delta.Patch[0].Path)
+	assert.Equal(t, graphNodePatchValue{NodeID: "node-1", Phase: "start"}, delta.Patch[0].Value)
+}
+
+func TestGraphNodeStartActivityDisabledByDefault(t *testing.T) {
+	tr := newTranslatorForTest(t)
+	if tr == nil {
+		return
+	}
+
+	meta := graph.NodeExecutionMetadata{
+		NodeID:   "node-1",
+		NodeType: graph.NodeTypeFunction,
+		Phase:    graph.ExecutionPhaseStart,
+		Attempt:  1,
+	}
+	raw, err := json.Marshal(meta)
+	assert.NoError(t, err)
+
+	evt := &agentevent.Event{
+		ID:       "node-start-disabled",
+		Response: &model.Response{Choices: []model.Choice{{}}},
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyNode: raw,
+		},
+	}
+	events, err := tr.Translate(context.Background(), evt)
+	assert.NoError(t, err)
+	assert.Empty(t, events)
+}
+
+func TestGraphNodeInterruptActivityDisabledByDefault(t *testing.T) {
+	tr := newTranslatorForTest(t)
+	if tr == nil {
+		return
+	}
+
+	meta := graph.PregelStepMetadata{
+		StepNumber:     3,
+		NodeID:         "nodeX",
+		InterruptValue: "ask",
+	}
+	raw, err := json.Marshal(meta)
+	assert.NoError(t, err)
+
+	evt := &agentevent.Event{
+		ID:       "pregel-interrupt-disabled",
+		Response: &model.Response{Choices: []model.Choice{{}}},
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyPregel: raw,
+		},
+	}
+	events, err := tr.Translate(context.Background(), evt)
+	assert.NoError(t, err)
+	assert.Empty(t, events)
+}
+
+func TestGraphNodeInterruptEmitsActivityDelta(t *testing.T) {
+	tr := newTranslatorImplForTest(t, WithGraphNodeInterruptActivityEnabled(true))
+	if tr == nil {
+		return
+	}
+
+	meta := graph.PregelStepMetadata{
+		StepNumber:     3,
+		NodeID:         "nodeX",
+		InterruptValue: "ask",
+	}
+	raw, err := json.Marshal(meta)
+	assert.NoError(t, err)
+
+	evt := &agentevent.Event{
+		ID:       "pregel-interrupt-1",
+		Response: &model.Response{Choices: []model.Choice{{}}},
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyPregel: raw,
+		},
+	}
+	events, err := tr.Translate(context.Background(), evt)
+	assert.NoError(t, err)
+	assert.Len(t, events, 1)
+
+	delta, ok := events[0].(*aguievents.ActivityDeltaEvent)
+	assert.True(t, ok)
+	assert.NotEmpty(t, delta.MessageID)
+	assert.Equal(t, graphNodeInterruptActivityType, delta.ActivityType)
+	assert.Len(t, delta.Patch, 1)
+	assert.Equal(t, "add", delta.Patch[0].Op)
+	assert.Equal(t, graphNodeInterruptPatchPath, delta.Patch[0].Path)
+	assert.Equal(t, graphNodeInterruptPatchValue{NodeID: "nodeX", Prompt: "ask"}, delta.Patch[0].Value)
+}
+
+func TestGraphNodeInterruptUnmarshalErrorEmitsRunError(t *testing.T) {
+	tr := newTranslatorImplForTest(t, WithGraphNodeInterruptActivityEnabled(true))
+	if tr == nil {
+		return
+	}
+
+	evt := &agentevent.Event{
+		ID:       "pregel-interrupt-bad-json",
+		Response: &model.Response{Choices: []model.Choice{{}}},
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyPregel: []byte("{"),
+		},
+	}
+
+	events, err := tr.Translate(context.Background(), evt)
+	assert.NoError(t, err)
+	assert.Len(t, events, 1)
+
+	runErr, ok := events[0].(*aguievents.RunErrorEvent)
+	assert.True(t, ok)
+	assert.Equal(t, "run", runErr.RunID())
+	assert.Contains(t, runErr.Message, "invalid graph pregel metadata")
+}
+
+func TestGraphNodeInterruptIgnoresEmptyNodeID(t *testing.T) {
+	tr := newTranslatorImplForTest(t, WithGraphNodeInterruptActivityEnabled(true))
+	if tr == nil {
+		return
+	}
+
+	meta := graph.PregelStepMetadata{
+		StepNumber:     3,
+		InterruptValue: "ask",
+	}
+	raw, err := json.Marshal(meta)
+	assert.NoError(t, err)
+
+	evt := &agentevent.Event{
+		ID:       "pregel-interrupt-no-nodeid",
+		Response: &model.Response{Choices: []model.Choice{{}}},
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyPregel: raw,
+		},
+	}
+	events, err := tr.Translate(context.Background(), evt)
+	assert.NoError(t, err)
+	assert.Empty(t, events)
+}
+
+func TestGraphNodeInterruptAllowsNilPrompt(t *testing.T) {
+	tr := newTranslatorImplForTest(t, WithGraphNodeInterruptActivityEnabled(true))
+	if tr == nil {
+		return
+	}
+
+	meta := graph.PregelStepMetadata{
+		StepNumber: 3,
+		NodeID:     "nodeX",
+	}
+	raw, err := json.Marshal(meta)
+	assert.NoError(t, err)
+
+	evt := &agentevent.Event{
+		ID:       "pregel-interrupt-no-value",
+		Response: &model.Response{Choices: []model.Choice{{}}},
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyPregel: raw,
+		},
+	}
+	events, err := tr.Translate(context.Background(), evt)
+	assert.NoError(t, err)
+	assert.Len(t, events, 1)
+
+	delta, ok := events[0].(*aguievents.ActivityDeltaEvent)
+	assert.True(t, ok)
+	assert.NotEmpty(t, delta.MessageID)
+	assert.Equal(t, graphNodeInterruptActivityType, delta.ActivityType)
+	assert.Len(t, delta.Patch, 1)
+	assert.Equal(t, "add", delta.Patch[0].Op)
+	assert.Equal(t, graphNodeInterruptPatchPath, delta.Patch[0].Path)
+	assert.Equal(t, graphNodeInterruptPatchValue{NodeID: "nodeX"}, delta.Patch[0].Value)
+}
+
+func TestGraphNodeInterruptIncludesKeyAndCheckpointFields(t *testing.T) {
+	tr := newTranslatorImplForTest(t, WithGraphNodeInterruptActivityEnabled(true))
+	if tr == nil {
+		return
+	}
+
+	meta := graph.PregelStepMetadata{
+		StepNumber:     3,
+		NodeID:         "nodeX",
+		InterruptKey:   "approval_key",
+		InterruptValue: map[string]any{"ok": true},
+		CheckpointID:   "ckpt-uuid-xxx",
+		LineageID:      "thread-123",
+	}
+	raw, err := json.Marshal(meta)
+	assert.NoError(t, err)
+
+	evt := &agentevent.Event{
+		ID:       "pregel-interrupt-with-key",
+		Response: &model.Response{Choices: []model.Choice{{}}},
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyPregel: raw,
+		},
+	}
+	events, err := tr.Translate(context.Background(), evt)
+	assert.NoError(t, err)
+	assert.Len(t, events, 1)
+
+	delta, ok := events[0].(*aguievents.ActivityDeltaEvent)
+	assert.True(t, ok)
+	assert.NotEmpty(t, delta.MessageID)
+	assert.Equal(t, graphNodeInterruptActivityType, delta.ActivityType)
+	assert.Len(t, delta.Patch, 1)
+	assert.Equal(t, "add", delta.Patch[0].Op)
+	assert.Equal(t, graphNodeInterruptPatchPath, delta.Patch[0].Path)
+	assert.Equal(t, graphNodeInterruptPatchValue{
+		NodeID:       "nodeX",
+		Key:          "approval_key",
+		Prompt:       map[string]any{"ok": true},
+		CheckpointID: "ckpt-uuid-xxx",
+		LineageID:    "thread-123",
+	}, delta.Patch[0].Value)
+}
+
+func TestGraphNodeStartEmitsActivityDeltaForAgentNode(t *testing.T) {
+	tr := newTranslatorForTest(t, WithGraphNodeLifecycleActivityEnabled(true))
+	if tr == nil {
+		return
+	}
+
+	meta := graph.NodeExecutionMetadata{
+		NodeID:   "agent-node-1",
+		NodeType: graph.NodeTypeAgent,
+		Phase:    graph.ExecutionPhaseStart,
+		Attempt:  1,
+	}
+	raw, err := json.Marshal(meta)
+	assert.NoError(t, err)
+
+	evt := &agentevent.Event{
+		ID:       "agent-node-start-1",
+		Response: &model.Response{Choices: []model.Choice{{}}},
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyNode: raw,
+		},
+	}
+	events, err := tr.Translate(context.Background(), evt)
+	assert.NoError(t, err)
+	assert.Len(t, events, 1)
+
+	delta, ok := events[0].(*aguievents.ActivityDeltaEvent)
+	assert.True(t, ok)
+	assert.NotEmpty(t, delta.MessageID)
+	assert.Equal(t, graphNodeLifecycleActivityType, delta.ActivityType)
+	assert.Len(t, delta.Patch, 1)
+	assert.Equal(t, graphNodePatchValue{NodeID: "agent-node-1", Phase: "start"}, delta.Patch[0].Value)
+}
+
+func TestGraphNodeStartIgnoresAgentStartWithoutAttempt(t *testing.T) {
+	tr := newTranslatorForTest(t, WithGraphNodeLifecycleActivityEnabled(true))
+	if tr == nil {
+		return
+	}
+
+	meta := graph.NodeExecutionMetadata{
+		NodeID:   "agent-node-1",
+		NodeType: graph.NodeTypeAgent,
+		Phase:    graph.ExecutionPhaseStart,
+	}
+	raw, err := json.Marshal(meta)
+	assert.NoError(t, err)
+
+	evt := &agentevent.Event{
+		ID:       "agent-start-without-attempt",
+		Response: &model.Response{Choices: []model.Choice{{}}},
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyNode: raw,
+		},
+	}
+	events, err := tr.Translate(context.Background(), evt)
+	assert.NoError(t, err)
+	assert.Empty(t, events)
+}
+
+func TestGraphNodeCompleteEmitsActivityDelta(t *testing.T) {
+	tr := newTranslatorForTest(t, WithGraphNodeLifecycleActivityEnabled(true))
+	if tr == nil {
+		return
+	}
+
+	meta := graph.NodeExecutionMetadata{
+		NodeID:   "node-complete",
+		NodeType: graph.NodeTypeFunction,
+		Phase:    graph.ExecutionPhaseComplete,
+	}
+	raw, err := json.Marshal(meta)
+	assert.NoError(t, err)
+
+	evt := &agentevent.Event{
+		ID:       "node-complete-evt",
+		Response: &model.Response{Choices: []model.Choice{{}}},
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyNode: raw,
+		},
+	}
+	events, err := tr.Translate(context.Background(), evt)
+	assert.NoError(t, err)
+	assert.Len(t, events, 1)
+
+	delta, ok := events[0].(*aguievents.ActivityDeltaEvent)
+	assert.True(t, ok)
+	assert.Equal(t, graphNodeLifecycleActivityType, delta.ActivityType)
+	assert.Len(t, delta.Patch, 1)
+	assert.Equal(t, graphNodePatchPath, delta.Patch[0].Path)
+	assert.Equal(t, graphNodePatchValue{NodeID: "node-complete", Phase: "complete"}, delta.Patch[0].Value)
+}
+
+func TestGraphNodeErrorEmitsActivityDelta(t *testing.T) {
+	tr := newTranslatorForTest(t, WithGraphNodeLifecycleActivityEnabled(true))
+	if tr == nil {
+		return
+	}
+
+	meta := graph.NodeExecutionMetadata{
+		NodeID:   "node-error",
+		NodeType: graph.NodeTypeFunction,
+		Phase:    graph.ExecutionPhaseError,
+		Error:    "boom",
+	}
+	raw, err := json.Marshal(meta)
+	assert.NoError(t, err)
+
+	evt := &agentevent.Event{
+		ID:       "node-error-evt",
+		Response: &model.Response{Choices: []model.Choice{{}}},
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyNode: raw,
+		},
+	}
+	events, err := tr.Translate(context.Background(), evt)
+	assert.NoError(t, err)
+	assert.Len(t, events, 1)
+
+	delta, ok := events[0].(*aguievents.ActivityDeltaEvent)
+	assert.True(t, ok)
+	assert.Equal(t, graphNodeLifecycleActivityType, delta.ActivityType)
+	assert.Len(t, delta.Patch, 1)
+	assert.Equal(t, graphNodePatchPath, delta.Patch[0].Path)
+	assert.Equal(t, graphNodePatchValue{NodeID: "node-error", Phase: "error", Error: "boom"}, delta.Patch[0].Value)
+}
+
+func TestGraphNodeStartInvalidMetadataEmitsRunError(t *testing.T) {
+	tr := newTranslatorForTest(t, WithGraphNodeLifecycleActivityEnabled(true))
+	if tr == nil {
+		return
+	}
+
+	evt := &agentevent.Event{
+		ID: "invalid-node-meta",
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyNode: []byte("invalid json"),
+		},
+	}
+	events, err := tr.Translate(context.Background(), evt)
+	assert.NoError(t, err)
+	assert.Len(t, events, 1)
+
+	runErr, ok := events[0].(*aguievents.RunErrorEvent)
+	assert.True(t, ok)
+	assert.Contains(t, runErr.Message, "invalid graph node metadata")
+	assert.Equal(t, "run", runErr.RunID())
+}
+
+func TestGraphNodeCustomEvents_CustomCategory(t *testing.T) {
+	tr := newTranslatorForTest(t)
+	if tr == nil {
+		return
+	}
+
+	meta := graph.NodeCustomEventMetadata{
+		EventType:    "my.custom.event",
+		Category:     graph.NodeCustomEventCategoryCustom,
+		NodeID:       "test-node",
+		InvocationID: "test-invocation",
+		StepNumber:   1,
+		Payload:      map[string]any{"key": "value"},
+	}
+	raw, err := json.Marshal(meta)
+	assert.NoError(t, err)
+
+	evt := &agentevent.Event{
+		ID:       "custom-evt-1",
+		Response: &model.Response{Choices: []model.Choice{{}}},
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyNodeCustom: raw,
+		},
+	}
+
+	events, err := tr.Translate(context.Background(), evt)
+	assert.NoError(t, err)
+	assert.Len(t, events, 1)
+
+	customEvt, ok := events[0].(*aguievents.CustomEvent)
+	assert.True(t, ok)
+	assert.Equal(t, "my.custom.event", customEvt.Name)
+
+	value, ok := customEvt.Value.(map[string]any)
+	assert.True(t, ok)
+	assert.Equal(t, "test-node", value["nodeId"])
+	assert.Equal(t, 1, value["stepNumber"])
+	assert.NotNil(t, value["payload"])
+}
+
+func TestGraphNodeCustomEvents_ProgressCategory(t *testing.T) {
+	tr := newTranslatorForTest(t)
+	if tr == nil {
+		return
+	}
+
+	meta := graph.NodeCustomEventMetadata{
+		EventType:    "progress",
+		Category:     graph.NodeCustomEventCategoryProgress,
+		NodeID:       "processing-node",
+		InvocationID: "test-invocation",
+		Progress:     75.5,
+		Message:      "Processing 75% complete",
+	}
+	raw, err := json.Marshal(meta)
+	assert.NoError(t, err)
+
+	evt := &agentevent.Event{
+		ID:       "progress-evt-1",
+		Response: &model.Response{Choices: []model.Choice{{}}},
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyNodeCustom: raw,
+		},
+	}
+
+	events, err := tr.Translate(context.Background(), evt)
+	assert.NoError(t, err)
+	assert.Len(t, events, 1)
+
+	customEvt, ok := events[0].(*aguievents.CustomEvent)
+	assert.True(t, ok)
+	assert.Equal(t, "progress", customEvt.Name)
+
+	value, ok := customEvt.Value.(map[string]any)
+	assert.True(t, ok)
+	assert.Equal(t, "processing-node", value["nodeId"])
+	assert.Equal(t, 75.5, value["progress"])
+	assert.Equal(t, "Processing 75% complete", value["message"])
+}
+
+func TestGraphNodeCustomEvents_TextCategory_NotReceivingMessage(t *testing.T) {
+	tr := newTranslatorForTest(t)
+	if tr == nil {
+		return
+	}
+
+	meta := graph.NodeCustomEventMetadata{
+		EventType:    "text",
+		Category:     graph.NodeCustomEventCategoryText,
+		NodeID:       "streaming-node",
+		InvocationID: "test-invocation",
+		Message:      "Hello streaming text",
+	}
+	raw, err := json.Marshal(meta)
+	assert.NoError(t, err)
+
+	evt := &agentevent.Event{
+		ID:       "text-evt-1",
+		Response: &model.Response{Choices: []model.Choice{{}}},
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyNodeCustom: raw,
+		},
+	}
+
+	events, err := tr.Translate(context.Background(), evt)
+	assert.NoError(t, err)
+	assert.Len(t, events, 1)
+
+	// Since we're not in a message context, it should be a CustomEvent
+	customEvt, ok := events[0].(*aguievents.CustomEvent)
+	assert.True(t, ok)
+	assert.Equal(t, "text", customEvt.Name)
+
+	value, ok := customEvt.Value.(map[string]any)
+	assert.True(t, ok)
+	assert.Equal(t, "streaming-node", value["nodeId"])
+	assert.Equal(t, "Hello streaming text", value["content"])
+}
+
+func TestGraphNodeCustomEvents_TextCategory_WhileReceivingMessage(t *testing.T) {
+	translator := newTranslatorImplForTest(t)
+	if translator == nil {
+		return
+	}
+
+	// First, start receiving a message
+	chunkRsp := &model.Response{
+		ID:     "msg-1",
+		Object: model.ObjectTypeChatCompletionChunk,
+		Choices: []model.Choice{{
+			Delta: model.Message{Role: model.RoleAssistant, Content: "Hello"},
+		}},
+	}
+	_, err := translator.textMessageEvent(chunkRsp)
+	assert.NoError(t, err)
+	assert.True(t, translator.receivingMessage)
+
+	// Now send a text event while receiving message
+	meta := graph.NodeCustomEventMetadata{
+		EventType:    "text",
+		Category:     graph.NodeCustomEventCategoryText,
+		NodeID:       "streaming-node",
+		InvocationID: "test-invocation",
+		Message:      "Streaming text content",
+	}
+	raw, err := json.Marshal(meta)
+	assert.NoError(t, err)
+
+	evt := &agentevent.Event{
+		ID:       "text-evt-2",
+		Response: &model.Response{Choices: []model.Choice{{}}},
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyNodeCustom: raw,
+		},
+	}
+
+	events, err := translator.Translate(context.Background(), evt)
+	assert.NoError(t, err)
+	assert.Len(t, events, 1)
+
+	// Since we're in a message context, it should be a TextMessageContentEvent
+	contentEvt, ok := events[0].(*aguievents.TextMessageContentEvent)
+	assert.True(t, ok)
+	assert.Equal(t, "msg-1", contentEvt.MessageID)
+	assert.Equal(t, "Streaming text content", contentEvt.Delta)
+}
+
+func TestGraphNodeCustomEvents_InvalidMetadata(t *testing.T) {
+	tr := newTranslatorImplForTest(t)
+	if tr == nil {
+		return
+	}
+
+	evt := &agentevent.Event{
+		ID: "invalid-evt",
+		StateDelta: map[string][]byte{
+			graph.MetadataKeyNodeCustom: []byte("invalid json"),
+		},
+	}
+
+	events := tr.graphNodeCustomEvents(evt)
+	assert.Len(t, events, 1)
+
+	errEvt, ok := events[0].(*aguievents.RunErrorEvent)
+	assert.True(t, ok)
+	assert.Contains(t, errEvt.Message, "invalid graph node custom metadata")
+}
+
+func TestGraphNodeCustomEvents_EmptyStateDelta(t *testing.T) {
+	tr := newTranslatorImplForTest(t)
+	if tr == nil {
+		return
+	}
+
+	// Test nil StateDelta
+	evt := &agentevent.Event{
+		ID: "empty-evt",
+	}
+	events := tr.graphNodeCustomEvents(evt)
+	assert.Empty(t, events)
+
+	// Test empty MetadataKeyNodeCustom
+	evt2 := &agentevent.Event{
+		ID:         "empty-evt-2",
+		StateDelta: map[string][]byte{},
+	}
+	events = tr.graphNodeCustomEvents(evt2)
+	assert.Empty(t, events)
 }

@@ -10,6 +10,7 @@
 package openai
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -315,6 +316,106 @@ func TestModel_convertMessages(t *testing.T) {
 	require.NotEmpty(t, assistantUnion.GetToolCalls(), "assistant message should contain tool calls")
 }
 
+// TestModel_convertMessages_ReasoningContent verifies that reasoning_content
+// is passed to the OpenAI API via SetExtraFields for assistant messages.
+func TestModel_convertMessages_ReasoningContent(t *testing.T) {
+	m := New("dummy-model")
+
+	const testReasoningContent = "This is my step-by-step reasoning process."
+
+	t.Run("assistant message with reasoning_content", func(t *testing.T) {
+		msgs := []model.Message{
+			{
+				Role:             model.RoleAssistant,
+				Content:          "The answer is 42.",
+				ReasoningContent: testReasoningContent,
+			},
+		}
+
+		converted := m.convertMessages(msgs)
+		require.Len(t, converted, 1)
+		require.NotNil(t, converted[0].OfAssistant)
+
+		// Verify reasoning_content is included by marshaling to JSON.
+		data, err := json.Marshal(converted[0].OfAssistant)
+		require.NoError(t, err)
+
+		var parsed map[string]any
+		err = json.Unmarshal(data, &parsed)
+		require.NoError(t, err)
+
+		reasoningValue, ok := parsed[model.ReasoningContentKey]
+		require.True(t, ok, "reasoning_content should be present in serialized JSON")
+		assert.Equal(t, testReasoningContent, reasoningValue)
+	})
+
+	t.Run("assistant message without reasoning_content", func(t *testing.T) {
+		msgs := []model.Message{
+			{
+				Role:    model.RoleAssistant,
+				Content: "Simple response without reasoning.",
+			},
+		}
+
+		converted := m.convertMessages(msgs)
+		require.Len(t, converted, 1)
+		require.NotNil(t, converted[0].OfAssistant)
+
+		// Verify reasoning_content is NOT included when empty.
+		data, err := json.Marshal(converted[0].OfAssistant)
+		require.NoError(t, err)
+
+		var parsed map[string]any
+		err = json.Unmarshal(data, &parsed)
+		require.NoError(t, err)
+
+		_, ok := parsed[model.ReasoningContentKey]
+		assert.False(t, ok, "reasoning_content should NOT be present when empty")
+	})
+
+	t.Run("assistant message with tool calls and reasoning_content", func(t *testing.T) {
+		msgs := []model.Message{
+			{
+				Role:             model.RoleAssistant,
+				Content:          "",
+				ReasoningContent: "I need to call the calculator tool.",
+				ToolCalls: []model.ToolCall{
+					{
+						ID:   "call-123",
+						Type: "function",
+						Function: model.FunctionDefinitionParam{
+							Name:      "calculator",
+							Arguments: []byte(`{"expression":"2+2"}`),
+						},
+					},
+				},
+			},
+		}
+
+		converted := m.convertMessages(msgs)
+		require.Len(t, converted, 1)
+		require.NotNil(t, converted[0].OfAssistant)
+
+		// Verify both reasoning_content and tool_calls are present.
+		data, err := json.Marshal(converted[0].OfAssistant)
+		require.NoError(t, err)
+
+		var parsed map[string]any
+		err = json.Unmarshal(data, &parsed)
+		require.NoError(t, err)
+
+		// Check reasoning_content.
+		reasoningValue, ok := parsed[model.ReasoningContentKey]
+		require.True(t, ok, "reasoning_content should be present")
+		assert.Equal(t, "I need to call the calculator tool.", reasoningValue)
+
+		// Check tool_calls.
+		toolCalls, ok := parsed["tool_calls"]
+		require.True(t, ok, "tool_calls should be present")
+		require.NotNil(t, toolCalls)
+	})
+}
+
 // TestModel_convertTools ensures that tool declarations are mapped to the
 // expected OpenAI function definitions.
 func TestModel_convertTools(t *testing.T) {
@@ -425,13 +526,63 @@ func TestConvertTools_UsesOutputSchemaInDescription(t *testing.T) {
 // TestModel_Callbacks tests that callback functions are properly called with
 // the correct parameters including the request parameter.
 func TestModel_Callbacks(t *testing.T) {
-	// Skip this test if no API key is provided.
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		t.Skip("OPENAI_API_KEY not set, skipping integration test")
+	newNonStreamingServer := func(t *testing.T) *httptest.Server {
+		t.Helper()
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{
+				"id": "test",
+				"object": "chat.completion",
+				"created": 1699200000,
+				"model": "gpt-3.5-turbo",
+				"choices": [
+					{
+						"index": 0,
+						"message": {
+							"role": "assistant",
+							"content": "ok"
+						},
+						"finish_reason": "stop"
+					}
+				]
+			}`)
+		}))
+	}
+
+	newStreamingServer := func(t *testing.T) *httptest.Server {
+		t.Helper()
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+
+			chunks := []string{
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}`,
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}]}`,
+				`data: [DONE]`,
+			}
+			for _, chunk := range chunks {
+				fmt.Fprintf(w, "%s\n\n", chunk)
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}))
 	}
 
 	t.Run("chat request callback", func(t *testing.T) {
+		server := newNonStreamingServer(t)
+		defer server.Close()
+
 		var capturedRequest *openaigo.ChatCompletionNewParams
 		var capturedCtx context.Context
 		callbackCalled := make(chan struct{})
@@ -443,7 +594,8 @@ func TestModel_Callbacks(t *testing.T) {
 		}
 
 		m := New("gpt-3.5-turbo",
-			WithAPIKey(apiKey),
+			WithBaseURL(server.URL),
+			WithAPIKey("test-key"),
 			WithChatRequestCallback(requestCallback),
 		)
 
@@ -463,7 +615,7 @@ func TestModel_Callbacks(t *testing.T) {
 		// Wait for callback to be called.
 		select {
 		case <-callbackCalled:
-		case <-time.After(10 * time.Second):
+		case <-time.After(3 * time.Second):
 			require.Fail(t, "timeout waiting for request callback")
 		}
 
@@ -481,18 +633,24 @@ func TestModel_Callbacks(t *testing.T) {
 	})
 
 	t.Run("chat response callback", func(t *testing.T) {
+		server := newNonStreamingServer(t)
+		defer server.Close()
+
 		var capturedRequest *openaigo.ChatCompletionNewParams
 		var capturedCtx context.Context
+		var capturedResponse *openaigo.ChatCompletion
 		callbackCalled := make(chan struct{})
 
 		responseCallback := func(ctx context.Context, req *openaigo.ChatCompletionNewParams, resp *openaigo.ChatCompletion) {
 			capturedCtx = ctx
 			capturedRequest = req
+			capturedResponse = resp
 			close(callbackCalled)
 		}
 
 		m := New("gpt-3.5-turbo",
-			WithAPIKey(apiKey),
+			WithBaseURL(server.URL),
+			WithAPIKey("test-key"),
 			WithChatResponseCallback(responseCallback),
 		)
 
@@ -519,22 +677,21 @@ func TestModel_Callbacks(t *testing.T) {
 		// Wait for callback to be called.
 		select {
 		case <-callbackCalled:
-		case <-time.After(10 * time.Second):
+		case <-time.After(3 * time.Second):
 			require.Fail(t, "timeout waiting for response callback")
 		}
 
 		// Verify the callback was called with correct parameters.
 		require.NotNil(t, capturedCtx, "expected context to be captured in callback")
 		require.NotNil(t, capturedRequest, "expected request to be captured in callback")
-		// Note: capturedResponse might be nil if there was an API error.
-		// We only check if it's not nil when we expect a successful response.
+		require.NotNil(t, capturedResponse, "expected response to be captured in callback")
 		assert.Equal(t, "gpt-3.5-turbo", capturedRequest.Model, "expected model %s, got %s", "gpt-3.5-turbo", capturedRequest.Model)
-		// Only check response model if we got a successful response.
-		// Note: Due to potential OpenAI API/SDK issues, we only verify the callback was called.
-		// The actual model field validation is skipped as it may be empty due to external factors.
 	})
 
 	t.Run("chat chunk callback", func(t *testing.T) {
+		server := newStreamingServer(t)
+		defer server.Close()
+
 		var capturedRequest *openaigo.ChatCompletionNewParams
 		var capturedChunk *openaigo.ChatCompletionChunk
 		var capturedCtx context.Context
@@ -552,7 +709,8 @@ func TestModel_Callbacks(t *testing.T) {
 		}
 
 		m := New("gpt-3.5-turbo",
-			WithAPIKey(apiKey),
+			WithBaseURL(server.URL),
+			WithAPIKey("test-key"),
 			WithChatChunkCallback(chunkCallback),
 		)
 
@@ -572,34 +730,26 @@ func TestModel_Callbacks(t *testing.T) {
 		// Wait for callback to be called or for responses to complete.
 		select {
 		case <-callbackCalled:
-			// Callback was called, consume remaining responses.
-			for response := range responseChan {
-				if response.Done {
-					break
-				}
-			}
-		case <-time.After(15 * time.Second):
-			// Timeout - consume responses anyway to avoid blocking.
-			t.Log("timeout waiting for chunk callback, consuming responses")
-			for response := range responseChan {
-				if response.Done {
-					break
-				}
-			}
-			// Don't fail the test if callback wasn't called - it might be due to API issues.
-			t.Skip("skipping chunk callback test due to timeout - API might be slow or failing")
+		case <-time.After(3 * time.Second):
+			require.Fail(t, "timeout waiting for chunk callback")
+		}
+
+		for response := range responseChan {
+			require.Nilf(t, response.Error, "Response error: %v", response.Error)
 		}
 
 		// Verify the callback was called with correct parameters (if it was called).
-		if capturedCtx != nil {
-			require.NotNil(t, capturedRequest, "expected request to be captured in callback")
-			require.NotNil(t, capturedChunk, "expected chunk to be captured in callback")
-			assert.Equal(t, "gpt-3.5-turbo", capturedRequest.Model, "expected model %s, got %s", "gpt-3.5-turbo", capturedRequest.Model)
-			require.Greater(t, chunkCount, 0, "expected chunk callback to be called at least once")
-		}
+		require.NotNil(t, capturedCtx, "expected context to be captured in callback")
+		require.NotNil(t, capturedRequest, "expected request to be captured in callback")
+		require.NotNil(t, capturedChunk, "expected chunk to be captured in callback")
+		assert.Equal(t, "gpt-3.5-turbo", capturedRequest.Model, "expected model %s, got %s", "gpt-3.5-turbo", capturedRequest.Model)
+		require.Greater(t, chunkCount, 0, "expected chunk callback to be called at least once")
 	})
 
 	t.Run("chat stream complete callback", func(t *testing.T) {
+		server := newStreamingServer(t)
+		defer server.Close()
+
 		var capturedRequest *openaigo.ChatCompletionNewParams
 		var capturedAccumulator *openaigo.ChatCompletionAccumulator
 		var capturedStreamErr error
@@ -615,7 +765,8 @@ func TestModel_Callbacks(t *testing.T) {
 		}
 
 		m := New("gpt-3.5-turbo",
-			WithAPIKey(apiKey),
+			WithBaseURL(server.URL),
+			WithAPIKey("test-key"),
 			WithChatStreamCompleteCallback(streamCompleteCallback),
 		)
 
@@ -643,21 +794,22 @@ func TestModel_Callbacks(t *testing.T) {
 		select {
 		case <-callbackCalled:
 			// Success - callback was called
-		case <-time.After(30 * time.Second):
-			// Timeout - this is expected when API key is invalid
-			t.Skip("skipping stream complete callback test due to timeout - API might be slow or failing")
+		case <-time.After(3 * time.Second):
+			require.Fail(t, "timeout waiting for stream complete callback")
 		}
 
-		// Verify the callback was called with correct parameters (if it was called)
-		if capturedCtx != nil {
-			require.NotNil(t, capturedRequest, "expected request to be captured in callback")
-			assert.Equal(t, "gpt-3.5-turbo", capturedRequest.Model, "expected model %s, got %s", "gpt-3.5-turbo", capturedRequest.Model)
-			// Either accumulator should be non-nil (success) or streamErr should be non-nil (failure)
-			require.True(t, capturedAccumulator != nil || capturedStreamErr != nil, "expected either accumulator or streamErr to be set")
-		}
+		// Verify the callback was called with correct parameters.
+		require.NotNil(t, capturedCtx, "expected context to be captured in callback")
+		require.NotNil(t, capturedRequest, "expected request to be captured in callback")
+		assert.Equal(t, "gpt-3.5-turbo", capturedRequest.Model, "expected model %s, got %s", "gpt-3.5-turbo", capturedRequest.Model)
+		require.NotNil(t, capturedAccumulator, "expected accumulator to be set on success")
+		require.NoError(t, capturedStreamErr)
 	})
 
 	t.Run("multiple callbacks", func(t *testing.T) {
+		server := newNonStreamingServer(t)
+		defer server.Close()
+
 		requestCalled := false
 		responseCalled := false
 		chunkCalled := false
@@ -679,7 +831,8 @@ func TestModel_Callbacks(t *testing.T) {
 		}
 
 		m := New("gpt-3.5-turbo",
-			WithAPIKey(apiKey),
+			WithBaseURL(server.URL),
+			WithAPIKey("test-key"),
 			WithChatRequestCallback(requestCallback),
 			WithChatResponseCallback(responseCallback),
 			WithChatChunkCallback(chunkCallback),
@@ -701,7 +854,7 @@ func TestModel_Callbacks(t *testing.T) {
 		// Wait for request callback.
 		select {
 		case <-requestCallbackDone:
-		case <-time.After(10 * time.Second):
+		case <-time.After(3 * time.Second):
 			require.Fail(t, "timeout waiting for request callback")
 		}
 
@@ -715,7 +868,7 @@ func TestModel_Callbacks(t *testing.T) {
 		// Wait for response callback.
 		select {
 		case <-responseCallbackDone:
-		case <-time.After(10 * time.Second):
+		case <-time.After(3 * time.Second):
 			require.Fail(t, "timeout waiting for response callback")
 		}
 
@@ -727,8 +880,11 @@ func TestModel_Callbacks(t *testing.T) {
 	})
 
 	t.Run("nil callbacks", func(t *testing.T) {
+		server := newNonStreamingServer(t)
+		defer server.Close()
+
 		// Test that the model works correctly when callbacks are nil.
-		m := New("gpt-3.5-turbo", WithAPIKey(apiKey))
+		m := New("gpt-3.5-turbo", WithBaseURL(server.URL), WithAPIKey("test-key"))
 
 		ctx := context.Background()
 		request := &model.Request{
@@ -755,11 +911,30 @@ func TestModel_Callbacks(t *testing.T) {
 // TestModel_CallbackParameters verifies that callback functions receive the
 // correct parameter types and values.
 func TestModel_CallbackParameters(t *testing.T) {
-	// Skip this test if no API key is provided.
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		t.Skip("OPENAI_API_KEY not set, skipping integration test")
-	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"id": "test",
+			"object": "chat.completion",
+			"created": 1699200000,
+			"model": "gpt-3.5-turbo",
+			"choices": [
+				{
+					"index": 0,
+					"message": {
+						"role": "assistant",
+						"content": "ok"
+					},
+					"finish_reason": "stop"
+				}
+			]
+		}`)
+	}))
+	defer server.Close()
 
 	t.Run("callback parameter types", func(t *testing.T) {
 		var requestParam *openaigo.ChatCompletionNewParams
@@ -783,7 +958,8 @@ func TestModel_CallbackParameters(t *testing.T) {
 		}
 
 		m := New("gpt-3.5-turbo",
-			WithAPIKey(apiKey),
+			WithBaseURL(server.URL),
+			WithAPIKey("test-key"),
 			WithChatRequestCallback(requestCallback),
 			WithChatResponseCallback(responseCallback),
 			WithChatChunkCallback(chunkCallback),
@@ -805,7 +981,7 @@ func TestModel_CallbackParameters(t *testing.T) {
 		// Wait for request callback.
 		select {
 		case <-requestCallbackDone:
-		case <-time.After(10 * time.Second):
+		case <-time.After(3 * time.Second):
 			require.Fail(t, "timeout waiting for request callback")
 		}
 
@@ -819,7 +995,7 @@ func TestModel_CallbackParameters(t *testing.T) {
 		// Wait for response callback.
 		select {
 		case <-responseCallbackDone:
-		case <-time.After(10 * time.Second):
+		case <-time.After(3 * time.Second):
 			require.Fail(t, "timeout waiting for response callback")
 		}
 
@@ -827,11 +1003,8 @@ func TestModel_CallbackParameters(t *testing.T) {
 		require.NotNil(t, requestParam, "expected request parameter to be set")
 		assert.Equal(t, reflect.TypeOf(&openaigo.ChatCompletionNewParams{}), reflect.TypeOf(requestParam), "expected request parameter type %T, got %T", &openaigo.ChatCompletionNewParams{}, requestParam)
 
-		// Note: responseParam might be nil if there was an API error.
-		// We only check the type if we got a successful response.
-		if responseParam != nil {
-			assert.Equal(t, reflect.TypeOf(&openaigo.ChatCompletion{}), reflect.TypeOf(responseParam), "expected response parameter type %T, got %T", &openaigo.ChatCompletion{}, responseParam)
-		}
+		require.NotNil(t, responseParam, "expected response parameter to be set")
+		assert.Equal(t, reflect.TypeOf(&openaigo.ChatCompletion{}), reflect.TypeOf(responseParam), "expected response parameter type %T, got %T", &openaigo.ChatCompletion{}, responseParam)
 
 		// Chunk parameter should be nil for non-streaming requests.
 		assert.Nil(t, chunkParam, "expected chunk parameter to be nil for non-streaming requests")
@@ -2318,12 +2491,11 @@ func TestOpenAI_TokenCounterInitialization(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Create OpenAI client
-			client := &Model{
-				name:                 "gpt-3.5-turbo",
-				apiKey:               "test-api-key",
-				enableTokenTailoring: true, // Enable token tailoring to trigger initialization
-				tokenCounter:         tt.initialTokenCounter,
-			}
+			client := New("gpt-3.5-turbo",
+				WithAPIKey("test-api-key"),
+				WithEnableTokenTailoring(true),
+				WithTokenCounter(tt.initialTokenCounter),
+			)
 
 			// Create a simple conversation to trigger the initialization logic
 			conv := []model.Message{
@@ -2403,12 +2575,11 @@ func TestOpenAI_TailoringStrategyInitialization(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Create OpenAI client
-			client := &Model{
-				name:                 "gpt-3.5-turbo",
-				apiKey:               "test-api-key",
-				enableTokenTailoring: true, // Enable token tailoring to trigger initialization
-				tailoringStrategy:    tt.initialTailoringStrategy,
-			}
+			client := New("gpt-3.5-turbo",
+				WithAPIKey("test-api-key"),
+				WithEnableTokenTailoring(true),
+				WithTailoringStrategy(tt.initialTailoringStrategy),
+			)
 
 			// Create a simple conversation to trigger the initialization logic
 			conv := []model.Message{
@@ -2469,12 +2640,11 @@ func TestOpenAI_TailoringStrategyInitialization(t *testing.T) {
 
 func TestOpenAI_ConcurrentInitialization(t *testing.T) {
 	// Test concurrent access to ensure sync.Once works correctly
-	client := &Model{
-		name:                 "gpt-3.5-turbo",
-		apiKey:               "test-api-key",
-		enableTokenTailoring: true, // Enable token tailoring to trigger initialization
-		// Don't set tokenCounter or tailoringStrategy to test default initialization
-	}
+	client := New(
+		"gpt-3.5-turbo",
+		WithAPIKey("test-api-key"),
+		WithEnableTokenTailoring(true),
+	)
 
 	// Create a mock HTTP server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3026,7 +3196,7 @@ func TestInverseOPENAISKDAddChunkUsage(t *testing.T) {
 			TotalTokens:      15,
 		}
 
-		result := inverseOPENAISKDAddChunkUsage(currentUsage, delta)
+		result := inverseOpenAISDKAddChunkUsage(currentUsage, delta)
 
 		assert.Equal(t, 90, result.PromptTokens, "expected prompt tokens to be 90 (100 - 10)")
 		assert.Equal(t, 45, result.CompletionTokens, "expected completion tokens to be 45 (50 - 5)")
@@ -3045,7 +3215,7 @@ func TestInverseOPENAISKDAddChunkUsage(t *testing.T) {
 			TotalTokens:      0,
 		}
 
-		result := inverseOPENAISKDAddChunkUsage(currentUsage, delta)
+		result := inverseOpenAISDKAddChunkUsage(currentUsage, delta)
 
 		assert.Equal(t, 100, result.PromptTokens, "expected prompt tokens to remain 100")
 		assert.Equal(t, 50, result.CompletionTokens, "expected completion tokens to remain 50")
@@ -3064,7 +3234,7 @@ func TestInverseOPENAISKDAddChunkUsage(t *testing.T) {
 			TotalTokens:      30,
 		}
 
-		result := inverseOPENAISKDAddChunkUsage(currentUsage, delta)
+		result := inverseOpenAISDKAddChunkUsage(currentUsage, delta)
 
 		assert.Equal(t, -10, result.PromptTokens, "expected prompt tokens to be -10 (10 - 20)")
 		assert.Equal(t, -5, result.CompletionTokens, "expected completion tokens to be -5 (5 - 10)")
@@ -4602,4 +4772,1362 @@ func TestWithTokenTailoringConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBuildThinkingOption tests the buildThinkingOption method for different variants.
+func TestBuildThinkingOption(t *testing.T) {
+	trueVal := true
+	falseVal := false
+	thinkingTokens := 1024
+
+	tests := []struct {
+		name            string
+		variant         Variant
+		thinkingEnabled *bool
+		thinkingTokens  *int
+		wantKeys        []string
+		wantValues      []any
+	}{
+		{
+			name:            "DeepSeek variant with thinking enabled",
+			variant:         VariantDeepSeek,
+			thinkingEnabled: &trueVal,
+			wantKeys:        []string{"thinking"},
+			wantValues:      []any{map[string]string{"type": "enabled"}},
+		},
+		{
+			name:            "DeepSeek variant with thinking disabled",
+			variant:         VariantDeepSeek,
+			thinkingEnabled: &falseVal,
+			wantKeys:        []string{"thinking"},
+			wantValues:      []any{map[string]string{"type": "disabled"}},
+		},
+		{
+			name:            "DeepSeek variant with thinking tokens",
+			variant:         VariantDeepSeek,
+			thinkingEnabled: &trueVal,
+			thinkingTokens:  &thinkingTokens,
+			wantKeys:        []string{model.ThinkingTokensKey, "thinking"},
+			wantValues:      []any{1024, map[string]string{"type": "enabled"}},
+		},
+		{
+			name:            "OpenAI variant with thinking enabled",
+			variant:         VariantOpenAI,
+			thinkingEnabled: &trueVal,
+			wantKeys:        []string{model.ThinkingEnabledKey},
+			wantValues:      []any{true},
+		},
+		{
+			name:            "OpenAI variant with thinking disabled",
+			variant:         VariantOpenAI,
+			thinkingEnabled: &falseVal,
+			wantKeys:        []string{model.ThinkingEnabledKey},
+			wantValues:      []any{false},
+		},
+		{
+			name:            "Qwen variant with thinking enabled",
+			variant:         VariantQwen,
+			thinkingEnabled: &trueVal,
+			wantKeys:        []string{model.EnabledThinkingKey},
+			wantValues:      []any{true},
+		},
+		{
+			name:            "nil thinking enabled returns empty opts",
+			variant:         VariantDeepSeek,
+			thinkingEnabled: nil,
+			wantKeys:        nil,
+			wantValues:      nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := &Model{
+				variant:       tt.variant,
+				variantConfig: variantConfigs[tt.variant],
+			}
+
+			request := &model.Request{
+				GenerationConfig: model.GenerationConfig{
+					ThinkingEnabled: tt.thinkingEnabled,
+					ThinkingTokens:  tt.thinkingTokens,
+				},
+			}
+
+			opts := m.buildThinkingOption(request)
+
+			if tt.wantKeys == nil {
+				assert.Empty(t, opts, "expected empty opts")
+				return
+			}
+
+			assert.Len(t, opts, len(tt.wantKeys), "expected %d opts", len(tt.wantKeys))
+		})
+	}
+}
+
+// TestFixToolCallIndices_ParallelToolCallsWithZeroIndex verifies that
+// fixToolCallIndices correctly assigns sequential indices to parallel tool
+// calls when the provider returns all indices as 0.
+func TestFixToolCallIndices_ParallelToolCallsWithZeroIndex(t *testing.T) {
+	t.Run("fix indices for parallel tool calls with same index 0", func(t *testing.T) {
+		idToIndexMap := make(map[string]int)
+		nextIndex := 0
+
+		// First tool call chunk with ID "call_1" and index 0.
+		chunk1 := openai.ChatCompletionChunk{
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						ToolCalls: []openai.ChatCompletionChunkChoiceDeltaToolCall{
+							{
+								Index: 0,
+								ID:    "call_1",
+								Function: openai.ChatCompletionChunkChoiceDeltaToolCallFunction{
+									Name: "tool_a",
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		fixed1 := fixToolCallIndices(chunk1, idToIndexMap, &nextIndex)
+		assert.Equal(t, int64(0), fixed1.Choices[0].Delta.ToolCalls[0].Index)
+		assert.Equal(t, 0, idToIndexMap["call_1"])
+		assert.Equal(t, 1, nextIndex)
+
+		// Second tool call chunk with ID "call_2" and index 0 (should be fixed to 1).
+		chunk2 := openai.ChatCompletionChunk{
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						ToolCalls: []openai.ChatCompletionChunkChoiceDeltaToolCall{
+							{
+								Index: 0,
+								ID:    "call_2",
+								Function: openai.ChatCompletionChunkChoiceDeltaToolCallFunction{
+									Name: "tool_b",
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		fixed2 := fixToolCallIndices(chunk2, idToIndexMap, &nextIndex)
+		assert.Equal(t, int64(1), fixed2.Choices[0].Delta.ToolCalls[0].Index)
+		assert.Equal(t, 1, idToIndexMap["call_2"])
+		assert.Equal(t, 2, nextIndex)
+	})
+
+	t.Run("preserve correct indices when provider sets them properly", func(t *testing.T) {
+		idToIndexMap := make(map[string]int)
+		nextIndex := 0
+
+		// First tool call with correct index 0.
+		chunk1 := openai.ChatCompletionChunk{
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						ToolCalls: []openai.ChatCompletionChunkChoiceDeltaToolCall{
+							{
+								Index: 0,
+								ID:    "call_1",
+								Function: openai.ChatCompletionChunkChoiceDeltaToolCallFunction{
+									Name: "tool_a",
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		fixed1 := fixToolCallIndices(chunk1, idToIndexMap, &nextIndex)
+		assert.Equal(t, int64(0), fixed1.Choices[0].Delta.ToolCalls[0].Index)
+
+		// Second tool call with correct index 1.
+		chunk2 := openai.ChatCompletionChunk{
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						ToolCalls: []openai.ChatCompletionChunkChoiceDeltaToolCall{
+							{
+								Index: 1,
+								ID:    "call_2",
+								Function: openai.ChatCompletionChunkChoiceDeltaToolCallFunction{
+									Name: "tool_b",
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		fixed2 := fixToolCallIndices(chunk2, idToIndexMap, &nextIndex)
+		// Should preserve the original index 1.
+		assert.Equal(t, int64(1), fixed2.Choices[0].Delta.ToolCalls[0].Index)
+	})
+
+	t.Run("handle continuation chunks without ID", func(t *testing.T) {
+		idToIndexMap := make(map[string]int)
+		nextIndex := 0
+
+		// First chunk with ID.
+		chunk1 := openai.ChatCompletionChunk{
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						ToolCalls: []openai.ChatCompletionChunkChoiceDeltaToolCall{
+							{
+								Index: 0,
+								ID:    "call_1",
+								Function: openai.ChatCompletionChunkChoiceDeltaToolCallFunction{
+									Name: "tool_a",
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		fixToolCallIndices(chunk1, idToIndexMap, &nextIndex)
+
+		// Continuation chunk without ID (arguments streaming).
+		chunk2 := openai.ChatCompletionChunk{
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						ToolCalls: []openai.ChatCompletionChunkChoiceDeltaToolCall{
+							{
+								Index: 0,
+								ID:    "",
+								Function: openai.ChatCompletionChunkChoiceDeltaToolCallFunction{
+									Arguments: `{"arg": "value"}`,
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		fixed2 := fixToolCallIndices(chunk2, idToIndexMap, &nextIndex)
+		// Should preserve index 0 for continuation.
+		assert.Equal(t, int64(0), fixed2.Choices[0].Delta.ToolCalls[0].Index)
+	})
+
+	t.Run("empty choices returns unchanged chunk", func(t *testing.T) {
+		idToIndexMap := make(map[string]int)
+		nextIndex := 0
+
+		chunk := openai.ChatCompletionChunk{
+			Choices: []openai.ChatCompletionChunkChoice{},
+		}
+
+		fixed := fixToolCallIndices(chunk, idToIndexMap, &nextIndex)
+		assert.Equal(t, chunk, fixed)
+	})
+
+	t.Run("no tool calls returns unchanged chunk", func(t *testing.T) {
+		idToIndexMap := make(map[string]int)
+		nextIndex := 0
+
+		chunk := openai.ChatCompletionChunk{
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						Content: "Hello",
+					},
+				},
+			},
+		}
+
+		fixed := fixToolCallIndices(chunk, idToIndexMap, &nextIndex)
+		assert.Equal(t, "Hello", fixed.Choices[0].Delta.Content)
+	})
+}
+
+// TestAccumulatorWithFixedIndices verifies that the OpenAI SDK accumulator
+// correctly handles tool calls after index fixing.
+func TestAccumulatorWithFixedIndices(t *testing.T) {
+	t.Run("accumulator separates tool calls with different indices", func(t *testing.T) {
+		acc := openai.ChatCompletionAccumulator{}
+		idToIndexMap := make(map[string]int)
+		nextIndex := 0
+
+		// First tool call chunk with ID "call_1" and index 0.
+		chunk1 := openai.ChatCompletionChunk{
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						ToolCalls: []openai.ChatCompletionChunkChoiceDeltaToolCall{
+							{
+								Index: 0,
+								ID:    "call_1",
+								Type:  "function",
+								Function: openai.ChatCompletionChunkChoiceDeltaToolCallFunction{
+									Name:      "tool_a",
+									Arguments: `{"arg": "value1"}`,
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		fixed1 := fixToolCallIndices(chunk1, idToIndexMap, &nextIndex)
+		t.Logf("fixed1 index: %d, nextIndex: %d", fixed1.Choices[0].Delta.ToolCalls[0].Index, nextIndex)
+		acc.AddChunk(fixed1)
+
+		// Second tool call chunk with ID "call_2" and index 0 (should be fixed to 1).
+		chunk2 := openai.ChatCompletionChunk{
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						ToolCalls: []openai.ChatCompletionChunkChoiceDeltaToolCall{
+							{
+								Index: 0,
+								ID:    "call_2",
+								Type:  "function",
+								Function: openai.ChatCompletionChunkChoiceDeltaToolCallFunction{
+									Name:      "tool_b",
+									Arguments: `{"arg": "value2"}`,
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		fixed2 := fixToolCallIndices(chunk2, idToIndexMap, &nextIndex)
+		t.Logf("fixed2 index: %d, nextIndex: %d", fixed2.Choices[0].Delta.ToolCalls[0].Index, nextIndex)
+		acc.AddChunk(fixed2)
+
+		// Verify accumulator has two separate tool calls.
+		t.Logf("Accumulated tool calls: %d", len(acc.Choices[0].Message.ToolCalls))
+		for i, tc := range acc.Choices[0].Message.ToolCalls {
+			t.Logf("Tool call %d: ID=%s, Name=%s, Args=%s", i, tc.ID, tc.Function.Name, tc.Function.Arguments)
+		}
+
+		assert.Len(t, acc.Choices, 1)
+		assert.Len(t, acc.Choices[0].Message.ToolCalls, 2)
+		assert.Equal(t, "tool_a", acc.Choices[0].Message.ToolCalls[0].Function.Name)
+		assert.Equal(t, "tool_b", acc.Choices[0].Message.ToolCalls[1].Function.Name)
+		assert.Equal(t, `{"arg": "value1"}`, acc.Choices[0].Message.ToolCalls[0].Function.Arguments)
+		assert.Equal(t, `{"arg": "value2"}`, acc.Choices[0].Message.ToolCalls[1].Function.Arguments)
+	})
+
+	t.Run("without fix, accumulator concatenates tool calls with same index", func(t *testing.T) {
+		acc := openai.ChatCompletionAccumulator{}
+
+		// First tool call chunk with ID "call_1" and index 0.
+		chunk1 := openai.ChatCompletionChunk{
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						ToolCalls: []openai.ChatCompletionChunkChoiceDeltaToolCall{
+							{
+								Index: 0,
+								ID:    "call_1",
+								Type:  "function",
+								Function: openai.ChatCompletionChunkChoiceDeltaToolCallFunction{
+									Name:      "tool_a",
+									Arguments: `{"arg": "value1"}`,
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		acc.AddChunk(chunk1)
+
+		// Second tool call chunk with ID "call_2" and index 0 (NOT fixed).
+		chunk2 := openai.ChatCompletionChunk{
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						ToolCalls: []openai.ChatCompletionChunkChoiceDeltaToolCall{
+							{
+								Index: 0,
+								ID:    "call_2",
+								Type:  "function",
+								Function: openai.ChatCompletionChunkChoiceDeltaToolCallFunction{
+									Name:      "tool_b",
+									Arguments: `{"arg": "value2"}`,
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		acc.AddChunk(chunk2)
+
+		// Without fix, accumulator should concatenate names and arguments.
+		assert.Len(t, acc.Choices, 1)
+		// The accumulator concatenates the second tool call onto the first.
+		assert.Len(t, acc.Choices[0].Message.ToolCalls, 1)
+		// Names and arguments are concatenated.
+		assert.Equal(t, "tool_atool_b", acc.Choices[0].Message.ToolCalls[0].Function.Name)
+		assert.Equal(t, `{"arg": "value1"}{"arg": "value2"}`, acc.Choices[0].Message.ToolCalls[0].Function.Arguments)
+	})
+}
+
+// TestModel_GenerateContent_StreamingExtraFields tests that ExtraFields (e.g., Gemini 3's thought_signature)
+// are correctly collected during streaming and passed through in the final response.
+func TestModel_GenerateContent_StreamingExtraFields(t *testing.T) {
+	tests := []struct {
+		name                 string
+		chunks               []string
+		expectedExtraContent string // Expected extra_content.google.thought_signature value
+		useIndex             bool   // Whether the chunk uses index instead of ID for ExtraFields
+	}{
+		{
+			name: "ExtraFields_with_ID",
+			chunks: []string{
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gemini-3-pro","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gemini-3-pro","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc123","type":"function","function":{"name":"multiply","arguments":"{\"a\":83,\"b\":83}"},"extra_content":{"google":{"thought_signature":"sig_abc123"}}}]},"finish_reason":null}]}`,
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gemini-3-pro","choices":[{"index":0,"delta":{"content":""},"finish_reason":"tool_calls"}]}`,
+			},
+			expectedExtraContent: "sig_abc123",
+			useIndex:             false,
+		},
+		{
+			name: "ExtraFields_with_index_only",
+			chunks: []string{
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gemini-3-pro","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gemini-3-pro","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"type":"function","function":{"name":"multiply","arguments":"{\"a\":83,\"b\":83}"},"extra_content":{"google":{"thought_signature":"sig_index_1"}}}]},"finish_reason":null}]}`,
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gemini-3-pro","choices":[{"index":0,"delta":{"content":""},"finish_reason":"tool_calls"}]}`,
+			},
+			expectedExtraContent: "sig_index_1",
+			useIndex:             true,
+		},
+		{
+			name: "Multiple_ToolCalls_with_ExtraFields",
+			chunks: []string{
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gemini-3-pro","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gemini-3-pro","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_first","type":"function","function":{"name":"add","arguments":"{\"a\":1,\"b\":2}"},"extra_content":{"google":{"thought_signature":"sig_first"}}}]},"finish_reason":null}]}`,
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gemini-3-pro","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_second","type":"function","function":{"name":"multiply","arguments":"{\"a\":3,\"b\":4}"},"extra_content":{"google":{"thought_signature":"sig_second"}}}]},"finish_reason":null}]}`,
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gemini-3-pro","choices":[{"index":0,"delta":{"content":""},"finish_reason":"tool_calls"}]}`,
+			},
+			expectedExtraContent: "sig_first", // Verify first tool call's extra content
+			useIndex:             false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("Cache-Control", "no-cache")
+				w.Header().Set("Connection", "keep-alive")
+
+				for _, chunk := range tt.chunks {
+					fmt.Fprintf(w, "%s\n\n", chunk)
+					if f, ok := w.(http.Flusher); ok {
+						f.Flush()
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+			}))
+			defer server.Close()
+
+			m := New("gemini-3-pro", WithBaseURL(server.URL), WithAPIKey("test-key"))
+
+			req := &model.Request{
+				Messages:         []model.Message{{Role: model.RoleUser, Content: "Calculate 83 * 83"}},
+				GenerationConfig: model.GenerationConfig{Stream: true},
+			}
+
+			ctx := context.Background()
+			responseChan, err := m.GenerateContent(ctx, req)
+			require.NoError(t, err)
+
+			var toolCallResponse *model.Response
+			for response := range responseChan {
+				require.Nil(t, response.Error)
+				if len(response.Choices) > 0 && len(response.Choices[0].Message.ToolCalls) > 0 {
+					toolCallResponse = response
+				}
+			}
+
+			require.NotNil(t, toolCallResponse, "No tool calls found in response")
+
+			toolCalls := toolCallResponse.Choices[0].Message.ToolCalls
+			require.Greater(t, len(toolCalls), 0, "Expected at least one tool call")
+
+			// Verify ExtraFields were collected and passed through.
+			tc := toolCalls[0]
+			require.NotNil(t, tc.ExtraFields, "ExtraFields should not be nil")
+
+			extraContent, ok := tc.ExtraFields["extra_content"].(map[string]any)
+			require.True(t, ok, "extra_content should be a map")
+
+			google, ok := extraContent["google"].(map[string]any)
+			require.True(t, ok, "google should be a map")
+
+			sig, ok := google["thought_signature"].(string)
+			require.True(t, ok, "thought_signature should be a string")
+			assert.Equal(t, tt.expectedExtraContent, sig)
+
+			// For multiple tool calls test, verify second tool call too.
+			if tt.name == "Multiple_ToolCalls_with_ExtraFields" && len(toolCalls) >= 2 {
+				tc2 := toolCalls[1]
+				require.NotNil(t, tc2.ExtraFields, "Second tool call ExtraFields should not be nil")
+				extraContent2, ok := tc2.ExtraFields["extra_content"].(map[string]any)
+				require.True(t, ok)
+				google2, ok := extraContent2["google"].(map[string]any)
+				require.True(t, ok)
+				sig2, ok := google2["thought_signature"].(string)
+				require.True(t, ok)
+				assert.Equal(t, "sig_second", sig2)
+			}
+		})
+	}
+}
+
+func TestConvertExtraFields(t *testing.T) {
+	t.Run("returns nil when extraFields is nil", func(t *testing.T) {
+		result := convertExtraFields(nil)
+		assert.Nil(t, result)
+	})
+
+	t.Run("returns nil when extraFields is empty", func(t *testing.T) {
+		extraFields := make(map[string]respjson.Field)
+		result := convertExtraFields(extraFields)
+		assert.Nil(t, result)
+	})
+
+	t.Run("converts extra_content with thought_signature", func(t *testing.T) {
+		extraFields := parseToolCallExtraFields(t, `{
+			"id": "call_123",
+			"type": "function",
+			"function": {"name": "test", "arguments": "{}"},
+			"extra_content": {"google": {"thought_signature": "nested_sig_456"}}
+		}`)
+		result := convertExtraFields(extraFields)
+		require.NotNil(t, result)
+		extraContent, ok := result["extra_content"].(map[string]any)
+		require.True(t, ok)
+		google, ok := extraContent["google"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "nested_sig_456", google["thought_signature"])
+	})
+
+	t.Run("converts multiple extra fields", func(t *testing.T) {
+		extraFields := parseToolCallExtraFields(t, `{
+			"id": "call_123",
+			"type": "function",
+			"function": {"name": "test", "arguments": "{}"},
+			"custom_field": "custom_value",
+			"extra_content": {"google": {"thought_signature": "sig123"}}
+		}`)
+		result := convertExtraFields(extraFields)
+		require.NotNil(t, result)
+		assert.Equal(t, "custom_value", result["custom_field"])
+		extraContent, ok := result["extra_content"].(map[string]any)
+		require.True(t, ok)
+		google, ok := extraContent["google"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "sig123", google["thought_signature"])
+	})
+}
+
+// parseToolCallExtraFields parses a JSON string into a ChatCompletionMessageToolCall
+// and returns its ExtraFields. This allows testing with properly populated respjson.Field values.
+func parseToolCallExtraFields(t *testing.T, jsonStr string) map[string]respjson.Field {
+	t.Helper()
+	var toolCall openai.ChatCompletionMessageToolCall
+	err := json.Unmarshal([]byte(jsonStr), &toolCall)
+	require.NoError(t, err)
+	return toolCall.JSON.ExtraFields
+}
+
+// TestConvertToolCalls_ExtraFields tests that convertToolCalls
+// correctly handles ExtraFields for transparent passthrough.
+func TestConvertToolCalls_ExtraFields(t *testing.T) {
+	m := New("test-model")
+
+	t.Run("no extra_fields", func(t *testing.T) {
+		toolCalls := []model.ToolCall{
+			{
+				ID:   "call-1",
+				Type: "function",
+				Function: model.FunctionDefinitionParam{
+					Name:      "test_func",
+					Arguments: []byte(`{"arg": "value"}`),
+				},
+			},
+		}
+
+		result := m.convertToolCalls(toolCalls)
+
+		require.Len(t, result, 1)
+		assert.Equal(t, "call-1", result[0].ID)
+		assert.Equal(t, "test_func", result[0].Function.Name)
+	})
+
+	t.Run("with extra_fields passes through", func(t *testing.T) {
+		toolCalls := []model.ToolCall{
+			{
+				ID:   "call-1",
+				Type: "function",
+				Function: model.FunctionDefinitionParam{
+					Name:      "test_func",
+					Arguments: []byte(`{}`),
+				},
+				ExtraFields: map[string]any{
+					"extra_content": map[string]any{
+						"google": map[string]any{
+							"thought_signature": "sig123",
+						},
+					},
+				},
+			},
+		}
+
+		result := m.convertToolCalls(toolCalls)
+
+		require.Len(t, result, 1)
+		assert.Equal(t, "call-1", result[0].ID)
+	})
+
+	t.Run("multiple tool calls with and without extra_fields", func(t *testing.T) {
+		toolCalls := []model.ToolCall{
+			{
+				ID:   "call-1",
+				Type: "function",
+				Function: model.FunctionDefinitionParam{
+					Name:      "func1",
+					Arguments: []byte(`{}`),
+				},
+				ExtraFields: map[string]any{
+					"extra_content": map[string]any{
+						"google": map[string]any{
+							"thought_signature": "sig1",
+						},
+					},
+				},
+			},
+			{
+				ID:   "call-2",
+				Type: "function",
+				Function: model.FunctionDefinitionParam{
+					Name:      "func2",
+					Arguments: []byte(`{}`),
+				},
+				ExtraFields: map[string]any{
+					"extra_content": map[string]any{
+						"google": map[string]any{
+							"thought_signature": "sig2",
+						},
+					},
+				},
+			},
+			{
+				ID:   "call-3",
+				Type: "function",
+				Function: model.FunctionDefinitionParam{
+					Name:      "func3",
+					Arguments: []byte(`{}`),
+				},
+				// No extra fields
+			},
+		}
+
+		result := m.convertToolCalls(toolCalls)
+
+		require.Len(t, result, 3)
+		assert.Equal(t, "call-1", result[0].ID)
+		assert.Equal(t, "call-2", result[1].ID)
+		assert.Equal(t, "call-3", result[2].ID)
+	})
+}
+
+// parseChunkWithExtraFields parses a JSON string into a ChatCompletionChunk
+// and returns it with properly populated respjson.Field values for ExtraFields.
+func parseChunkWithExtraFields(t *testing.T, jsonStr string) openai.ChatCompletionChunk {
+	t.Helper()
+	var chunk openai.ChatCompletionChunk
+	err := json.Unmarshal([]byte(jsonStr), &chunk)
+	require.NoError(t, err)
+	return chunk
+}
+
+// TestModel_collectExtraFieldsFromChunk tests the collectExtraFieldsFromChunk method.
+func TestModel_collectExtraFieldsFromChunk(t *testing.T) {
+	m := New("test-model", WithAPIKey("test-key"))
+
+	t.Run("empty chunk choices", func(t *testing.T) {
+		chunk := openai.ChatCompletionChunk{}
+		extraFieldsMap := make(map[string]map[string]any)
+		m.collectExtraFieldsFromChunk(chunk, extraFieldsMap)
+		assert.Empty(t, extraFieldsMap)
+	})
+
+	t.Run("no tool calls in delta", func(t *testing.T) {
+		chunk := openai.ChatCompletionChunk{
+			Choices: []openai.ChatCompletionChunkChoice{
+				{Delta: openai.ChatCompletionChunkChoiceDelta{}},
+			},
+		}
+		extraFieldsMap := make(map[string]map[string]any)
+		m.collectExtraFieldsFromChunk(chunk, extraFieldsMap)
+		assert.Empty(t, extraFieldsMap)
+	})
+
+	t.Run("tool call with ID and extra fields", func(t *testing.T) {
+		chunk := parseChunkWithExtraFields(t, `{
+			"id": "test-id",
+			"object": "chat.completion.chunk",
+			"created": 1699200000,
+			"model": "test-model",
+			"choices": [{
+				"index": 0,
+				"delta": {
+					"tool_calls": [{
+						"index": 0,
+						"id": "call_123",
+						"type": "function",
+						"function": {"name": "test_func", "arguments": "{}"},
+						"extra_key": "extra_value"
+					}]
+				}
+			}]
+		}`)
+		extraFieldsMap := make(map[string]map[string]any)
+		m.collectExtraFieldsFromChunk(chunk, extraFieldsMap)
+		assert.Contains(t, extraFieldsMap, "call_123")
+	})
+
+	t.Run("tool call with index but no ID", func(t *testing.T) {
+		chunk := parseChunkWithExtraFields(t, `{
+			"id": "test-id",
+			"object": "chat.completion.chunk",
+			"created": 1699200000,
+			"model": "test-model",
+			"choices": [{
+				"index": 0,
+				"delta": {
+					"tool_calls": [{
+						"index": 1,
+						"type": "function",
+						"function": {"name": "test_func", "arguments": "{}"},
+						"extra_key": "extra_value"
+					}]
+				}
+			}]
+		}`)
+		extraFieldsMap := make(map[string]map[string]any)
+		m.collectExtraFieldsFromChunk(chunk, extraFieldsMap)
+		assert.Contains(t, extraFieldsMap, "index_1")
+	})
+
+	t.Run("tool call with no extra fields", func(t *testing.T) {
+		chunk := openai.ChatCompletionChunk{
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						ToolCalls: []openai.ChatCompletionChunkChoiceDeltaToolCall{
+							{
+								ID:    "call_456",
+								Index: 0,
+							},
+						},
+					},
+				},
+			},
+		}
+		extraFieldsMap := make(map[string]map[string]any)
+		m.collectExtraFieldsFromChunk(chunk, extraFieldsMap)
+		assert.Empty(t, extraFieldsMap)
+	})
+}
+
+// TestModel_accumulateChunk tests the accumulateChunk method.
+func TestModel_accumulateChunk(t *testing.T) {
+	m := New("test-model", WithAPIKey("test-key"))
+
+	t.Run("accumulate normal chunk without reasoning", func(t *testing.T) {
+		chunk := openai.ChatCompletionChunk{
+			ID:      "test-id",
+			Object:  "chat.completion.chunk",
+			Created: 1699200000,
+			Model:   "test-model",
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Index: 0,
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						Content: "Hello",
+					},
+				},
+			},
+		}
+		acc := openai.ChatCompletionAccumulator{}
+		var reasoningBuf bytes.Buffer
+
+		m.accumulateChunk(chunk, &acc, &reasoningBuf)
+
+		assert.NotEmpty(t, acc.Choices)
+		assert.Equal(t, "", reasoningBuf.String())
+	})
+
+	t.Run("skip chunk with reasoning content", func(t *testing.T) {
+		chunk := parseChunkWithExtraFields(t, `{
+			"id": "test-id",
+			"object": "chat.completion.chunk",
+			"created": 1699200000,
+			"model": "test-model",
+			"choices": [{
+				"index": 0,
+				"delta": {
+					"reasoning_content": "First reasoning"
+				}
+			}]
+		}`)
+		acc := openai.ChatCompletionAccumulator{}
+		var reasoningBuf bytes.Buffer
+
+		m.accumulateChunk(chunk, &acc, &reasoningBuf)
+
+		assert.Equal(t, "First reasoning", reasoningBuf.String())
+		assert.Empty(t, acc.Choices)
+	})
+
+	t.Run("accumulate with custom usage function", func(t *testing.T) {
+		customAccFunc := func(u model.Usage, delta model.Usage) model.Usage {
+			return model.Usage{
+				PromptTokens:     u.PromptTokens + delta.PromptTokens*2,
+				CompletionTokens: u.CompletionTokens + delta.CompletionTokens*2,
+				TotalTokens:      u.TotalTokens + delta.TotalTokens*2,
+			}
+		}
+		m := New("test-model", WithAPIKey("test-key"), WithAccumulateChunkTokenUsage(customAccFunc))
+
+		chunk := openai.ChatCompletionChunk{
+			ID:      "test-id",
+			Object:  "chat.completion.chunk",
+			Created: 1699200000,
+			Model:   "test-model",
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Index: 0,
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						Content: "Hello",
+					},
+				},
+			},
+			Usage: openai.CompletionUsage{
+				PromptTokens:     10,
+				CompletionTokens: 5,
+				TotalTokens:      15,
+			},
+		}
+		acc := openai.ChatCompletionAccumulator{}
+		var reasoningBuf bytes.Buffer
+
+		m.accumulateChunk(chunk, &acc, &reasoningBuf)
+
+		assert.Equal(t, int64(20), acc.Usage.PromptTokens)
+		assert.Equal(t, int64(10), acc.Usage.CompletionTokens)
+	})
+}
+
+// TestModel_sendPartialResponse tests the sendPartialResponse method.
+func TestModel_sendPartialResponse(t *testing.T) {
+	m := New("test-model", WithAPIKey("test-key"))
+
+	t.Run("successfully send response", func(t *testing.T) {
+		chunk := openai.ChatCompletionChunk{
+			ID:      "test-id",
+			Object:  "chat.completion.chunk",
+			Created: 1699200000,
+			Model:   "test-model",
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Index: 0,
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						Content: "Hello",
+					},
+				},
+			},
+		}
+		responseChan := make(chan *model.Response, 1)
+		ctx := context.Background()
+
+		err := m.sendPartialResponse(ctx, chunk, responseChan)
+
+		assert.NoError(t, err)
+		assert.Len(t, responseChan, 1)
+		response := <-responseChan
+		assert.Equal(t, "test-id", response.ID)
+		assert.True(t, response.IsPartial)
+		assert.False(t, response.Done)
+	})
+
+	t.Run("context cancelled", func(t *testing.T) {
+		chunk := openai.ChatCompletionChunk{
+			ID:      "test-id",
+			Object:  "chat.completion.chunk",
+			Created: 1699200000,
+			Model:   "test-model",
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Index: 0,
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						Content: "Hello",
+					},
+				},
+			},
+		}
+		responseChan := make(chan *model.Response)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := m.sendPartialResponse(ctx, chunk, responseChan)
+
+		assert.Error(t, err)
+		assert.Equal(t, context.Canceled, err)
+	})
+}
+
+// TestModel_handleStreamCompleteCallback tests the handleStreamCompleteCallback method.
+func TestModel_handleStreamCompleteCallback(t *testing.T) {
+	t.Run("callback not set", func(t *testing.T) {
+		m := New("test-model", WithAPIKey("test-key"))
+		chatRequest := openai.ChatCompletionNewParams{}
+		acc := openai.ChatCompletionAccumulator{}
+
+		m.handleStreamCompleteCallback(context.Background(), chatRequest, acc, nil)
+	})
+
+	t.Run("callback called with no error", func(t *testing.T) {
+		var callbackCalled bool
+		var capturedAcc *openai.ChatCompletionAccumulator
+		var capturedErr error
+
+		callback := func(ctx context.Context, req *openai.ChatCompletionNewParams, acc *openai.ChatCompletionAccumulator, streamErr error) {
+			callbackCalled = true
+			capturedAcc = acc
+			capturedErr = streamErr
+		}
+
+		m := New("test-model", WithAPIKey("test-key"), WithChatStreamCompleteCallback(callback))
+		chatRequest := openai.ChatCompletionNewParams{}
+		acc := openai.ChatCompletionAccumulator{}
+
+		m.handleStreamCompleteCallback(context.Background(), chatRequest, acc, nil)
+
+		assert.True(t, callbackCalled)
+		assert.NotNil(t, capturedAcc)
+		assert.NoError(t, capturedErr)
+	})
+
+	t.Run("callback called with error", func(t *testing.T) {
+		var callbackCalled bool
+		var capturedAcc *openai.ChatCompletionAccumulator
+		var capturedErr error
+
+		callback := func(ctx context.Context, req *openai.ChatCompletionNewParams, acc *openai.ChatCompletionAccumulator, streamErr error) {
+			callbackCalled = true
+			capturedAcc = acc
+			capturedErr = streamErr
+		}
+
+		m := New("test-model", WithAPIKey("test-key"), WithChatStreamCompleteCallback(callback))
+		chatRequest := openai.ChatCompletionNewParams{}
+		acc := openai.ChatCompletionAccumulator{}
+		streamError := fmt.Errorf("stream error")
+
+		m.handleStreamCompleteCallback(context.Background(), chatRequest, acc, streamError)
+
+		assert.True(t, callbackCalled)
+		assert.Nil(t, capturedAcc)
+		assert.Error(t, capturedErr)
+		assert.Equal(t, "stream error", capturedErr.Error())
+	})
+}
+
+// TestModel_StreamingResponse_ReasoningChunkNotSuppressed tests that chunks with
+// reasoning content are not suppressed even when shouldSuppressChunk returns true.
+func TestModel_StreamingResponse_ReasoningChunkNotSuppressed(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		// Send chunks with reasoning content but no regular content.
+		// These should NOT be suppressed even though they would normally be.
+		chunks := []string{
+			`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"thinking step 1"},"finish_reason":null}]}`,
+			`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"test-model","choices":[{"index":0,"delta":{"reasoning_content":" thinking step 2"},"finish_reason":null}]}`,
+			`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"test-model","choices":[{"index":0,"delta":{"content":"Final answer"},"finish_reason":"stop"}]}`,
+			`data: [DONE]`,
+		}
+
+		for _, chunk := range chunks {
+			fmt.Fprintf(w, "%s\n\n", chunk)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	}))
+	defer server.Close()
+
+	m := New("test-model", WithBaseURL(server.URL), WithAPIKey("test-key"))
+
+	req := &model.Request{
+		Messages:         []model.Message{{Role: model.RoleUser, Content: "Test"}},
+		GenerationConfig: model.GenerationConfig{Stream: true},
+	}
+
+	ctx := context.Background()
+	responseChan, err := m.GenerateContent(ctx, req)
+	require.NoError(t, err)
+
+	var responses []*model.Response
+	var reasoningChunks int
+	for response := range responseChan {
+		responses = append(responses, response)
+		require.Nil(t, response.Error)
+		if len(response.Choices) > 0 && response.Choices[0].Delta.ReasoningContent != "" {
+			reasoningChunks++
+		}
+	}
+
+	// Verify we received reasoning chunks despite them having no regular content.
+	assert.Greater(t, reasoningChunks, 0, "Expected to receive reasoning chunks")
+	assert.Greater(t, len(responses), 1, "Expected multiple responses")
+}
+
+// TestModel_StreamingResponse_ContextCancellation tests that context cancellation
+// is properly handled during streaming.
+func TestModel_StreamingResponse_ContextCancellation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		// Send a few chunks then wait for context cancellation.
+		for i := 0; i < 5; i++ {
+			chunk := fmt.Sprintf(`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"test-model","choices":[{"index":0,"delta":{"content":"chunk %d"},"finish_reason":null}]}`, i)
+			fmt.Fprintf(w, "%s\n\n", chunk)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}))
+	defer server.Close()
+
+	m := New("test-model", WithBaseURL(server.URL), WithAPIKey("test-key"))
+
+	req := &model.Request{
+		Messages:         []model.Message{{Role: model.RoleUser, Content: "Test"}},
+		GenerationConfig: model.GenerationConfig{Stream: true},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	responseChan, err := m.GenerateContent(ctx, req)
+	require.NoError(t, err)
+
+	var responses []*model.Response
+	// Read a few responses then cancel.
+	for response := range responseChan {
+		responses = append(responses, response)
+		if len(responses) >= 2 {
+			cancel()
+			// Continue reading to drain the channel.
+		}
+	}
+
+	// Should have received at least 2 responses before cancellation.
+	assert.GreaterOrEqual(t, len(responses), 2, "Expected at least 2 responses before cancellation")
+}
+
+// TestWithOptimizeForCache tests the WithOptimizeForCache option.
+func TestWithOptimizeForCache(t *testing.T) {
+	tests := []struct {
+		name     string
+		optimize bool
+		expected bool
+	}{
+		{
+			name:     "enable cache optimization",
+			optimize: true,
+			expected: true,
+		},
+		{
+			name:     "disable cache optimization",
+			optimize: false,
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := &options{}
+			WithOptimizeForCache(tt.optimize)(opts)
+			assert.Equal(t, tt.expected, opts.OptimizeForCache)
+		})
+	}
+}
+
+// TestOptimizeForCache_DefaultDisabled tests that cache optimization is disabled by default.
+func TestOptimizeForCache_DefaultDisabled(t *testing.T) {
+	m := New("gpt-4o", WithAPIKey("test-key"))
+	assert.False(t, m.optimizeForCache, "cache optimization should be disabled by default")
+}
+
+// TestOptimizeMessagesForCache tests the optimizeMessagesForCache function.
+func TestOptimizeMessagesForCache(t *testing.T) {
+	tests := []struct {
+		name     string
+		messages []model.Message
+		expected []model.Message
+	}{
+		{
+			name:     "empty messages",
+			messages: []model.Message{},
+			expected: []model.Message{},
+		},
+		{
+			name: "no system messages - no reordering",
+			messages: []model.Message{
+				{Role: model.RoleUser, Content: "Hello"},
+				{Role: model.RoleAssistant, Content: "Hi"},
+			},
+			expected: []model.Message{
+				{Role: model.RoleUser, Content: "Hello"},
+				{Role: model.RoleAssistant, Content: "Hi"},
+			},
+		},
+		{
+			name: "system message already first - no change",
+			messages: []model.Message{
+				{Role: model.RoleSystem, Content: "You are helpful"},
+				{Role: model.RoleUser, Content: "Hello"},
+			},
+			expected: []model.Message{
+				{Role: model.RoleSystem, Content: "You are helpful"},
+				{Role: model.RoleUser, Content: "Hello"},
+			},
+		},
+		{
+			name: "system message in middle - move to front",
+			messages: []model.Message{
+				{Role: model.RoleUser, Content: "Hello"},
+				{Role: model.RoleSystem, Content: "You are helpful"},
+				{Role: model.RoleAssistant, Content: "Hi"},
+			},
+			expected: []model.Message{
+				{Role: model.RoleSystem, Content: "You are helpful"},
+				{Role: model.RoleUser, Content: "Hello"},
+				{Role: model.RoleAssistant, Content: "Hi"},
+			},
+		},
+		{
+			name: "multiple system messages - all move to front",
+			messages: []model.Message{
+				{Role: model.RoleUser, Content: "Hello"},
+				{Role: model.RoleSystem, Content: "System 1"},
+				{Role: model.RoleAssistant, Content: "Hi"},
+				{Role: model.RoleSystem, Content: "System 2"},
+			},
+			expected: []model.Message{
+				{Role: model.RoleSystem, Content: "System 1"},
+				{Role: model.RoleSystem, Content: "System 2"},
+				{Role: model.RoleUser, Content: "Hello"},
+				{Role: model.RoleAssistant, Content: "Hi"},
+			},
+		},
+		{
+			name: "only system messages",
+			messages: []model.Message{
+				{Role: model.RoleSystem, Content: "System 1"},
+				{Role: model.RoleSystem, Content: "System 2"},
+			},
+			expected: []model.Message{
+				{Role: model.RoleSystem, Content: "System 1"},
+				{Role: model.RoleSystem, Content: "System 2"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := New("gpt-4o", WithAPIKey("test-key"))
+			result := m.optimizeMessagesForCache(tt.messages)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+// TestGenerateContent_OptimizeForCache tests that messages are optimized when cache is enabled.
+func TestGenerateContent_OptimizeForCache(t *testing.T) {
+	var capturedRoles []string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Messages []json.RawMessage `json:"messages"`
+		}
+		json.Unmarshal(body, &req)
+
+		// Parse message roles
+		capturedRoles = nil
+		for _, msg := range req.Messages {
+			var m struct {
+				Role string `json:"role"`
+			}
+			json.Unmarshal(msg, &m)
+			capturedRoles = append(capturedRoles, m.Role)
+		}
+
+		// Verify system messages come first
+		nonSystemSeen := false
+		for _, role := range capturedRoles {
+			if role != "system" {
+				nonSystemSeen = true
+			} else if nonSystemSeen {
+				assert.Fail(t, "system messages should be at the front")
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"id":      "test-id",
+			"object":  "chat.completion",
+			"created": 1699200000,
+			"model":   "gpt-4o",
+			"choices": []map[string]any{
+				{
+					"index":         0,
+					"message":       map[string]any{"role": "assistant", "content": "Hello!"},
+					"finish_reason": "stop",
+				},
+			},
+			"usage": map[string]any{
+				"prompt_tokens":     100,
+				"completion_tokens": 10,
+				"total_tokens":      110,
+			},
+		})
+	}))
+	defer server.Close()
+
+	// Test with cache optimization enabled (default)
+	m := New("gpt-4o", WithBaseURL(server.URL), WithAPIKey("test-key"))
+
+	req := &model.Request{
+		Messages: []model.Message{
+			{Role: model.RoleSystem, Content: "You are helpful"},
+			{Role: model.RoleUser, Content: "Hello"},
+			{Role: model.RoleAssistant, Content: "Hi"},
+		},
+	}
+
+	ctx := context.Background()
+	responseChan, err := m.GenerateContent(ctx, req)
+	require.NoError(t, err)
+
+	for range responseChan {
+		// Drain the channel
+	}
+
+	// Verify system message was moved to front
+	assert.Equal(t, "system", capturedRoles[0], "system message should be first")
+}
+
+// TestGenerateContent_OptimizeForCache_Disabled tests that messages are not reordered when disabled.
+func TestGenerateContent_OptimizeForCache_Disabled(t *testing.T) {
+	var capturedRoles []string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Messages []json.RawMessage `json:"messages"`
+		}
+		json.Unmarshal(body, &req)
+
+		capturedRoles = nil
+		for _, msg := range req.Messages {
+			var m struct {
+				Role string `json:"role"`
+			}
+			json.Unmarshal(msg, &m)
+			capturedRoles = append(capturedRoles, m.Role)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"id":      "test-id",
+			"object":  "chat.completion",
+			"created": 1699200000,
+			"model":   "gpt-4o",
+			"choices": []map[string]any{
+				{
+					"index":         0,
+					"message":       map[string]any{"role": "assistant", "content": "Hello!"},
+					"finish_reason": "stop",
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	// Test with cache optimization disabled
+	m := New("gpt-4o", WithBaseURL(server.URL), WithAPIKey("test-key"), WithOptimizeForCache(false))
+
+	req := &model.Request{
+		Messages: []model.Message{
+			{Role: model.RoleUser, Content: "Hello"},
+			{Role: model.RoleSystem, Content: "You are helpful"},
+			{Role: model.RoleAssistant, Content: "Hi"},
+		},
+	}
+
+	ctx := context.Background()
+	responseChan, err := m.GenerateContent(ctx, req)
+	require.NoError(t, err)
+
+	for range responseChan {
+		// Drain the channel
+	}
+
+	// Verify original order is preserved (user, system, assistant)
+	assert.Equal(t, []string{"user", "system", "assistant"}, capturedRoles)
 }

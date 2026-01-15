@@ -31,3 +31,7 @@ pnpm-lock.yaml
 !.github/scripts/run-go-tests.sh
 .DS_Store
 .gomodcache
+next-env.d.ts
+.codebuddy
+examples/**/*.evalset_result.json
+!examples/evaluation/**/*.evalset_result.json

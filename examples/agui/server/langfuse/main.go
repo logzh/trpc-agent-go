@@ -69,10 +69,10 @@ func main() {
 	callbacks := translator.NewCallbacks().RegisterAfterTranslate(langfuseCallback())
 	server, err := agui.New(runner,
 		agui.WithPath(*path),
-		agui.WithServiceFactory(NewSSE),
 		agui.WithAGUIRunnerOptions(
 			aguirunner.WithUserIDResolver(userIDResolver),
 			aguirunner.WithTranslateCallbacks(callbacks),
+			aguirunner.WithRunOptionResolver(runOptionResolver),
 		),
 	)
 	if err != nil {
@@ -83,6 +83,28 @@ func main() {
 	if err := http.ListenAndServe(*address, server.Handler()); err != nil {
 		log.Fatalf("server stopped with error: %v", err)
 	}
+}
+
+// runOptionResolver resolves the run options for the agent.
+func runOptionResolver(ctx context.Context, input *adapter.RunAgentInput) ([]agent.RunOption, error) {
+	userID, err := userIDResolver(ctx, input)
+	if err != nil {
+		return nil, fmt.Errorf("userIDResolver: %w", err)
+	}
+	content, ok := input.Messages[len(input.Messages)-1].ContentString()
+	if !ok {
+		return nil, fmt.Errorf("last message content is not a string")
+	}
+	return []agent.RunOption{
+		agent.WithSpanAttributes(
+			attribute.String("agentName", agentName),
+			attribute.String("modelName", *modelName),
+			attribute.String("langfuse.environment", "development"),
+			attribute.String("langfuse.session.id", input.ThreadID),
+			attribute.String("langfuse.user.id", userID),
+			attribute.String("langfuse.trace.input", content),
+		),
+	}, nil
 }
 
 // langfuseCallback is a callback that sends the output to Langfuse.

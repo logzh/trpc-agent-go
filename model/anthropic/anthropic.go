@@ -15,8 +15,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
@@ -45,9 +45,7 @@ type Model struct {
 	chatStreamCompleteCallback ChatStreamCompleteCallbackFunc
 	enableTokenTailoring       bool                    // Enable automatic token tailoring.
 	maxInputTokens             int                     // Max input tokens for token tailoring.
-	tokenCounterOnce           sync.Once               // sync.Once for lazy initialization of tokenCounter.
 	tokenCounter               model.TokenCounter      // Token counter for token tailoring.
-	tailoringStrategyOnce      sync.Once               // sync.Once for lazy initialization of tailoringStrategy.
 	tailoringStrategy          model.TailoringStrategy // Tailoring strategy for token tailoring.
 	// Token tailoring budget parameters (instance-level overrides).
 	protocolOverheadTokens int
@@ -56,6 +54,12 @@ type Model struct {
 	outputTokensFloor      int
 	safetyMarginRatio      float64
 	maxInputTokensRatio    float64
+	// Prompt cache configuration
+	enablePromptCache  bool
+	minCacheableTokens int
+	cacheSystemPrompt  bool
+	cacheTools         bool
+	cacheMessages      bool
 }
 
 // New creates a new Anthropic model adapter.
@@ -76,15 +80,8 @@ func New(name string, opts ...Option) *Model {
 	clientOpts = append(clientOpts, o.anthropicClientOptions...)
 	client := anthropic.NewClient(clientOpts...)
 
-	// Provide defaults at construction time when token tailoring is enabled.
-	// These are best-effort defaults; user-provided counter/strategy always take priority.
-	if o.maxInputTokens > 0 {
-		if o.tokenCounter == nil {
-			o.tokenCounter = model.NewSimpleTokenCounter()
-		}
-		if o.tailoringStrategy == nil {
-			o.tailoringStrategy = model.NewMiddleOutStrategy(o.tokenCounter)
-		}
+	if o.tailoringStrategy == nil {
+		o.tailoringStrategy = model.NewMiddleOutStrategy(o.tokenCounter)
 	}
 
 	return &Model{
@@ -108,6 +105,11 @@ func New(name string, opts ...Option) *Model {
 		outputTokensFloor:          o.tokenTailoringConfig.OutputTokensFloor,
 		safetyMarginRatio:          o.tokenTailoringConfig.SafetyMarginRatio,
 		maxInputTokensRatio:        o.tokenTailoringConfig.MaxInputTokensRatio,
+		enablePromptCache:          o.enablePromptCache,
+		minCacheableTokens:         o.minCacheableTokens,
+		cacheSystemPrompt:          o.cacheSystemPrompt,
+		cacheTools:                 o.cacheTools,
+		cacheMessages:              o.cacheMessages,
 	}
 }
 
@@ -177,45 +179,37 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 			// Use default parameters.
 			maxInputTokens = imodel.CalculateMaxInputTokens(contextWindow)
 		}
-		log.Debugf("auto-calculated max input tokens: model=%s, contextWindow=%d, maxInputTokens=%d",
-			m.name, contextWindow, maxInputTokens)
-	}
-
-	// Determine token counter using priority: user config > default.
-	tokenCounter := m.tokenCounter
-	if tokenCounter == nil {
-		m.tokenCounterOnce.Do(func() {
-			if m.tokenCounter == nil {
-				m.tokenCounter = model.NewSimpleTokenCounter()
-			}
-		})
-		tokenCounter = m.tokenCounter
-	}
-
-	// Determine tailoring strategy using priority: user config > default.
-	tailoringStrategy := m.tailoringStrategy
-	if tailoringStrategy == nil {
-		m.tailoringStrategyOnce.Do(func() {
-			if m.tailoringStrategy == nil {
-				m.tailoringStrategy = model.NewMiddleOutStrategy(tokenCounter)
-			}
-		})
-		tailoringStrategy = m.tailoringStrategy
+		log.DebugfContext(
+			ctx,
+			"auto-calculated max input tokens: model=%s, "+
+				"contextWindow=%d, maxInputTokens=%d",
+			m.name,
+			contextWindow,
+			maxInputTokens,
+		)
 	}
 
 	// Apply token tailoring.
-	tailored, err := tailoringStrategy.TailorMessages(ctx, request.Messages, maxInputTokens)
+	tailored, err := m.tailoringStrategy.TailorMessages(ctx, request.Messages, maxInputTokens)
 	if err != nil {
-		log.Warn("token tailoring failed in anthropic.Model", err)
+		log.WarnContext(
+			ctx,
+			"token tailoring failed in anthropic.Model",
+			err,
+		)
 		return
 	}
 
 	request.Messages = tailored
 
 	// Calculate remaining tokens for output based on context window.
-	usedTokens, err := tokenCounter.CountTokensRange(ctx, request.Messages, 0, len(request.Messages))
+	usedTokens, err := m.tokenCounter.CountTokensRange(ctx, request.Messages, 0, len(request.Messages))
 	if err != nil {
-		log.Warn("failed to count tokens after tailoring", err)
+		log.WarnContext(
+			ctx,
+			"failed to count tokens after tailoring",
+			err,
+		)
 		return
 	}
 
@@ -239,8 +233,14 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 		}
 		if maxOutputTokens > 0 {
 			request.GenerationConfig.MaxTokens = &maxOutputTokens
-			log.Debugf("token tailoring: contextWindow=%d, usedTokens=%d, maxOutputTokens=%d",
-				contextWindow, usedTokens, maxOutputTokens)
+			log.DebugfContext(
+				ctx,
+				"token tailoring: contextWindow=%d, usedTokens=%d, "+
+					"maxOutputTokens=%d",
+				contextWindow,
+				usedTokens,
+				maxOutputTokens,
+			)
 		}
 	}
 }
@@ -255,11 +255,25 @@ func (m *Model) buildChatRequest(request *model.Request) (*anthropic.MessageNewP
 	if len(messages) == 0 {
 		return nil, fmt.Errorf("request must include at least one message")
 	}
+
+	// Convert tools
+	tools := convertTools(request.Tools)
+
+	// Apply automatic optimal cache control if enabled.
+	// Strategy: Use a single cache breakpoint at the optimal position for maximum efficiency.
+	// Priority order (only one breakpoint is used):
+	// 1. If messages caching enabled and has history: cache at last assistant message (covers everything)
+	// 2. If tools exist: cache at last tool (covers System+Tools)
+	// 3. If only system prompt: cache at last system block
+	if m.shouldEnableCache(request) {
+		messages, systemPrompts, tools = m.applyOptimalCacheControl(messages, systemPrompts, tools)
+	}
+
 	// Build chat request.
 	chatRequest := &anthropic.MessageNewParams{
 		Model:    anthropic.Model(m.name),
 		Messages: messages,
-		Tools:    convertTools(request.Tools),
+		Tools:    tools,
 	}
 	if len(systemPrompts) > 0 {
 		chatRequest.System = systemPrompts
@@ -280,6 +294,222 @@ func (m *Model) buildChatRequest(request *model.Request) (*anthropic.MessageNewP
 		chatRequest.Thinking = anthropic.ThinkingConfigParamOfEnabled(int64(*request.ThinkingTokens))
 	}
 	return chatRequest, nil
+}
+
+// shouldEnableCache determines whether to enable prompt caching for this request.
+func (m *Model) shouldEnableCache(request *model.Request) bool {
+	if !m.enablePromptCache {
+		return false
+	}
+
+	// Estimate total cacheable tokens
+	systemTokens := m.estimateSystemTokens(request.Messages)
+	toolTokens := m.estimateToolTokens(request.Tools)
+	messageTokens := m.estimateMessageTokens(request.Messages)
+
+	// Check if any caching strategy would be beneficial
+	// Priority: messages > tools > system (based on what covers more content)
+	if m.cacheMessages && messageTokens > 0 {
+		// For multi-turn, we cache at the last assistant message
+		// which covers system + tools + all previous messages
+		totalTokens := systemTokens + toolTokens + messageTokens
+		if totalTokens >= m.minCacheableTokens {
+			return true
+		}
+	}
+
+	if m.cacheTools && len(request.Tools) > 0 {
+		totalTokens := systemTokens + toolTokens
+		if totalTokens >= m.minCacheableTokens {
+			return true
+		}
+	}
+
+	if m.cacheSystemPrompt && systemTokens >= m.minCacheableTokens {
+		return true
+	}
+
+	return false
+}
+
+// applyOptimalCacheControl applies the optimal cache control strategy.
+// It uses a single cache breakpoint at the most efficient position.
+// The strategy follows Anthropic's prefix caching model where everything
+// before the cache breakpoint is cached together.
+func (m *Model) applyOptimalCacheControl(
+	messages []anthropic.MessageParam,
+	systemPrompts []anthropic.TextBlockParam,
+	tools []anthropic.ToolUnionParam,
+) ([]anthropic.MessageParam, []anthropic.TextBlockParam, []anthropic.ToolUnionParam) {
+	// Strategy 1: Cache at last assistant message (covers System + Tools + Messages)
+	// This is the most efficient for multi-turn conversations
+	if m.cacheMessages && len(messages) > 1 {
+		lastAssistantIdx := m.findLastAssistantMessageIndex(messages)
+		if lastAssistantIdx >= 0 {
+			messages = m.applyCacheControlToMessages(messages, lastAssistantIdx)
+			return messages, systemPrompts, tools
+		}
+	}
+
+	// Strategy 2: Cache at last tool (covers System + Tools)
+	if m.cacheTools && len(tools) > 0 {
+		tools = m.applyCacheControlToTools(tools)
+		return messages, systemPrompts, tools
+	}
+
+	// Strategy 3: Cache at last system block (covers System only)
+	if m.cacheSystemPrompt && len(systemPrompts) > 0 {
+		systemPrompts = m.applyCacheControlToSystem(systemPrompts)
+	}
+
+	return messages, systemPrompts, tools
+}
+
+// findLastAssistantMessageIndex finds the index of the last assistant message
+// that is not the final message (we want to cache up to but not including the current turn).
+func (m *Model) findLastAssistantMessageIndex(messages []anthropic.MessageParam) int {
+	// We look for the last assistant message before the final user message
+	// In a typical conversation: [user, assistant, user, assistant, user]
+	// We want to cache at the second-to-last assistant (index 3)
+	for i := len(messages) - 2; i >= 0; i-- {
+		if messages[i].Role == "assistant" {
+			return i
+		}
+	}
+	return -1
+}
+
+// applyCacheControlToMessages adds cache control to a specific message.
+// This is used for multi-turn conversation caching.
+func (m *Model) applyCacheControlToMessages(messages []anthropic.MessageParam, index int) []anthropic.MessageParam {
+	if index < 0 || index >= len(messages) {
+		return messages
+	}
+
+	// Create a copy to avoid modifying the original
+	result := make([]anthropic.MessageParam, len(messages))
+	copy(result, messages)
+
+	// Add cache control to the last cacheable content block of the target message.
+	// We iterate backwards to find the first block that supports cache control,
+	// in case the last block is an image or other unsupported media type.
+	msg := result[index]
+	for i := len(msg.Content) - 1; i >= 0; i-- {
+		content := msg.Content[i]
+		cacheApplied := false
+
+		// Apply cache control based on content type
+		if content.OfText != nil {
+			newContent := *content.OfText
+			newContent.CacheControl = anthropic.NewCacheControlEphemeralParam()
+			msg.Content[i] = anthropic.ContentBlockParamUnion{OfText: &newContent}
+			cacheApplied = true
+		} else if content.OfToolResult != nil {
+			newContent := *content.OfToolResult
+			newContent.CacheControl = anthropic.NewCacheControlEphemeralParam()
+			msg.Content[i] = anthropic.ContentBlockParamUnion{OfToolResult: &newContent}
+			cacheApplied = true
+		} else if content.OfToolUse != nil {
+			newContent := *content.OfToolUse
+			newContent.CacheControl = anthropic.NewCacheControlEphemeralParam()
+			msg.Content[i] = anthropic.ContentBlockParamUnion{OfToolUse: &newContent}
+			cacheApplied = true
+		}
+
+		if cacheApplied {
+			break // Stop after applying to the first valid block from the end
+		}
+	}
+	result[index] = msg
+
+	return result
+}
+
+// estimateMessageTokens estimates the token count of non-system messages.
+func (m *Model) estimateMessageTokens(messages []model.Message) int {
+	count := 0
+	for _, msg := range messages {
+		if msg.Role == model.RoleSystem {
+			continue
+		}
+		// Rough estimate: 1 token ~= 4 characters
+		count += len(msg.Content) / 4
+		for _, part := range msg.ContentParts {
+			if part.Type == model.ContentTypeText && part.Text != nil {
+				count += len(*part.Text) / 4
+			}
+		}
+	}
+	return count
+}
+
+// estimateSystemTokens estimates the token count of system messages.
+func (m *Model) estimateSystemTokens(messages []model.Message) int {
+	count := 0
+	for _, msg := range messages {
+		if msg.Role == model.RoleSystem {
+			// Rough estimate: 1 token ~= 4 characters
+			count += len(msg.Content) / 4
+			for _, part := range msg.ContentParts {
+				if part.Type == model.ContentTypeText && part.Text != nil {
+					count += len(*part.Text) / 4
+				}
+			}
+		}
+	}
+	return count
+}
+
+// estimateToolTokens estimates the token count of tool definitions.
+func (m *Model) estimateToolTokens(tools map[string]tool.Tool) int {
+	count := 0
+	for _, t := range tools {
+		decl := t.Declaration()
+		// Rough estimate based on JSON schema size
+		count += len(decl.Name) / 4
+		count += len(decl.Description) / 4
+		if decl.InputSchema != nil {
+			// Estimate JSON schema size
+			count += 100 // Base overhead for schema structure
+		}
+	}
+	return count
+}
+
+// applyCacheControlToSystem adds cache control to system prompts.
+// According to Anthropic's docs, we should add cache_control to the last
+// block in system prompts to create a cache breakpoint.
+// This enables prompt caching with up to 90% cost savings on cached tokens.
+func (m *Model) applyCacheControlToSystem(systemPrompts []anthropic.TextBlockParam) []anthropic.TextBlockParam {
+	if len(systemPrompts) == 0 {
+		return systemPrompts
+	}
+
+	// Add cache control to the last system block to create a cache breakpoint
+	// This tells Anthropic to cache everything up to and including this block
+	lastIdx := len(systemPrompts) - 1
+	systemPrompts[lastIdx].CacheControl = anthropic.NewCacheControlEphemeralParam()
+
+	return systemPrompts
+}
+
+// applyCacheControlToTools adds cache control to tool definitions.
+// According to Anthropic's docs, we should add cache_control to the last
+// tool to create a cache breakpoint for all tool definitions.
+// This is particularly useful when you have many tools with large schemas.
+func (m *Model) applyCacheControlToTools(tools []anthropic.ToolUnionParam) []anthropic.ToolUnionParam {
+	if len(tools) == 0 || !m.cacheTools {
+		return tools
+	}
+
+	// Add cache control to the last tool to create a cache breakpoint
+	// This caches all tool definitions up to and including this one
+	lastIdx := len(tools) - 1
+	if tools[lastIdx].OfTool != nil {
+		tools[lastIdx].OfTool.CacheControl = anthropic.NewCacheControlEphemeralParam()
+	}
+
+	return tools
 }
 
 // handleNonStreamingResponse sends a non-streaming request to the Anthropic API and emits exactly one final response.
@@ -325,6 +555,11 @@ func (m *Model) handleNonStreamingResponse(
 			PromptTokens:     int(message.Usage.InputTokens),
 			CompletionTokens: int(message.Usage.OutputTokens),
 			TotalTokens:      int(message.Usage.InputTokens + message.Usage.OutputTokens),
+			PromptTokensDetails: model.PromptTokensDetails{
+				CachedTokens:        int(message.Usage.CacheReadInputTokens),
+				CacheCreationTokens: int(message.Usage.CacheCreationInputTokens),
+				CacheReadTokens:     int(message.Usage.CacheReadInputTokens),
+			},
 		}
 	}
 	// Emit final response.
@@ -490,6 +725,11 @@ func buildStreamingFinalResponse(acc anthropic.Message) *model.Response {
 			PromptTokens:     int(acc.Usage.InputTokens),
 			CompletionTokens: int(acc.Usage.OutputTokens),
 			TotalTokens:      int(acc.Usage.InputTokens + acc.Usage.OutputTokens),
+			PromptTokensDetails: model.PromptTokensDetails{
+				CachedTokens:        int(acc.Usage.CacheReadInputTokens),
+				CacheCreationTokens: int(acc.Usage.CacheCreationInputTokens),
+				CacheReadTokens:     int(acc.Usage.CacheReadInputTokens),
+			},
 		},
 		Timestamp: now,
 		Done:      true,
@@ -548,8 +788,17 @@ func convertContentBlock(contents []anthropic.ContentBlockUnion) model.Message {
 
 // convertTools maps our tool declarations to Anthropic tool parameters.
 func convertTools(tools map[string]tool.Tool) []anthropic.ToolUnionParam {
+	// Extract and sort tool names for stable ordering to improve cache hit rate
+	toolNames := make([]string, 0, len(tools))
+	for name := range tools {
+		toolNames = append(toolNames, name)
+	}
+	sort.Strings(toolNames)
+
+	// Build tools in sorted order
 	var result []anthropic.ToolUnionParam
-	for _, tool := range tools {
+	for _, name := range toolNames {
+		tool := tools[name]
 		declaration := tool.Declaration()
 		result = append(result, anthropic.ToolUnionParam{
 			OfTool: &anthropic.ToolParam{

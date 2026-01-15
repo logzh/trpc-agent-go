@@ -10,15 +10,28 @@
 package evalset
 
 import (
-	"google.golang.org/genai"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/epochtime"
+	"trpc.group/trpc-go/trpc-agent-go/model"
+)
+
+// EvalMode determines how an eval case conversation should be interpreted during evaluation.
+type EvalMode string
+
+const (
+	// EvalModeDefault indicates the eval case uses the default evaluation mode.
+	EvalModeDefault EvalMode = ""
+	// EvalModeTrace indicates the eval case conversation already contains the actual trace output.
+	EvalModeTrace EvalMode = "trace"
 )
 
 // EvalCase represents a single evaluation case.
-// It mirrors the schema used by ADK Web, with field names in camel to align with the JSON format.
 type EvalCase struct {
 	// EvalID uniquely identifies this evaluation case.
 	EvalID string `json:"evalId,omitempty"`
+	// EvalMode controls how the eval case conversation is interpreted.
+	EvalMode EvalMode `json:"evalMode,omitempty"`
+	// ContextMessages contains per-case context messages injected into each inference run.
+	ContextMessages []*model.Message `json:"contextMessages,omitempty"`
 	// Conversation contains the sequence of invocations.
 	Conversation []*Invocation `json:"conversation,omitempty"`
 	// SessionInput contains initialization data for the session.
@@ -28,35 +41,30 @@ type EvalCase struct {
 }
 
 // Invocation represents a single invocation in a conversation.
-// It mirrors the schema used by ADK Web, with field names in camel to align with the JSON format.
 type Invocation struct {
 	// InvocationID uniquely identifies this invocation.
 	InvocationID string `json:"invocationId,omitempty"`
 	// UserContent represents the user's input.
-	UserContent *genai.Content `json:"userContent,omitempty"`
+	UserContent *model.Message `json:"userContent,omitempty"`
 	// FinalResponse represents the agent's final response.
-	FinalResponse *genai.Content `json:"finalResponse,omitempty"`
-	// IntermediateData contains intermediate steps during execution.
-	IntermediateData *IntermediateData `json:"intermediateData,omitempty"`
+	FinalResponse *model.Message `json:"finalResponse,omitempty"`
+	// Tools represents the tool calls and responses.
+	Tools []*Tool `json:"tools,omitempty"`
+	// IntermediateResponses contains intermediate responses during execution.
+	IntermediateResponses []*model.Message `json:"intermediateResponses,omitempty"`
 	// CreationTimestamp when this invocation was created.
 	CreationTimestamp *epochtime.EpochTime `json:"creationTimestamp,omitempty"`
 }
 
-// IntermediateData contains intermediate execution data.
-// It mirrors the schema used by ADK Web, with field names in camel to align with the JSON format.
-type IntermediateData struct {
-	// ToolUses represents tool calls made during execution.
-	ToolUses []*genai.FunctionCall `json:"toolUses,omitempty"`
-	// ToolResponses represents tool responses made during execution.
-	ToolResponses []*genai.FunctionResponse `json:"toolResponses,omitempty"`
-	// IntermediateResponses represents intermediate responses, including text responses and tool responses.
-	// For each intermediate response, the first element is the author string,
-	// and the second element is the genai.Part slice.
-	IntermediateResponses [][]any `json:"intermediateResponses,omitempty"`
+// Tool represents a single tool invocation and its execution result.
+type Tool struct {
+	ID        string `json:"id,omitempty"`        // Tool call ID.
+	Name      string `json:"name,omitempty"`      // Tool name.
+	Arguments any    `json:"arguments,omitempty"` // Tool call parameters.
+	Result    any    `json:"result,omitempty"`    // Tool execution result.
 }
 
 // SessionInput represents values that help initialize a session.
-// It mirrors the schema used by ADK Web, with field names in camel to align with the JSON format.
 type SessionInput struct {
 	// AppName identifies the app.
 	AppName string `json:"appName,omitempty"`

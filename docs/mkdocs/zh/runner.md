@@ -2,7 +2,7 @@
 
 ## 概述
 
-Runner 提供了运行 Agent 的接口，负责会话管理和事件流处理。Runner 的核心职责是：获取或创建会话、生成 Invocation ID、调用 Agent.Run 方法、处理返回的事件流并将非 partial 响应事件追加到会话中。
+Runner 提供了运行 Agent 的接口，负责会话管理和事件流处理。Runner 的核心职责是：获取或创建会话、生成 Invocation ID、通过 `agent.RunWithPlugins` 调用 Agent、处理返回的事件流并将非 partial 响应事件追加到会话中。
 
 ### 🎯 核心特性
 
@@ -11,6 +11,7 @@ Runner 提供了运行 Agent 的接口，负责会话管理和事件流处理。
 - **🆔 ID 生成**：自动生成 Invocation ID 和事件 ID
 - **📊 可观测集成**：集成 telemetry/trace，自动记录 span
 - **✅ 完成事件**：在 Agent 事件流结束后生成 runner-completion 事件
+- **🔌 插件**：在 Runner 上注册一次，全局作用于该 Runner 管理的 Agent、Tool 和模型调用。
 
 ## 架构设计
 
@@ -19,7 +20,7 @@ Runner 提供了运行 Agent 的接口，负责会话管理和事件流处理。
 │       Runner        │  - 会话管理
 └─────────┬───────────┘  - 事件流处理
           │
-          │ r.agent.Run(ctx, invocation)
+          │ agent.RunWithPlugins(ctx, invocation, r.agent)
           │
 ┌─────────▼───────────┐
 │       Agent         │  - 接收 Invocation
@@ -153,12 +154,92 @@ r := runner.NewRunner("my-app", agent,
 )
 ```
 
+### 🔌 插件
+
+Runner 插件是一类全局、Runner 作用域的 Hook（钩子）。只需要在创建 Runner 时
+注册一次，后续该 Runner 执行的所有 Agent、Tool 和模型调用都会自动生效。
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/plugin"
+
+r := runner.NewRunner("my-app", a,
+    runner.WithPlugins(
+        plugin.NewLogging(),
+        plugin.NewGlobalInstruction("You must follow security policies."),
+    ),
+)
+defer r.Close()
+```
+
+说明：
+
+- 插件名在同一个 Runner 内必须唯一。
+- 插件按注册顺序执行。
+- 如果插件实现了 `plugin.Closer`，Runner 会在 `Close()` 时调用它。
+
 ### 运行对话
 
 ```go
 // 执行单次对话
 eventChan, err := r.Run(ctx, userID, sessionID, message, options...)
 ```
+
+#### RequestID（request identifier，请求标识）与运行控制
+
+每次调用 `Runner.Run` 都是一轮 **run**。如果你需要取消某次 run，或者查询它的
+运行状态，就需要一个 request identifier（requestID，请求标识）。
+
+推荐由调用方自己生成 requestID，并通过 `agent.WithRequestID` 传入（比如用
+Universally Unique Identifier（UUID，通用唯一标识）生成一个唯一字符串）。
+Runner 会把它保存到 `RunOptions.RequestID`，并注入到每个事件 `event.Event` 的
+`event.RequestID` 字段里。
+
+```go
+requestID := "req-123"
+
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    message,
+    agent.WithRequestID(requestID),
+)
+if err != nil {
+    panic(err)
+}
+
+managed := r.(runner.ManagedRunner)
+status, ok := managed.RunStatus(requestID)
+_ = status
+_ = ok
+
+// 用 requestID 取消本次 run。
+managed.Cancel(requestID)
+```
+
+#### DetachedCancel（忽略父 ctx cancel）
+
+在 Go 里，`context.Context`（通常命名为 `ctx`）同时承载“取消信号”和“截止时间”。
+默认情况下，父 `ctx` 被取消（cancel）时，Runner 会停止这次 run。
+
+如果你希望父 `ctx` 的 cancel 不影响 run，但仍然要用超时来限制总运行时长，可以：
+
+```go
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    message,
+    agent.WithRequestID(requestID),
+    agent.WithDetachedCancel(true),
+    agent.WithMaxRunDuration(30*time.Second),
+)
+```
+
+Runner 会取以下两者中较早的时间作为真正的超时上限：
+
+- 父 `ctx` 的 deadline（如果存在）
+- `MaxRunDuration`（如果设置了）
 
 #### 中断恢复（工具优先继续执行）
 
@@ -265,6 +346,97 @@ for e := range eventChan {
 
 这样应用层可以始终“看最后一条事件”来判断流程结束并读取最终结果，避免因为提前退出而错过 `output` 等后续节点。
 
+#### 🔁 开关：让 Graph 的 LLM 节点输出最终响应事件
+
+在 GraphAgent 里，一次 `Run` 可能会在多个节点里多次调用 LLM。当开启流式输出时，
+一次模型调用通常会产生一串事件：
+
+- 分片（`partial`）事件：`IsPartial=true`、`Done=false`，增量文本在
+  `choice.Delta.Content`
+- 最终（`final`）事件：`IsPartial=false`、`Done=true`，完整文本在
+  `choice.Message.Content`
+
+默认情况下，Graph 的 LLM 节点只输出分片事件，不输出最终 `Done=true` 的 assistant 消息
+事件。这样可以避免“中间节点的输出”被当作普通助手回复（例如被 Runner 写进会话，或被
+上层用户界面直接展示）。
+
+如果你希望 Graph 的 LLM 节点也输出最终 `Done=true` 的 assistant 消息事件，可以开启这个
+RunOption：
+
+```go
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    message,
+    agent.WithGraphEmitFinalModelResponses(true),
+)
+```
+
+行为总结：
+
+先讲清楚一句话：这个开关控制的是“图里每个 LLM 节点是否要额外输出最终 `Done=true`
+的消息事件”，它不等价于“Runner 的完成事件一定会带（或一定不会带）
+`Response.Choices`”。
+
+假设你的图是：`llm1 -> llm2 -> llm3`，最后由 `llm3` 产出最终答案：
+
+- 情况 1：`agent.WithGraphEmitFinalModelResponses(false)`（默认）
+  - `llm1/llm2/llm3`：只输出分片事件（`Done=false`），不输出最终 `Done=true` 的
+    assistant 消息事件。
+  - Runner 完成事件：为了让“只看最后一条事件也能拿到最终答案”，Runner 会把 `llm3`
+    的最终结果回显到完成事件的 `Response.Choices`（前提是图的完成事件里带了
+    `Response.Choices`）。同时，最终文本也始终能从
+    `StateDelta[graph.StateKeyLastResponse]` 读取。
+- 情况 2：`agent.WithGraphEmitFinalModelResponses(true)`
+  - `llm1/llm2/llm3`：除了分片事件外，还会各自输出最终 `Done=true` 的 assistant
+    消息事件（因此中间节点也可能出现完整 assistant 消息，Runner 也可能把这些非分片事件
+    写入会话）。
+  - Runner 完成事件：为了避免和 `llm3` 的最终消息重复展示，Runner 会用响应 ID 做去重；
+    当它确认“最终消息已在前面的事件里出现过”时，就会省略回显，因此完成事件的
+    `Response.Choices` 可能为空，这是预期行为。最终文本仍然以
+    `StateDelta[graph.StateKeyLastResponse]` 为准。
+
+建议：在 GraphAgent 场景里，请始终以 Runner “完成事件”的 `StateDelta` 作为最终输出的
+唯一来源（例如 `graph.StateKeyLastResponse`）。当开启该选项时，请把“完成事件”里的
+`Response.Choices` 当作可选字段，不要作为唯一依赖。
+
+#### 🎛️ 开关：StreamMode
+
+Runner 支持在事件到达业务代码之前先做一次过滤：你可以用一个 RunOption 来选择
+“本次运行”向 `eventChan` 转发哪些类别的事件。
+
+使用 `agent.WithStreamMode(...)`：
+
+```go
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    message,
+    agent.WithStreamMode(agent.StreamModeMessages),
+)
+```
+
+支持的模式（图式工作流）：
+
+- `messages`：模型输出事件（例如 `chat.completion.chunk`）
+- `updates`：`graph.state.update` / `graph.channel.update` / `graph.execution`
+- `checkpoints`：`graph.checkpoint.*`
+- `tasks`：任务生命周期事件（`graph.node.*`、`graph.pregel.*`）
+- `debug`：等价于 `checkpoints` + `tasks`
+- `custom`：节点主动发出的自定义事件（`graph.node.custom`）
+
+注意事项：
+
+- 当选择 `agent.StreamModeMessages` 时，Runner 会为本次运行自动开启 Graph 的最终响应事件
+  输出。若你需要关闭该行为，请在 `agent.WithStreamMode(...)` 之后调用
+  `agent.WithGraphEmitFinalModelResponses(false)` 覆盖。
+- StreamMode 只影响 Runner 向你的 `eventChan` 转发哪些事件；Runner 内部仍会处理并持久化
+  所有事件。
+- 对于图式工作流，部分事件类型（例如 `graph.checkpoint.*`）只会在选择对应模式时才会产生。
+- Runner 总会额外发出一条 `runner.completion` 完成事件。
+
 ## 💾 会话管理
 
 ### 内存会话（默认）
@@ -316,6 +488,36 @@ agent := llmagent.New("assistant",
 // 使用 Runner 执行 Agent
 r := runner.NewRunner("my-app", agent)
 ```
+
+### 在请求级别切换 Agent
+
+Runner 支持在构造时注册多个可选 Agent，并在单次 Run 时切换。
+
+```go
+reader := llmagent.New("agent1", llmagent.WithModel(model))
+writer := llmagent.New("agent2", llmagent.WithModel(model))
+
+r := runner.NewRunner("appName", reader, // 使用 reader agent 作为默认 agent
+    runner.WithAgent("writer", writer),  // 按名称注册可选 Agent
+)
+
+// 使用 reader agent 作为默认 agent
+ch, err := r.Run(ctx, userID, sessionID, msg)
+
+// 通过 Agent Name 指定使用 writer agent
+ch, err := r.Run(ctx, userID, sessionID, msg, agent.WithAgentByName("writer"))
+
+// 直接传入实例，无需预注册。
+custom := llmagent.New("custom", llmagent.WithModel(model))
+ch, err := r.Run(ctx, userID, sessionID, msg, agent.WithAgent(custom))
+```
+
+- `runner.NewRunner("appName", agent)`：在创建 runner 时设置默认 Agent；
+- `runner.WithAgent("agentName", agent)`: 在创建 Runner 时预注册一个 Agent，供后续请求按名称切换；
+- `agent.WithAgentByName("agentName")`: 在单次请求里通过名称选用已注册的 Agent；
+- `agent.WithAgent(agent)`: 在单次请求里直接传入一个 Agent 实例临时覆盖，无需预注册。
+
+Agent 生效优先级：`agent.WithAgent` > `agent.WithAgentByName` > `runner.NewRunner` 设置的默认 Agent。
 
 ### 生成配置
 
@@ -510,13 +712,52 @@ for event := range eventChan {
 }
 ```
 
+### 安全中断执行
+
+- **取消上下文**：用 `context.WithCancel` 包裹 `runner.Run` 的 ctx，
+  当轮次或 token 超限时调用 `cancel()`。`llmflow` 将
+  `context.Canceled` 视为正常退出，会关闭 agent 事件通道，
+  runner 的消费循环也会正常结束，避免阻塞。
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+eventCh, err := r.Run(ctx, userID, sessionID, message)
+if err != nil {
+    return err
+}
+
+turns := 0
+for evt := range eventCh {
+    if evt.Error != nil {
+        log.Printf("事件错误: %s", evt.Error.Message)
+        continue
+    }
+    // ... 处理事件 ...
+    if evt.IsFinalResponse() {
+        break
+    }
+    turns++
+    if turns >= maxTurns {
+        cancel() // 停止后续模型或工具调用
+    }
+}
+```
+
+- **发送停止事件**：在自定义处理器或工具内部返回 `agent.NewStopError("原因")`。`llmflow` 会把它转换为 `stop_agent_error` 事件并停止流程。
+  仍建议配合 ctx cancel 进行硬截止。详见 [回调中的停止用法](https://trpc-group.github.io/trpc-agent-go/zh/callbacks/#stop-agent-via-callbacks)。
+
+- **避免直接 break 事件循环**：直接在 runner 的事件消费循环里 break 会让 agent goroutine 继续运行并可能在写通道时阻塞。
+  优先使用上下文取消或 `StopError`。
+
 ### 资源管理
 
 #### 🔒 关闭 Runner（重要）
 
 **Runner 在不使用时必须调用 `Close()` 方法，否则会导致 goroutine 泄漏（要求 `trpc-agent-go >= v0.5.0`）。**
 
-**Runner 只关闭它自己创建的资源** 
+**Runner 只关闭它自己创建的资源**
 
 当 Runner 创建时如果未提供 Session Service，会自动创建默认的 inmemory Session Service。该 Service 内部会启动后台 goroutines（用于异步处理 summary、基于 TTL 的会话清理等任务）。**Runner 只管理这个自己创建的 inmemory Session Service 的生命周期。** 如果你通过 `WithSessionService()` 提供了自己的 Session Service，你需要自己管理它的生命周期——Runner 不会关闭它。
 
@@ -551,7 +792,7 @@ sessionService := redis.NewService(redis.WithRedisClientURL("redis://localhost:6
 defer sessionService.Close()  // 你负责关闭它
 
 // Runner 使用但不拥有这个 session service
-r := runner.NewRunner("my-app", agent, 
+r := runner.NewRunner("my-app", agent,
 	runner.WithSessionService(sessionService))
 defer r.Close()  // 这不会关闭 sessionService（因为是你提供的） (trpc-agent-go >= v0.5.0)
 
@@ -583,12 +824,12 @@ func (s *Service) Stop() error {
 	if err := s.runner.Close(); err != nil {
 		return err
 	}
-	
+
 	// 如果你提供了自己的 session service，在这里关闭它
 	if s.sessionService != nil {
 		return s.sessionService.Close()
 	}
-	
+
 	return nil
 }
 ```

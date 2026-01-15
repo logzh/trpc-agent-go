@@ -19,7 +19,9 @@ import (
 
 	"github.com/google/uuid"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/internal/session/hook"
 	"trpc.group/trpc-go/trpc-agent-go/session"
+	isummary "trpc.group/trpc-go/trpc-agent-go/session/internal/summary"
 )
 
 // stateWithTTL wraps state data with expiration time.
@@ -87,22 +89,14 @@ func newAppSessions() *appSessions {
 
 // SessionService provides an in-memory implementation of SessionService.
 type SessionService struct {
-	mu              sync.RWMutex
-	apps            map[string]*appSessions
-	opts            serviceOpts
-	cleanupTicker   *time.Ticker
-	cleanupDone     chan struct{}
-	cleanupOnce     sync.Once
-	summaryJobChans []chan *summaryJob // channel for summary jobs to processing
-	summaryWg       sync.WaitGroup     // wait group for summary workers
-	once            sync.Once          // ensure Close is called only once
-}
-
-// summaryJob represents a summary job to be processed asynchronously
-type summaryJob struct {
-	filterKey string
-	force     bool
-	session   *session.Session
+	mu            sync.RWMutex
+	apps          map[string]*appSessions
+	opts          serviceOpts
+	cleanupTicker *time.Ticker
+	cleanupDone   chan struct{}
+	cleanupOnce   sync.Once
+	asyncWorker   *isummary.AsyncSummaryWorker
+	once          sync.Once // ensure Close is called only once
 }
 
 // NewSessionService creates a new in-memory session service.
@@ -130,8 +124,17 @@ func NewSessionService(options ...ServiceOpt) *SessionService {
 		s.startCleanupRoutine()
 	}
 
-	// Always start async summary workers by default
-	s.startAsyncSummaryWorker()
+	// Start async summary workers if summarizer is configured
+	if opts.summarizer != nil && opts.asyncSummaryNum > 0 {
+		s.asyncWorker = isummary.NewAsyncSummaryWorker(isummary.AsyncSummaryConfig{
+			Summarizer:        opts.summarizer,
+			AsyncSummaryNum:   opts.asyncSummaryNum,
+			SummaryQueueSize:  opts.summaryQueueSize,
+			SummaryJobTimeout: opts.summaryJobTimeout,
+			CreateSummaryFunc: s.CreateSessionSummary,
+		})
+		s.asyncWorker.Start()
+	}
 
 	return s
 }
@@ -187,7 +190,7 @@ func (s *SessionService) CreateSession(
 
 	// Set initial state if provided
 	for k, v := range state {
-		sess.State[k] = v
+		sess.SetState(k, v)
 	}
 
 	app.mu.Lock()
@@ -232,6 +235,24 @@ func (s *SessionService) GetSession(
 	if err := key.CheckSessionKey(); err != nil {
 		return nil, err
 	}
+
+	opt := &session.Options{}
+	for _, o := range opts {
+		o(opt)
+	}
+
+	hctx := &session.GetSessionContext{
+		Context: ctx,
+		Key:     key,
+		Options: opt,
+	}
+	final := func(c *session.GetSessionContext, next func() (*session.Session, error)) (*session.Session, error) {
+		return s.getSession(c.Context, c.Key, c.Options)
+	}
+	return hook.RunGetSessionHooks(s.opts.getSessionHooks, hctx, final)
+}
+
+func (s *SessionService) getSession(ctx context.Context, key session.Key, opt *session.Options) (*session.Session, error) {
 	app, ok := s.getAppSessions(key.AppName)
 	if !ok {
 		return nil, nil
@@ -259,7 +280,10 @@ func (s *SessionService) GetSession(
 	copiedSess := sess.Clone()
 
 	// apply filtering options if provided
-	copiedSess.ApplyEventFiltering(opts...)
+	copiedSess.ApplyEventFiltering(
+		session.WithEventNum(opt.EventNum),
+		session.WithEventTime(opt.EventTime),
+	)
 
 	appState := getValidState(app.appState)
 	userState := getValidState(app.userState[key.UserID])
@@ -507,9 +531,7 @@ func (s *SessionService) UpdateSessionState(ctx context.Context, key session.Key
 
 	// Update session state (allow temp: prefix and unprefixed keys)
 	for k, v := range state {
-		copiedValue := make([]byte, len(v))
-		copy(copiedValue, v)
-		sessWithTTL.session.State[k] = copiedValue
+		sessWithTTL.session.SetState(k, v)
 	}
 
 	// Update timestamp
@@ -588,10 +610,9 @@ func (s *SessionService) ListUserStates(ctx context.Context, userKey session.Use
 func (s *SessionService) AppendEvent(
 	ctx context.Context,
 	sess *session.Session,
-	event *event.Event,
+	evt *event.Event,
 	opts ...session.Option,
 ) error {
-	sess.UpdateUserSession(event, opts...)
 	key := session.Key{
 		AppName:   sess.AppName,
 		UserID:    sess.UserID,
@@ -600,6 +621,27 @@ func (s *SessionService) AppendEvent(
 	if err := key.CheckSessionKey(); err != nil {
 		return err
 	}
+
+	hctx := &session.AppendEventContext{
+		Context: ctx,
+		Session: sess,
+		Event:   evt,
+		Key:     key,
+	}
+	final := func(c *session.AppendEventContext, next func() error) error {
+		return s.appendEvent(c.Context, c.Session, c.Event, c.Key, opts...)
+	}
+	return hook.RunAppendEventHooks(s.opts.appendEventHooks, hctx, final)
+}
+
+func (s *SessionService) appendEvent(
+	ctx context.Context,
+	sess *session.Session,
+	evt *event.Event,
+	key session.Key,
+	opts ...session.Option,
+) error {
+	sess.UpdateUserSession(evt, opts...)
 
 	app, ok := s.getAppSessions(key.AppName)
 	if !ok {
@@ -627,7 +669,7 @@ func (s *SessionService) AppendEvent(
 	}
 
 	// update stored session with the given event
-	s.updateStoredSession(storedSession, event)
+	s.updateStoredSession(storedSession, evt)
 
 	// Update the session in the wrapper and refresh TTL.
 	storedSessionWithTTL.session = storedSession
@@ -757,7 +799,9 @@ func (s *SessionService) stopCleanupRoutine() {
 func (s *SessionService) Close() error {
 	s.once.Do(func() {
 		s.stopCleanupRoutine()
-		s.stopAsyncSummaryWorker()
+		if s.asyncWorker != nil {
+			s.asyncWorker.Stop()
+		}
 	})
 	return nil
 }
@@ -781,10 +825,10 @@ func (s *SessionService) updateStoredSession(sess *session.Session, e *event.Eve
 // mergeState merges app-level and user-level state into the session state.
 func mergeState(appState, userState session.StateMap, sess *session.Session) *session.Session {
 	for k, v := range appState {
-		sess.State[session.StateAppPrefix+k] = v
+		sess.SetState(session.StateAppPrefix+k, v)
 	}
 	for k, v := range userState {
-		sess.State[session.StateUserPrefix+k] = v
+		sess.SetState(session.StateUserPrefix+k, v)
 	}
 	return sess
 }

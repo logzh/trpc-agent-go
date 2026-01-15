@@ -94,7 +94,10 @@ type Response struct {
     // 时间戳
     Timestamp time.Time `json:"timestamp"`
     
-    // 表示整个对话是否完成
+    // 表示当前响应流是否结束。
+    //
+    // 注意：Done=true 不一定代表整个流程已结束。
+    // 对于图式流程，请以 Runner 完成事件作为结束信号。
     Done bool `json:"done"`
     
     // 是否为部分响应
@@ -231,6 +234,15 @@ const (
  - 按标签（Tag）过滤：隐藏 `Event.Tag` 中包含 `transfer` 的事件。框架会为与委托相关的事件（包括 transfer 工具结果）统一打上 `transfer` 标签，按标签过滤不会破坏 ToolCall/ToolResult 的配对关系。
 
  标签以分号（`;`）分隔。自定义事件可使用 `event.WithTag(tag)` 追加标签，多标签格式为 `tag1;tag2;...`。
+
+### 代码执行事件标签
+
+对于代码执行（Code Execution）相关的事件，可通过 `Event.Tag` 区分代码和执行结果：
+
+- **代码执行事件**：`Response.Object == "postprocessing.code_execution"` 且 `Event.ContainsTag(event.TagCodeExecution)`
+- **执行结果事件**：`Response.Object == "postprocessing.code_execution"` 且 `Event.ContainsTag(event.TagCodeExecutionResult)`
+
+相关常量定义在 `trpc.group/trpc-go/trpc-agent-go/event` 包中。
 
 #### 辅助方法：检测 Runner 完成
 

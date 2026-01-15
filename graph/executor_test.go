@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/internal/state/barrier"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 	"trpc.group/trpc-go/trpc-agent-go/tool/function"
@@ -256,6 +258,38 @@ func TestHandleInterrupt_EmitsEvent_WithCanceledContext(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatalf("expected interrupt event emission")
 	}
+}
+
+func TestExecutor_EvaluateRetryDecision_SetsTaskIDOnInterrupt(t *testing.T) {
+	t.Parallel()
+
+	const (
+		nodeID  = "node_1"
+		prompt  = "ask"
+		stepNum = 7
+	)
+
+	exec := &Executor{}
+	task := &Task{NodeID: nodeID}
+	intr := NewInterruptError(prompt)
+	retryCtx := &retryContext{err: intr}
+
+	shouldRetry, err := exec.evaluateRetryDecision(
+		context.Background(),
+		nil,
+		nil,
+		task,
+		stepNum,
+		nil,
+		retryCtx,
+	)
+
+	require.False(t, shouldRetry)
+	require.Same(t, intr, err)
+	require.Equal(t, nodeID, intr.NodeID)
+	require.Equal(t, nodeID, intr.TaskID)
+	require.Equal(t, stepNum, intr.Step)
+	require.Equal(t, prompt, intr.Value)
 }
 
 // Cover empty WithDefaultRetryPolicy branch ensuring no defaults are set.
@@ -1142,6 +1176,150 @@ func TestAfterCallbackOverride(t *testing.T) {
 	require.Equal(t, "override", rv)
 }
 
+func TestBeforeCallbackError_BarrierWaitsForCompletion(t *testing.T) {
+	var nodeRuns int32
+	var onErrCalls int32
+
+	g := NewStateGraph(NewStateSchema())
+	g.AddNode("N", func(ctx context.Context, s State) (any, error) {
+		atomic.AddInt32(&nodeRuns, 1)
+		return State{"ok": true}, nil
+	})
+	g.SetEntryPoint("N")
+	g.SetFinishPoint("N")
+
+	cbs := NewNodeCallbacks().
+		RegisterBeforeNode(func(ctx context.Context, cb *NodeCallbackContext, st State) (any, error) {
+			return nil, fmt.Errorf("before callback failed")
+		}).
+		RegisterOnNodeError(func(ctx context.Context, cb *NodeCallbackContext, st State, err error) {
+			atomic.AddInt32(&onErrCalls, 1)
+		})
+	g.WithNodeCallbacks(cbs)
+
+	compiled, err := g.Compile()
+	require.NoError(t, err)
+	exec, err := NewExecutor(compiled)
+	require.NoError(t, err)
+
+	inv := agent.NewInvocation(agent.WithInvocationID("inv-before-callback-barrier"))
+	barrier.Enable(inv)
+
+	ch, err := exec.Execute(context.Background(), State{}, inv)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	var sawNodeError bool
+	var sawNodeBarrier bool
+	for {
+		select {
+		case evt, ok := <-ch:
+			if !ok {
+				require.True(t, sawNodeError, "expected a node error event")
+				require.True(t, sawNodeBarrier, "expected a node barrier event")
+				require.Equal(t, int32(0), atomic.LoadInt32(&nodeRuns), "node should not run when before callback fails")
+				require.Equal(t, int32(1), atomic.LoadInt32(&onErrCalls), "on-node-error callback should run once")
+				return
+			}
+			require.NotNil(t, evt)
+			if evt.Object == model.ObjectTypeError && evt.Response != nil && evt.Response.Error != nil {
+				sawNodeError = true
+			}
+			if evt.Object != ObjectTypeGraphNodeBarrier {
+				continue
+			}
+			sawNodeBarrier = true
+			require.True(t, evt.RequiresCompletion)
+			select {
+			case nextEvt, stillOpen := <-ch:
+				if stillOpen {
+					require.FailNow(t, "unexpected event before barrier completion", "event: %+v", nextEvt)
+				}
+				require.FailNow(t, "unexpected channel close before barrier completion")
+			case <-time.After(100 * time.Millisecond):
+			}
+			completionID := agent.GetAppendEventNoticeKey(evt.ID)
+			require.NoError(t, inv.NotifyCompletion(context.Background(), completionID))
+		case <-ctx.Done():
+			require.NoError(t, ctx.Err(), "timed out waiting for graph events")
+		}
+	}
+}
+
+func TestAfterCallbackError_BarrierWaitsForCompletion(t *testing.T) {
+	var nodeRuns int32
+	var onErrCalls int32
+
+	g := NewStateGraph(NewStateSchema())
+	g.AddNode("N", func(ctx context.Context, s State) (any, error) {
+		atomic.AddInt32(&nodeRuns, 1)
+		return State{"ok": true}, nil
+	})
+	g.SetEntryPoint("N")
+	g.SetFinishPoint("N")
+
+	cbs := NewNodeCallbacks().
+		RegisterAfterNode(func(ctx context.Context, cb *NodeCallbackContext, st State, result any, nodeErr error) (any, error) {
+			return nil, fmt.Errorf("after callback failed")
+		}).
+		RegisterOnNodeError(func(ctx context.Context, cb *NodeCallbackContext, st State, err error) {
+			atomic.AddInt32(&onErrCalls, 1)
+		})
+	g.WithNodeCallbacks(cbs)
+
+	compiled, err := g.Compile()
+	require.NoError(t, err)
+	exec, err := NewExecutor(compiled)
+	require.NoError(t, err)
+
+	inv := agent.NewInvocation(agent.WithInvocationID("inv-after-callback-barrier"))
+	barrier.Enable(inv)
+
+	ch, err := exec.Execute(context.Background(), State{}, inv)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	var sawNodeError bool
+	var sawNodeBarrier bool
+	for {
+		select {
+		case evt, ok := <-ch:
+			if !ok {
+				require.True(t, sawNodeError, "expected a node error event")
+				require.True(t, sawNodeBarrier, "expected a node barrier event")
+				require.Equal(t, int32(1), atomic.LoadInt32(&nodeRuns), "node should run once before after callback fails")
+				require.Equal(t, int32(1), atomic.LoadInt32(&onErrCalls), "on-node-error callback should run once")
+				return
+			}
+			require.NotNil(t, evt)
+			if evt.Object == model.ObjectTypeError && evt.Response != nil && evt.Response.Error != nil {
+				sawNodeError = true
+			}
+			if evt.Object != ObjectTypeGraphNodeBarrier {
+				continue
+			}
+			sawNodeBarrier = true
+			require.True(t, evt.RequiresCompletion)
+			select {
+			case nextEvt, stillOpen := <-ch:
+				if stillOpen {
+					require.FailNow(t, "unexpected event before barrier completion", "event: %+v", nextEvt)
+				}
+				require.FailNow(t, "unexpected channel close before barrier completion")
+			case <-time.After(100 * time.Millisecond):
+			}
+			completionID := agent.GetAppendEventNoticeKey(evt.ID)
+			require.NoError(t, inv.NotifyCompletion(context.Background(), completionID))
+		case <-ctx.Done():
+			require.NoError(t, ctx.Err(), "timed out waiting for graph events")
+		}
+	}
+}
+
 // TestNilResultStillTriggersStaticEdges verifies that a node returning nil
 // still triggers its outgoing static edges, so downstream nodes run.
 func TestNilResultStillTriggersStaticEdges(t *testing.T) {
@@ -1946,14 +2124,25 @@ func TestProcessConditionalEdges_DedupMulti(t *testing.T) {
 
 	exec, err := NewExecutor(g)
 	require.NoError(t, err)
-	execCtx := &ExecutionContext{Graph: g, State: State{}, EventChan: make(chan *event.Event, 16)}
+	// Build a full execution context so that conditional edges create
+	// per-run channels on the ExecutionContext instead of mutating the
+	// shared Graph definition.
+	execCtx := exec.buildExecutionContext(
+		make(chan *event.Event, 16),
+		"inv-cond-dedup",
+		State{},
+		false,
+		nil,
+	)
 
 	// Process and verify only one update per target channel.
 	require.NoError(t, exec.processConditionalEdges(context.Background(), nil, execCtx, "start", 0))
-	chB, _ := g.getChannel("branch:to:B")
-	chC, _ := g.getChannel("branch:to:C")
-	require.NotNil(t, chB)
-	require.NotNil(t, chC)
+	// The dynamic branch channels should exist only on the per-execution
+	// channel manager and each receive a single update.
+	chB, okB := execCtx.channels.GetChannel(ChannelBranchPrefix + "B")
+	chC, okC := execCtx.channels.GetChannel(ChannelBranchPrefix + "C")
+	require.True(t, okB)
+	require.True(t, okC)
 	require.Equal(t, int64(1), chB.Version)
 	require.Equal(t, int64(1), chC.Version)
 }
@@ -2075,29 +2264,29 @@ func TestProcessConditionalEdges_Multi_SkipEmpty(t *testing.T) {
 	exec, err := NewExecutor(g)
 	require.NoError(t, err)
 
-	execCtx := &ExecutionContext{
-		Graph:        g,
-		State:        State{},
-		EventChan:    make(chan *event.Event, 8),
-		InvocationID: "inv-multi-skip",
-	}
+	execCtx := exec.buildExecutionContext(
+		make(chan *event.Event, 8),
+		"inv-multi-skip",
+		State{},
+		false,
+		nil,
+	)
 
 	require.NoError(t, exec.processConditionalEdges(
 		context.Background(), nil, execCtx, nodeStart, 0,
 	))
 
 	// Expect channels only for B and C, one update each.
-	chB, okB := g.getChannel(ChannelBranchPrefix + nodeB)
-	chC, okC := g.getChannel(ChannelBranchPrefix + nodeC)
+	chB, okB := execCtx.channels.GetChannel(ChannelBranchPrefix + nodeB)
+	chC, okC := execCtx.channels.GetChannel(ChannelBranchPrefix + nodeC)
 	require.True(t, okB)
 	require.True(t, okC)
 	require.Equal(t, int64(1), chB.Version)
 	require.Equal(t, int64(1), chC.Version)
 
 	// No channel should be created for empty branch key.
-	if _, ok := g.getChannel(ChannelBranchPrefix + ""); !ok {
-		t.Fatalf("expected channel for empty branch key created")
-	}
+	_, okEmpty := execCtx.channels.GetChannel(ChannelBranchPrefix + "")
+	require.False(t, okEmpty, "expected no channel for empty branch key")
 }
 
 // minimalNoopNode returns a trivial node function for building test graphs.
@@ -2373,4 +2562,79 @@ func TestDisableDeepCopy(t *testing.T) {
 	require.Equal(t, "content", deepCopyPointer.Content)
 
 	require.NoError(t, err)
+}
+
+func TestExecutor_JoinEdge_WaitsForAll(t *testing.T) {
+	const orderKey = "order"
+
+	schema := NewStateSchema().AddField(orderKey, StateField{
+		Type:    reflect.TypeOf([]string{}),
+		Reducer: StringSliceReducer,
+		Default: func() any { return []string{} },
+	})
+
+	sg := NewStateGraph(schema)
+	sg.AddNode("start", func(ctx context.Context, state State) (any, error) {
+		return State{orderKey: []string{"start"}}, nil
+	})
+	sg.AddNode("b", func(ctx context.Context, state State) (any, error) {
+		return State{orderKey: []string{"b"}}, nil
+	})
+	sg.AddNode("c", func(ctx context.Context, state State) (any, error) {
+		return State{orderKey: []string{"c"}}, nil
+	})
+	sg.AddNode("join", func(ctx context.Context, state State) (any, error) {
+		return State{orderKey: []string{"join"}}, nil
+	})
+
+	g, err := sg.
+		SetEntryPoint("start").
+		AddEdge("start", "b").
+		AddEdge("start", "c").
+		AddJoinEdge([]string{"b", "c"}, "join").
+		SetFinishPoint("join").
+		Compile()
+	require.NoError(t, err)
+
+	exec, err := NewExecutor(g)
+	require.NoError(t, err)
+
+	inv := &agent.Invocation{InvocationID: "inv-join-edge"}
+	ch, err := exec.Execute(context.Background(), State{}, inv)
+	require.NoError(t, err)
+
+	var doneEvent *event.Event
+	for evt := range ch {
+		if evt.Done {
+			doneEvent = evt
+			break
+		}
+	}
+	require.NotNil(t, doneEvent)
+	require.NotNil(t, doneEvent.StateDelta)
+
+	raw, ok := doneEvent.StateDelta[orderKey]
+	require.True(t, ok)
+
+	var order []string
+	require.NoError(t, json.Unmarshal(raw, &order))
+	require.GreaterOrEqual(t, len(order), 4)
+
+	indexOf := func(target string) int {
+		for i, name := range order {
+			if name == target {
+				return i
+			}
+		}
+		return -1
+	}
+
+	iStart := indexOf("start")
+	iB := indexOf("b")
+	iC := indexOf("c")
+	iJoin := indexOf("join")
+
+	require.Equal(t, 0, iStart)
+	require.Greater(t, iJoin, iB)
+	require.Greater(t, iJoin, iC)
 }

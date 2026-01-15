@@ -21,8 +21,8 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
-	"sync"
 	"time"
 
 	openai "github.com/openai/openai-go"
@@ -64,6 +64,27 @@ const (
 	VariantQwen Variant = "qwen"
 )
 
+// thinkingValueConvertor converts ThinkingEnabled bool to the variant-specific value.
+type thinkingValueConvertor func(enabled bool) any
+
+// defaultThinkingValueConvertor returns the bool value as-is.
+var defaultThinkingValueConvertor = func(enabled bool) any {
+	return enabled
+}
+
+// deepSeekThinkingValueConvertor converts to DeepSeek 3.2 format: {"type": "enabled"/"disabled"}.
+var deepSeekThinkingValueConvertor = func(enabled bool) any {
+	const (
+		thinkingTypeEnabled  = "enabled"
+		thinkingTypeDisabled = "disabled"
+	)
+	thinkingType := thinkingTypeDisabled
+	if enabled {
+		thinkingType = thinkingTypeEnabled
+	}
+	return map[string]string{"type": thinkingType}
+}
+
 // variantConfig holds configuration for different variants.
 type variantConfig struct {
 	// Default file upload path for this variant.
@@ -84,6 +105,8 @@ type variantConfig struct {
 	apiKeyName string
 	// Thinking key for this variant.
 	thinkingEnabledKey string
+	// thinkingValueConvertor converts ThinkingEnabled to variant-specific format.
+	thinkingValueConvertor thinkingValueConvertor
 }
 type fileDeletionBodyConvertor func(body []byte, fileID string) []byte
 
@@ -103,6 +126,7 @@ var variantConfigs = map[Variant]variantConfig{
 		skipFileTypeInContent:     false,
 		fileDeletionBodyConvertor: defaultFileDeletionBodyConvertor,
 		thinkingEnabledKey:        model.ThinkingEnabledKey,
+		thinkingValueConvertor:    defaultThinkingValueConvertor,
 	},
 	VariantDeepSeek: {
 		fileUploadPath:            "/openapi/v1/files",
@@ -112,7 +136,9 @@ var variantConfigs = map[Variant]variantConfig{
 		fileDeletionBodyConvertor: defaultFileDeletionBodyConvertor,
 		apiKeyName:                deepSeekAPIKeyName,
 		defaultBaseURL:            defaultDeepSeekBaseURL,
-		thinkingEnabledKey:        model.ThinkingEnabledKey,
+		// DeepSeek 3.2 uses {"thinking": {"type": "enabled"}} format.
+		thinkingEnabledKey:     "thinking",
+		thinkingValueConvertor: deepSeekThinkingValueConvertor,
 	},
 	VariantHunyuan: {
 		fileUploadPath:        "/openapi/v1/files/uploads",
@@ -160,7 +186,8 @@ var variantConfigs = map[Variant]variantConfig{
 			r.ContentLength = int64(body.Len())
 			return r, nil
 		},
-		thinkingEnabledKey: model.ThinkingEnabledKey,
+		thinkingEnabledKey:     model.ThinkingEnabledKey,
+		thinkingValueConvertor: defaultThinkingValueConvertor,
 	},
 	VariantQwen: {
 		fileUploadPath:            "/openapi/v1/files",
@@ -171,7 +198,8 @@ var variantConfigs = map[Variant]variantConfig{
 		apiKeyName:                qwenAPIKeyName,
 		defaultBaseURL:            defaultQwenBaseURL,
 		// refer:https://help.aliyun.com/zh/model-studio/deep-thinking
-		thinkingEnabledKey: model.EnabledThinkingKey,
+		thinkingEnabledKey:     model.EnabledThinkingKey,
+		thinkingValueConvertor: defaultThinkingValueConvertor,
 	},
 }
 
@@ -195,9 +223,7 @@ type Model struct {
 	batchBaseURL               string
 	enableTokenTailoring       bool                    // Enable automatic token tailoring.
 	maxInputTokens             int                     // Max input tokens for token tailoring.
-	tokenCounterOnce           sync.Once               // sync.Once for lazy initialization of tokenCounter.
 	tokenCounter               model.TokenCounter      // Token counter for token tailoring.
-	tailoringStrategyOnce      sync.Once               // sync.Once for lazy initialization of tailoringStrategy.
 	tailoringStrategy          model.TailoringStrategy // Tailoring strategy for token tailoring.
 	// Token tailoring budget parameters (instance-level overrides).
 	protocolOverheadTokens int
@@ -208,6 +234,7 @@ type Model struct {
 	maxInputTokensRatio    float64
 
 	accumulateChunkUsage AccumulateChunkUsage
+	optimizeForCache     bool // Optimize message structure for prompt caching
 }
 
 // New creates a new OpenAI-like model.
@@ -242,15 +269,8 @@ func New(name string, opts ...Option) *Model {
 
 	client := openai.NewClient(clientOpts...)
 
-	// Provide defaults at construction time when token tailoring is enabled.
-	// These are best-effort defaults; user-provided counter/strategy always take priority.
-	if o.MaxInputTokens > 0 {
-		if o.TokenCounter == nil {
-			o.TokenCounter = model.NewSimpleTokenCounter()
-		}
-		if o.TailoringStrategy == nil {
-			o.TailoringStrategy = model.NewMiddleOutStrategy(o.TokenCounter)
-		}
+	if o.TailoringStrategy == nil {
+		o.TailoringStrategy = model.NewMiddleOutStrategy(o.TokenCounter)
 	}
 
 	return &Model{
@@ -281,6 +301,7 @@ func New(name string, opts ...Option) *Model {
 		safetyMarginRatio:          o.TokenTailoringConfig.SafetyMarginRatio,
 		maxInputTokensRatio:        o.TokenTailoringConfig.MaxInputTokensRatio,
 		accumulateChunkUsage:       o.accumulateChunkUsage,
+		optimizeForCache:           o.OptimizeForCache,
 	}
 }
 
@@ -298,6 +319,11 @@ func (m *Model) GenerateContent(
 ) (<-chan *model.Response, error) {
 	if request == nil {
 		return nil, errors.New("request cannot be nil")
+	}
+
+	// Optimize message structure for cache if enabled
+	if m.optimizeForCache {
+		request.Messages = m.optimizeMessagesForCache(request.Messages)
 	}
 
 	// Apply token tailoring if configured.
@@ -322,6 +348,32 @@ func (m *Model) GenerateContent(
 	}()
 
 	return responseChan, nil
+}
+
+// optimizeMessagesForCache reorders messages to improve cache hit rates.
+// System messages are moved to the front as they are most likely to be cached.
+func (m *Model) optimizeMessagesForCache(messages []model.Message) []model.Message {
+	if len(messages) == 0 {
+		return messages
+	}
+
+	var systemMsgs, otherMsgs []model.Message
+
+	for _, msg := range messages {
+		if msg.Role == model.RoleSystem {
+			systemMsgs = append(systemMsgs, msg)
+		} else {
+			otherMsgs = append(otherMsgs, msg)
+		}
+	}
+
+	// If no reordering needed, return original
+	if len(systemMsgs) == 0 {
+		return messages
+	}
+
+	// System messages first, then other messages
+	return append(systemMsgs, otherMsgs...)
 }
 
 // applyTokenTailoring performs best-effort token tailoring if configured.
@@ -351,45 +403,37 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 			// Use default parameters.
 			maxInputTokens = imodel.CalculateMaxInputTokens(contextWindow)
 		}
-		log.Debugf("auto-calculated max input tokens: model=%s, contextWindow=%d, maxInputTokens=%d",
-			m.name, contextWindow, maxInputTokens)
-	}
-
-	// Determine token counter using priority: user config > default.
-	tokenCounter := m.tokenCounter
-	if tokenCounter == nil {
-		m.tokenCounterOnce.Do(func() {
-			if m.tokenCounter == nil {
-				m.tokenCounter = model.NewSimpleTokenCounter()
-			}
-		})
-		tokenCounter = m.tokenCounter
-	}
-
-	// Determine tailoring strategy using priority: user config > default.
-	tailoringStrategy := m.tailoringStrategy
-	if tailoringStrategy == nil {
-		m.tailoringStrategyOnce.Do(func() {
-			if m.tailoringStrategy == nil {
-				m.tailoringStrategy = model.NewMiddleOutStrategy(tokenCounter)
-			}
-		})
-		tailoringStrategy = m.tailoringStrategy
+		log.DebugfContext(
+			ctx,
+			"auto-calculated max input tokens: model=%s, "+
+				"contextWindow=%d, maxInputTokens=%d",
+			m.name,
+			contextWindow,
+			maxInputTokens,
+		)
 	}
 
 	// Apply token tailoring.
-	tailored, err := tailoringStrategy.TailorMessages(ctx, request.Messages, maxInputTokens)
+	tailored, err := m.tailoringStrategy.TailorMessages(ctx, request.Messages, maxInputTokens)
 	if err != nil {
-		log.Warn("token tailoring failed in openai.Model", err)
+		log.WarnContext(
+			ctx,
+			"token tailoring failed in openai.Model",
+			err,
+		)
 		return
 	}
 
 	request.Messages = tailored
 
 	// Calculate remaining tokens for output based on context window.
-	usedTokens, err := tokenCounter.CountTokensRange(ctx, request.Messages, 0, len(request.Messages))
+	usedTokens, err := m.tokenCounter.CountTokensRange(ctx, request.Messages, 0, len(request.Messages))
 	if err != nil {
-		log.Warn("failed to count tokens after tailoring", err)
+		log.WarnContext(
+			ctx,
+			"failed to count tokens after tailoring",
+			err,
+		)
 		return
 	}
 
@@ -413,8 +457,14 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 		}
 		if maxOutputTokens > 0 {
 			request.GenerationConfig.MaxTokens = &maxOutputTokens
-			log.Debugf("token tailoring: contextWindow=%d, usedTokens=%d, maxOutputTokens=%d",
-				contextWindow, usedTokens, maxOutputTokens)
+			log.DebugfContext(
+				ctx,
+				"token tailoring: contextWindow=%d, usedTokens=%d, "+
+					"maxOutputTokens=%d",
+				contextWindow,
+				usedTokens,
+				maxOutputTokens,
+			)
 		}
 	}
 }
@@ -485,7 +535,7 @@ func (m *Model) buildChatRequest(request *model.Request) (openai.ChatCompletionN
 	return chatRequest, opts
 }
 
-// buildThinkingOption converts our Request to OpenAI request RequestOption
+// buildThinkingOption converts our Request to OpenAI request RequestOption.
 func (m *Model) buildThinkingOption(request *model.Request) []openaiopt.RequestOption {
 	var opts []openaiopt.RequestOption
 	if request.ThinkingTokens != nil {
@@ -494,13 +544,17 @@ func (m *Model) buildThinkingOption(request *model.Request) []openaiopt.RequestO
 	if request.ThinkingEnabled == nil {
 		return opts
 	}
-	// Set default API key and base URL if not specified.
-	cfg, ok := variantConfigs[m.variant]
-	if !ok || cfg.thinkingEnabledKey == "" {
-		opts = append(opts, openaiopt.WithJSONSet(model.ThinkingEnabledKey, *request.ThinkingEnabled))
-		return opts
+	// Use variant-specific key and value convertor.
+	cfg := m.variantConfig
+	key := cfg.thinkingEnabledKey
+	if key == "" {
+		key = model.ThinkingEnabledKey
 	}
-	opts = append(opts, openaiopt.WithJSONSet(cfg.thinkingEnabledKey, *request.ThinkingEnabled))
+	convertor := cfg.thinkingValueConvertor
+	if convertor == nil {
+		convertor = defaultThinkingValueConvertor
+	}
+	opts = append(opts, openaiopt.WithJSONSet(key, convertor(*request.ThinkingEnabled)))
 	return opts
 }
 
@@ -529,11 +583,19 @@ func (m *Model) convertMessages(messages []model.Message) []openai.ChatCompletio
 				},
 			}
 		case model.RoleAssistant:
+			assistantMsg := &openai.ChatCompletionAssistantMessageParam{
+				Content:   m.convertAssistantMessageContent(msg),
+				ToolCalls: m.convertToolCalls(msg.ToolCalls),
+			}
+			// Pass reasoning_content to API if present (required by DeepSeek for
+			// tool call scenarios within the same request turn).
+			if msg.ReasoningContent != "" {
+				assistantMsg.SetExtraFields(map[string]any{
+					model.ReasoningContentKey: msg.ReasoningContent,
+				})
+			}
 			result[i] = openai.ChatCompletionMessageParamUnion{
-				OfAssistant: &openai.ChatCompletionAssistantMessageParam{
-					Content:   m.convertAssistantMessageContent(msg),
-					ToolCalls: m.convertToolCalls(msg.ToolCalls),
-				},
+				OfAssistant: assistantMsg,
 			}
 		case model.RoleTool:
 			result[i] = openai.ChatCompletionMessageParamUnion{
@@ -735,20 +797,34 @@ func audioToBase64(audio *model.Audio) string {
 func (m *Model) convertToolCalls(toolCalls []model.ToolCall) []openai.ChatCompletionMessageToolCallParam {
 	var result []openai.ChatCompletionMessageToolCallParam
 	for _, toolCall := range toolCalls {
-		result = append(result, openai.ChatCompletionMessageToolCallParam{
+		param := openai.ChatCompletionMessageToolCallParam{
 			ID: toolCall.ID,
 			Function: openai.ChatCompletionMessageToolCallFunctionParam{
 				Name:      toolCall.Function.Name,
 				Arguments: string(toolCall.Function.Arguments),
 			},
-		})
+		}
+		// Pass through ExtraFields transparently (e.g., Gemini 3's thought_signature).
+		if len(toolCall.ExtraFields) > 0 {
+			param.SetExtraFields(toolCall.ExtraFields)
+		}
+		result = append(result, param)
 	}
 	return result
 }
 
 func (m *Model) convertTools(tools map[string]tool.Tool) []openai.ChatCompletionToolParam {
+	// Extract and sort tool names for stable ordering to improve cache hit rate
+	toolNames := make([]string, 0, len(tools))
+	for name := range tools {
+		toolNames = append(toolNames, name)
+	}
+	sort.Strings(toolNames)
+
+	// Build tools in sorted order
 	var result []openai.ChatCompletionToolParam
-	for _, tool := range tools {
+	for _, name := range toolNames {
+		tool := tools[name]
 		declaration := tool.Declaration()
 		// Convert the InputSchema to JSON to correctly map to OpenAI's expected format
 		schemaBytes, err := json.Marshal(declaration.InputSchema)
@@ -802,8 +878,12 @@ func (m *Model) handleStreamingResponse(
 	acc := openai.ChatCompletionAccumulator{}
 	// Track ID -> Index mapping.
 	idToIndexMap := make(map[string]int)
+	// Track ExtraFields by tool call ID (SDK accumulator doesn't preserve ExtraFields).
+	extraFieldsMap := make(map[string]map[string]any)
 	// Aggregate reasoning deltas for final message fallback (some providers don't retain it in accumulator).
 	var reasoningBuf bytes.Buffer
+	// Track next available index for tool calls (for providers that don't set correct indices).
+	nextToolCallIndex := 0
 
 	for stream.Next() {
 		chunk := stream.Current()
@@ -813,33 +893,19 @@ func (m *Model) handleStreamingResponse(
 			continue
 		}
 
+		// Fix tool call indices for providers that return all indices as 0.
+		// This must be done before updateToolCallIndexMapping and accumulation.
+		chunk = fixToolCallIndices(chunk, idToIndexMap, &nextToolCallIndex)
+
+		// Collect ExtraFields from chunk tool_calls (SDK accumulator doesn't preserve ExtraFields).
+		m.collectExtraFieldsFromChunk(chunk, extraFieldsMap)
+
 		// Track ID -> Index mapping when ID is present (first chunk of each tool call).
 		m.updateToolCallIndexMapping(chunk, idToIndexMap)
 
-		// Always accumulate for correctness (tool call deltas are assembled later),
+		// Accumulate chunk for correctness (tool call deltas are assembled later),
 		// but skip chunks with reasoning content that would cause the SDK accumulator to panic.
-		if !m.hasReasoningContent(chunk.Choices) {
-			// Sanitize chunks before feeding them into the upstream accumulator to
-			// avoid known panics when JSON.ToolCalls is marked present but the
-			// typed ToolCalls slice is empty, especially on finish_reason chunks.
-			sanitizedChunk := sanitizeChunkForAccumulator(chunk)
-
-			acc.AddChunk(sanitizedChunk)
-			if m.accumulateChunkUsage != nil {
-				accUsage, chunkUsage := completionUsageToModelUsage(acc.Usage), completionUsageToModelUsage(chunk.Usage)
-				usage := inverseOPENAISKDAddChunkUsage(accUsage, chunkUsage)
-				usage = m.accumulateChunkUsage(usage, chunkUsage)
-				acc.Usage = modelUsageToCompletionUsage(usage)
-
-			}
-		}
-
-		// Aggregate reasoning delta (if any) for final response fallback.
-		if len(chunk.Choices) > 0 {
-			if reasoningContent := extractReasoningContent(chunk.Choices[0].Delta.JSON.ExtraFields); reasoningContent != "" {
-				reasoningBuf.WriteString(reasoningContent)
-			}
-		}
+		m.accumulateChunk(chunk, &acc, &reasoningBuf)
 
 		// Suppress chunks that carry no meaningful visible delta (including
 		// tool_call deltas, which we'll surface only in the final response).
@@ -854,26 +920,16 @@ func (m *Model) handleStreamingResponse(
 			m.chatChunkCallback(ctx, &chatRequest, &chunk)
 		}
 
-		response := m.createPartialResponse(chunk)
-
-		select {
-		case responseChan <- response:
-		case <-ctx.Done():
+		if err := m.sendPartialResponse(ctx, chunk, responseChan); err != nil {
 			return
 		}
 	}
 
 	// Send final response with usage information if available.
-	m.sendFinalResponse(ctx, stream, acc, idToIndexMap, reasoningBuf.String(), responseChan)
+	m.sendFinalResponse(ctx, stream, acc, idToIndexMap, extraFieldsMap, reasoningBuf.String(), responseChan)
 
-	// Call the stream complete callback after final response is sent
-	if m.chatStreamCompleteCallback != nil {
-		var callbackAcc *openai.ChatCompletionAccumulator
-		if stream.Err() == nil {
-			callbackAcc = &acc
-		}
-		m.chatStreamCompleteCallback(ctx, &chatRequest, callbackAcc, stream.Err())
-	}
+	// Call the stream complete callback after final response is sent.
+	m.handleStreamCompleteCallback(ctx, chatRequest, acc, stream.Err())
 }
 
 // sanitizeChunkForAccumulator returns a defensive copy of the given chunk that
@@ -914,6 +970,94 @@ func sanitizeChunkForAccumulator(chunk openai.ChatCompletionChunk) openai.ChatCo
 	return sanitized
 }
 
+// fixToolCallIndices fixes tool call indices for providers that return all
+// indices as 0 when making parallel tool calls. The OpenAI SDK accumulator
+// uses the index field to distinguish different tool calls, so if all tool
+// calls have index 0, their names and arguments get concatenated together.
+//
+// This function detects new tool calls by their ID and assigns them correct
+// sequential indices. It modifies the chunk in place and returns it.
+func fixToolCallIndices(
+	chunk openai.ChatCompletionChunk,
+	idToIndexMap map[string]int,
+	nextIndex *int,
+) openai.ChatCompletionChunk {
+	if len(chunk.Choices) == 0 {
+		return chunk
+	}
+
+	delta := chunk.Choices[0].Delta
+	if len(delta.ToolCalls) == 0 {
+		return chunk
+	}
+
+	// Check if we need to fix indices. We need to create a copy of the chunk
+	// to avoid modifying the original.
+	needsFix := false
+	for _, tc := range delta.ToolCalls {
+		// If this tool call has an ID we haven't seen before, and its index
+		// is 0, it might need fixing.
+		if tc.ID != "" {
+			if _, exists := idToIndexMap[tc.ID]; !exists {
+				// New tool call ID. Check if index is 0 and we already have
+				// other tool calls (which would indicate incorrect indices).
+				if tc.Index == 0 && *nextIndex > 0 {
+					needsFix = true
+					break
+				}
+			}
+		}
+	}
+
+	if !needsFix {
+		// Update nextIndex based on the indices we see.
+		for _, tc := range delta.ToolCalls {
+			if tc.ID != "" {
+				if _, exists := idToIndexMap[tc.ID]; !exists {
+					// First time seeing this ID, record its index.
+					idToIndexMap[tc.ID] = int(tc.Index)
+					if int(tc.Index) >= *nextIndex {
+						*nextIndex = int(tc.Index) + 1
+					}
+				}
+			}
+		}
+		return chunk
+	}
+
+	// Create a deep copy of the chunk to modify tool call indices.
+	fixedChunk := chunk
+	fixedChunk.Choices = make([]openai.ChatCompletionChunkChoice, len(chunk.Choices))
+	copy(fixedChunk.Choices, chunk.Choices)
+
+	// Deep copy the tool calls slice.
+	fixedChunk.Choices[0].Delta.ToolCalls = make(
+		[]openai.ChatCompletionChunkChoiceDeltaToolCall,
+		len(delta.ToolCalls),
+	)
+	copy(fixedChunk.Choices[0].Delta.ToolCalls, delta.ToolCalls)
+
+	// Fix indices for tool calls.
+	for i := range fixedChunk.Choices[0].Delta.ToolCalls {
+		tc := &fixedChunk.Choices[0].Delta.ToolCalls[i]
+		if tc.ID == "" {
+			// No ID means this is a continuation chunk, keep original index.
+			continue
+		}
+		if existingIndex, exists := idToIndexMap[tc.ID]; exists {
+			// Use the existing index for this ID.
+			tc.Index = int64(existingIndex)
+		} else {
+			// New tool call ID with index 0, assign next available index.
+			tc.Index = int64(*nextIndex)
+			idToIndexMap[tc.ID] = *nextIndex
+			*nextIndex++
+		}
+	}
+
+	return fixedChunk
+}
+
 // updateToolCallIndexMapping updates the tool call index mapping.
 func (m *Model) updateToolCallIndexMapping(chunk openai.ChatCompletionChunk, idToIndexMap map[string]int) {
 	if len(chunk.Choices) > 0 && len(chunk.Choices[0].Delta.ToolCalls) > 0 {
@@ -923,6 +1067,93 @@ func (m *Model) updateToolCallIndexMapping(chunk openai.ChatCompletionChunk, idT
 			idToIndexMap[toolCall.ID] = index
 		}
 	}
+}
+
+// collectExtraFieldsFromChunk collects ExtraFields from chunk tool_calls.
+func (m *Model) collectExtraFieldsFromChunk(
+	chunk openai.ChatCompletionChunk,
+	extraFieldsMap map[string]map[string]any,
+) {
+	if len(chunk.Choices) == 0 || len(chunk.Choices[0].Delta.ToolCalls) == 0 {
+		return
+	}
+	for _, tc := range chunk.Choices[0].Delta.ToolCalls {
+		extraFields := convertExtraFields(tc.JSON.ExtraFields)
+		if len(extraFields) == 0 {
+			continue
+		}
+		// Use ID if available, otherwise use index as key.
+		key := tc.ID
+		if key == "" && tc.Index != 0 {
+			key = fmt.Sprintf("index_%d", tc.Index)
+		}
+		if key != "" {
+			extraFieldsMap[key] = extraFields
+		}
+	}
+}
+
+// accumulateChunk accumulates the chunk into the accumulator and reasoning buffer.
+func (m *Model) accumulateChunk(
+	chunk openai.ChatCompletionChunk,
+	acc *openai.ChatCompletionAccumulator,
+	reasoningBuf *bytes.Buffer,
+) {
+	// Always accumulate for correctness (tool call deltas are assembled later),
+	// but skip chunks with reasoning content that would cause the SDK accumulator to panic.
+	if !m.hasReasoningContent(chunk.Choices) {
+		// Sanitize chunks before feeding them into the upstream accumulator to
+		// avoid known panics when JSON.ToolCalls is marked present but the
+		// typed ToolCalls slice is empty, especially on finish_reason chunks.
+		sanitizedChunk := sanitizeChunkForAccumulator(chunk)
+		acc.AddChunk(sanitizedChunk)
+		if m.accumulateChunkUsage != nil {
+			accUsage, chunkUsage := completionUsageToModelUsage(acc.Usage), completionUsageToModelUsage(chunk.Usage)
+			usage := inverseOpenAISDKAddChunkUsage(accUsage, chunkUsage)
+			usage = m.accumulateChunkUsage(usage, chunkUsage)
+			acc.Usage = modelUsageToCompletionUsage(usage)
+		}
+	}
+
+	// Aggregate reasoning delta (if any) for final response fallback.
+	if len(chunk.Choices) > 0 {
+		reasoningContent := extractReasoningContent(chunk.Choices[0].Delta.JSON.ExtraFields)
+		if reasoningContent != "" {
+			reasoningBuf.WriteString(reasoningContent)
+		}
+	}
+}
+
+// sendPartialResponse creates and sends a partial response from a chunk.
+func (m *Model) sendPartialResponse(
+	ctx context.Context,
+	chunk openai.ChatCompletionChunk,
+	responseChan chan<- *model.Response,
+) error {
+	response := m.createPartialResponse(chunk)
+	select {
+	case responseChan <- response:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// handleStreamCompleteCallback handles the stream complete callback.
+func (m *Model) handleStreamCompleteCallback(
+	ctx context.Context,
+	chatRequest openai.ChatCompletionNewParams,
+	acc openai.ChatCompletionAccumulator,
+	streamErr error,
+) {
+	if m.chatStreamCompleteCallback == nil {
+		return
+	}
+	var callbackAcc *openai.ChatCompletionAccumulator
+	if streamErr == nil {
+		callbackAcc = &acc
+	}
+	m.chatStreamCompleteCallback(ctx, &chatRequest, callbackAcc, streamErr)
 }
 
 // shouldSuppressChunk returns true when the chunk contains no meaningful delta
@@ -1037,6 +1268,28 @@ func extractReasoningContent(extraFields map[string]respjson.Field) string {
 	return ""
 }
 
+// convertExtraFields converts SDK's respjson.Field map to a generic map[string]any.
+// This preserves all extra fields from the API response (e.g., Gemini 3's thought_signature)
+// for transparent passthrough to subsequent requests.
+func convertExtraFields(extraFields map[string]respjson.Field) map[string]any {
+	if len(extraFields) == 0 {
+		return nil
+	}
+
+	result := make(map[string]any, len(extraFields))
+	for key, field := range extraFields {
+		var value any
+		if err := json.Unmarshal([]byte(field.Raw()), &value); err == nil {
+			result[key] = value
+		}
+	}
+
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
 // createPartialResponse creates a partial response from a chunk.
 func (m *Model) createPartialResponse(chunk openai.ChatCompletionChunk) *model.Response {
 	response := &model.Response{
@@ -1110,6 +1363,7 @@ func (m *Model) sendFinalResponse(
 	stream *ssestream.Stream[openai.ChatCompletionChunk],
 	acc openai.ChatCompletionAccumulator,
 	idToIndexMap map[string]int,
+	extraFieldsMap map[string]map[string]any,
 	aggregatedReasoning string,
 	responseChan chan<- *model.Response,
 ) {
@@ -1120,7 +1374,7 @@ func (m *Model) sendFinalResponse(
 
 		if len(acc.Choices) > 0 && len(acc.Choices[0].Message.ToolCalls) > 0 {
 			hasToolCall = true
-			accumulatedToolCalls = m.processAccumulatedToolCalls(acc, idToIndexMap)
+			accumulatedToolCalls = m.processAccumulatedToolCalls(acc, idToIndexMap, extraFieldsMap)
 		}
 
 		// If accumulator is empty but we have aggregated reasoning, create a response with it.
@@ -1178,6 +1432,7 @@ func (m *Model) sendFinalResponse(
 func (m *Model) processAccumulatedToolCalls(
 	acc openai.ChatCompletionAccumulator,
 	idToIndexMap map[string]int,
+	extraFieldsMap map[string]map[string]any,
 ) []model.ToolCall {
 	accumulatedToolCalls := make([]model.ToolCall, 0, len(acc.Choices[0].Message.ToolCalls))
 
@@ -1203,10 +1458,19 @@ func (m *Model) processAccumulatedToolCalls(
 			synthesizedID = fmt.Sprintf("auto_call_%d", originalIndex)
 		}
 
+		// Look up ExtraFields by ID first, then by index.
+		var extraFields map[string]any
+		if ef, ok := extraFieldsMap[toolCall.ID]; ok {
+			extraFields = ef
+		} else if ef, ok := extraFieldsMap[fmt.Sprintf("index_%d", originalIndex)]; ok {
+			extraFields = ef
+		}
+
 		accumulatedToolCalls = append(accumulatedToolCalls, model.ToolCall{
-			Index: func() *int { idx := originalIndex; return &idx }(),
-			ID:    synthesizedID,
-			Type:  functionToolType, // OpenAI supports function tools for now.
+			Index:       func() *int { idx := originalIndex; return &idx }(),
+			ID:          synthesizedID,
+			Type:        functionToolType, // OpenAI supports function tools for now.
+			ExtraFields: extraFields,
 			Function: model.FunctionDefinitionParam{
 				Name:      toolCall.Function.Name,
 				Arguments: []byte(toolCall.Function.Arguments),
@@ -1334,8 +1598,9 @@ func (m *Model) handleNonStreamingResponse(
 					synthesizedID = fmt.Sprintf("auto_call_%d", j)
 				}
 				response.Choices[i].Message.ToolCalls[j] = model.ToolCall{
-					ID:   synthesizedID,
-					Type: string(toolCall.Type),
+					ID:          synthesizedID,
+					Type:        string(toolCall.Type),
+					ExtraFields: convertExtraFields(toolCall.JSON.ExtraFields),
 					Function: model.FunctionDefinitionParam{
 						Name:      toolCall.Function.Name,
 						Arguments: []byte(toolCall.Function.Arguments),

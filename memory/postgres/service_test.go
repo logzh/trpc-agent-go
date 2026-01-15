@@ -22,46 +22,13 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"trpc.group/trpc-go/trpc-agent-go/memory"
+	"trpc.group/trpc-go/trpc-agent-go/memory/extractor"
+	imemory "trpc.group/trpc-go/trpc-agent-go/memory/internal/memory"
+	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/session"
 	storage "trpc.group/trpc-go/trpc-agent-go/storage/postgres"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
-
-func TestGenerateMemoryID(t *testing.T) {
-	tests := []struct {
-		name   string
-		memory *memory.Memory
-	}{
-		{
-			name: "memory with content only",
-			memory: &memory.Memory{
-				Memory: "test content",
-			},
-		},
-		{
-			name: "memory with content and topics",
-			memory: &memory.Memory{
-				Memory: "test content",
-				Topics: []string{"topic1", "topic2"},
-			},
-		},
-		{
-			name: "memory with empty topics",
-			memory: &memory.Memory{
-				Memory: "test content",
-				Topics: []string{},
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			id := generateMemoryID(tt.memory)
-			assert.NotEmpty(t, id, "Generated memory ID should not be empty")
-			// The ID is a hex encoding, so it should be even length.
-			assert.Equal(t, 0, len(id)%2, "Generated memory ID should have even length")
-		})
-	}
-}
 
 func TestServiceOpts_Defaults(t *testing.T) {
 	opts := ServiceOpts{}
@@ -167,6 +134,30 @@ func TestServiceOpts_WithSchema_Invalid(t *testing.T) {
 
 	opts := ServiceOpts{}
 	WithSchema("invalid-schema-name")(&opts)
+}
+
+func TestServiceOpts_WithPostgresClientDSN(t *testing.T) {
+	tests := []struct {
+		name string
+		dsn  string
+	}{
+		{
+			name: "URL format",
+			dsn:  "postgres://user:password@localhost:5432/mydb?sslmode=disable",
+		},
+		{
+			name: "Key-Value format",
+			dsn:  "host=localhost port=5432 user=postgres password=secret dbname=mydb sslmode=disable",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := ServiceOpts{}
+			WithPostgresClientDSN(tt.dsn)(&opts)
+			assert.Equal(t, tt.dsn, opts.dsn)
+		})
+	}
 }
 
 func TestServiceOpts_WithPostgresInstance(t *testing.T) {
@@ -798,10 +789,10 @@ func (c *testClient) Close() error {
 func setupMockService(t *testing.T, db *sql.DB, mock sqlmock.Sqlmock, opts ...ServiceOpt) *Service {
 	originalBuilder := storage.GetClientBuilder()
 
-	// Create a test client that wraps sql.DB
+	// Create a test client that wraps sql.DB.
 	client := &testClient{db: db}
 
-	// Set up builder to return our test client
+	// Set up builder to return our test client.
 	storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
 		return client, nil
 	})
@@ -809,36 +800,75 @@ func setupMockService(t *testing.T, db *sql.DB, mock sqlmock.Sqlmock, opts ...Se
 		storage.SetClientBuilder(originalBuilder)
 	})
 
-	// Check if skipDBInit is set in opts
-	skipDBInit := false
+	// Determine schema and table name from opts.
+	testOpts := defaultOptions.clone()
 	for _, opt := range opts {
-		testOpts := &ServiceOpts{}
-		opt(testOpts)
-		if testOpts.skipDBInit {
-			skipDBInit = true
-			break
-		}
+		opt(&testOpts)
 	}
+	skipDBInit := testOpts.skipDBInit
+	schema := testOpts.schema
+	if schema == "" {
+		schema = "public"
+	}
+	tableName := testOpts.tableName
 
 	if !skipDBInit {
-		// Mock table creation
+		// Mock DDL privilege check.
+		mock.ExpectQuery(`SELECT has_schema_privilege\(\$1, 'CREATE'\)`).
+			WithArgs(schema).
+			WillReturnRows(sqlmock.NewRows([]string{"has_schema_privilege"}).AddRow(true))
+
+		// Mock table creation.
 		mock.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
-		// Mock index creation (3 indexes)
+		// Mock index creation (3 indexes).
 		mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+
+		// Mock schema verification queries - use actual schema and table name.
+		// Mock table exists query.
+		mock.ExpectQuery(`SELECT EXISTS \(
+			SELECT FROM information_schema.tables
+			WHERE table_schema = \$1
+			AND table_name = \$2
+		\)`).WithArgs(schema, tableName).WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+		// Mock columns query - match expected schema.
+		mock.ExpectQuery(`SELECT column_name, data_type, is_nullable
+			FROM information_schema.columns
+			WHERE table_schema = \$1
+			AND table_name = \$2
+			ORDER BY ordinal_position`).WithArgs(schema, tableName).WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable"}).
+			AddRow("memory_id", "text", "NO").
+			AddRow("app_name", "text", "NO").
+			AddRow("user_id", "text", "NO").
+			AddRow("memory_data", "jsonb", "NO").
+			AddRow("created_at", "timestamp without time zone", "NO").
+			AddRow("updated_at", "timestamp without time zone", "NO").
+			AddRow("deleted_at", "timestamp without time zone", "YES"))
+
+		// Mock indexes query - match expected indexes with actual table name and column info.
+		mock.ExpectQuery(`SELECT
+			i\.indexname,
+			a\.attname AS column_name,
+			a\.attnum AS ordinal_position
+		FROM pg_indexes i
+		JOIN pg_class c ON c\.relname = i\.indexname
+		JOIN pg_index ix ON ix\.indexrelid = c\.oid
+		JOIN pg_attribute a ON a\.attrelid = ix\.indrelid
+			AND a\.attnum = ANY\(ix\.indkey\)
+		WHERE i\.schemaname = \$1
+			AND i\.tablename = \$2
+		ORDER BY i\.indexname, a\.attnum`).WithArgs(schema, tableName).WillReturnRows(
+			sqlmock.NewRows([]string{"indexname", "column_name", "ordinal_position"}).
+				AddRow("idx_"+tableName+"_app_user", "app_name", 1).
+				AddRow("idx_"+tableName+"_app_user", "user_id", 2).
+				AddRow("idx_"+tableName+"_deleted_at", "deleted_at", 1).
+				AddRow("idx_"+tableName+"_updated_at", "updated_at", 1))
 	}
 
-	// Ensure host is set if not already set
-	hasHost := false
-	for _, opt := range opts {
-		testOpts := &ServiceOpts{}
-		opt(testOpts)
-		if testOpts.host != "" {
-			hasHost = true
-			break
-		}
-	}
+	// Ensure host is set if not already set.
+	hasHost := testOpts.host != ""
 	if !hasHost {
 		opts = append(opts, WithHost("localhost"))
 	}
@@ -892,11 +922,57 @@ func TestNewService_WithHost(t *testing.T) {
 	})
 	defer storage.SetClientBuilder(originalBuilder)
 
-	// Mock table and index creation
+	// Mock DDL privilege check.
+	mock.ExpectQuery(`SELECT has_schema_privilege\(\$1, 'CREATE'\)`).
+		WithArgs("public").
+		WillReturnRows(sqlmock.NewRows([]string{"has_schema_privilege"}).AddRow(true))
+
+	// Mock table and index creation.
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	// Mock schema verification queries for public schema.
+	// Mock table exists query.
+	mock.ExpectQuery(`SELECT EXISTS \(
+		SELECT FROM information_schema.tables
+		WHERE table_schema = \$1
+		AND table_name = \$2
+	\)`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+	// Mock columns query - match expected schema.
+	mock.ExpectQuery(`SELECT column_name, data_type, is_nullable
+		FROM information_schema.columns
+		WHERE table_schema = \$1
+		AND table_name = \$2
+		ORDER BY ordinal_position`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable"}).
+		AddRow("memory_id", "text", "NO").
+		AddRow("app_name", "text", "NO").
+		AddRow("user_id", "text", "NO").
+		AddRow("memory_data", "jsonb", "NO").
+		AddRow("created_at", "timestamp without time zone", "NO").
+		AddRow("updated_at", "timestamp without time zone", "NO").
+		AddRow("deleted_at", "timestamp without time zone", "YES"))
+
+	// Mock indexes query - match expected indexes with column info.
+	mock.ExpectQuery(`SELECT
+		i\.indexname,
+		a\.attname AS column_name,
+		a\.attnum AS ordinal_position
+	FROM pg_indexes i
+	JOIN pg_class c ON c\.relname = i\.indexname
+	JOIN pg_index ix ON ix\.indexrelid = c\.oid
+	JOIN pg_attribute a ON a\.attrelid = ix\.indrelid
+		AND a\.attnum = ANY\(ix\.indkey\)
+	WHERE i\.schemaname = \$1
+		AND i\.tablename = \$2
+	ORDER BY i\.indexname, a\.attnum`).WithArgs("public", "memories").WillReturnRows(
+		sqlmock.NewRows([]string{"indexname", "column_name", "ordinal_position"}).
+			AddRow("idx_memories_app_user", "app_name", 1).
+			AddRow("idx_memories_app_user", "user_id", 2).
+			AddRow("idx_memories_deleted_at", "deleted_at", 1).
+			AddRow("idx_memories_updated_at", "updated_at", 1))
 
 	service, err := NewService(WithHost("localhost"), WithPort(5432), WithDatabase("testdb"))
 	require.NoError(t, err)
@@ -917,6 +993,11 @@ func TestNewService_InitDBError(t *testing.T) {
 	})
 	defer storage.SetClientBuilder(originalBuilder)
 
+	// Mock DDL privilege check.
+	mock.ExpectQuery(`SELECT has_schema_privilege\(\$1, 'CREATE'\)`).
+		WithArgs("public").
+		WillReturnRows(sqlmock.NewRows([]string{"has_schema_privilege"}).AddRow(true))
+
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnError(fmt.Errorf("table creation failed"))
 
 	_, err := NewService(WithHost("localhost"), WithPort(5432), WithDatabase("testdb"))
@@ -936,6 +1017,40 @@ func TestService_AddMemory_Success(t *testing.T) {
 	mock.ExpectExec("INSERT INTO").WillReturnResult(sqlmock.NewResult(0, 1))
 
 	err := svc.AddMemory(ctx, userKey, "test memory", []string{"topic1"})
+	require.NoError(t, err)
+
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestService_AddMemory_Idempotent(t *testing.T) {
+	db, mock := setupMockDB(t)
+	defer db.Close()
+	svc := setupMockService(t, db, mock, WithMemoryLimit(10))
+	defer svc.Close()
+
+	ctx := context.Background()
+	userKey := memory.UserKey{AppName: "test-app", UserID: "u1"}
+	memoryStr := "test memory"
+	topics := []string{"topic1"}
+
+	// Mock count query for first call.
+	mock.ExpectQuery("SELECT COUNT").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	// Mock insert for first call.
+	mock.ExpectExec("INSERT INTO.*ON CONFLICT").WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Mock count query for second call.
+	mock.ExpectQuery("SELECT COUNT").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	// Mock upsert for second call (should update existing).
+	mock.ExpectExec("INSERT INTO.*ON CONFLICT").WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// First call should succeed.
+	err := svc.AddMemory(ctx, userKey, memoryStr, topics)
+	require.NoError(t, err)
+
+	// Second call with same content should also succeed (idempotent).
+	err = svc.AddMemory(ctx, userKey, memoryStr, topics)
 	require.NoError(t, err)
 
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -1411,10 +1526,56 @@ func TestNewService_ConnectionSettingsPriority(t *testing.T) {
 		storage.WithClientConnString("postgres://localhost:5432/testdb"),
 	)
 
+	// Mock DDL privilege check.
+	mock.ExpectQuery(`SELECT has_schema_privilege\(\$1, 'CREATE'\)`).
+		WithArgs("public").
+		WillReturnRows(sqlmock.NewRows([]string{"has_schema_privilege"}).AddRow(true))
+
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	// Mock schema verification queries for public schema.
+	// Mock table exists query.
+	mock.ExpectQuery(`SELECT EXISTS \(
+		SELECT FROM information_schema.tables
+		WHERE table_schema = \$1
+		AND table_name = \$2
+	\)`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+	// Mock columns query - match expected schema
+	mock.ExpectQuery(`SELECT column_name, data_type, is_nullable
+		FROM information_schema.columns
+		WHERE table_schema = \$1
+		AND table_name = \$2
+		ORDER BY ordinal_position`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable"}).
+		AddRow("memory_id", "text", "NO").
+		AddRow("app_name", "text", "NO").
+		AddRow("user_id", "text", "NO").
+		AddRow("memory_data", "jsonb", "NO").
+		AddRow("created_at", "timestamp without time zone", "NO").
+		AddRow("updated_at", "timestamp without time zone", "NO").
+		AddRow("deleted_at", "timestamp without time zone", "YES"))
+
+	// Mock indexes query - match expected indexes with column info.
+	mock.ExpectQuery(`SELECT
+		i\.indexname,
+		a\.attname AS column_name,
+		a\.attnum AS ordinal_position
+	FROM pg_indexes i
+	JOIN pg_class c ON c\.relname = i\.indexname
+	JOIN pg_index ix ON ix\.indexrelid = c\.oid
+	JOIN pg_attribute a ON a\.attrelid = ix\.indrelid
+		AND a\.attnum = ANY\(ix\.indkey\)
+	WHERE i\.schemaname = \$1
+		AND i\.tablename = \$2
+	ORDER BY i\.indexname, a\.attnum`).WithArgs("public", "memories").WillReturnRows(
+		sqlmock.NewRows([]string{"indexname", "column_name", "ordinal_position"}).
+			AddRow("idx_memories_app_user", "app_name", 1).
+			AddRow("idx_memories_app_user", "user_id", 2).
+			AddRow("idx_memories_deleted_at", "deleted_at", 1).
+			AddRow("idx_memories_updated_at", "updated_at", 1))
 
 	service, err := NewService(
 		WithHost("customhost"),
@@ -1426,6 +1587,86 @@ func TestNewService_ConnectionSettingsPriority(t *testing.T) {
 	assert.NotNil(t, service)
 	assert.Contains(t, receivedConnString, "customhost", "direct connection settings should have priority over instanceName")
 	assert.Contains(t, receivedConnString, "customdb", "direct connection settings should have priority over instanceName")
+
+	require.NoError(t, mock.ExpectationsWereMet())
+	service.Close()
+}
+
+func TestNewService_DSNPriority(t *testing.T) {
+	db, mock := setupMockDB(t)
+	defer db.Close()
+
+	originalBuilder := storage.GetClientBuilder()
+	client := &testClient{db: db}
+	receivedConnString := ""
+	storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+		opts := &storage.ClientBuilderOpts{}
+		for _, opt := range builderOpts {
+			opt(opts)
+		}
+		receivedConnString = opts.ConnString
+		return client, nil
+	})
+	defer storage.SetClientBuilder(originalBuilder)
+
+	// Mock DDL privilege check.
+	mock.ExpectQuery(`SELECT has_schema_privilege\(\$1, 'CREATE'\)`).
+		WithArgs("public").
+		WillReturnRows(sqlmock.NewRows([]string{"has_schema_privilege"}).AddRow(true))
+
+	mock.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	// Mock schema verification queries.
+	mock.ExpectQuery(`SELECT EXISTS \(
+		SELECT FROM information_schema.tables
+		WHERE table_schema = \$1
+		AND table_name = \$2
+	\)`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+	mock.ExpectQuery(`SELECT column_name, data_type, is_nullable
+		FROM information_schema.columns
+		WHERE table_schema = \$1
+		AND table_name = \$2
+		ORDER BY ordinal_position`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable"}).
+		AddRow("memory_id", "text", "NO").
+		AddRow("app_name", "text", "NO").
+		AddRow("user_id", "text", "NO").
+		AddRow("memory_data", "jsonb", "NO").
+		AddRow("created_at", "timestamp without time zone", "NO").
+		AddRow("updated_at", "timestamp without time zone", "NO").
+		AddRow("deleted_at", "timestamp without time zone", "YES"))
+
+	mock.ExpectQuery(`SELECT
+		i\.indexname,
+		a\.attname AS column_name,
+		a\.attnum AS ordinal_position
+	FROM pg_indexes i
+	JOIN pg_class c ON c\.relname = i\.indexname
+	JOIN pg_index ix ON ix\.indexrelid = c\.oid
+	JOIN pg_attribute a ON a\.attrelid = ix\.indrelid
+		AND a\.attnum = ANY\(ix\.indkey\)
+	WHERE i\.schemaname = \$1
+		AND i\.tablename = \$2
+	ORDER BY i\.indexname, a\.attnum`).WithArgs("public", "memories").WillReturnRows(
+		sqlmock.NewRows([]string{"indexname", "column_name", "ordinal_position"}).
+			AddRow("idx_memories_app_user", "app_name", 1).
+			AddRow("idx_memories_app_user", "user_id", 2).
+			AddRow("idx_memories_deleted_at", "deleted_at", 1).
+			AddRow("idx_memories_updated_at", "updated_at", 1))
+
+	dsn := "postgres://dsn-user:password@dsn-host:5432/dsndb?sslmode=disable"
+	service, err := NewService(
+		WithPostgresClientDSN(dsn),
+		WithHost("other-host"),
+		WithPort(5433),
+		WithUser("other-user"),
+	)
+	require.NoError(t, err)
+	assert.NotNil(t, service)
+	assert.Equal(t, dsn, receivedConnString, "DSN should take priority over host settings")
 
 	require.NoError(t, mock.ExpectationsWereMet())
 	service.Close()
@@ -1827,11 +2068,57 @@ func TestNewService_WithSchema(t *testing.T) {
 	})
 	defer storage.SetClientBuilder(originalBuilder)
 
-	// Mock table and index creation with schema
+	// Mock DDL privilege check.
+	mock.ExpectQuery(`SELECT has_schema_privilege\(\$1, 'CREATE'\)`).
+		WithArgs("test_schema").
+		WillReturnRows(sqlmock.NewRows([]string{"has_schema_privilege"}).AddRow(true))
+
+	// Mock table and index creation with schema.
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS.*test_schema.memories").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	// Mock schema verification queries for test_schema.
+	// Mock table exists query.
+	mock.ExpectQuery(`SELECT EXISTS \(
+		SELECT FROM information_schema.tables
+		WHERE table_schema = \$1
+		AND table_name = \$2
+	\)`).WithArgs("test_schema", "memories").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+	// Mock columns query - match expected schema.
+	mock.ExpectQuery(`SELECT column_name, data_type, is_nullable
+		FROM information_schema.columns
+		WHERE table_schema = \$1
+		AND table_name = \$2
+		ORDER BY ordinal_position`).WithArgs("test_schema", "memories").WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable"}).
+		AddRow("memory_id", "text", "NO").
+		AddRow("app_name", "text", "NO").
+		AddRow("user_id", "text", "NO").
+		AddRow("memory_data", "jsonb", "NO").
+		AddRow("created_at", "timestamp without time zone", "NO").
+		AddRow("updated_at", "timestamp without time zone", "NO").
+		AddRow("deleted_at", "timestamp without time zone", "YES"))
+
+	// Mock indexes query - match expected indexes with column info.
+	mock.ExpectQuery(`SELECT
+		i\.indexname,
+		a\.attname AS column_name,
+		a\.attnum AS ordinal_position
+	FROM pg_indexes i
+	JOIN pg_class c ON c\.relname = i\.indexname
+	JOIN pg_index ix ON ix\.indexrelid = c\.oid
+	JOIN pg_attribute a ON a\.attrelid = ix\.indrelid
+		AND a\.attnum = ANY\(ix\.indkey\)
+	WHERE i\.schemaname = \$1
+		AND i\.tablename = \$2
+	ORDER BY i\.indexname, a\.attnum`).WithArgs("test_schema", "memories").WillReturnRows(
+		sqlmock.NewRows([]string{"indexname", "column_name", "ordinal_position"}).
+			AddRow("idx_memories_app_user", "app_name", 1).
+			AddRow("idx_memories_app_user", "user_id", 2).
+			AddRow("idx_memories_deleted_at", "deleted_at", 1).
+			AddRow("idx_memories_updated_at", "updated_at", 1))
 
 	service, err := NewService(
 		WithHost("localhost"),
@@ -1859,9 +2146,14 @@ func TestInitDB_IndexCreationError(t *testing.T) {
 	})
 	defer storage.SetClientBuilder(originalBuilder)
 
-	// Mock table creation success
+	// Mock DDL privilege check.
+	mock.ExpectQuery(`SELECT has_schema_privilege\(\$1, 'CREATE'\)`).
+		WithArgs("public").
+		WillReturnRows(sqlmock.NewRows([]string{"has_schema_privilege"}).AddRow(true))
+
+	// Mock table creation success.
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
-	// Mock first index creation error
+	// Mock first index creation error.
 	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnError(fmt.Errorf("index creation failed"))
 
 	_, err := NewService(
@@ -1887,18 +2179,64 @@ func TestService_WithSchema(t *testing.T) {
 	})
 	defer storage.SetClientBuilder(originalBuilder)
 
-	// Mock table and index creation
+	// Mock DDL privilege check.
+	mock.ExpectQuery(`SELECT has_schema_privilege\(\$1, 'CREATE'\)`).
+		WithArgs("test_schema").
+		WillReturnRows(sqlmock.NewRows([]string{"has_schema_privilege"}).AddRow(true))
+
+	// Mock table and index creation.
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS.*test_schema.memories").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	// Mock schema verification queries for test_schema.
+	// Mock table exists query.
+	mock.ExpectQuery(`SELECT EXISTS \(
+		SELECT FROM information_schema.tables
+		WHERE table_schema = \$1
+		AND table_name = \$2
+	\)`).WithArgs("test_schema", "memories").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+	// Mock columns query - match expected schema.
+	mock.ExpectQuery(`SELECT column_name, data_type, is_nullable
+		FROM information_schema.columns
+		WHERE table_schema = \$1
+		AND table_name = \$2
+		ORDER BY ordinal_position`).WithArgs("test_schema", "memories").WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable"}).
+		AddRow("memory_id", "text", "NO").
+		AddRow("app_name", "text", "NO").
+		AddRow("user_id", "text", "NO").
+		AddRow("memory_data", "jsonb", "NO").
+		AddRow("created_at", "timestamp without time zone", "NO").
+		AddRow("updated_at", "timestamp without time zone", "NO").
+		AddRow("deleted_at", "timestamp without time zone", "YES"))
+
+	// Mock indexes query - match expected indexes with column info.
+	mock.ExpectQuery(`SELECT
+		i\.indexname,
+		a\.attname AS column_name,
+		a\.attnum AS ordinal_position
+	FROM pg_indexes i
+	JOIN pg_class c ON c\.relname = i\.indexname
+	JOIN pg_index ix ON ix\.indexrelid = c\.oid
+	JOIN pg_attribute a ON a\.attrelid = ix\.indrelid
+		AND a\.attnum = ANY\(ix\.indkey\)
+	WHERE i\.schemaname = \$1
+		AND i\.tablename = \$2
+	ORDER BY i\.indexname, a\.attnum`).WithArgs("test_schema", "memories").WillReturnRows(
+		sqlmock.NewRows([]string{"indexname", "column_name", "ordinal_position"}).
+			AddRow("idx_memories_app_user", "app_name", 1).
+			AddRow("idx_memories_app_user", "user_id", 2).
+			AddRow("idx_memories_deleted_at", "deleted_at", 1).
+			AddRow("idx_memories_updated_at", "updated_at", 1))
 
 	service, err := NewService(
 		WithHost("localhost"),
 		WithPort(5432),
 		WithDatabase("testdb"),
 		WithSchema("test_schema"),
-		WithMemoryLimit(0), // Disable memory limit to avoid COUNT query
+		WithMemoryLimit(0), // Disable memory limit to avoid COUNT query.
 	)
 	require.NoError(t, err)
 	defer service.Close()
@@ -1906,7 +2244,7 @@ func TestService_WithSchema(t *testing.T) {
 	ctx := context.Background()
 	userKey := memory.UserKey{AppName: "test-app", UserID: "u1"}
 
-	// Test AddMemory with schema-qualified table name
+	// Test AddMemory with schema-qualified table name.
 	mock.ExpectExec("INSERT INTO.*test_schema.memories").WillReturnResult(sqlmock.NewResult(0, 1))
 
 	err = service.AddMemory(ctx, userKey, "test memory", []string{"topic1"})
@@ -1915,23 +2253,1091 @@ func TestService_WithSchema(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// Test generateMemoryID with different inputs
-func TestGenerateMemoryID_DifferentContent(t *testing.T) {
-	mem1 := &memory.Memory{Memory: "content1"}
-	mem2 := &memory.Memory{Memory: "content2"}
+// Test parseTableName.
+func TestParseTableName(t *testing.T) {
+	tests := []struct {
+		name           string
+		fullTableName  string
+		expectedSchema string
+		expectedTable  string
+	}{
+		{
+			name:           "simple table name",
+			fullTableName:  "memories",
+			expectedSchema: "public",
+			expectedTable:  "memories",
+		},
+		{
+			name:           "schema qualified table name",
+			fullTableName:  "myschema.memories",
+			expectedSchema: "myschema",
+			expectedTable:  "memories",
+		},
+		{
+			name:           "empty string",
+			fullTableName:  "",
+			expectedSchema: "public",
+			expectedTable:  "",
+		},
+	}
 
-	id1 := generateMemoryID(mem1)
-	id2 := generateMemoryID(mem2)
-
-	assert.NotEqual(t, id1, id2, "Different content should generate different IDs")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			schema, table := parseTableName(tt.fullTableName)
+			assert.Equal(t, tt.expectedSchema, schema)
+			assert.Equal(t, tt.expectedTable, table)
+		})
+	}
 }
 
-func TestGenerateMemoryID_DifferentTopics(t *testing.T) {
-	mem1 := &memory.Memory{Memory: "content", Topics: []string{"topic1"}}
-	mem2 := &memory.Memory{Memory: "content", Topics: []string{"topic2"}}
+// Test equalStringSlices helper function.
+func TestEqualStringSlices(t *testing.T) {
+	tests := []struct {
+		name     string
+		a        []string
+		b        []string
+		expected bool
+	}{
+		{
+			name:     "equal slices",
+			a:        []string{"app_name", "user_id"},
+			b:        []string{"app_name", "user_id"},
+			expected: true,
+		},
+		{
+			name:     "different order",
+			a:        []string{"app_name", "user_id"},
+			b:        []string{"user_id", "app_name"},
+			expected: false,
+		},
+		{
+			name:     "different length",
+			a:        []string{"app_name", "user_id"},
+			b:        []string{"app_name"},
+			expected: false,
+		},
+		{
+			name:     "empty slices",
+			a:        []string{},
+			b:        []string{},
+			expected: true,
+		},
+		{
+			name:     "nil vs empty",
+			a:        nil,
+			b:        []string{},
+			expected: true,
+		},
+		{
+			name:     "both nil",
+			a:        nil,
+			b:        nil,
+			expected: true,
+		},
+		{
+			name:     "different values",
+			a:        []string{"app_name", "user_id"},
+			b:        []string{"app_name", "created_at"},
+			expected: false,
+		},
+	}
 
-	id1 := generateMemoryID(mem1)
-	id2 := generateMemoryID(mem2)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := equalStringSlices(tt.a, tt.b)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
 
-	assert.NotEqual(t, id1, id2, "Different topics should generate different IDs")
+func TestSchemaVerificationErrors(t *testing.T) {
+	// Test table does not exist.
+	t.Run("table does not exist", func(t *testing.T) {
+		db, mock := setupMockDB(t)
+		defer db.Close()
+
+		originalBuilder := storage.GetClientBuilder()
+		client := &testClient{db: db}
+		storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+			return client, nil
+		})
+		defer storage.SetClientBuilder(originalBuilder)
+
+		service, err := NewService(WithSkipDBInit(true))
+		require.NoError(t, err)
+
+		// Mock table exists query to return false.
+		mock.ExpectQuery(`SELECT EXISTS \(`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+
+		err = service.verifySchema(context.Background())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "does not exist")
+
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	// Test tableExists query failure.
+	t.Run("tableExists query failure", func(t *testing.T) {
+		db, mock := setupMockDB(t)
+		defer db.Close()
+
+		originalBuilder := storage.GetClientBuilder()
+		client := &testClient{db: db}
+		storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+			return client, nil
+		})
+		defer storage.SetClientBuilder(originalBuilder)
+
+		service, err := NewService(WithSkipDBInit(true))
+		require.NoError(t, err)
+
+		// Mock table exists query to fail.
+		mock.ExpectQuery(`SELECT EXISTS \(`).WillReturnError(fmt.Errorf("table query failed"))
+
+		err = service.verifySchema(context.Background())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "check table")
+		assert.Contains(t, err.Error(), "existence failed")
+
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	// Test verifyColumns query failure.
+	t.Run("verifyColumns query failure", func(t *testing.T) {
+		db, mock := setupMockDB(t)
+		defer db.Close()
+
+		originalBuilder := storage.GetClientBuilder()
+		client := &testClient{db: db}
+		storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+			return client, nil
+		})
+		defer storage.SetClientBuilder(originalBuilder)
+
+		service, err := NewService(WithSkipDBInit(true))
+		require.NoError(t, err)
+
+		// Mock table exists.
+		mock.ExpectQuery(`SELECT EXISTS \(`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+		// Mock columns query to fail.
+		mock.ExpectQuery(`SELECT column_name, data_type, is_nullable`).WillReturnError(fmt.Errorf("columns query failed"))
+
+		err = service.verifySchema(context.Background())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "verify columns")
+
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	// Test column missing.
+	t.Run("column missing", func(t *testing.T) {
+		db, mock := setupMockDB(t)
+		defer db.Close()
+
+		originalBuilder := storage.GetClientBuilder()
+		client := &testClient{db: db}
+		storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+			return client, nil
+		})
+		defer storage.SetClientBuilder(originalBuilder)
+
+		service, err := NewService(WithSkipDBInit(true))
+		require.NoError(t, err)
+
+		// Mock table exists.
+		mock.ExpectQuery(`SELECT EXISTS \(`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+		// Mock columns query - missing memory_id column.
+		mock.ExpectQuery(`SELECT column_name, data_type, is_nullable`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable"}).
+			AddRow("app_name", "text", "NO").
+			AddRow("user_id", "text", "NO").
+			AddRow("memory_data", "jsonb", "NO").
+			AddRow("created_at", "timestamp without time zone", "NO").
+			AddRow("updated_at", "timestamp without time zone", "NO").
+			AddRow("deleted_at", "timestamp without time zone", "YES"))
+
+		err = service.verifySchema(context.Background())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "memory_id")
+		assert.Contains(t, err.Error(), "is missing")
+
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	// Test column type mismatch.
+	t.Run("column type mismatch", func(t *testing.T) {
+		db, mock := setupMockDB(t)
+		defer db.Close()
+
+		originalBuilder := storage.GetClientBuilder()
+		client := &testClient{db: db}
+		storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+			return client, nil
+		})
+		defer storage.SetClientBuilder(originalBuilder)
+
+		service, err := NewService(WithSkipDBInit(true))
+		require.NoError(t, err)
+
+		// Mock table exists.
+		mock.ExpectQuery(`SELECT EXISTS \(`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+		// Mock columns query - wrong type for memory_id.
+		mock.ExpectQuery(`SELECT column_name, data_type, is_nullable`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable"}).
+			AddRow("memory_id", "varchar", "NO"). // Wrong type: should be "text".
+			AddRow("app_name", "text", "NO").
+			AddRow("user_id", "text", "NO").
+			AddRow("memory_data", "jsonb", "NO").
+			AddRow("created_at", "timestamp without time zone", "NO").
+			AddRow("updated_at", "timestamp without time zone", "NO").
+			AddRow("deleted_at", "timestamp without time zone", "YES"))
+
+		err = service.verifySchema(context.Background())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "has type")
+		assert.Contains(t, err.Error(), "expected")
+
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	// Test nullable mismatch.
+	t.Run("nullable mismatch", func(t *testing.T) {
+		db, mock := setupMockDB(t)
+		defer db.Close()
+
+		originalBuilder := storage.GetClientBuilder()
+		client := &testClient{db: db}
+		storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+			return client, nil
+		})
+		defer storage.SetClientBuilder(originalBuilder)
+
+		service, err := NewService(WithSkipDBInit(true))
+		require.NoError(t, err)
+
+		// Mock table exists.
+		mock.ExpectQuery(`SELECT EXISTS \(`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+		// Mock columns query - wrong nullable for app_name.
+		mock.ExpectQuery(`SELECT column_name, data_type, is_nullable`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable"}).
+			AddRow("memory_id", "text", "NO").
+			AddRow("app_name", "text", "YES"). // Wrong: should be "NO".
+			AddRow("user_id", "text", "NO").
+			AddRow("memory_data", "jsonb", "NO").
+			AddRow("created_at", "timestamp without time zone", "NO").
+			AddRow("updated_at", "timestamp without time zone", "NO").
+			AddRow("deleted_at", "timestamp without time zone", "YES"))
+
+		err = service.verifySchema(context.Background())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "nullable mismatch")
+
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	// Test verifyColumns rows.Scan failure.
+	t.Run("verifyColumns rows.Scan failure", func(t *testing.T) {
+		db, mock := setupMockDB(t)
+		defer db.Close()
+
+		originalBuilder := storage.GetClientBuilder()
+		client := &testClient{db: db}
+		storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+			return client, nil
+		})
+		defer storage.SetClientBuilder(originalBuilder)
+
+		service, err := NewService(WithSkipDBInit(true))
+		require.NoError(t, err)
+
+		// Mock table exists.
+		mock.ExpectQuery(`SELECT EXISTS \(`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+		// Mock columns query with wrong number of columns to cause Scan failure.
+		rows := sqlmock.NewRows([]string{"column_name", "data_type"}). // Missing is_nullable column.
+										AddRow("memory_id", "text")
+		mock.ExpectQuery(`SELECT column_name, data_type, is_nullable`).WillReturnRows(rows)
+
+		err = service.verifySchema(context.Background())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "verify columns")
+
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	// Test tableExists rows.Scan failure.
+	t.Run("tableExists rows.Scan failure", func(t *testing.T) {
+		db, mock := setupMockDB(t)
+		defer db.Close()
+
+		originalBuilder := storage.GetClientBuilder()
+		client := &testClient{db: db}
+		storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+			return client, nil
+		})
+		defer storage.SetClientBuilder(originalBuilder)
+
+		service, err := NewService(WithSkipDBInit(true))
+		require.NoError(t, err)
+
+		// Mock table exists query with wrong column type to cause Scan failure.
+		rows := sqlmock.NewRows([]string{"wrong_column"}).AddRow("some_value")
+		mock.ExpectQuery(`SELECT EXISTS \(`).WillReturnRows(rows)
+
+		err = service.verifySchema(context.Background())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "check table")
+
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	// Test verifyIndexes query failure.
+	t.Run("verifyIndexes query failure", func(t *testing.T) {
+		db, mock := setupMockDB(t)
+		defer db.Close()
+
+		originalBuilder := storage.GetClientBuilder()
+		client := &testClient{db: db}
+		storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+			return client, nil
+		})
+		defer storage.SetClientBuilder(originalBuilder)
+
+		service, err := NewService(WithSkipDBInit(true))
+		require.NoError(t, err)
+
+		// Mock table exists.
+		mock.ExpectQuery(`SELECT EXISTS \(`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+		// Mock columns query - all correct.
+		mock.ExpectQuery(`SELECT column_name, data_type, is_nullable`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable"}).
+			AddRow("memory_id", "text", "NO").
+			AddRow("app_name", "text", "NO").
+			AddRow("user_id", "text", "NO").
+			AddRow("memory_data", "jsonb", "NO").
+			AddRow("created_at", "timestamp without time zone", "NO").
+			AddRow("updated_at", "timestamp without time zone", "NO").
+			AddRow("deleted_at", "timestamp without time zone", "YES"))
+		// Mock indexes query to fail.
+		mock.ExpectQuery(`SELECT
+		i\.indexname,
+		a\.attname AS column_name,
+		a\.attnum AS ordinal_position
+	FROM pg_indexes i`).WillReturnError(fmt.Errorf("indexes query failed"))
+
+		err = service.verifySchema(context.Background())
+		require.NoError(t, err) // verifyIndexes failure is logged but not fatal.
+
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	// Test verifyIndexes rows.Scan failure.
+	t.Run("verifyIndexes rows.Scan failure", func(t *testing.T) {
+		db, mock := setupMockDB(t)
+		defer db.Close()
+
+		originalBuilder := storage.GetClientBuilder()
+		client := &testClient{db: db}
+		storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+			return client, nil
+		})
+		defer storage.SetClientBuilder(originalBuilder)
+
+		service, err := NewService(WithSkipDBInit(true))
+		require.NoError(t, err)
+
+		// Mock table exists.
+		mock.ExpectQuery(`SELECT EXISTS \(`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+		// Mock columns query - all correct.
+		mock.ExpectQuery(`SELECT column_name, data_type, is_nullable`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable"}).
+			AddRow("memory_id", "text", "NO").
+			AddRow("app_name", "text", "NO").
+			AddRow("user_id", "text", "NO").
+			AddRow("memory_data", "jsonb", "NO").
+			AddRow("created_at", "timestamp without time zone", "NO").
+			AddRow("updated_at", "timestamp without time zone", "NO").
+			AddRow("deleted_at", "timestamp without time zone", "YES"))
+		// Mock indexes query with wrong column type to cause Scan failure.
+		rows := sqlmock.NewRows([]string{"wrong_column"}).AddRow("some_value")
+		mock.ExpectQuery(`SELECT
+		i\.indexname,
+		a\.attname AS column_name,
+		a\.attnum AS ordinal_position
+	FROM pg_indexes i`).WillReturnRows(rows)
+
+		err = service.verifySchema(context.Background())
+		require.NoError(t, err) // verifyIndexes failure is logged but not fatal.
+
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	// Test verifyIndexes with missing index (prints CREATE SQL).
+	t.Run("verifyIndexes_missing_index_with_SQL", func(t *testing.T) {
+		db, mock := setupMockDB(t)
+		defer db.Close()
+
+		originalBuilder := storage.GetClientBuilder()
+		client := &testClient{db: db}
+		storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+			return client, nil
+		})
+		defer storage.SetClientBuilder(originalBuilder)
+
+		service, err := NewService(WithSkipDBInit(true))
+		require.NoError(t, err)
+
+		mock.ExpectQuery(`SELECT EXISTS \(`).WithArgs("public", "memories").
+			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+		mock.ExpectQuery(`SELECT column_name, data_type, is_nullable`).
+			WithArgs("public", "memories").
+			WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable"}).
+				AddRow("memory_id", "text", "NO").
+				AddRow("app_name", "text", "NO").
+				AddRow("user_id", "text", "NO").
+				AddRow("memory_data", "jsonb", "NO").
+				AddRow("created_at", "timestamp without time zone", "NO").
+				AddRow("updated_at", "timestamp without time zone", "NO").
+				AddRow("deleted_at", "timestamp without time zone", "YES"))
+
+		// Return only partial indexes - missing updated_at and deleted_at.
+		mock.ExpectQuery(`SELECT
+			i\.indexname,
+			a\.attname AS column_name,
+			a\.attnum AS ordinal_position
+		FROM pg_indexes i`).WithArgs("public", "memories").
+			WillReturnRows(
+				sqlmock.NewRows([]string{"indexname", "column_name", "ordinal_position"}).
+					AddRow("idx_memories_app_user", "app_name", 1).
+					AddRow("idx_memories_app_user", "user_id", 2))
+
+		err = service.verifySchema(context.Background())
+		require.NoError(t, err)
+
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	// Test verifyIndexes with wrong column order.
+	t.Run("verifyIndexes_wrong_column_order", func(t *testing.T) {
+		db, mock := setupMockDB(t)
+		defer db.Close()
+
+		originalBuilder := storage.GetClientBuilder()
+		client := &testClient{db: db}
+		storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+			return client, nil
+		})
+		defer storage.SetClientBuilder(originalBuilder)
+
+		service, err := NewService(WithSkipDBInit(true))
+		require.NoError(t, err)
+
+		mock.ExpectQuery(`SELECT EXISTS \(`).WithArgs("public", "memories").
+			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+		mock.ExpectQuery(`SELECT column_name, data_type, is_nullable`).
+			WithArgs("public", "memories").
+			WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable"}).
+				AddRow("memory_id", "text", "NO").
+				AddRow("app_name", "text", "NO").
+				AddRow("user_id", "text", "NO").
+				AddRow("memory_data", "jsonb", "NO").
+				AddRow("created_at", "timestamp without time zone", "NO").
+				AddRow("updated_at", "timestamp without time zone", "NO").
+				AddRow("deleted_at", "timestamp without time zone", "YES"))
+
+		// Return indexes with wrong column order for app_user index.
+		mock.ExpectQuery(`SELECT
+			i\.indexname,
+			a\.attname AS column_name,
+			a\.attnum AS ordinal_position
+		FROM pg_indexes i`).WithArgs("public", "memories").
+			WillReturnRows(
+				sqlmock.NewRows([]string{"indexname", "column_name", "ordinal_position"}).
+					AddRow("idx_memories_app_user", "user_id", 1).
+					AddRow("idx_memories_app_user", "app_name", 2).
+					AddRow("idx_memories_deleted_at", "deleted_at", 1).
+					AddRow("idx_memories_updated_at", "updated_at", 1))
+
+		err = service.verifySchema(context.Background())
+		require.NoError(t, err)
+
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	// Test verifyIndexes with unexpected indexes.
+	t.Run("verifyIndexes_unexpected_indexes", func(t *testing.T) {
+		db, mock := setupMockDB(t)
+		defer db.Close()
+
+		originalBuilder := storage.GetClientBuilder()
+		client := &testClient{db: db}
+		storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+			return client, nil
+		})
+		defer storage.SetClientBuilder(originalBuilder)
+
+		service, err := NewService(WithSkipDBInit(true))
+		require.NoError(t, err)
+
+		mock.ExpectQuery(`SELECT EXISTS \(`).WithArgs("public", "memories").
+			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+		mock.ExpectQuery(`SELECT column_name, data_type, is_nullable`).
+			WithArgs("public", "memories").
+			WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable"}).
+				AddRow("memory_id", "text", "NO").
+				AddRow("app_name", "text", "NO").
+				AddRow("user_id", "text", "NO").
+				AddRow("memory_data", "jsonb", "NO").
+				AddRow("created_at", "timestamp without time zone", "NO").
+				AddRow("updated_at", "timestamp without time zone", "NO").
+				AddRow("deleted_at", "timestamp without time zone", "YES"))
+
+		// Return expected indexes plus unexpected ones.
+		mock.ExpectQuery(`SELECT
+			i\.indexname,
+			a\.attname AS column_name,
+			a\.attnum AS ordinal_position
+		FROM pg_indexes i`).WithArgs("public", "memories").
+			WillReturnRows(
+				sqlmock.NewRows([]string{"indexname", "column_name", "ordinal_position"}).
+					AddRow("idx_memories_app_user", "app_name", 1).
+					AddRow("idx_memories_app_user", "user_id", 2).
+					AddRow("idx_memories_deleted_at", "deleted_at", 1).
+					AddRow("idx_memories_updated_at", "updated_at", 1).
+					AddRow("idx_memories_extra", "app_name", 1).
+					AddRow("idx_memories_another", "user_id", 1))
+
+		err = service.verifySchema(context.Background())
+		require.NoError(t, err)
+
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	// Test verifyIndexes skips primary key indexes.
+	t.Run("verifyIndexes_skips_pkey", func(t *testing.T) {
+		db, mock := setupMockDB(t)
+		defer db.Close()
+
+		originalBuilder := storage.GetClientBuilder()
+		client := &testClient{db: db}
+		storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+			return client, nil
+		})
+		defer storage.SetClientBuilder(originalBuilder)
+
+		service, err := NewService(WithSkipDBInit(true))
+		require.NoError(t, err)
+
+		mock.ExpectQuery(`SELECT EXISTS \(`).WithArgs("public", "memories").
+			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+		mock.ExpectQuery(`SELECT column_name, data_type, is_nullable`).
+			WithArgs("public", "memories").
+			WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable"}).
+				AddRow("memory_id", "text", "NO").
+				AddRow("app_name", "text", "NO").
+				AddRow("user_id", "text", "NO").
+				AddRow("memory_data", "jsonb", "NO").
+				AddRow("created_at", "timestamp without time zone", "NO").
+				AddRow("updated_at", "timestamp without time zone", "NO").
+				AddRow("deleted_at", "timestamp without time zone", "YES"))
+
+		// Return indexes including a primary key index that should be skipped.
+		mock.ExpectQuery(`SELECT
+			i\.indexname,
+			a\.attname AS column_name,
+			a\.attnum AS ordinal_position
+		FROM pg_indexes i`).WithArgs("public", "memories").
+			WillReturnRows(
+				sqlmock.NewRows([]string{"indexname", "column_name", "ordinal_position"}).
+					AddRow("idx_memories_app_user", "app_name", 1).
+					AddRow("idx_memories_app_user", "user_id", 2).
+					AddRow("idx_memories_deleted_at", "deleted_at", 1).
+					AddRow("idx_memories_updated_at", "updated_at", 1).
+					AddRow("memories_pkey", "memory_id", 1))
+
+		err = service.verifySchema(context.Background())
+		require.NoError(t, err)
+
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+}
+
+// Test checkDDLPrivilege function.
+func TestCheckDDLPrivilege(t *testing.T) {
+	t.Run("has privilege on public schema", func(t *testing.T) {
+		db, mock := setupMockDB(t)
+		defer db.Close()
+
+		originalBuilder := storage.GetClientBuilder()
+		client := &testClient{db: db}
+		storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+			return client, nil
+		})
+		defer storage.SetClientBuilder(originalBuilder)
+
+		service, err := NewService(WithSkipDBInit(true))
+		require.NoError(t, err)
+
+		// Mock DDL privilege check - has privilege.
+		mock.ExpectQuery(`SELECT has_schema_privilege\(\$1, 'CREATE'\)`).
+			WithArgs("public").
+			WillReturnRows(sqlmock.NewRows([]string{"has_schema_privilege"}).AddRow(true))
+
+		hasPrivilege, err := service.checkDDLPrivilege(context.Background())
+		require.NoError(t, err)
+		assert.True(t, hasPrivilege)
+
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("has privilege on custom schema", func(t *testing.T) {
+		db, mock := setupMockDB(t)
+		defer db.Close()
+
+		originalBuilder := storage.GetClientBuilder()
+		client := &testClient{db: db}
+		storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+			return client, nil
+		})
+		defer storage.SetClientBuilder(originalBuilder)
+
+		service, err := NewService(WithSkipDBInit(true), WithSchema("custom_schema"))
+		require.NoError(t, err)
+
+		// Mock DDL privilege check - has privilege.
+		mock.ExpectQuery(`SELECT has_schema_privilege\(\$1, 'CREATE'\)`).
+			WithArgs("custom_schema").
+			WillReturnRows(sqlmock.NewRows([]string{"has_schema_privilege"}).AddRow(true))
+
+		hasPrivilege, err := service.checkDDLPrivilege(context.Background())
+		require.NoError(t, err)
+		assert.True(t, hasPrivilege)
+
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("no privilege - returns false", func(t *testing.T) {
+		db, mock := setupMockDB(t)
+		defer db.Close()
+
+		originalBuilder := storage.GetClientBuilder()
+		client := &testClient{db: db}
+		storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+			return client, nil
+		})
+		defer storage.SetClientBuilder(originalBuilder)
+
+		service, err := NewService(WithSkipDBInit(true))
+		require.NoError(t, err)
+
+		// Mock DDL privilege check - no privilege.
+		mock.ExpectQuery(`SELECT has_schema_privilege\(\$1, 'CREATE'\)`).
+			WithArgs("public").
+			WillReturnRows(sqlmock.NewRows([]string{"has_schema_privilege"}).AddRow(false))
+
+		hasPrivilege, err := service.checkDDLPrivilege(context.Background())
+		require.NoError(t, err)
+		assert.False(t, hasPrivilege)
+
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("query error - returns error", func(t *testing.T) {
+		db, mock := setupMockDB(t)
+		defer db.Close()
+
+		originalBuilder := storage.GetClientBuilder()
+		client := &testClient{db: db}
+		storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+			return client, nil
+		})
+		defer storage.SetClientBuilder(originalBuilder)
+
+		service, err := NewService(WithSkipDBInit(true))
+		require.NoError(t, err)
+
+		// Mock DDL privilege check - query error.
+		mock.ExpectQuery(`SELECT has_schema_privilege\(\$1, 'CREATE'\)`).
+			WithArgs("public").
+			WillReturnError(fmt.Errorf("connection refused"))
+
+		hasPrivilege, err := service.checkDDLPrivilege(context.Background())
+		require.Error(t, err)
+		assert.False(t, hasPrivilege)
+		assert.Contains(t, err.Error(), "check DDL privilege")
+
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+}
+
+// Test initDB panics when has DDL privilege but schema verification fails.
+func TestInitDB_PanicOnSchemaVerificationWithDDLPrivilege(t *testing.T) {
+	db, mock := setupMockDB(t)
+	defer db.Close()
+
+	originalBuilder := storage.GetClientBuilder()
+	client := &testClient{db: db}
+	storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+		return client, nil
+	})
+	defer storage.SetClientBuilder(originalBuilder)
+
+	service, err := NewService(WithSkipDBInit(true))
+	require.NoError(t, err)
+
+	// Mock DDL privilege check - has privilege.
+	mock.ExpectQuery(`SELECT has_schema_privilege\(\$1, 'CREATE'\)`).
+		WithArgs("public").
+		WillReturnRows(sqlmock.NewRows([]string{"has_schema_privilege"}).AddRow(true))
+
+	// Mock table creation.
+	mock.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+	// Mock index creation.
+	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	// Mock table exists query - table does not exist (schema verification fails).
+	mock.ExpectQuery(`SELECT EXISTS \(`).
+		WithArgs("public", "memories").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+
+	// Should panic because has DDL privilege but schema verification fails.
+	defer func() {
+		r := recover()
+		require.NotNil(t, r, "expected panic when has DDL privilege but schema verification fails")
+		assert.Contains(t, fmt.Sprintf("%v", r), "schema verification failed with DDL privilege")
+	}()
+
+	_ = service.initDB(context.Background())
+}
+
+// Test initDB skips DDL operations when user lacks CREATE privilege.
+func TestInitDB_SkipDDLWhenNoDDLPrivilege(t *testing.T) {
+	db, mock := setupMockDB(t)
+	defer db.Close()
+
+	originalBuilder := storage.GetClientBuilder()
+	client := &testClient{db: db}
+	storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+		return client, nil
+	})
+	defer storage.SetClientBuilder(originalBuilder)
+
+	service, err := NewService(WithSkipDBInit(true))
+	require.NoError(t, err)
+
+	// Mock DDL privilege check - no privilege.
+	mock.ExpectQuery(`SELECT has_schema_privilege\(\$1, 'CREATE'\)`).
+		WithArgs("public").
+		WillReturnRows(sqlmock.NewRows([]string{"has_schema_privilege"}).AddRow(false))
+
+	// No CREATE TABLE or CREATE INDEX should be expected because we skip DDL.
+
+	err = service.initDB(context.Background())
+	require.NoError(t, err)
+
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestNewService_FallbackToDefaultConnString tests the fallback branch when
+// no DSN, host, or instanceName is provided.
+func TestNewService_FallbackToDefaultConnString(t *testing.T) {
+	db, mock := setupMockDB(t)
+	defer db.Close()
+
+	originalBuilder := storage.GetClientBuilder()
+	client := &testClient{db: db}
+	receivedConnString := ""
+	storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+		opts := &storage.ClientBuilderOpts{}
+		for _, opt := range builderOpts {
+			opt(opts)
+		}
+		receivedConnString = opts.ConnString
+		return client, nil
+	})
+	defer storage.SetClientBuilder(originalBuilder)
+
+	// Mock DDL privilege check.
+	mock.ExpectQuery(`SELECT has_schema_privilege\(\$1, 'CREATE'\)`).
+		WithArgs("public").
+		WillReturnRows(sqlmock.NewRows([]string{"has_schema_privilege"}).AddRow(true))
+
+	// Mock table and index creation.
+	mock.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	// Mock schema verification queries.
+	mock.ExpectQuery(`SELECT EXISTS \(
+		SELECT FROM information_schema.tables
+		WHERE table_schema = \$1
+		AND table_name = \$2
+	\)`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+	mock.ExpectQuery(`SELECT column_name, data_type, is_nullable
+		FROM information_schema.columns
+		WHERE table_schema = \$1
+		AND table_name = \$2
+		ORDER BY ordinal_position`).WithArgs("public", "memories").WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable"}).
+		AddRow("memory_id", "text", "NO").
+		AddRow("app_name", "text", "NO").
+		AddRow("user_id", "text", "NO").
+		AddRow("memory_data", "jsonb", "NO").
+		AddRow("created_at", "timestamp without time zone", "NO").
+		AddRow("updated_at", "timestamp without time zone", "NO").
+		AddRow("deleted_at", "timestamp without time zone", "YES"))
+
+	mock.ExpectQuery(`SELECT
+		i\.indexname,
+		a\.attname AS column_name,
+		a\.attnum AS ordinal_position
+	FROM pg_indexes i
+	JOIN pg_class c ON c\.relname = i\.indexname
+	JOIN pg_index ix ON ix\.indexrelid = c\.oid
+	JOIN pg_attribute a ON a\.attrelid = ix\.indrelid
+		AND a\.attnum = ANY\(ix\.indkey\)
+	WHERE i\.schemaname = \$1
+		AND i\.tablename = \$2
+	ORDER BY i\.indexname, a\.attnum`).WithArgs("public", "memories").WillReturnRows(
+		sqlmock.NewRows([]string{"indexname", "column_name", "ordinal_position"}).
+			AddRow("idx_memories_app_user", "app_name", 1).
+			AddRow("idx_memories_app_user", "user_id", 2).
+			AddRow("idx_memories_deleted_at", "deleted_at", 1).
+			AddRow("idx_memories_updated_at", "updated_at", 1))
+
+	// Create service without DSN, host, or instanceName - should use default
+	// connection string.
+	service, err := NewService()
+	require.NoError(t, err)
+	assert.NotNil(t, service)
+
+	// Verify that the default connection string was used.
+	assert.Contains(t, receivedConnString, "host=localhost", "Should use default host")
+	assert.Contains(t, receivedConnString, "port=5432", "Should use default port")
+	assert.Contains(t, receivedConnString, defaultDatabase, "Should use default database")
+	assert.Contains(t, receivedConnString, "sslmode=disable", "Should use default sslmode")
+
+	require.NoError(t, mock.ExpectationsWereMet())
+	service.Close()
+}
+
+// TestNewService_WithCustomTableName tests schema verification with custom
+// table name.
+func TestNewService_WithCustomTableName(t *testing.T) {
+	db, mock := setupMockDB(t)
+	defer db.Close()
+
+	originalBuilder := storage.GetClientBuilder()
+	client := &testClient{db: db}
+	storage.SetClientBuilder(func(ctx context.Context, builderOpts ...storage.ClientBuilderOpt) (storage.Client, error) {
+		return client, nil
+	})
+	defer storage.SetClientBuilder(originalBuilder)
+
+	customTableName := "custom_memories"
+
+	// Mock DDL privilege check.
+	mock.ExpectQuery(`SELECT has_schema_privilege\(\$1, 'CREATE'\)`).
+		WithArgs("public").
+		WillReturnRows(sqlmock.NewRows([]string{"has_schema_privilege"}).AddRow(true))
+
+	// Mock table creation with custom table name.
+	mock.ExpectExec("CREATE TABLE IF NOT EXISTS.*" + customTableName).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("CREATE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+
+	// Mock schema verification queries - should use custom table name.
+	mock.ExpectQuery(`SELECT EXISTS \(
+		SELECT FROM information_schema.tables
+		WHERE table_schema = \$1
+		AND table_name = \$2
+	\)`).WithArgs("public", customTableName).WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+	// Mock columns query with custom table name.
+	mock.ExpectQuery(`SELECT column_name, data_type, is_nullable
+		FROM information_schema.columns
+		WHERE table_schema = \$1
+		AND table_name = \$2
+		ORDER BY ordinal_position`).WithArgs("public", customTableName).WillReturnRows(sqlmock.NewRows([]string{"column_name", "data_type", "is_nullable"}).
+		AddRow("memory_id", "text", "NO").
+		AddRow("app_name", "text", "NO").
+		AddRow("user_id", "text", "NO").
+		AddRow("memory_data", "jsonb", "NO").
+		AddRow("created_at", "timestamp without time zone", "NO").
+		AddRow("updated_at", "timestamp without time zone", "NO").
+		AddRow("deleted_at", "timestamp without time zone", "YES"))
+
+	// Mock indexes query with custom table name and column info.
+	mock.ExpectQuery(`SELECT
+		i\.indexname,
+		a\.attname AS column_name,
+		a\.attnum AS ordinal_position
+	FROM pg_indexes i
+	JOIN pg_class c ON c\.relname = i\.indexname
+	JOIN pg_index ix ON ix\.indexrelid = c\.oid
+	JOIN pg_attribute a ON a\.attrelid = ix\.indrelid
+		AND a\.attnum = ANY\(ix\.indkey\)
+	WHERE i\.schemaname = \$1
+		AND i\.tablename = \$2
+	ORDER BY i\.indexname, a\.attnum`).WithArgs("public", customTableName).WillReturnRows(
+		sqlmock.NewRows([]string{"indexname", "column_name", "ordinal_position"}).
+			AddRow("idx_"+customTableName+"_app_user", "app_name", 1).
+			AddRow("idx_"+customTableName+"_app_user", "user_id", 2).
+			AddRow("idx_"+customTableName+"_deleted_at", "deleted_at", 1).
+			AddRow("idx_"+customTableName+"_updated_at", "updated_at", 1))
+
+	service, err := NewService(
+		WithHost("localhost"),
+		WithPort(5432),
+		WithDatabase("testdb"),
+		WithTableName(customTableName),
+	)
+	require.NoError(t, err)
+	assert.NotNil(t, service)
+	assert.Equal(t, customTableName, service.tableName)
+
+	require.NoError(t, mock.ExpectationsWereMet())
+	service.Close()
+}
+
+// mockExtractor is a mock implementation of extractor.MemoryExtractor.
+type mockExtractor struct {
+	extractCalled bool
+}
+
+func (m *mockExtractor) Extract(
+	ctx context.Context,
+	messages []model.Message,
+	existing []*memory.Entry,
+) ([]*extractor.Operation, error) {
+	m.extractCalled = true
+	return nil, nil
+}
+
+func (m *mockExtractor) ShouldExtract(ctx *extractor.ExtractionContext) bool {
+	return true
+}
+
+func (m *mockExtractor) SetPrompt(prompt string) {}
+
+func (m *mockExtractor) SetModel(mdl model.Model) {}
+
+func (m *mockExtractor) Metadata() map[string]any {
+	return map[string]any{}
+}
+
+func TestWithExtractor(t *testing.T) {
+	ext := &mockExtractor{}
+	opts := defaultOptions.clone()
+	WithExtractor(ext)(&opts)
+	assert.Equal(t, ext, opts.extractor)
+}
+
+func TestWithAsyncMemoryNum(t *testing.T) {
+	t.Run("valid value", func(t *testing.T) {
+		opts := defaultOptions.clone()
+		WithAsyncMemoryNum(5)(&opts)
+		assert.Equal(t, 5, opts.asyncMemoryNum)
+	})
+
+	t.Run("invalid value uses default", func(t *testing.T) {
+		opts := defaultOptions.clone()
+		WithAsyncMemoryNum(0)(&opts)
+		assert.Equal(t, imemory.DefaultAsyncMemoryNum, opts.asyncMemoryNum)
+	})
+}
+
+func TestWithMemoryQueueSize(t *testing.T) {
+	t.Run("valid value", func(t *testing.T) {
+		opts := defaultOptions.clone()
+		WithMemoryQueueSize(200)(&opts)
+		assert.Equal(t, 200, opts.memoryQueueSize)
+	})
+
+	t.Run("invalid value uses default", func(t *testing.T) {
+		opts := defaultOptions.clone()
+		WithMemoryQueueSize(0)(&opts)
+		assert.Equal(t, imemory.DefaultMemoryQueueSize, opts.memoryQueueSize)
+	})
+}
+
+func TestWithMemoryJobTimeout(t *testing.T) {
+	opts := defaultOptions.clone()
+	WithMemoryJobTimeout(time.Minute)(&opts)
+	assert.Equal(t, time.Minute, opts.memoryJobTimeout)
+}
+
+func TestEnqueueAutoMemoryJob_NoWorker(t *testing.T) {
+	db, mock := setupMockDB(t)
+	defer db.Close()
+	s := setupMockService(t, db, mock)
+
+	ctx := context.Background()
+	sess := session.NewSession("test-app", "test-user", "test-session")
+	// Should return nil when no worker is configured.
+	err := s.EnqueueAutoMemoryJob(ctx, sess)
+	assert.NoError(t, err)
+}
+
+func TestClose_NoWorker(t *testing.T) {
+	db, mock := setupMockDB(t)
+	s := setupMockService(t, db, mock)
+
+	// Expect db.Close() to be called.
+	mock.ExpectClose()
+
+	err := s.Close()
+	assert.NoError(t, err)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestTools_AutoMemoryMode(t *testing.T) {
+	db, mock := setupMockDB(t)
+	defer db.Close()
+	s := setupMockService(t, db, mock)
+
+	// Enable auto memory mode.
+	s.opts.extractor = &mockExtractor{}
+	s.opts.toolCreators = imemory.AllToolCreators
+	// Apply auto mode defaults (nil for userExplicitlySet since this is a test).
+	imemory.ApplyAutoModeDefaults(s.opts.enabledTools, nil)
+	// Re-compute tools list after changing opts to simulate auto memory mode.
+	s.precomputedTools = imemory.BuildToolsList(
+		s.opts.extractor,
+		s.opts.toolCreators,
+		s.opts.enabledTools,
+		s.cachedTools,
+	)
+
+	tools := s.Tools()
+
+	// In auto memory mode, Search is enabled by default.
+	assert.Len(t, tools, 1, "Auto mode should return Search tool by default")
+	toolNames := make(map[string]bool)
+	for _, tool := range tools {
+		toolNames[tool.Declaration().Name] = true
+	}
+	assert.True(t, toolNames[memory.SearchToolName], "Search tool should be returned by default")
+
+	// Enable Load tool explicitly.
+	s.opts.enabledTools[memory.LoadToolName] = true
+	s.precomputedTools = imemory.BuildToolsList(
+		s.opts.extractor,
+		s.opts.toolCreators,
+		s.opts.enabledTools,
+		s.cachedTools,
+	)
+
+	tools = s.Tools()
+	assert.Len(t, tools, 2, "Auto mode should return Search and Load tools when Load is enabled")
+	toolNames = make(map[string]bool)
+	for _, tool := range tools {
+		toolNames[tool.Declaration().Name] = true
+	}
+	assert.True(t, toolNames[memory.SearchToolName], "Search tool should be returned")
+	assert.True(t, toolNames[memory.LoadToolName], "Load tool should be returned when enabled")
+	assert.False(t, toolNames[memory.AddToolName], "Add tool should not be exposed via Tools()")
+	assert.False(t, toolNames[memory.ClearToolName], "Clear tool should not be exposed via Tools()")
 }

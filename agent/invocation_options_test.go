@@ -16,6 +16,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
 	"trpc.group/trpc-go/trpc-agent-go/artifact"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -98,6 +99,31 @@ func TestWithInvocationRunOptions(t *testing.T) {
 	assert.Equal(t, runOpts, inv.RunOptions)
 	assert.Equal(t, "test-request-123", inv.RunOptions.RequestID)
 	assert.Equal(t, "value1", inv.RunOptions.RuntimeState["key1"])
+}
+
+func TestRunOptionsAgentSelectors(t *testing.T) {
+	override := &mockAgent{name: "override"}
+	opts := &RunOptions{}
+
+	WithAgent(override)(opts)
+	assert.Equal(t, override, opts.Agent)
+	assert.Empty(t, opts.AgentByName)
+
+	WithAgentByName("named")(opts)
+	assert.Equal(t, "named", opts.AgentByName)
+	assert.Equal(t, override, opts.Agent)
+}
+
+func TestRunOptionsStreamSelector(t *testing.T) {
+	opts := &RunOptions{}
+
+	WithStream(true)(opts)
+	require.NotNil(t, opts.Stream)
+	assert.True(t, *opts.Stream)
+
+	WithStream(false)(opts)
+	require.NotNil(t, opts.Stream)
+	assert.False(t, *opts.Stream)
 }
 
 func TestGetRuntimeStateValue(t *testing.T) {
@@ -228,6 +254,25 @@ func TestGetRuntimeStateValue(t *testing.T) {
 		assert.Equal(t, ctx.RoomID, retrieved.RoomID)
 		assert.Equal(t, ctx.Metadata, retrieved.Metadata)
 	})
+}
+
+func TestWithSpanAttributes(t *testing.T) {
+	opts := &RunOptions{}
+	attrs := []attribute.KeyValue{
+		attribute.String("k1", "v1"),
+		attribute.Int("k2", 2),
+	}
+
+	WithSpanAttributes(attrs...)(opts)
+	require.Len(t, opts.SpanAttributes, 2)
+	expected := attribute.String("k1", "v1")
+	assert.Equal(t, expected, opts.SpanAttributes[0])
+
+	attrs[0] = attribute.String("k1", "mutated")
+	assert.Equal(t, expected, opts.SpanAttributes[0])
+
+	WithSpanAttributes()(opts)
+	assert.Nil(t, opts.SpanAttributes)
 }
 
 func TestWithInvocationTransferInfo(t *testing.T) {
@@ -372,6 +417,14 @@ func (m *mockMemoryService) SearchMemories(ctx context.Context, userKey memory.U
 }
 
 func (m *mockMemoryService) Tools() []tool.Tool {
+	return nil
+}
+
+func (m *mockMemoryService) EnqueueAutoMemoryJob(ctx context.Context, sess *session.Session) error {
+	return nil
+}
+
+func (m *mockMemoryService) Close() error {
 	return nil
 }
 

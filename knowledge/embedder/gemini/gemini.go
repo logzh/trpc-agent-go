@@ -197,7 +197,7 @@ func (e *Embedder) GetEmbedding(ctx context.Context, text string) ([]float64, er
 	}
 	// Extract embedding from response.
 	if len(response.Embeddings) == 0 || len(response.Embeddings[0].Values) == 0 {
-		log.Warn("received empty embedding response from Gemini API")
+		log.WarnContext(ctx, "received empty embedding response from Gemini API")
 		return []float64{}, nil
 	}
 	embedding := make([]float64, len(response.Embeddings[0].Values))
@@ -220,7 +220,7 @@ func (e *Embedder) GetEmbeddingWithUsage(ctx context.Context, text string) ([]fl
 	}
 	// Extract embedding from response.
 	if len(response.Embeddings) == 0 || len(response.Embeddings[0].Values) == 0 {
-		log.Warn("received empty embedding response from Gemini API")
+		log.WarnContext(ctx, "received empty embedding response from Gemini API")
 		return []float64{}, nil, nil
 	}
 	embedding := make([]float64, len(response.Embeddings[0].Values))
@@ -241,8 +241,14 @@ func (e *Embedder) response(ctx context.Context, text string) (rsp *genai.EmbedC
 		return nil, fmt.Errorf("text cannot be empty")
 	}
 	ctx, span := trace.Tracer.Start(ctx, fmt.Sprintf("%s %s", itelemetry.OperationEmbeddings, e.model))
+	embeddingAttributes := &itelemetry.EmbeddingAttributes{
+		RequestEncodingFormat: &e.requestOptions.MIMEType,
+		RequestModel:          e.model,
+		Dimensions:            e.dimensions,
+	}
 	defer func() {
-		itelemetry.TraceEmbedding(span, e.requestOptions.MIMEType, e.model, nil, err)
+		embeddingAttributes.Error = err
+		itelemetry.TraceEmbedding(span, embeddingAttributes)
 		span.End()
 	}()
 	// Remove the `models/` prefix from the model id if it exists.

@@ -13,6 +13,7 @@ import (
 	"context"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/server/agui/adapter"
 	"trpc.group/trpc-go/trpc-agent-go/server/agui/aggregator"
@@ -21,29 +22,45 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/session"
 )
 
+const (
+	defaultTimeout                           = time.Hour
+	defaultGraphNodeLifecycleActivityEnabled = false
+	defaultGraphNodeInterruptActivityEnabled = false
+)
+
 // Options holds the options for the runner.
 type Options struct {
-	TranslatorFactory  TranslatorFactory     // TranslatorFactory creates a translator for an AG-UI run.
-	UserIDResolver     UserIDResolver        // UserIDResolver derives the user identifier for an AG-UI run.
-	TranslateCallbacks *translator.Callbacks // TranslateCallbacks translates the run events to AG-UI events.
-	RunAgentInputHook  RunAgentInputHook     // RunAgentInputHook allows modifying the run input before processing.
-	AppName            string                // AppName is the name of the application.
-	SessionService     session.Service       // SessionService is the session service.
-	RunOptionResolver  RunOptionResolver     // RunOptionResolver resolves the runner options for an AG-UI run.
-	AggregatorFactory  aggregator.Factory    // AggregatorFactory builds an aggregator for each run.
-	AggregationOption  []aggregator.Option   // AggregationOption is the aggregation options for each run.
-	FlushInterval      time.Duration         // FlushInterval controls how often buffered AG-UI events are flushed for a session.
+	TranslatorFactory                 TranslatorFactory     // TranslatorFactory creates a translator for an AG-UI run.
+	UserIDResolver                    UserIDResolver        // UserIDResolver derives the user identifier for an AG-UI run.
+	TranslateCallbacks                *translator.Callbacks // TranslateCallbacks translates the run events to AG-UI events.
+	RunAgentInputHook                 RunAgentInputHook     // RunAgentInputHook allows modifying the run input before processing.
+	AppName                           string                // AppName is the name of the application.
+	SessionService                    session.Service       // SessionService is the session service.
+	StateResolver                     StateResolver         // StateResolver resolves runtime state for an AG-UI run.
+	RunOptionResolver                 RunOptionResolver     // RunOptionResolver resolves the runner options for an AG-UI run.
+	AggregatorFactory                 aggregator.Factory    // AggregatorFactory builds an aggregator for each run.
+	AggregationOption                 []aggregator.Option   // AggregationOption is the aggregation options for each run.
+	FlushInterval                     time.Duration         // FlushInterval controls how often buffered AG-UI events are flushed for a session.
+	StartSpan                         StartSpan             // StartSpan starts a span for an AG-UI run.
+	Timeout                           time.Duration         // Timeout controls how long a run is allowed to execute.
+	GraphNodeLifecycleActivityEnabled bool                  // GraphNodeLifecycleActivityEnabled enables graph node lifecycle activity events.
+	GraphNodeInterruptActivityEnabled bool                  // GraphNodeInterruptActivityEnabled enables graph interrupt activity events.
 }
 
 // NewOptions creates a new options instance.
 func NewOptions(opt ...Option) *Options {
 	opts := &Options{
-		UserIDResolver:    defaultUserIDResolver,
-		TranslatorFactory: defaultTranslatorFactory,
-		RunAgentInputHook: defaultRunAgentInputHook,
-		RunOptionResolver: defaultRunOptionResolver,
-		AggregatorFactory: aggregator.New,
-		FlushInterval:     track.DefaultFlushInterval,
+		UserIDResolver:                    defaultUserIDResolver,
+		TranslatorFactory:                 defaultTranslatorFactory,
+		RunAgentInputHook:                 defaultRunAgentInputHook,
+		StateResolver:                     defaultStateResolver,
+		RunOptionResolver:                 defaultRunOptionResolver,
+		AggregatorFactory:                 aggregator.New,
+		FlushInterval:                     track.DefaultFlushInterval,
+		StartSpan:                         defaultStartSpan,
+		Timeout:                           defaultTimeout,
+		GraphNodeLifecycleActivityEnabled: defaultGraphNodeLifecycleActivityEnabled,
+		GraphNodeInterruptActivityEnabled: defaultGraphNodeInterruptActivityEnabled,
 	}
 	for _, o := range opt {
 		o(opts)
@@ -65,7 +82,8 @@ func WithUserIDResolver(u UserIDResolver) Option {
 }
 
 // TranslatorFactory is a function that creates a translator for an AG-UI run.
-type TranslatorFactory func(ctx context.Context, input *adapter.RunAgentInput) translator.Translator
+type TranslatorFactory func(ctx context.Context, input *adapter.RunAgentInput,
+	opts ...translator.Option) (translator.Translator, error)
 
 // WithTranslatorFactory sets the translator factory.
 func WithTranslatorFactory(factory TranslatorFactory) Option {
@@ -105,6 +123,16 @@ func WithSessionService(s session.Service) Option {
 	}
 }
 
+// StateResolver is a function that derives runtime state for an AG-UI run.
+type StateResolver func(ctx context.Context, input *adapter.RunAgentInput) (map[string]any, error)
+
+// WithStateResolver sets the runtime state resolver.
+func WithStateResolver(r StateResolver) Option {
+	return func(o *Options) {
+		o.StateResolver = r
+	}
+}
+
 // WithAggregationOption forwards aggregator options to the runner-level factory.
 func WithAggregationOption(option ...aggregator.Option) Option {
 	return func(o *Options) {
@@ -136,14 +164,45 @@ func WithRunOptionResolver(r RunOptionResolver) Option {
 	}
 }
 
+// StartSpan starts a span for an AG-UI run and returns the updated context.
+type StartSpan func(ctx context.Context, input *adapter.RunAgentInput) (context.Context, trace.Span, error)
+
+// WithStartSpan sets the span starter for AG-UI runs.
+func WithStartSpan(start StartSpan) Option {
+	return func(o *Options) {
+		o.StartSpan = start
+	}
+}
+
+// WithTimeout sets the maximum execution time for a run.
+func WithTimeout(d time.Duration) Option {
+	return func(o *Options) {
+		o.Timeout = d
+	}
+}
+
+// WithGraphNodeLifecycleActivityEnabled enables emitting graph node lifecycle activity events.
+func WithGraphNodeLifecycleActivityEnabled(enabled bool) Option {
+	return func(o *Options) {
+		o.GraphNodeLifecycleActivityEnabled = enabled
+	}
+}
+
+// WithGraphNodeInterruptActivityEnabled enables emitting graph interrupt activity events.
+func WithGraphNodeInterruptActivityEnabled(enabled bool) Option {
+	return func(o *Options) {
+		o.GraphNodeInterruptActivityEnabled = enabled
+	}
+}
+
 // defaultUserIDResolver is the default user ID resolver.
 func defaultUserIDResolver(ctx context.Context, input *adapter.RunAgentInput) (string, error) {
 	return "user", nil
 }
 
-// defaultTranslatorFactory is the default translator factory.
-func defaultTranslatorFactory(ctx context.Context, input *adapter.RunAgentInput) translator.Translator {
-	return translator.New(ctx, input.ThreadID, input.RunID)
+func defaultTranslatorFactory(ctx context.Context, input *adapter.RunAgentInput,
+	opts ...translator.Option) (translator.Translator, error) {
+	return translator.New(ctx, input.ThreadID, input.RunID, opts...)
 }
 
 // defaultRunAgentInputHook returns the input unchanged.
@@ -154,4 +213,14 @@ func defaultRunAgentInputHook(ctx context.Context, input *adapter.RunAgentInput)
 // defaultRunOptionResolver is the default run option resolver.
 func defaultRunOptionResolver(ctx context.Context, input *adapter.RunAgentInput) ([]agent.RunOption, error) {
 	return nil, nil
+}
+
+// defaultStateResolver returns no runtime state.
+func defaultStateResolver(ctx context.Context, input *adapter.RunAgentInput) (map[string]any, error) {
+	return nil, nil
+}
+
+// defaultStartSpan returns the original context and a non-recording span.
+func defaultStartSpan(ctx context.Context, _ *adapter.RunAgentInput) (context.Context, trace.Span, error) {
+	return ctx, trace.SpanFromContext(ctx), nil
 }

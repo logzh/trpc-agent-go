@@ -11,6 +11,7 @@
 package state
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -18,6 +19,11 @@ import (
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/session"
+)
+
+const (
+	// Prefix for current invocation-scoped state variables from invocation.state
+	stateInvocationKey = "invocation:"
 )
 
 // mustachePlaceholderRE matches Mustache-style placeholders like {{key}},
@@ -53,6 +59,33 @@ func normalizePlaceholders(s string) string {
 //	state: {"capital_city": "Paris"}
 //	result: "Tell me about the city stored in Paris."
 func InjectSessionState(template string, invocation *agent.Invocation) (string, error) {
+	return injectSessionState(template, invocation, nil)
+}
+
+// InjectSessionStateWithSession injects state into template using invocation
+// state and an explicit session override.
+//
+// This is useful when the caller wants to read placeholders from a session
+// object that is not attached to the invocation, while still supporting
+// {invocation:*} placeholders.
+//
+// Precedence:
+//   - {invocation:*} reads from invocation state (invocation.GetState)
+//   - other placeholders read from the provided session when non-nil;
+//     otherwise from invocation.Session
+func InjectSessionStateWithSession(
+	template string,
+	invocation *agent.Invocation,
+	sess *session.Session,
+) (string, error) {
+	return injectSessionState(template, invocation, sess)
+}
+
+func injectSessionState(
+	template string,
+	invocation *agent.Invocation,
+	sess *session.Session,
+) (string, error) {
 	if template == "" {
 		return template, nil
 	}
@@ -92,16 +125,20 @@ func InjectSessionState(template string, invocation *agent.Invocation) (string, 
 			return match // Return original match for invalid names.
 		}
 
+		if stateKey, ok := strings.CutPrefix(varName, stateInvocationKey); ok && invocation != nil {
+			if val, exists := invocation.GetState(stateKey); exists && val != nil {
+				return fmt.Sprintf("%+v", val)
+			}
+		}
+
 		// Get the value from session state.
-		if invocation != nil && invocation.Session != nil && invocation.Session.State != nil {
-			if jsonBytes, exists := invocation.Session.State[varName]; exists {
-				// Try to unmarshal as JSON first.
-				var jsonValue any
-				if err := json.Unmarshal(jsonBytes, &jsonValue); err == nil {
-					return fmt.Sprintf("%v", jsonValue)
-				}
-				// If JSON unmarshaling fails, treat as string.
-				return string(jsonBytes)
+		sessionToUse := sess
+		if sessionToUse == nil && invocation != nil {
+			sessionToUse = invocation.Session
+		}
+		if sessionToUse != nil {
+			if jsonBytes, exists := sessionToUse.GetState(varName); exists {
+				return renderStateValue(jsonBytes)
 			}
 		}
 
@@ -115,6 +152,35 @@ func InjectSessionState(template string, invocation *agent.Invocation) (string, 
 		return match
 	})
 	return result, nil
+}
+
+// renderStateValue converts a raw state value to its string representation.
+// It preserves JSON semantics while avoiding scientific notation and precision
+// issues for numeric literals by decoding them into json.Number.
+func renderStateValue(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	if !json.Valid(raw) {
+		return string(raw)
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var jsonValue any
+	if err := dec.Decode(&jsonValue); err != nil {
+		return string(raw)
+	}
+	switch v := jsonValue.(type) {
+	case string:
+		return v
+	case json.Number:
+		return v.String()
+	default:
+		// Preserve JSON objects/arrays as JSON text so injection does not
+		// degrade them into Go's fmt representation (e.g. map[k:v]).
+		return string(raw)
+	}
 }
 
 // isValidStateName checks if the variable name is a valid state name.
@@ -135,7 +201,7 @@ func isValidStateName(varName string) bool {
 	parts := strings.Split(varName, ":")
 	if len(parts) == 2 {
 		prefix := parts[0] + ":"
-		validPrefixes := []string{session.StateAppPrefix, session.StateUserPrefix, session.StateTempPrefix}
+		validPrefixes := []string{session.StateAppPrefix, session.StateUserPrefix, session.StateTempPrefix, stateInvocationKey}
 		for _, validPrefix := range validPrefixes {
 			if prefix == validPrefix {
 				return isIdentifier(parts[1])

@@ -47,6 +47,7 @@ agentEvaluator, err := evaluation.New(
 if err != nil {
 	log.Fatalf("create evaluator: %v", err)
 }
+defer agentEvaluator.Close()
 // 执行评估
 result, err := agentEvaluator.Evaluate(context.Background(), evalSetID)
 if err != nil {
@@ -62,58 +63,42 @@ if err != nil {
   "name": "math-basic",
   "evalCases": [
     {
-        "evalId": "calc_add",
-        "conversation": [
-          {
-            "invocationId": "calc_add-1",
-            "userContent": {
-              "parts": [
-                {
-                  "text": "calc add 2 3"
-                }
-              ],
-              "role": "user"
-            },
-            "finalResponse": {
-              "parts": [
-                {
-                  "text": "calc result: 5"
-                }
-              ],
-              "role": "assistant"
-            },
-            "intermediateData": {
-              "toolUses": [
-                {
-                  "id": "tool_use_1",
-                  "args": {
-                    "a": 2,
-                    "b": 3,
-                    "operation": "add"
-                  },
-                  "name": "calculator"
-                }
-              ],
-              "toolResponses": [
-                {
-                  "id": "tool_use_1",
-                  "name": "calculator",
-                  "response": {
-                    "a": 2,
-                    "b": 3,
-                    "operation": "add",
-                    "result": 5
-                  }
-                }
-              ]
+      "evalId": "calc_add",
+      "conversation": [
+        {
+          "invocationId": "calc_add-1",
+          "userContent": {
+            "role": "user",
+            "content": "calc add 2 3"
+          },
+          "finalResponse": {
+            "role": "assistant",
+            "content": "calc result: 5"
+          },
+          "tools": [
+            {
+              "id": "tool_use_1",
+              "name": "calculator",
+              "arguments": {
+                "operation": "add",
+                "a": 2,
+                "b": 3
+              },
+              "result": {
+                "a": 2,
+                "b": 3,
+                "operation": "add",
+                "result": 5
+              }
             }
-          }
-        ],
-        "sessionInput": {
-          "appName": "math-eval-app",
-          "userId": "user"
+          ]
         }
+      ],
+      "sessionInput": {
+        "appName": "math-eval-app",
+        "userId": "user"
       }
+    }
   ],
   "creationTimestamp": 1761134484.9804401
 }
@@ -128,6 +113,7 @@ if err != nil {
     "threshold": 1,
     "criterion": {
       "toolTrajectory": {
+        "orderSensitive": false,
         "defaultStrategy": {
           "name": {
             "matchStrategy": "exact"
@@ -135,7 +121,7 @@ if err != nil {
           "arguments": {
             "matchStrategy": "exact"
           },
-          "response": {
+          "result": {
             "matchStrategy": "exact"
           }
         }
@@ -149,19 +135,19 @@ if err != nil {
 
 ```json
 {
-  "evalSetResultId": "math-eval-app_math-basic_d545562e-f2fa-4dcf-816e-3474e85b3494",
-  "evalSetResultName": "math-eval-app_math-basic_d545562e-f2fa-4dcf-816e-3474e85b3494",
+  "evalSetResultId": "math-eval-app_math-basic_538cdf6e-925d-41cf-943b-2849982b195e",
+  "evalSetResultName": "math-eval-app_math-basic_538cdf6e-925d-41cf-943b-2849982b195e",
   "evalSetId": "math-basic",
   "evalCaseResults": [
     {
       "evalSetId": "math-basic",
       "evalId": "calc_add",
-      "finalEvalStatus": 1,
+      "finalEvalStatus": "passed",
       "overallEvalMetricResults": [
         {
           "metricName": "tool_trajectory_avg_score",
           "score": 1,
-          "evalStatus": 1,
+          "evalStatus": "passed",
           "threshold": 1,
           "criterion": {
             "toolTrajectory": {
@@ -172,109 +158,80 @@ if err != nil {
                 "arguments": {
                   "matchStrategy": "exact"
                 },
-                "response": {
+                "result": {
                   "matchStrategy": "exact"
                 }
               }
             }
+          },
+          "details": {
+            "score": 1
           }
         }
       ],
       "evalMetricResultPerInvocation": [
         {
           "actualInvocation": {
-            "invocationId": "53845847-16e0-4960-9d00-d3abf0ab1807",
+            "invocationId": "5cc1f162-37e6-4d07-90e9-eb3ec5205b8d",
             "userContent": {
-              "parts": [
-                {
-                  "text": "calc add 2 3"
-                }
-              ],
-              "role": "user"
+              "role": "user",
+              "content": "calc add 2 3"
             },
             "finalResponse": {
-              "parts": [
-                {
-                  "text": "The result of 2 + 3 is **5**."
-                }
-              ],
-              "role": "assistant"
+              "role": "assistant",
+              "content": "The result of 2 + 3 is **5**."
             },
-            "intermediateData": {
-              "toolUses": [
-                {
-                  "id": "call_00_J7WhW8PJurYtWji3J5H7ITN9",
-                  "args": {
-                    "a": 2,
-                    "b": 3,
-                    "operation": "add"
-                  },
-                  "name": "calculator"
+            "tools": [
+              {
+                "id": "call_00_etTEEthmCocxvq7r3m2LJRXf",
+                "name": "calculator",
+                "arguments": {
+                  "a": 2,
+                  "b": 3,
+                  "operation": "add"
+                },
+                "result": {
+                  "a": 2,
+                  "b": 3,
+                  "operation": "add",
+                  "result": 5
                 }
-              ],
-              "toolResponses": [
-                {
-                  "id": "call_00_J7WhW8PJurYtWji3J5H7ITN9",
-                  "name": "calculator",
-                  "response": {
-                    "a": 2,
-                    "b": 3,
-                    "operation": "add",
-                    "result": 5
-                  }
-                }
-              ]
-            }
+              }
+            ]
           },
           "expectedInvocation": {
             "invocationId": "calc_add-1",
             "userContent": {
-              "parts": [
-                {
-                  "text": "calc add 2 3"
-                }
-              ],
-              "role": "user"
+              "role": "user",
+              "content": "calc add 2 3"
             },
             "finalResponse": {
-              "parts": [
-                {
-                  "text": "calc result: 5"
-                }
-              ],
-              "role": "assistant"
+              "role": "assistant",
+              "content": "calc result: 5"
             },
-            "intermediateData": {
-              "toolUses": [
-                {
-                  "id": "tool_use_1",
-                  "args": {
-                    "a": 2,
-                    "b": 3,
-                    "operation": "add"
-                  },
-                  "name": "calculator"
+            "tools": [
+              {
+                "id": "tool_use_1",
+                "name": "calculator",
+                "arguments": {
+                  "a": 2,
+                  "b": 3,
+                  "operation": "add"
+                },
+                "result": {
+                  "a": 2,
+                  "b": 3,
+                  "operation": "add",
+                  "result": 5
                 }
-              ],
-              "toolResponses": [
-                {
-                  "id": "tool_use_1",
-                  "name": "calculator",
-                  "response": {
-                    "a": 2,
-                    "b": 3,
-                    "operation": "add",
-                    "result": 5
-                  }
-                }
-              ]
-            }
+              }
+            ]
           },
           "evalMetricResults": [
             {
               "metricName": "tool_trajectory_avg_score",
               "score": 1,
-              "evalStatus": 1,
+              "evalStatus": "passed",
               "threshold": 1,
               "criterion": {
                 "toolTrajectory": {
@@ -285,21 +242,24 @@ if err != nil {
                     "arguments": {
                       "matchStrategy": "exact"
                     },
-                    "response": {
+                    "result": {
                       "matchStrategy": "exact"
                     }
                   }
                 }
+              },
+              "details": {
+                "score": 1
               }
             }
           ]
         }
       ],
-      "sessionId": "e9cc851f-8c89-45f4-b430-7c54991c7dda",
+      "sessionId": "19877398-9586-4a97-b1d3-f8ce636ea54f",
       "userId": "user"
     }
   ],
-  "creationTimestamp": 1763997862.5581782
+  "creationTimestamp": 1766455261.342534
 }
 ```
 
@@ -352,6 +312,7 @@ agentEvaluator, err := evaluation.New(
 if err != nil {
 	log.Fatalf("create evaluator: %v", err)
 }
+defer agentEvaluator.Close()
 // 执行评估
 result, err := agentEvaluator.Evaluate(ctx, evalSetID)
 if err != nil {
@@ -363,7 +324,7 @@ if err != nil {
 
 ```go
 import (
-	"google.golang.org/genai"
+	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/evalset"
 )
 
@@ -376,44 +337,28 @@ cases := []*evalset.EvalCase{
 		Conversation: []*evalset.Invocation{
 			{
 				InvocationID: "calc_add-1",
-				UserContent: &genai.Content{
-					Role: "user",
-					Parts: []*genai.Part{
-						{
-							Text: "calc add 2 3",
-						},
-					},
+				UserContent: &model.Message{
+					Role:    model.RoleUser,
+					Content: "calc add 2 3",
 				},
-				FinalResponse: &genai.Content{
-					Role: "assistant",
-					Parts: []*genai.Part{
-						{
-							Text: "calc result: 5",
-						},
-					},
+				FinalResponse: &model.Message{
+					Role:    model.RoleAssistant,
+					Content: "calc result: 5",
 				},
-				IntermediateData: &evalset.IntermediateData{
-					ToolUses: []*genai.FunctionCall{
-						{
-							ID:   "tool_use_1",
-							Name: "calculator",
-							Args: map[string]interface{}{
-								"operation": "add",
-								"a":         2.0,
-								"b":         3.0,
-							},
+				Tools: []*evalset.Tool{
+					{
+						ID:   "tool_use_1",
+						Name: "calculator",
+						Arguments: map[string]any{
+							"operation": "add",
+							"a":         2,
+							"b":         3,
 						},
-					},
-					ToolResponses: []*genai.FunctionResponse{
-						{
-							ID:   "tool_use_1",
-							Name: "calculator",
-							Response: map[string]interface{}{
-								"a":         2.0,
-								"b":         3.0,
-								"operation": "add",
-								"result":    5.0,
-							},
+						Result: map[string]any{
+							"a":         2,
+							"b":         3,
+							"operation": "add",
+							"result":    5,
 						},
 					},
 				},
@@ -435,7 +380,13 @@ for _, evalCase := range cases {
 #### 评估指标 Metric 构建
 
 ```go
-import "trpc.group/trpc-go/trpc-agent-go/evaluation/metric"
+import (
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric"
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion"
+	cjson "trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion/json"
+	ctext "trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion/text"
+	ctooltrajectory "trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion/tooltrajectory"
+)
 
 evalMetric := &metric.EvalMetric{
 	MetricName: "tool_trajectory_avg_score",
@@ -445,13 +396,13 @@ evalMetric := &metric.EvalMetric{
 			ctooltrajectory.New(
 				ctooltrajectory.WithDefault(
 					&ctooltrajectory.ToolTrajectoryStrategy{
-						Name: &text.TextCriterion{
-							MatchStrategy: text.TextMatchStrategyExact,
+						Name: &ctext.TextCriterion{
+							MatchStrategy: ctext.TextMatchStrategyExact,
 						},
 						Arguments: &cjson.JSONCriterion{
 							MatchStrategy: cjson.JSONMatchStrategyExact,
 						},
-						Response: &cjson.JSONCriterion{
+						Result: &cjson.JSONCriterion{
 							MatchStrategy: cjson.JSONMatchStrategyExact,
 						},
 					},
@@ -466,13 +417,13 @@ metricManager.Add(ctx, appName, evalSetID, evalMetric)
 ## 核心概念
 
 ![evaluation](../assets/img/evaluation/evaluation.png)
-                                                                                                                           
+
 - 评估集 EvalSet 提供评估所需的数据集，包含用户输入及其对应的预期 Agent 输出。
 - 评估指标 Metric 定义用于衡量模型表现的指标信息，包括指标名称及对应的分数阈值。
 - 评估器 Evaluator 负责对比实际会话结果与预期会话结果，计算具体得分，并依据评估指标阈值判断评估状态。
 - 评估器注册中心 Registry 维护评估指标名称与对应评估器的映射关系，支持动态注册与查找评估器。
 - 评估服务 Service 作为核心组件，整合了待评估的 Agent、评估集 EvalSet、评估指标 Metric、评估器注册中心 Registry 以及评估结果 EvalResult Registry。评估流程分为两个阶段：
-  - 推理阶段 Inference：从评估集提取用户输入，调用 Agent 执行推理，将 Agent 的实际输出与预期输出组合形成推理结果。
+  - 推理阶段 Inference：默认模式下从评估集提取用户输入并调用 Agent 执行推理，将 Agent 的实际输出与预期输出组合形成推理结果；trace 模式下直接将评估集 `conversation` 作为实际 trace 输出，跳过 Runner 推理。
   - 结果评估阶段 Evaluate：根据评估指标名称 Metric Name 从注册中心获取相应的评估器，并使用多个评估器对推理结果进行多维度评估，最终生成评估结果  EvalResult。
 - Agent Evaluator 为降低 Agent 输出的偶然性，评估服务会被调用 NumRuns 次，并聚合多次结果，以获得更稳定的评估结果。
 
@@ -480,21 +431,32 @@ metricManager.Add(ctx, appName, evalSetID, evalMetric)
 
 EvalSet 是一组 EvalCase 的集合，通过唯一的 EvalSetID 进行标识，作为评估流程中的会话数据。
 
-而 EvalCase 表示同一 Session 下的一组评估用例，包含唯一标识符 EvalID、对话内容以及 Session 初始化信息。
+而 EvalCase 表示同一 Session 下的一组评估用例，包含唯一标识符 EvalID、对话内容、可选的 `contextMessages` 以及 Session 初始化信息。
 
-对话数据包括三类内容：
+对话数据包括四类内容：
 
 - 用户输入
 - Agent 最终响应
-- Agent 中间响应，包括:
-  - 工具调用
-  - 工具响应
-  - 中间响应信息
+- 工具调用与结果
+- 中间响应信息
+
+EvalCase 支持通过 `evalMode` 配置评估模式：
+
+- 默认模式（`evalMode` 省略或空字符串）：`conversation` 作为预期输出，评估过程会调用 Runner/Agent 生成实际输出。
+- trace 模式（`evalMode` 为 `"trace"`）：`conversation` 作为实际输出 trace，评估过程不会调用 Runner/Agent 执行推理。
 
 ```go
 import (
-	"google.golang.org/genai"
-	"trpc.group/trpc-go/trpc-agent-go/evaluation/internal/epochtime"
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/epochtime"
+	"trpc.group/trpc-go/trpc-agent-go/model"
+)
+
+// EvalMode 表示评估模式类型
+type EvalMode string
+
+const (
+	EvalModeDefault EvalMode = ""      // EvalModeDefault 表示默认模式
+	EvalModeTrace   EvalMode = "trace" // EvalModeTrace 表示 Trace 评估模式
 )
 
 // EvalSet 表示一个评估集
@@ -509,6 +471,8 @@ type EvalSet struct {
 // EvalCase 表示单个评估用例
 type EvalCase struct {
 	EvalID            string               // 用例唯一标识
+	EvalMode          EvalMode             // 评估模式
+	ContextMessages   []*model.Message     // 用于在每次推理时注入上下文消息。
 	Conversation      []*Invocation        // 对话序列
 	SessionInput      *SessionInput        // Session 初始化数据
 	CreationTimestamp *epochtime.EpochTime // 创建时间
@@ -516,25 +480,27 @@ type EvalCase struct {
 
 // Invocation 表示一次用户与 Agent 的交互
 type Invocation struct {
-	InvocationID      string
-	UserContent       *genai.Content       // 用户输入
-	FinalResponse     *genai.Content       // Agent 最终响应
-	IntermediateData  *IntermediateData    // Agent 中间响应数据
-	CreationTimestamp *epochtime.EpochTime // 创建时间
+	InvocationID          string
+	UserContent           *model.Message       // 用户输入
+	FinalResponse         *model.Message       // Agent 最终响应
+	Tools                 []*Tool              // 工具调用与工具执行结果
+	IntermediateResponses []*model.Message     // Agent 中间响应数据
+	CreationTimestamp     *epochtime.EpochTime // 创建时间
 }
 
-// IntermediateData 表示执行过程中的中间数据
-type IntermediateData struct {
-	ToolUses              []*genai.FunctionCall     // 工具调用
-	ToolResponses         []*genai.FunctionResponse // 工具响应
-	IntermediateResponses [][]any                   // 中间响应，包含来源与内容
+// Tool 表示一次工具调用和工具执行结果
+type Tool struct {
+	ID        string // 工具调用 ID
+	Name      string // 工具名
+	Arguments any    // 工具调用输入参数
+	Result    any    // 工具执行结果
 }
 
 // SessionInput 表示 Session 初始化输入
 type SessionInput struct {
-	AppName string                 // 应用名
-	UserID  string                 // 用户 ID
-	State   map[string]interface{} // 初始状态
+	AppName string         // 应用名
+	UserID  string         // 用户 ID
+	State   map[string]any // 初始状态
 }
 ```
 
@@ -570,6 +536,7 @@ Metric 表示一个评估指标，用于衡量 EvalSet 的某一方面表现，�
 ```go
 import (
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion"
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion/llm"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion/tooltrajectory"
 )
 
@@ -583,6 +550,7 @@ type EvalMetric struct {
 // Criterion 聚合各类评估准则
 type Criterion struct {
 	ToolTrajectory *tooltrajectory.ToolTrajectoryCriterion // 工具轨迹评估准则
+	LLMJudge       *llm.LLMCriterion                       // LLM 评估准则
 }
 ```
 
@@ -635,6 +603,7 @@ Evaluator 根据实际会话、预期会话 与评估指标计算最终评估结
 
 ```go
 import (
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/evalresult"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/evalset"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/status"
@@ -653,17 +622,25 @@ type Evaluator interface {
 
 // EvaluateResult 表示评估器在多次会话上的汇总结果
 type EvaluateResult struct {
-	OverallScore         float64               // 总体得分
-	OverallStatus        status.EvalStatus     // 总体状态，分为通过/未通过/未评估
-	PerInvocationResults []PerInvocationResult // 单次会话评估结果
+	OverallScore         float64                // 总体得分
+	OverallStatus        status.EvalStatus      // 总体状态，分为通过/未通过/未评估
+	PerInvocationResults []*PerInvocationResult // 单次会话评估结果
 }
 
 // PerInvocationResult 表示单次会话的评估结果
 type PerInvocationResult struct {
-	ActualInvocation   *evalset.Invocation // 实际会话
-	ExpectedInvocation *evalset.Invocation // 预期会话
-	Score              float64             // 当前会话得分
-	Status             status.EvalStatus   // 当前会话状态
+	ActualInvocation   *evalset.Invocation   // 实际会话
+	ExpectedInvocation *evalset.Invocation   // 预期会话
+	Score              float64               // 当前会话得分
+	Status             status.EvalStatus     // 当前会话状态
+	Details            *PerInvocationDetails // 额外信息，例如原因和评分
+}
+
+// PerInvocationDetails 表示单轮评估的额外信息
+type PerInvocationDetails struct {
+	Reason       string                    // 评分原因
+	Score        float64                   // 评估得分
+	RubricScores []*evalresult.RubricScore // 各项评估细则结果
 }
 ```
 
@@ -690,11 +667,10 @@ type Registry interface {
 
 框架默认注册了以下评估器：
 
-- `tool_trajectory_avg_score` 工具轨迹一致性评估器。
-  - 对于单次会话：
-    - 若实际工具调用序列与预期完全一致，则计 1 分；
-    - 若不一致，则计 0 分。
-  - 对于多次会话：计算各会话得分的平均值作为最终得分。
+- `tool_trajectory_avg_score` 工具轨迹一致性评估器，需要配置预期输出。
+- `llm_final_response` LLM 最终响应评估器，需要配置预期输出。
+- `llm_rubric_response` LLM rubric 响应评估器，需要评估集提供会话输入并配置 LLMJudge/rubrics。
+- `llm_rubric_knowledge_recall` LLM rubric 知识召回评估器，需要评估集提供会话输入并配置 LLMJudge/rubrics。
 
 ### 评估结果 -- EvalResult
 
@@ -742,12 +718,33 @@ import (
 
 // EvalMetricResult 表示单项指标的评估结果
 type EvalMetricResult struct {
-	MetricName string               // 指标名称
-	Score      float64              // 实际得分
-	EvalStatus status.EvalStatus    // 评测状态
-	Threshold  float64              // 阈值
-	Criterion  *criterion.Criterion // 评估准则
-	Details    map[string]any       // 额外信息，如评分过程、错误描述等
+	MetricName string                   // 指标名称
+	Score      float64                  // 实际得分
+	EvalStatus status.EvalStatus        // 评测状态
+	Threshold  float64                  // 阈值
+	Criterion  *criterion.Criterion     // 评估准则
+	Details    *EvalMetricResultDetails // 额外信息，如评分过程、错误描述等
+}
+
+// EvalMetricResultDetails 表示指标评估的附加信息
+type EvalMetricResultDetails struct {
+	Reason       string         // 评分原因
+	Score        float64        // 评估得分
+	RubricScores []*RubricScore // 各项评估细则结果
+}
+
+// RubricScore 表示单条评估细则结果
+type RubricScore struct {
+	ID     string  // 评估细则 ID
+	Reason string  // 评分原因
+	Score  float64 // 评估得分
+}
+
+// ScoreResult 表示单项指标的评分结果
+type ScoreResult struct {
+	Reason       string         // 评分原因
+	Score        float64        // 评估得分
+	RubricScores []*RubricScore // 各项评估细则结果
 }
 ```
 
@@ -882,10 +879,12 @@ type EvaluateConfig struct {
 `AgentEvaluator` 用于根据配置的评估集 EvalSetID 对 Agent 进行评估。
 
 ```go
-// AgentEvaluator 根据评估集评估 Agent
+// AgentEvaluator evaluates an agent based on an evaluation set.
 type AgentEvaluator interface {
-	// Evaluate 对指定的评估集执行评估
+	// Evaluate evaluates the specified evaluation set.
 	Evaluate(ctx context.Context, evalSetID string) (*EvaluationResult, error)
+	// Close closes the evaluator and releases owned resources.
+	Close() error
 }
 ```
 
@@ -925,6 +924,10 @@ type EvaluationCaseResult struct {
 
 ```go
 agentEvaluator, err := evaluation.New(appName, runner, evaluation.WithNumRuns(numRuns))
+if err != nil {
+	panic(err)
+}
+defer agentEvaluator.Close()
 ```
 
 由于 Agent 的运行过程可能存不确定性，`evaluation.WithNumRuns` 提供了多次评估运行的机制，用于降低单次运行带来的偶然性。
@@ -933,40 +936,22 @@ agentEvaluator, err := evaluation.New(appName, runner, evaluation.WithNumRuns(nu
 - 通过指定 `evaluation.WithNumRuns(n)`，可对每个评估用例运行多次；
 - 最终结果将基于多次运行的综合统计结果得出，默认统计方法是多次运行评估得分的平均值。
 
-## 使用指南
+对于较大的评估集，为了加速 inference 阶段，可以开启 EvalCase 级别的并发推理：
 
-### Debug Server 集成
-
-Debug Server 集成了 Evaluation 管理与运行接口，提供了可视化评估能力。
+- `evaluation.WithEvalCaseParallelInferenceEnabled(true)`：开启 eval case 并发推理，默认关闭。
+- `evaluation.WithEvalCaseParallelism(n)`：设置最大并发数，默认值为 `runtime.GOMAXPROCS(0)`。
 
 ```go
-import (
-	"net/http"
-
-	"trpc.group/trpc-go/trpc-agent-go/agent"
-	"trpc.group/trpc-go/trpc-agent-go/evaluation/evalresult"
-	evalresultlocal "trpc.group/trpc-go/trpc-agent-go/evaluation/evalresult/local"
-	"trpc.group/trpc-go/trpc-agent-go/evaluation/evalset"
-	evalsetlocal "trpc.group/trpc-go/trpc-agent-go/evaluation/evalset/local"
-	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric"
-	metriclocal "trpc.group/trpc-go/trpc-agent-go/evaluation/metric/local"
-	debugserver "trpc.group/trpc-go/trpc-agent-go/server/debug"
+agentEvaluator, err := evaluation.New(
+	appName,
+	runner,
+	evaluation.WithEvalCaseParallelInferenceEnabled(true),
+	evaluation.WithEvalCaseParallelism(runtime.GOMAXPROCS(0)),
 )
-
-agents := map[string]agent.Agent{
-	"math-app": myAgent,
-}
-srv := debugserver.New(
-	agents,
-	debugserver.WithEvalSetManager(evalsetlocal.New(evalset.WithBaseDir("./evaldata"))),
-	debugserver.WithEvalResultManager(evalresultlocal.New(evalresult.WithBaseDir("./evaldata"))),
-	debugserver.WithMetricManager(metriclocal.New(metric.WithBaseDir("./evaldata"))),
-)
-// Debug Server returns an http.Handler; register it to your HTTP server.
-_ = http.ListenAndServe(":8000", srv.Handler())
+defer agentEvaluator.Close()
 ```
 
-完整代码参见 [examples/evaluation/debug](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/evaluation/debug)。
+## 使用指南
 
 ### 本地文件路径
 
@@ -991,6 +976,10 @@ import (
 
 evalSetManager := evalsetlocal.New(evalset.WithBaseDir("<BaseDir>"))
 agentEvaluator, err := evaluation.New(appName, runner, evaluation.WithEvalSetManager(evalSetManager))
+if err != nil {
+	panic(err)
+}
+defer agentEvaluator.Close()
 ```
 
 此外，若默认路径结构不满足需求，可通过实现 `Locator` 接口自定义文件路径规则，接口定义如下：
@@ -1016,6 +1005,10 @@ import (
 
 evalSetManager := evalsetlocal.New(evalset.WithLocator(&customLocator{}))
 agentEvaluator, err := evaluation.New(appName, runner, evaluation.WithEvalSetManager(evalSetManager))
+if err != nil {
+	panic(err)
+}
+defer agentEvaluator.Close()
 
 type customLocator struct {
 }
@@ -1065,6 +1058,10 @@ import (
 
 metricManager := metriclocal.New(metric.WithBaseDir("<BaseDir>"))
 agentEvaluator, err := evaluation.New(appName, runner, evaluation.WithMetricManager(metricManager))
+if err != nil {
+	panic(err)
+}
+defer agentEvaluator.Close()
 ```
 
 此外，若默认路径结构不满足需求，可通过实现 `Locator` 接口自定义文件路径规则，接口定义如下：
@@ -1088,6 +1085,10 @@ import (
 
 metricManager := metriclocal.New(metric.WithLocator(&customLocator{}))
 agentEvaluator, err := evaluation.New(appName, runner, evaluation.WithMetricManager(metricManager))
+if err != nil {
+	panic(err)
+}
+defer agentEvaluator.Close()
 
 type customLocator struct {
 }
@@ -1113,6 +1114,10 @@ import (
 
 evalResultManager := evalresultlocal.New(evalresult.WithBaseDir("<BaseDir>"))
 agentEvaluator, err := evaluation.New(appName, runner, evaluation.WithEvalResultManager(evalResultManager))
+if err != nil {
+	panic(err)
+}
+defer agentEvaluator.Close()
 ```
 
 此外，若默认路径结构不满足需求，可通过实现 `Locator` 接口自定义文件路径规则，接口定义如下：
@@ -1138,6 +1143,10 @@ import (
 
 evalResultManager := evalresultlocal.New(evalresult.WithLocator(&customLocator{}))
 agentEvaluator, err := evaluation.New(appName, runner, evaluation.WithEvalResultManager(evalResultManager))
+if err != nil {
+	panic(err)
+}
+defer agentEvaluator.Close()
 
 type customLocator struct {
 }
@@ -1172,6 +1181,62 @@ func (l *customLocator) List(baseDir, appName string) ([]string, error) {
 }
 ```
 
+### Trace 评估模式
+
+Trace 评估模式用于评估离线采集到的 Trace 执行轨迹，评估过程中不会调用 Runner 执行推理。
+
+在 EvalSet 的 evalCase 中设置 `evalMode: "trace"`，并将 `conversation` 填写为实际输出的 invocation 序列，例如 `userContent`、`finalResponse`、`tools`、`intermediateResponses`。由于 trace 模式不提供预期输出，建议选择不依赖预期输出的 Metric，例如 `llm_rubric_response`。
+
+```json
+{
+  "evalSetId": "trace-basic",
+  "name": "trace-basic",
+  "evalCases": [
+    {
+      "evalId": "trace_calc_add",
+      "evalMode": "trace",
+      "conversation": [
+        {
+          "invocationId": "trace_calc_add-1",
+          "userContent": {
+            "role": "user",
+            "content": "calc add 123 456"
+          },
+          "finalResponse": {
+            "role": "assistant",
+            "content": "calc result: 579"
+          },
+          "tools": [
+            {
+              "id": "call_00_example",
+              "name": "calculator",
+              "arguments": {
+                "a": 123,
+                "b": 456,
+                "operation": "add"
+              },
+              "result": {
+                "a": 123,
+                "b": 456,
+                "operation": "add",
+                "result": 579
+              }
+            }
+          ]
+        }
+      ],
+      "sessionInput": {
+        "appName": "trace-eval-app",
+        "userId": "demo-user"
+      }
+    }
+  ]
+}
+```
+
+
+完整示例参见 [examples/evaluation/trace](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/evaluation/trace)。
+
 ### 评估准则
 
 评估准则描述具体的评估方式，可按需组合使用。
@@ -1183,6 +1248,7 @@ func (l *customLocator) List(baseDir, appName string) ([]string, error) {
 | TextCriterion           | 文本字符串                             |
 | JSONCriterion           | JSON 对象，通常用于比较 map[string]any  |
 | ToolTrajectoryCriterion | 工具调用轨迹                           |
+| LLMCriterion            | 基于 LLM 评估模型的评估                 |
 | Criterion               | 多种准则的聚合                         |
 
 #### TextCriterion
@@ -1214,9 +1280,11 @@ JSONCriterion 用于对比结构化 JSON 数据，可配置是否忽略比较以
 ```go
 // JSONCriterion 定义 JSON 对象的匹配方式。
 type JSONCriterion struct {
-	Ignore       bool              // 是否跳过匹配
-	MatchStrategy JSONMatchStrategy // 匹配策略
-	Compare       func(actual, expected map[string]any) (bool, error) // 自定义比较
+	Ignore          bool                                                // 是否跳过匹配
+	IgnoreTree      map[string]any                                      // 忽略的字段树，值为 true 时跳过该字段及其子树
+	MatchStrategy   JSONMatchStrategy                                   // 匹配策略
+	NumberTolerance *float64                                            // 数值容差，默认 1e-6，对叶子上的数字做近似比较
+	Compare         func(actual, expected map[string]any) (bool, error) // 自定义比较
 }
 ```
 
@@ -1226,24 +1294,74 @@ JSONMatchStrategy 取值说明：
 |-----------------------|------------------------------|
 | exact                 | 实际 JSON 与预期 JSON 完全一致（默认）。 |
 
-#### ToolTrajectoryCriterion
+`IgnoreTree` 支持在比较时跳过特定字段以及其子树，只校验未被忽略的字段。
 
-ToolTrajectoryCriterion 用于配置工具调用与响应的评估准则，可设置默认策略、按工具名定制策略以及是否忽略调用顺序。
+例如忽略 `metadata.updatedAt` 但校验其他字段：
 
 ```go
-// ToolTrajectoryCriterion 定义工具调用与响应的评估准则。
+criterion := &json.JSONCriterion{
+	IgnoreTree: map[string]any{
+		"metadata": map[string]any{
+			"updatedAt": true,
+		},
+	},
+	NumberTolerance: 1e-6,
+}
+```
+
+配置文件示例如下：
+
+```json
+[
+  {
+    "metricName": "tool_trajectory_avg_score",
+    "threshold": 1,
+    "criterion": {
+      "toolTrajectory": {
+        "orderSensitive": false,
+        "defaultStrategy": {
+          "name": {
+            "matchStrategy": "exact"
+          },
+          "arguments": {
+            "matchStrategy": "exact",
+            "numberTolerance": 1e-6,
+          },
+          "result": {
+            "matchStrategy": "exact",
+            "numberTolerance": 1e-6,
+            "ignoreTree": {
+              "metadata": {
+                "updatedAt": true
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+]
+```
+
+#### ToolTrajectoryCriterion
+
+ToolTrajectoryCriterion 用于配置工具调用与结果的评估准则，可设置默认策略、按工具名定制策略以及是否要求保持调用顺序。
+
+```go
+// ToolTrajectoryCriterion 定义工具调用与结果的评估准则。
 type ToolTrajectoryCriterion struct {
-	DefaultStrategy  *ToolTrajectoryStrategy            // 默认策略
-	ToolStrategy     map[string]*ToolTrajectoryStrategy // 按工具名定制策略
-	OrderInsensitive bool                               // 是否忽略调用顺序
-	Compare          func(actual, expected *evalset.Invocation) (bool, error) // 自定义比较
+	DefaultStrategy *ToolTrajectoryStrategy                                  // 默认策略
+	ToolStrategy    map[string]*ToolTrajectoryStrategy                       // 按工具名定制策略
+	OrderSensitive  bool                                                     // 是否要求按顺序严格匹配
+	SubsetMatching  bool                                                     // 是否允许预期调用为实际调用的子集
+	Compare         func(actual, expected *evalset.Invocation) (bool, error) // 自定义比较
 }
 
 // ToolTrajectoryStrategy 定义单个工具的匹配策略。
 type ToolTrajectoryStrategy struct {
-	Name      *TextCriterion  // 工具名匹配
-	Arguments *JSONCriterion  // 调用参数匹配
-	Response  *JSONCriterion  // 工具响应匹配
+	Name      *TextCriterion // 工具名匹配
+	Arguments *JSONCriterion // 调用参数匹配
+	Result    *JSONCriterion // 工具结果匹配
 }
 ```
 
@@ -1251,7 +1369,7 @@ DefaultStrategy 用于配置全局默认评估准则，适用于所有工具。
 
 ToolStrategy 按工具名覆盖特定工具的评估准则，未设置 ToolStrategy 时所有工具调用都使用 DefaultStrategy。
 
-若未设置任何评估准则，框架会使用默认评估准则：工具名按 TextCriterion 的 exact 策略比较，参数和响应按 JSONCriterion 的 exact 策略比较，保证工具轨迹评估始终有合理的兜底行为。
+若未设置任何评估准则，框架会使用默认评估准则：工具名按 TextCriterion 的 exact 策略比较，参数和结果按 JSONCriterion 的 exact 策略比较，保证工具轨迹评估始终有合理的兜底行为。
 
 下面的示例展示了一个典型场景，大部分工具希望严格对齐工具调用和结果，但 current_time 这类时间相关工具的响应值本身不稳定，因此只需要检查是否按预期调用了正确的工具和参数，而不要求时间值本身完全一致。
 
@@ -1274,7 +1392,7 @@ criterion := criterion.New(
 					Arguments: &json.JSONCriterion{
 						MatchStrategy: json.JSONMatchStrategyExact,
 					},
-					Response: &json.JSONCriterion{
+					Result: &json.JSONCriterion{
 						MatchStrategy: json.JSONMatchStrategyExact,
 					},
 				},
@@ -1287,8 +1405,8 @@ criterion := criterion.New(
 					Arguments: &json.JSONCriterion{
 						MatchStrategy: json.JSONMatchStrategyExact,
 					},
-					Response: &json.JSONCriterion{
-						Ignore: true, // 忽略该工具响应的匹配.
+					Result: &json.JSONCriterion{
+						Ignore: true, // 忽略该工具结果的匹配
 					},
 				},
 			}),
@@ -1297,15 +1415,215 @@ criterion := criterion.New(
 )
 ```
 
-默认情况下，工具调用是按出现顺序逐条比对的，实际调用工具序列与预期工具调用序列在长度、顺序以及每一步的工具名、参数和响应上都需要匹配，若调用顺序不同则会被判定为评估不通过。
+默认情况下，工具调用匹配对顺序不敏感，每个预期工具会与任意一个满足策略的实际工具尝试配对，同一个工具调用不会被重复复用，当所有预期工具都能找到匹配时视为通过。具体来说，此时会通过二分图最大匹配计算最大匹配数，将预期工具调用视为左节点，实际工具调用视为右节点，对于每对预期/实际工具调用，若两者满足工具匹配策略，则从预期工具节点向实际工具节点建一条边。建图完成之后，通过 Kuhn 算法求解二分图最大匹配，然后扫描未匹配的预期工具节点。若达成完美匹配，即所有预期工具节点都有匹配的实际工具节点，则认为工具匹配通过；否则，框架将返回未成功匹配的预期节点。
 
-OrderInsensitive 用于控制是否对工具调用顺序不敏感。开启后，评估逻辑会先为每一次工具调用生成一个排序键（由工具名以及参数和响应的规范化表示共同构成），再分别对实际调用序列和预期调用序列按照这一键进行排序，得到两个具有稳定顺序的调用列表；随后按排序后的顺序逐一比对对应位置的调用，并根据配置的评估准则判断这些调用是否匹配。换简单来说，只要两侧包含的工具调用在调用内容上完全一致，即使原始调用顺序不同，也不会因为顺序差异而导致评估不通过，示例如下：
+若希望严格按预期工具的出现顺序逐条比对，可开启 `WithOrderSensitive(true)`，此时评估器按预期/实际列表顺序扫描，若预期工具调用找不到对应的实际工具调用匹配，则判定为失败。
+
+开启顺序严格匹配的代码示例如下：
 
 ```go
 criterion := criterion.New(
 	criterion.WithToolTrajectory(
 		ctooltrajectory.New(
-			ctooltrajectory.WithOrderInsensitive(true),
+			ctooltrajectory.WithOrderSensitive(true), // 开启顺序敏感匹配.
+		),
+	),
+)
+```
+
+开启顺序严格匹配的配置文件示例如下：
+
+```json
+[
+  {
+    "metricName": "tool_trajectory_avg_score",
+    "threshold": 1,
+    "criterion": {
+      "toolTrajectory": {
+        "orderSensitive": true,
+        "defaultStrategy": {
+          "name": {
+            "matchStrategy": "exact"
+          },
+          "arguments": {
+            "matchStrategy": "exact"
+          },
+          "result": {
+            "matchStrategy": "exact"
+          }
+        }
+      }
+    }
+  }
+]
+```
+
+SubsetMatching 控制预期工具序列是否可以只是实际工具序列的子集，默认关闭。
+
+- 关闭时，预期和实际的工具调用数量必须一致。
+- 开启时，实际工具调用数量可以比预期更多，允许预期工具序列作为实际工具序列的子集。
+
+开启子集匹配的代码示例如下：
+
+```go
+criterion := criterion.New(
+	criterion.WithToolTrajectory(
+		ctooltrajectory.New(
+			ctooltrajectory.WithSubsetMatching(true),
+		),
+	),
+)
+```
+
+开启子集匹配的配置文件如下：
+
+```json
+[
+  {
+    "metricName": "tool_trajectory_avg_score",
+    "threshold": 1,
+    "criterion": {
+      "toolTrajectory": {
+        "subsetMatching": true,
+        "defaultStrategy": {
+          "name": {
+            "matchStrategy": "exact"
+          },
+          "arguments": {
+            "matchStrategy": "exact"
+          },
+          "result": {
+            "matchStrategy": "exact"
+          }
+        }
+      }
+    }
+  }
+]
+```
+
+假设 `A`、`B`、`C` 和 `D` 各自是一组工具调用，匹配情况示例如下。
+
+| SubsetMatching | OrderSensitive | 预期序列 | 实际序列 | 结果 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| 关 | 关 | `[A]` | `[A, B]` | 不匹配 | 数量不等 |
+| 开 | 关 | `[A]` | `[A, B]` | 匹配 | 预期是子集 |
+| 开 | 关 | `[C, A]` | `[A, B, C]` | 匹配 | 预期是子集且无序匹配 |
+| 开 | 开 | `[A, C]` | `[A, B, C]` | 匹配 | 预期是子集且顺序匹配 |
+| 开 | 开 | `[C, A]` | `[A, B, C]` | 不匹配 | 顺序不满足 |
+| 开 | 关 | `[C, D]` | `[A, B, C]` | 不匹配 | 实际工具序列缺少 D |
+| 任意 | 任意 | `[A, A]` | `[A]` | 不匹配 | 实际调用不足，同一调用不能重复匹配 |
+
+
+#### LLMCriterion
+
+LLMCriterion 用于配置基于大模型的评估准则，适用于需要由模型给出评估结论的场景。
+
+```go
+// LLMCriterion 配置评估模型
+type LLMCriterion struct {
+	Rubrics    []*Rubric          // 评估细则配置
+	JudgeModel *JudgeModelOptions // 评估模型配置
+}
+
+// Rubric 定义评估细则
+type Rubric struct {
+	ID          string         // 评估细则唯一标识
+	Description string         // 评估细则描述，供人类阅读
+	Type        string         // 评估细则类型
+	Content     *RubricContent // 评估细则内容，供评估模型阅读
+}
+
+// RubricContent 定义评估细则内容
+type RubricContent struct {
+	Text string // 评估细则具体内容
+}
+
+// JudgeModelOptions 定义评估模型的详细参数
+type JudgeModelOptions struct {
+	ProviderName string                  // 模型供应商名称
+	ModelName    string                  // 评估模型名称
+	BaseURL      string                  // 模型 Base URL
+	APIKey       string                  // 模型 API Key
+	ExtraFields  map[string]any          // 模型请求的额外参数
+	NumSamples   int                     // 评估采样次数
+	Generation   *model.GenerationConfig // 评估模型的生成配置
+}
+```
+
+- `Rubrics` 用于定义评估细则，仅在 rubric 类评估器中使用，无需配置预期输出，评估模型将根据评估细则逐项评估。
+- `NumSamples` 控制评估模型调用次数，未配置时默认值为 1。
+- `Generation` 默认使用 `MaxTokens=2000`、`Temperature=0.8`、`Stream=false`。
+
+出于安全考虑，建议不要把 `judgeModel.apiKey` / `judgeModel.baseURL` 明文写入指标配置文件或者代码。
+
+框架支持在 `.metrics.json` 中对 `judgeModel.providerName`、`judgeModel.modelName`、`judgeModel.apiKey` 和 `judgeModel.baseURL` 使用环境变量占位符，加载配置时会自动展开为对应的环境变量值。
+
+例如：
+
+```json
+[
+  {
+    "metricName": "llm_final_response",
+    "threshold": 0.9,
+    "criterion": {
+      "llmJudge": {
+        "judgeModel": {
+          "providerName": "${JUDGE_MODEL_PROVIDER_NAME}",
+          "modelName":  "${JUDGE_MODEL_NAME}",
+          "baseURL": "${JUDGE_MODEL_BASE_URL}",
+          "apiKey": "${JUDGE_MODEL_API_KEY}",
+          "numSamples": 3,
+          "generationConfig": {
+            "max_tokens": 512,
+            "temperature": 1.0,
+            "stream": false
+          }
+        }
+      }
+    }
+  }
+]
+```
+
+可通过 `criterion.WithLLMJudge` 传入自定义配置，例如：
+
+```go
+import (
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion"
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion/llm"
+	"trpc.group/trpc-go/trpc-agent-go/model"
+)
+
+criterion := criterion.New(
+	criterion.WithLLMJudge(
+		llm.New(
+			"openai",
+			"deepseek-chat",
+			llm.WithNumSamples(3),
+			llm.WithGeneration(&model.GenerationConfig{
+				MaxTokens:   floatPtr(512),
+				Temperature: floatPtr(1.0),
+				Stream:      false,
+			}),
+			llm.WithRubrics([]*llm.Rubric{
+				{
+					ID:          "1",
+					Type:        "FINAL_RESPONSE_QUALITY",
+					Description: "The final answer is correct.",
+					Content: &llm.RubricContent{
+						Text: "The final answer directly addresses the user question, provides the required result, and is consistent with the facts given.",
+					},
+				},
+				{
+					ID:          "2",
+					Type:        "CONTEXT_RELEVANCE",
+					Description: "The final answer is relevant to the user prompt.",
+					Content: &llm.RubricContent{
+						Text: "The final answer stays on topic and does not include unrelated or missing key points from the user prompt.",
+					},
+				},
+			}),
 		),
 	),
 )
@@ -1338,9 +1656,335 @@ evalMetric := &metric.EvalMetric{
 	Threshold:  1.0,
 	Criterion: criterion.New(
 		criterion.WithToolTrajectory(
-			// 使用默认评估准则，工具的名称、参数和响应需严格一致
+			// 使用默认评估准则，工具的名称、参数和执行结果需严格一致
 			ctooltrajectory.New(),
 		),
 	),
 }
 ```
+
+对应的指标配置文件写法示例：
+
+```json
+[
+  {
+    "metricName": "tool_trajectory_avg_score",
+    "threshold": 1,
+    "criterion": {
+      "toolTrajectory": {}
+    }
+  }
+]
+```
+
+完整示例参见 [examples/evaluation/tooltrajectory](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/evaluation/tooltrajectory)。
+
+#### LLM 最终响应评估器
+
+LLM 最终响应评估器对应的指标名称为 `llm_final_response`，通过评估模型判定 Agent 的最终回答是否有效。评估提示词会包含用户输入、参考答案与 Agent 的最终回答，适用于自动化校验最终文本输出。
+
+评估逻辑：
+
+- 使用 `LLMCriterion` 的 `JudgeModel` 调用评估模型，按配置的 `NumSamples` 采样多次。
+- 评估模型需返回字段 `is_the_agent_response_valid`，取值为 `valid` 或 `invalid`（大小写不敏感）；`valid` 记 1 分，`invalid` 记 0 分，其他结果或解析失败会报错。
+- 多次采样时按多数表决聚合，最终得分与 `EvalMetric.Threshold` 比较得到评估结论。
+
+典型配置示例如下：
+
+```go
+import (
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric"
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion"
+	cllm "trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion/llm"
+	"trpc.group/trpc-go/trpc-agent-go/model"
+)
+
+evalMetric := &metric.EvalMetric{
+	MetricName: "llm_final_response",
+	Threshold:  0.9,
+	Criterion: criterion.New(
+		criterion.WithLLMJudge(
+			cllm.New(
+				"openai",
+				"gpt-4o",
+				cllm.WithBaseURL(os.Getenv("JUDGE_MODEL_BASE_URL")),
+				cllm.WithAPIKey(os.Getenv("JUDGE_MODEL_API_KEY")),
+				cllm.WithNumSamples(3),
+				cllm.WithGeneration(&model.GenerationConfig{
+					MaxTokens:   ptr(512),
+					Temperature: ptr(1.0),
+					Stream:      false,
+				}),
+			),
+		),
+	),
+}
+```
+
+对应的指标配置文件写法示例：
+
+```json
+[
+  {
+    "metricName": "llm_final_response",
+    "threshold": 0.9,
+    "criterion": {
+      "llmJudge": {
+        "judgeModel": {
+          "providerName": "openai",
+          "modelName": "gpt-4o",
+          "baseURL": "${JUDGE_MODEL_BASE_URL}",
+          "apiKey": "${JUDGE_MODEL_API_KEY}",
+          "numSamples": 3,
+          "generationConfig": {
+            "max_tokens": 512,
+            "temperature": 1.0,
+            "stream": false
+          }
+        }
+      }
+    }
+  }
+]
+```
+
+完整示例参见 [examples/evaluation/llm/finalresponse](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/evaluation/llm/finalresponse)。
+
+#### LLM Rubric 响应评估器
+
+LLM Rubric 响应评估器对应的指标名称为 `llm_rubric_response`，用于按评估细则判定 Agent 最终回答是否满足各项要求。
+
+评估逻辑：
+
+- 使用 `LLMCriterion` 的 `Rubrics` 构造提示，评估模型返回每个 rubric 的 `yes`/`no` 判定。
+- 单次采样得分为所有 rubric 得分的平均值（`yes`=1，`no`=0）。
+- 多次采样按多数表决选择代表结果，再与 `EvalMetric.Threshold` 比较得出通过/未通过。
+
+典型配置示例：
+
+```go
+import (
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric"
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion"
+	cllm "trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion/llm"
+	"trpc.group/trpc-go/trpc-agent-go/model"
+)
+
+evalMetric := &metric.EvalMetric{
+	MetricName: "llm_rubric_response",
+	Threshold:  0.9,
+	Criterion: criterion.New(
+		criterion.WithLLMJudge(
+			cllm.New(
+				"openai",
+				"deepseek-chat",
+				cllm.WithBaseURL(os.Getenv("JUDGE_MODEL_BASE_URL")),
+				cllm.WithAPIKey(os.Getenv("JUDGE_MODEL_API_KEY")),
+				cllm.WithNumSamples(3),
+				cllm.WithGeneration(&model.GenerationConfig{
+					MaxTokens:   ptr(512),
+					Temperature: ptr(1.0),
+					Stream:      false,
+				}),
+				cllm.WithRubrics([]*cllm.Rubric{
+					{
+						ID:          "1",
+						Type:        "FINAL_RESPONSE_QUALITY",
+						Description: "The final answer is correct.",
+						Content: &cllm.RubricContent{
+							Text: "The final answer is correct and consistent with the user request.",
+						},
+					},
+					{
+						ID:          "2",
+						Type:        "CONTEXT_RELEVANCE",
+						Description: "The final answer is relevant to the user prompt.",
+						Content: &cllm.RubricContent{
+							Text: "The final answer is relevant to the user prompt without unrelated content.",
+						},
+					},
+				}),
+			),
+		),
+	),
+}
+```
+
+对应的指标配置文件写法示例：
+
+```json
+[
+  {
+    "metricName": "llm_rubric_response",
+    "threshold": 0.9,
+    "criterion": {
+      "llmJudge": {
+        "judgeModel": {
+          "providerName": "openai",
+          "modelName": "deepseek-chat",
+          "baseURL": "${JUDGE_MODEL_BASE_URL}",
+          "apiKey": "${JUDGE_MODEL_API_KEY}",
+          "numSamples": 3,
+          "generationConfig": {
+            "max_tokens": 512,
+            "temperature": 1.0,
+            "stream": false
+          }
+        },
+        "rubrics": [
+          {
+            "id": "1",
+            "type": "FINAL_RESPONSE_QUALITY",
+            "description": "The final answer is correct.",
+            "content": {
+              "text": "The final answer is correct and consistent with the user request."
+            }
+          },
+          {
+            "id": "2",
+            "type": "CONTEXT_RELEVANCE",
+            "description": "The final answer is relevant to the user prompt.",
+            "content": {
+              "text": "The final answer is relevant to the user prompt without unrelated content."
+            }
+          }
+        ]
+      }
+    }
+  }
+]
+```
+
+完整示例参见 [examples/evaluation/llm/rubricresponse](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/evaluation/llm/rubricresponse)。
+
+#### LLM Rubric 知识召回评估器
+
+LLM Rubric 知识召回评估器对应的指标名称为 `llm_rubric_knowledge_recall`，用于判定检索到的知识是否支撑用户问题中的关键信息。
+
+评估逻辑：
+
+- 从 `IntermediateData.ToolResponses` 中提取 `knowledge_search`/`knowledge_search_with_agentic_filter` 工具的响应，作为检索结果。
+- 结合 `Rubrics` 生成提示，评估模型对每个 rubric 返回 `yes`/`no`，单次采样得分为平均值。
+- 多次采样使用多数表决确定代表结果，再与阈值比较得到最终结论。
+
+典型配置示例：
+
+```go
+import (
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric"
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion"
+	cllm "trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion/llm"
+	"trpc.group/trpc-go/trpc-agent-go/model"
+)
+
+evalMetric := &metric.EvalMetric{
+	MetricName: "llm_rubric_knowledge_recall",
+	Threshold:  0.9,
+	Criterion: criterion.New(
+		criterion.WithLLMJudge(
+			cllm.New(
+				"openai",
+				"deepseek-chat",
+				cllm.WithBaseURL(os.Getenv("JUDGE_MODEL_BASE_URL")),
+				cllm.WithAPIKey(os.Getenv("JUDGE_MODEL_API_KEY")),
+				cllm.WithNumSamples(3),
+				cllm.WithGeneration(&model.GenerationConfig{
+					MaxTokens:   ptr(512),
+					Temperature: ptr(1.0),
+					Stream:      false,
+				}),
+				cllm.WithRubrics([]*cllm.Rubric{
+					{
+						ID:          "1",
+						Type:        "KNOWLEDGE_RELEVANCE",
+						Description: "The recalled knowledge is relevant to the user's prompt.",
+						Content: &cllm.RubricContent{
+							Text: "The retrieved knowledge directly supports the user prompt and includes key facts.",
+						},
+					},
+				}),
+			),
+		),
+	),
+}
+```
+
+对应的指标配置文件写法示例：
+
+```json
+[
+  {
+    "metricName": "llm_rubric_knowledge_recall",
+    "threshold": 0.9,
+    "criterion": {
+      "llmJudge": {
+        "judgeModel": {
+          "providerName": "openai",
+          "modelName": "deepseek-chat",
+          "baseURL": "${JUDGE_MODEL_BASE_URL}",
+          "apiKey": "${JUDGE_MODEL_API_KEY}",
+          "numSamples": 3,
+          "generationConfig": {
+            "max_tokens": 512,
+            "temperature": 1.0,
+            "stream": false
+          }
+        },
+        "rubrics": [
+          {
+            "id": "1",
+            "type": "KNOWLEDGE_RELEVANCE",
+            "description": "The recalled knowledge is relevant to the user's prompt.",
+            "content": {
+              "text": "The retrieved knowledge directly supports the user prompt and includes key facts."
+            }
+          }
+        ]
+      }
+    }
+  }
+]
+```
+
+该评估器要求 Agent 的工具调用返回检索结果，完整示例参见 [examples/evaluation/llm/knowledgerecall](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/evaluation/llm/knowledgerecall)。
+
+## 最佳实践
+
+### 上下文注入
+
+`contextMessages` 用于为 EvalCase 提供一组额外上下文消息，常用于补充背景信息、角色设定或样本示例。它也适用于纯模型评估场景，将 system prompt 作为评估数据按用例配置，便于对比不同模型与提示词组合的能力。
+
+上下文注入示例：
+
+```json
+{
+  "evalSetId": "contextmessage-basic",
+  "name": "contextmessage-basic",
+  "evalCases": [
+    {
+      "evalId": "identity_name",
+      "contextMessages": [
+        {
+          "role": "system",
+          "content": "You are trpc-agent-go bot."
+        }
+      ],
+      "conversation": [
+        {
+          "invocationId": "identity_name-1",
+          "userContent": {
+            "role": "user",
+            "content": "Who are you?"
+          }
+        }
+      ],
+      "sessionInput": {
+        "appName": "contextmessage-app",
+        "userId": "demo-user"
+      }
+    }
+  ]
+}
+```
+
+完整示例参见 [examples/evaluation/contextmessage](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/evaluation/contextmessage)。

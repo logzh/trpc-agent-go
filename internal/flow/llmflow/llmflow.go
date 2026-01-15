@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	oteltrace "go.opentelemetry.io/otel/trace"
@@ -75,7 +76,8 @@ func New(
 func (f *Flow) Run(ctx context.Context, invocation *agent.Invocation) (<-chan *event.Event, error) {
 	eventChan := make(chan *event.Event, f.channelBufferSize) // Configurable buffered channel for events.
 
-	go func() {
+	runCtx := agent.CloneContext(ctx)
+	go func(ctx context.Context) {
 		defer close(eventChan)
 
 		// Optionally resume from pending tool calls before starting a new
@@ -95,7 +97,12 @@ func (f *Flow) Run(ctx context.Context, invocation *agent.Invocation) (<-chan *e
 				// Treat context cancellation as graceful termination (common in streaming
 				// pipelines where the client closes the stream after final event).
 				if errors.Is(err, context.Canceled) {
-					log.Debugf("Flow context canceled for agent %s; exiting without error", invocation.AgentName)
+					log.DebugfContext(
+						ctx,
+						"Flow context canceled for agent %s; exiting "+
+							"without error",
+						invocation.AgentName,
+					)
 					return
 				}
 				var errorEvent *event.Event
@@ -106,7 +113,12 @@ func (f *Flow) Run(ctx context.Context, invocation *agent.Invocation) (<-chan *e
 						agent.ErrorTypeStopAgentError,
 						err.Error(),
 					)
-					log.Errorf("Flow step stopped for agent %s: %v", invocation.AgentName, err)
+					log.ErrorfContext(
+						ctx,
+						"Flow step stopped for agent %s: %v",
+						invocation.AgentName,
+						err,
+					)
 				} else {
 					// Send error event through channel instead of just logging.
 					errorEvent = event.NewErrorEvent(
@@ -115,7 +127,12 @@ func (f *Flow) Run(ctx context.Context, invocation *agent.Invocation) (<-chan *e
 						model.ErrorTypeFlowError,
 						err.Error(),
 					)
-					log.Errorf("Flow step failed for agent %s: %v", invocation.AgentName, err)
+					log.ErrorfContext(
+						ctx,
+						"Flow step failed for agent %s: %v",
+						invocation.AgentName,
+						err,
+					)
 				}
 
 				agent.EmitEvent(ctx, invocation, eventChan, errorEvent)
@@ -129,7 +146,7 @@ func (f *Flow) Run(ctx context.Context, invocation *agent.Invocation) (<-chan *e
 				break
 			}
 		}
-	}()
+	}(runCtx)
 
 	return eventChan, nil
 }
@@ -307,13 +324,23 @@ func (f *Flow) handleAfterModelCallbacks(
 	response *model.Response,
 	eventChan chan<- *event.Event,
 ) (*model.Response, error) {
-	ctx, customResp, err := f.runAfterModelCallbacks(ctx, llmRequest, response)
+	ctx, customResp, err := f.runAfterModelCallbacks(
+		ctx,
+		invocation,
+		llmRequest,
+		response,
+	)
 	if err != nil {
 		if _, ok := agent.AsStopError(err); ok {
 			return nil, err
 		}
 
-		log.Errorf("After model callback failed for agent %s: %v", invocation.AgentName, err)
+		log.ErrorfContext(
+			ctx,
+			"After model callback failed for agent %s: %v",
+			invocation.AgentName,
+			err,
+		)
 		agent.EmitEvent(ctx, invocation, eventChan, event.NewErrorEvent(
 			invocation.InvocationID,
 			invocation.AgentName,
@@ -354,35 +381,73 @@ func collectLongRunningToolIDs(ToolCalls []model.ToolCall, tools map[string]tool
 
 func (f *Flow) runAfterModelCallbacks(
 	ctx context.Context,
+	invocation *agent.Invocation,
 	req *model.Request,
 	response *model.Response,
 ) (context.Context, *model.Response, error) {
-	if f.modelCallbacks == nil {
-		return ctx, response, nil
+	var (
+		override bool
+		err      error
+	)
+	if invocation != nil && invocation.Plugins != nil {
+		callbacks := invocation.Plugins.ModelCallbacks()
+		ctx, response, override, err = runAfterModelCallbackSet(
+			ctx,
+			callbacks,
+			req,
+			response,
+		)
+		if err != nil {
+			return ctx, nil, err
+		}
+		if override {
+			return ctx, response, nil
+		}
 	}
 
-	// Convert response.Error to Go error for callback.
+	ctx, response, _, err = runAfterModelCallbackSet(
+		ctx,
+		f.modelCallbacks,
+		req,
+		response,
+	)
+	return ctx, response, err
+}
+
+func runAfterModelCallbackSet(
+	ctx context.Context,
+	callbacks *model.Callbacks,
+	req *model.Request,
+	response *model.Response,
+) (context.Context, *model.Response, bool, error) {
+	if callbacks == nil {
+		return ctx, response, false, nil
+	}
+
 	var modelErr error
 	if response != nil && response.Error != nil {
-		modelErr = fmt.Errorf("%s: %s", response.Error.Type, response.Error.Message)
+		modelErr = fmt.Errorf(
+			"%s: %s",
+			response.Error.Type,
+			response.Error.Message,
+		)
 	}
 
-	result, err := f.modelCallbacks.RunAfterModel(ctx, &model.AfterModelArgs{
+	result, err := callbacks.RunAfterModel(ctx, &model.AfterModelArgs{
 		Request:  req,
 		Response: response,
 		Error:    modelErr,
 	})
 	if err != nil {
-		return ctx, nil, err
+		return ctx, nil, false, err
 	}
-	// Use the context from result if provided for subsequent operations.
 	if result != nil && result.Context != nil {
 		ctx = result.Context
 	}
 	if result != nil && result.CustomResponse != nil {
-		return ctx, result.CustomResponse, nil
+		return ctx, result.CustomResponse, true, nil
 	}
-	return ctx, response, nil
+	return ctx, response, false, nil
 }
 
 // preprocess handles pre-LLM call preparation using request processors.
@@ -492,6 +557,13 @@ func (f *Flow) getFilteredTools(ctx context.Context, invocation *agent.Invocatio
 		}
 	}
 
+	// Sort tools by name to ensure stable order for better prompt cache hit rate.
+	// Map iteration order is random in Go, so sorting ensures consistent tool ordering
+	// across requests, which improves cache efficiency.
+	sort.Slice(filtered, func(i, j int) bool {
+		return filtered[i].Declaration().Name < filtered[j].Declaration().Name
+	})
+
 	invocation.SetState(stateKeyToolsSnapshot, filtered)
 
 	return filtered
@@ -507,15 +579,59 @@ func (f *Flow) callLLM(
 		return nil, errors.New("no model available for LLM call")
 	}
 
-	log.Debugf("Calling LLM for agent %s", invocation.AgentName)
+	log.DebugfContext(
+		ctx,
+		"Calling LLM for agent %s",
+		invocation.AgentName,
+	)
+
+	// Enforce optional per-invocation LLM call limit. When the limit is not
+	// configured (<= 0), this is a no-op and preserves existing behavior.
+	if err := invocation.IncLLMCallCount(); err != nil {
+		log.Errorf("LLM call limit exceeded for agent %s: %v", invocation.AgentName, err)
+		return nil, err
+	}
 
 	// Run before model callbacks if they exist.
+	if invocation.Plugins != nil {
+		callbacks := invocation.Plugins.ModelCallbacks()
+		if callbacks != nil {
+			result, err := callbacks.RunBeforeModel(
+				ctx,
+				&model.BeforeModelArgs{Request: llmRequest},
+			)
+			if err != nil {
+				log.ErrorfContext(
+					ctx,
+					"Before model plugin failed for agent %s: %v",
+					invocation.AgentName,
+					err,
+				)
+				return nil, err
+			}
+			if result != nil && result.Context != nil {
+				ctx = result.Context
+			}
+			if result != nil && result.CustomResponse != nil {
+				responseChan := make(chan *model.Response, 1)
+				responseChan <- result.CustomResponse
+				close(responseChan)
+				return responseChan, nil
+			}
+		}
+	}
+
 	if f.modelCallbacks != nil {
 		result, err := f.modelCallbacks.RunBeforeModel(ctx, &model.BeforeModelArgs{
 			Request: llmRequest,
 		})
 		if err != nil {
-			log.Errorf("Before model callback failed for agent %s: %v", invocation.AgentName, err)
+			log.ErrorfContext(
+				ctx,
+				"Before model callback failed for agent %s: %v",
+				invocation.AgentName,
+				err,
+			)
 			return nil, err
 		}
 		// Use the context from result if provided.
@@ -534,7 +650,12 @@ func (f *Flow) callLLM(
 	// Call the model.
 	responseChan, err := invocation.Model.GenerateContent(ctx, llmRequest)
 	if err != nil {
-		log.Errorf("LLM call failed for agent %s: %v", invocation.AgentName, err)
+		log.ErrorfContext(
+			ctx,
+			"LLM call failed for agent %s: %v",
+			invocation.AgentName,
+			err,
+		)
 		return nil, err
 	}
 
@@ -557,4 +678,13 @@ func (f *Flow) postprocess(
 	for _, processor := range f.responseProcessors {
 		processor.ProcessResponse(ctx, invocation, llmRequest, llmResponse, eventChan)
 	}
+}
+
+// WaitEventTimeout returns the remaining time until the context deadline.
+// If the context has no deadline, it returns the default event completion timeout.
+func WaitEventTimeout(ctx context.Context) time.Duration {
+	if deadline, ok := ctx.Deadline(); ok {
+		return time.Until(deadline)
+	}
+	return eventCompletionTimeout
 }

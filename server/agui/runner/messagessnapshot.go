@@ -15,14 +15,15 @@ import (
 	"fmt"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
+	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/server/agui/adapter"
 	"trpc.group/trpc-go/trpc-agent-go/server/agui/internal/reduce"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 )
 
-// MessagesSnapshotProvider provides a MessagesSnapshot event stream by replaying persisted AG-UI track events.
-type MessagesSnapshotProvider interface {
+// MessagesSnapshotter provides a MessagesSnapshot event stream by replaying persisted AG-UI track events.
+type MessagesSnapshotter interface {
 	// MessagesSnapshot sends a MessagesSnapshot event stream by replaying persisted AG-UI track events.
 	MessagesSnapshot(ctx context.Context, input *adapter.RunAgentInput) (<-chan aguievents.Event, error)
 }
@@ -31,20 +32,20 @@ type MessagesSnapshotProvider interface {
 func (r *runner) MessagesSnapshot(ctx context.Context,
 	runAgentInput *adapter.RunAgentInput) (<-chan aguievents.Event, error) {
 	if r.runner == nil {
-		return nil, errors.New("agui: runner is nil")
+		return nil, errors.New("runner is nil")
 	}
 	if runAgentInput == nil {
-		return nil, errors.New("agui: run input cannot be nil")
+		return nil, errors.New("run input cannot be nil")
 	}
 	if r.appName == "" {
-		return nil, errors.New("agui: app name is empty")
+		return nil, errors.New("app name is empty")
 	}
 	if r.tracker == nil {
-		return nil, errors.New("agui: tracker is nil")
+		return nil, errors.New("tracker is nil")
 	}
 	runAgentInput, err := r.applyRunAgentInputHook(ctx, runAgentInput)
 	if err != nil {
-		return nil, fmt.Errorf("agui: run input hook: %w", err)
+		return nil, fmt.Errorf("run input hook: %w", err)
 	}
 	userID, err := r.userIDResolver(ctx, runAgentInput)
 	if err != nil {
@@ -62,7 +63,8 @@ func (r *runner) MessagesSnapshot(ctx context.Context,
 		enableTrack: false,
 	}
 	events := make(chan aguievents.Event)
-	go r.messagesSnapshot(ctx, input, events)
+	runCtx := agent.CloneContext(ctx)
+	go r.messagesSnapshot(runCtx, input, events)
 	return events, nil
 }
 
@@ -78,7 +80,14 @@ func (r *runner) messagesSnapshot(ctx context.Context, input *runInput, events c
 
 	messagesSnapshotEvent, err := r.getMessagesSnapshotEvent(ctx, input.key)
 	if err != nil {
-		log.Errorf("agui messages snapshot: threadID: %s, runID: %s, load history: %v", threadID, runID, err)
+		log.ErrorfContext(
+			ctx,
+			"agui messages snapshot: threadID: %s, runID: %s, "+
+				"load history: %v",
+			threadID,
+			runID,
+			err,
+		)
 		if messagesSnapshotEvent == nil {
 			r.emitEvent(ctx, events, aguievents.NewRunErrorEvent(fmt.Sprintf("load history: %v", err),
 				aguievents.WithRunID(runID)), input)

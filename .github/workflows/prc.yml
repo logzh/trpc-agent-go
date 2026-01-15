@@ -31,7 +31,8 @@ jobs:
           mapfile -t modules < <(find . -name go.mod \
             -not -path "./.resource/*" \
             -not -path "./docs/*" \
-            -not -path "./examples/*" | sort)
+            -not -path "./examples/*" \
+            -not -path "./test/*" | sort)
           if [ "${#modules[@]}" -eq 0 ]; then
             echo "matrix={\"module\":[]}" >> "$GITHUB_OUTPUT"
             exit 0
@@ -84,6 +85,20 @@ jobs:
           name: coverage-${{ steps.module-info.outputs.safe_name }}
           path: coverage-${{ steps.module-info.outputs.safe_name }}.out
           if-no-files-found: error
+  e2e:
+    name: e2e test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+      - name: Run e2e tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd test
+          go test ./...
   coverage:
     name: coverage
     runs-on: ubuntu-latest
@@ -155,6 +170,29 @@ jobs:
             echo "✓ All files are properly formatted and use modern 'any' type"
           fi
           echo "::endgroup::"
+      - name: goimports
+        run: |
+          echo "::group::Checking import formatting with goimports"
+          go install golang.org/x/tools/cmd/goimports@latest
+          files=$(goimports -l .)
+          if [ -n "$files" ]; then
+            echo "::error::Found files with incorrect import formatting."
+            echo "goimports checks:"
+            echo "  - Import statement formatting"
+            echo "  - Import grouping (stdlib, external, internal)"
+            echo "  - Import sorting within groups"
+            echo ""
+            echo "Files that need attention:"
+            echo "$files"
+            echo ""
+            echo "You can fix this automatically by running:"
+            echo "  go install golang.org/x/tools/cmd/goimports@latest"
+            echo "  goimports -w ."
+            exit 1
+          else
+            echo "✓ All files have properly formatted imports"
+          fi
+          echo "::endgroup::"
       - name: license
         run: |
           echo "::group::Checking license headers in Go files"
@@ -209,7 +247,16 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.21"
+      # Use merge-base to only detect breaking changes introduced by this PR,
+      # not changes from main that were merged after the PR branch was created.
+      - name: Get merge base
+        id: merge-base
+        run: |
+          MERGE_BASE=$(git merge-base HEAD origin/${{ github.base_ref }})
+          echo "sha=$MERGE_BASE" >> "$GITHUB_OUTPUT"
       - uses: joelanford/go-apidiff@main
+        with:
+          base-ref: ${{ steps.merge-base.outputs.sha }}
   docs-build:
     name: docs-build
     runs-on: ubuntu-latest
@@ -225,3 +272,17 @@ jobs:
         run: pip install -r mkdocs/assets/requirements.txt
       - name: Build documentation
         run: mkdocs build --strict
+  check-go-mod-version:
+    name: check go.mod version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+      - name: Validate go.mod version strings
+        shell: bash
+        run: bash .github/scripts/check-go-mod-version.sh

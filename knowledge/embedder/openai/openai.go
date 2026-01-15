@@ -170,13 +170,13 @@ func (e *Embedder) GetEmbedding(ctx context.Context, text string) ([]float64, er
 
 	// Extract embedding from response.
 	if len(response.Data) == 0 {
-		log.Warn("received empty embedding response from OpenAI API")
+		log.WarnContext(ctx, "received empty embedding response from OpenAI API")
 		return []float64{}, nil
 	}
 
 	embedding := response.Data[0].Embedding
 	if len(embedding) == 0 {
-		log.Warn("received empty embedding vector from OpenAI API")
+		log.WarnContext(ctx, "received empty embedding vector from OpenAI API")
 		return []float64{}, nil
 	}
 
@@ -193,13 +193,13 @@ func (e *Embedder) GetEmbeddingWithUsage(ctx context.Context, text string) ([]fl
 
 	// Extract embedding from response.
 	if len(response.Data) == 0 {
-		log.Warn("received empty embedding response from OpenAI API")
+		log.WarnContext(ctx, "received empty embedding response from OpenAI API")
 		return []float64{}, nil, nil
 	}
 
 	embedding := response.Data[0].Embedding
 	if len(embedding) == 0 {
-		log.Warn("received empty embedding vector from OpenAI API")
+		log.WarnContext(ctx, "received empty embedding vector from OpenAI API")
 		return []float64{}, nil, nil
 	}
 
@@ -218,12 +218,17 @@ func (e *Embedder) response(ctx context.Context, text string) (rsp *openai.Creat
 		return nil, fmt.Errorf("text cannot be empty")
 	}
 	ctx, span := trace.Tracer.Start(ctx, fmt.Sprintf("%s %s", itelemetry.OperationEmbeddings, e.model))
+	embeddingAttributes := &itelemetry.EmbeddingAttributes{
+		RequestEncodingFormat: &e.encodingFormat,
+		RequestModel:          e.model,
+		Dimensions:            e.dimensions,
+	}
 	defer func() {
-		var inputToken *int64
+		embeddingAttributes.Error = err
 		if rsp != nil {
-			inputToken = &rsp.Usage.PromptTokens
+			embeddingAttributes.InputToken = &rsp.Usage.PromptTokens
 		}
-		itelemetry.TraceEmbedding(span, e.encodingFormat, e.model, inputToken, err)
+		itelemetry.TraceEmbedding(span, embeddingAttributes)
 		span.End()
 	}()
 

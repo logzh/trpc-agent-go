@@ -104,12 +104,60 @@ func transformSpan(span *tracepb.Span) {
 	}
 
 	switch operationName {
+	case itelemetry.OperationInvokeAgent:
+		transformInvokeAgent(span)
 	case itelemetry.OperationChat:
 		transformCallLLM(span)
 	case itelemetry.OperationExecuteTool:
 		transformExecuteTool(span)
 	default:
 	}
+}
+
+func transformInvokeAgent(span *tracepb.Span) {
+	var newAttributes []*commonpb.KeyValue
+
+	newAttributes = append(newAttributes, &commonpb.KeyValue{
+		Key: observationType,
+		Value: &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_StringValue{StringValue: observationTypeAgent},
+		},
+	})
+
+	for _, attr := range span.Attributes {
+		switch attr.Key {
+		case itelemetry.KeyGenAIInputMessages:
+			if attr.Value != nil {
+				newAttributes = append(newAttributes, &commonpb.KeyValue{
+					Key: observationInput,
+					Value: &commonpb.AnyValue{
+						Value: &commonpb.AnyValue_StringValue{StringValue: attr.Value.GetStringValue()},
+					},
+				})
+			}
+			// Skip this attribute (delete it)
+		case itelemetry.KeyGenAIOutputMessages:
+			if attr.Value != nil {
+				newAttributes = append(newAttributes, &commonpb.KeyValue{
+					Key: observationOutput,
+					Value: &commonpb.AnyValue{
+						Value: &commonpb.AnyValue_StringValue{StringValue: attr.Value.GetStringValue()},
+					},
+				})
+			}
+			// Skip token usage attributes for InvokeAgent observations.
+			//
+			// Reason: the top-level span represents the whole trace, and Langfuse aggregates token
+			// usage across all spans in the trace. We recently started emitting token usage for
+			// InvokeAgent spans (to support Galileo); previously only Chat spans had token usage.
+			// Keeping token attributes on InvokeAgent would make Langfuse double count tokens
+			// compared to the old behavior (Chat-only token accounting).
+		case itelemetry.KeyGenAIUsageInputTokens, itelemetry.KeyGenAIUsageOutputTokens:
+		default:
+			newAttributes = append(newAttributes, attr)
+		}
+	}
+	span.Attributes = newAttributes
 }
 
 // transformCallLLM transforms LLM call spans for Langfuse
@@ -120,7 +168,7 @@ func transformCallLLM(span *tracepb.Span) {
 	newAttributes = append(newAttributes, &commonpb.KeyValue{
 		Key: observationType,
 		Value: &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_StringValue{StringValue: "generation"},
+			Value: &commonpb.AnyValue_StringValue{StringValue: observationTypeGeneration},
 		},
 	})
 
@@ -204,7 +252,7 @@ func transformExecuteTool(span *tracepb.Span) {
 	newAttributes = append(newAttributes, &commonpb.KeyValue{
 		Key: observationType,
 		Value: &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_StringValue{StringValue: "tool"},
+			Value: &commonpb.AnyValue_StringValue{StringValue: observationTypeTool},
 		},
 	})
 

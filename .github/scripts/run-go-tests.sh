@@ -40,7 +40,8 @@ else
   done < <(find . -name go.mod \
     -not -path "./.resource/*" \
     -not -path "./docs/*" \
-    -not -path "./examples/*" | sort)
+    -not -path "./examples/*" \
+    -not -path "./test/*" | sort)
 fi
 
 if [ "${#gomodules[@]}" -eq 0 ]; then
@@ -71,7 +72,7 @@ for mod in "${gomodules[@]}"; do
   echo "module import path: ${module_path}"
   (
     cd "${mod_dir}"
-    go test -v -coverprofile=coverage.out ./...
+    go test -coverprofile=coverage.out ./...
   )
   relative_prefix="${mod_dir#./}"
   if [ "${relative_prefix}" = "" ] || [ "${relative_prefix}" = "." ]; then

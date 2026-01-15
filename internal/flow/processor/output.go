@@ -46,8 +46,9 @@ func (p *OutputResponseProcessor) ProcessResponse(
 	rsp *model.Response,
 	ch chan<- *event.Event,
 ) {
-	if invocation == nil || rsp == nil || rsp.IsPartial ||
-		(invocation.StructuredOutputType == nil && p.outputKey == "" && p.outputSchema == nil) {
+	if invocation == nil || rsp == nil || !rsp.IsFinalResponse() ||
+		(invocation.StructuredOutput == nil && invocation.StructuredOutputType == nil &&
+			p.outputKey == "" && p.outputSchema == nil) {
 		return
 	}
 	// Only process complete (non-partial) responses.
@@ -59,8 +60,8 @@ func (p *OutputResponseProcessor) ProcessResponse(
 	jsonObject, ok := extractFirstJSONObject(content)
 
 	if ok {
-		// 1) Emit typed structured output payload if configured.
-		p.emitTypedStructuredOutput(ctx, invocation, jsonObject, ch)
+		// 1) Emit structured output payload if configured.
+		p.emitStructuredOutput(ctx, invocation, jsonObject, ch)
 	}
 
 	// 2) Handle output_key functionality (raw persistence, optional schema validation).
@@ -78,32 +79,61 @@ func (p *OutputResponseProcessor) extractFinalContent(rsp *model.Response) (stri
 	return rsp.Choices[0].Message.Content, true
 }
 
-// emitTypedStructuredOutput emits a typed payload event when StructuredOutputType is set.
-func (p *OutputResponseProcessor) emitTypedStructuredOutput(
+// emitStructuredOutput emits a structured output payload event when structured output is requested.
+//
+// If StructuredOutputType is set, the payload is unmarshaled into that Go type (typed mode).
+// Otherwise, if StructuredOutput is set, the payload is unmarshaled into an untyped value (map/slice/etc).
+func (p *OutputResponseProcessor) emitStructuredOutput(
 	ctx context.Context, invocation *agent.Invocation, jsonObject string, ch chan<- *event.Event,
 ) {
-	if invocation.StructuredOutputType == nil {
+	// Case 1: Typed struct via WithStructuredOutputJSON
+	if invocation.StructuredOutputType != nil {
+		var instance any
+		if invocation.StructuredOutputType.Kind() == reflect.Pointer {
+			instance = reflect.New(invocation.StructuredOutputType.Elem()).Interface()
+		} else {
+			instance = reflect.New(invocation.StructuredOutputType).Interface()
+		}
+		if err := json.Unmarshal([]byte(jsonObject), instance); err != nil {
+			log.ErrorfContext(
+				ctx,
+				"Structured output unmarshal failed: %v",
+				err,
+			)
+			return
+		}
+		typedEvt := event.New(
+			invocation.InvocationID,
+			invocation.AgentName,
+			event.WithObject(model.ObjectTypeStateUpdate),
+			event.WithStructuredOutputPayload(instance),
+		)
+		log.DebugContext(ctx, "Emitted typed structured output payload event.")
+		agent.EmitEvent(ctx, invocation, ch, typedEvt)
 		return
 	}
-	var instance any
-	if invocation.StructuredOutputType.Kind() == reflect.Pointer {
-		instance = reflect.New(invocation.StructuredOutputType.Elem()).Interface()
-	} else {
-		instance = reflect.New(invocation.StructuredOutputType).Interface()
-	}
-	if err := json.Unmarshal([]byte(jsonObject), instance); err != nil {
-		log.Errorf("Structured output unmarshal failed: %v", err)
+
+	// Case 2: Untyped payload via WithStructuredOutputJSONSchema
+	if invocation.StructuredOutput == nil {
 		return
 	}
-	typedEvt := event.New(
+	var parsed any
+	if err := json.Unmarshal([]byte(jsonObject), &parsed); err != nil {
+		log.ErrorfContext(
+			ctx,
+			"Structured output unmarshal failed: %v",
+			err,
+		)
+		return
+	}
+	untypedEvt := event.New(
 		invocation.InvocationID,
 		invocation.AgentName,
 		event.WithObject(model.ObjectTypeStateUpdate),
-		event.WithStructuredOutputPayload(instance),
+		event.WithStructuredOutputPayload(parsed),
 	)
-
-	log.Debugf("Emitted typed structured output payload event.")
-	agent.EmitEvent(ctx, invocation, ch, typedEvt)
+	log.DebugContext(ctx, "Emitted untyped structured output payload event.")
+	agent.EmitEvent(ctx, invocation, ch, untypedEvt)
 }
 
 // handleOutputKey validates and emits state delta for output_key/output_schema cases.
@@ -120,7 +150,12 @@ func (p *OutputResponseProcessor) handleOutputKey(ctx context.Context, invocatio
 		}
 		var parsedJSON any
 		if err := json.Unmarshal([]byte(jsonObject), &parsedJSON); err != nil {
-			log.Warnf("Failed to parse output as JSON for output_schema validation: %v", err)
+			log.WarnfContext(
+				ctx,
+				"Failed to parse output as JSON for output_schema "+
+					"validation: %v",
+				err,
+			)
 			return
 		}
 		// Store the original JSON string.
@@ -137,7 +172,11 @@ func (p *OutputResponseProcessor) handleOutputKey(ctx context.Context, invocatio
 	)
 	stateEvent.RequiresCompletion = true
 
-	log.Debugf("Emitted state delta event with key '%s'.", p.outputKey)
+	log.DebugfContext(
+		ctx,
+		"Emitted state delta event with key '%s'.",
+		p.outputKey,
+	)
 	if err := agent.EmitEvent(ctx, invocation, ch, stateEvent); err != nil {
 		return
 	}
@@ -147,7 +186,12 @@ func (p *OutputResponseProcessor) handleOutputKey(ctx context.Context, invocatio
 	completionID := agent.GetAppendEventNoticeKey(stateEvent.ID)
 	if err := invocation.AddNoticeChannelAndWait(ctx, completionID,
 		agent.WaitNoticeWithoutTimeout); err != nil {
-		log.Warnf("Failed to add notice channel for completion ID %s: %v", completionID, err)
+		log.WarnfContext(
+			ctx,
+			"Failed to add notice channel for completion ID %s: %v",
+			completionID,
+			err,
+		)
 	}
 }
 

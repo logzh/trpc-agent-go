@@ -49,6 +49,7 @@ const (
 	OperationInvokeAgent     = "invoke_agent"
 	OperationCreateAgent     = "create_agent"
 	OperationEmbeddings      = "embeddings"
+	OperationWorkflow        = "workflow"
 )
 
 // NewChatSpanName creates a new chat span name.
@@ -59,6 +60,62 @@ func NewChatSpanName(requestModel string) string {
 // NewExecuteToolSpanName creates a new execute tool span name.
 func NewExecuteToolSpanName(toolName string) string {
 	return fmt.Sprintf("%s %s", OperationExecuteTool, toolName)
+}
+
+const (
+	// KeyGenAIWorkflowName is the name of the workflow.
+	KeyGenAIWorkflowName = "gen_ai.workflow.name"
+	// KeyGenAIWorkflowID is the id of the workflow.
+	KeyGenAIWorkflowID = "gen_ai.workflow.id"
+)
+
+var (
+	// KeyGenAIWorkflowRequest is the request of the workflow.
+	KeyGenAIWorkflowRequest = semconvtrace.KeyGenAIWorkflowRequest
+	// KeyGenAIWorkflowResponse is the response of the workflow.
+	KeyGenAIWorkflowResponse = semconvtrace.KeyGenAIWorkflowResponse
+)
+
+// Workflow is the workflow information.
+type Workflow struct {
+	Name     string
+	ID       string
+	Request  any
+	Response any
+	Error    error
+}
+
+// NewWorkflowSpanName creates a new workflow span name.
+func NewWorkflowSpanName(workflowName string) string {
+	return fmt.Sprintf("%s %s", OperationWorkflow, workflowName)
+}
+
+// TraceWorkflow traces the workflow.
+func TraceWorkflow(span trace.Span, workflow *Workflow) {
+	span.SetAttributes(attribute.String(KeyGenAIOperationName, OperationWorkflow))
+	span.SetAttributes(attribute.String(KeyGenAIWorkflowName, workflow.Name))
+	span.SetAttributes(attribute.String(KeyGenAIWorkflowID, workflow.ID))
+	if workflow.Request != nil {
+		request, err := json.Marshal(workflow.Request)
+		if err != nil {
+			span.SetAttributes(attribute.String(KeyGenAIWorkflowRequest, fmt.Sprintf("<not json serializable: %v>", err)))
+		} else {
+			span.SetAttributes(attribute.String(KeyGenAIWorkflowRequest, string(request)))
+		}
+	}
+	if workflow.Response != nil {
+		response, err := json.Marshal(workflow.Response)
+		if err != nil {
+			span.SetAttributes(attribute.String(KeyGenAIWorkflowResponse, fmt.Sprintf("<not json serializable>: %v", err)))
+		} else {
+			span.SetAttributes(attribute.String(KeyGenAIWorkflowResponse, string(response)))
+		}
+	}
+	if workflow.Error != nil {
+		span.SetAttributes(attribute.String(KeyErrorType, ValueDefaultErrorType))
+		span.SetStatus(codes.Error, workflow.Error.Error())
+		span.RecordError(workflow.Error)
+	}
 }
 
 // newInferenceSpanName creates a new inference span name.
@@ -125,14 +182,13 @@ var (
 	KeyGenAISystemInstructions      = semconvtrace.KeyGenAISystemInstructions
 	KeyGenAITokenType               = semconvtrace.KeyGenAITokenType
 	KeyGenAIRequestThinkingEnabled  = semconvtrace.KeyGenAIRequestThinkingEnabled
+	KeyGenAIRequestToolDefinitions  = "gen_ai.request.tool.definitions"
 
 	KeyGenAIToolName          = semconvtrace.KeyGenAIToolName
 	KeyGenAIToolDescription   = semconvtrace.KeyGenAIToolDescription
 	KeyGenAIToolCallID        = semconvtrace.KeyGenAIToolCallID
 	KeyGenAIToolCallArguments = semconvtrace.KeyGenAIToolCallArguments
 	KeyGenAIToolCallResult    = semconvtrace.KeyGenAIToolCallResult
-
-	KeyGenAIRequestEncodingFormats = semconvtrace.KeyGenAIRequestEncodingFormats
 
 	KeyErrorType          = semconvtrace.KeyErrorType
 	KeyErrorMessage       = semconvtrace.KeyErrorMessage
@@ -193,7 +249,7 @@ const ToolNameMergedTools = "(merged tools)"
 
 // TraceMergedToolCalls traces the invocation of a merged tool call.
 // Calling this function is not needed for telemetry purposes. This is provided
-// for preventing /debug/trace requests (typically sent by web UI).
+// for preventing trace-query requests typically sent by web UIs.
 func TraceMergedToolCalls(span trace.Span, rspEvent *event.Event) {
 	span.SetAttributes(
 		attribute.String(KeyGenAISystem, SystemTRPCGoAgent),
@@ -229,7 +285,10 @@ func TraceMergedToolCalls(span trace.Span, rspEvent *event.Event) {
 
 // TraceBeforeInvokeAgent traces the before invocation of an agent.
 func TraceBeforeInvokeAgent(span trace.Span, invoke *agent.Invocation, agentDescription, instructions string, genConfig *model.GenerationConfig) {
-	if bts, err := json.Marshal(&model.Request{Messages: []model.Message{invoke.Message}}); err == nil {
+	if invoke != nil && len(invoke.RunOptions.SpanAttributes) > 0 {
+		span.SetAttributes(invoke.RunOptions.SpanAttributes...)
+	}
+	if bts, err := json.Marshal([]model.Message{invoke.Message}); err == nil {
 		span.SetAttributes(
 			attribute.String(KeyGenAIInputMessages, string(bts)),
 		)
@@ -282,7 +341,7 @@ type TokenUsage struct {
 }
 
 // TraceAfterInvokeAgent traces the after invocation of an agent.
-func TraceAfterInvokeAgent(span trace.Span, rspEvent *event.Event, tokenUsage *TokenUsage) {
+func TraceAfterInvokeAgent(span trace.Span, rspEvent *event.Event, tokenUsage *TokenUsage, timeToFirstToken time.Duration) {
 	if rspEvent == nil {
 		return
 	}
@@ -317,6 +376,9 @@ func TraceAfterInvokeAgent(span trace.Span, rspEvent *event.Event, tokenUsage *T
 	if e := rsp.Error; e != nil {
 		span.SetStatus(codes.Error, e.Message)
 		span.SetAttributes(attribute.String(KeyErrorType, e.Type), attribute.String(KeyErrorMessage, e.Message))
+	}
+	if timeToFirstToken > 0 {
+		span.SetAttributes(attribute.Float64(KeyTRPCAgentGoClientTimeToFirstToken, timeToFirstToken.Seconds()))
 	}
 }
 
@@ -416,6 +478,25 @@ func buildRequestAttributes(req *model.Request) []attribute.KeyValue {
 		attrs = append(attrs, attribute.String(KeyLLMRequest, "<not json serializable>"))
 	}
 
+	// Add tool definitions as best-effort structured array (JSON string fallback)
+	if len(req.Tools) > 0 {
+		definitions := make([]*tool.Declaration, 0, len(req.Tools))
+		for _, t := range req.Tools {
+			if t == nil {
+				continue
+			}
+			if decl := t.Declaration(); decl != nil {
+				definitions = append(definitions, decl)
+			}
+		}
+
+		if len(definitions) > 0 {
+			if bts, err := json.Marshal(definitions); err == nil {
+				attrs = append(attrs, attribute.String(KeyGenAIRequestToolDefinitions, string(bts)))
+			}
+		}
+	}
+
 	// Add messages
 	if bts, err := json.Marshal(req.Messages); err == nil {
 		attrs = append(attrs, attribute.String(KeyGenAIInputMessages, string(bts)))
@@ -476,22 +557,6 @@ func buildResponseAttributes(rsp *model.Response) []attribute.KeyValue {
 	}
 
 	return attrs
-}
-
-// TraceEmbedding traces the invocation of an embedding call.
-func TraceEmbedding(span trace.Span, requestEncodingFormat, requestModel string, inputToken *int64, err error) {
-	span.SetAttributes(
-		attribute.String(KeyGenAIOperationName, OperationEmbeddings),
-		attribute.String(KeyGenAIRequestModel, requestModel),
-		attribute.StringSlice(KeyGenAIRequestEncodingFormats, []string{requestEncodingFormat}),
-	)
-	if err != nil {
-		span.SetAttributes(attribute.String(KeyErrorType, ValueDefaultErrorType), attribute.String(KeyErrorMessage, err.Error()))
-		span.SetStatus(codes.Error, err.Error())
-	}
-	if inputToken != nil {
-		span.SetAttributes(attribute.Int64(KeyGenAIUsageInputTokens, *inputToken))
-	}
 }
 
 // NewGRPCConn creates a new gRPC connection to the OpenTelemetry Collector.

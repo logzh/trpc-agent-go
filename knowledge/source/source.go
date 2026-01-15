@@ -47,14 +47,16 @@ const (
 	MetaInputCount    = MetaPrefix + "input_count"
 	MetaInputs        = MetaPrefix + "inputs"
 
-	MetaChunkType = MetaPrefix + "chunk_type"
-	MetaChunkSize = MetaPrefix + "chunk_size"
+	MetaChunkType          = MetaPrefix + "chunk_type"
+	MetaChunkSize          = MetaPrefix + "chunk_size"
+	MetaMarkdownHeaderPath = MetaPrefix + "markdown_header_path" // header path for markdown chunks
+	MetadataDenseScore     = MetaPrefix + "dense_score"
+	MetadataSparseScore    = MetaPrefix + "sparse_score"
 
 	// necessary metadata
-	MetaURI                = MetaPrefix + "uri"                  // URI (absolute path / URL / md5 for pure text)
-	MetaSourceName         = MetaPrefix + "source_name"          // source name
-	MetaChunkIndex         = MetaPrefix + "chunk_index"          // chunk index
-	MetaMarkdownHeaderPath = MetaPrefix + "markdown_header_path" // header path for markdown chunks
+	MetaURI        = MetaPrefix + "uri"         // URI (absolute path / URL / md5 for pure text)
+	MetaSourceName = MetaPrefix + "source_name" // source name
+	MetaChunkIndex = MetaPrefix + "chunk_index" // chunk index
 )
 
 // Source represents a knowledge source that can provide documents.
@@ -73,7 +75,12 @@ type Source interface {
 	GetMetadata() map[string]any
 }
 
+// MetadataFieldPrefix is the prefix for metadata fields in filter conditions.
+// Fields with this prefix are treated as metadata fields and will be processed accordingly.
+const MetadataFieldPrefix = "metadata."
+
 // GetAllMetadata returns all metadata collected from sources with deduplication.
+// Keys are prefixed with "metadata." for use in filter conditions.
 func GetAllMetadata(sources []Source) map[string][]any {
 	// Use temporary map for deduplication
 	tempMetadataMap := make(map[string]map[string]struct{})
@@ -83,17 +90,20 @@ func GetAllMetadata(sources []Source) map[string][]any {
 	for _, src := range sources {
 		metadata := src.GetMetadata()
 		for key, value := range metadata {
+			// Add metadata prefix to key
+			prefixedKey := MetadataFieldPrefix + key
+
 			// Initialize key in temporary map
-			if _, exists := tempMetadataMap[key]; !exists {
-				tempMetadataMap[key] = make(map[string]struct{})
-				allMetadata[key] = make([]any, 0)
+			if _, exists := tempMetadataMap[prefixedKey]; !exists {
+				tempMetadataMap[prefixedKey] = make(map[string]struct{})
+				allMetadata[prefixedKey] = make([]any, 0)
 			}
 
 			// Create a unique key that includes type information to avoid conflicts
 			valueKey := fmt.Sprintf("%T:%v", value, value)
-			if _, exists := tempMetadataMap[key][valueKey]; !exists {
-				allMetadata[key] = append(allMetadata[key], value)
-				tempMetadataMap[key][valueKey] = struct{}{}
+			if _, exists := tempMetadataMap[prefixedKey][valueKey]; !exists {
+				allMetadata[prefixedKey] = append(allMetadata[prefixedKey], value)
+				tempMetadataMap[prefixedKey][valueKey] = struct{}{}
 			}
 		}
 	}
@@ -101,13 +111,15 @@ func GetAllMetadata(sources []Source) map[string][]any {
 }
 
 // GetAllMetadataWithoutValues returns all metadata keys with their string values collected from sources with deduplication.
+// Keys are prefixed with "metadata." for use in filter conditions.
 func GetAllMetadataWithoutValues(sources []Source) map[string][]any {
 	result := make(map[string][]any)
 	for _, src := range sources {
 		metadata := src.GetMetadata()
 		for key := range metadata {
-			if _, exists := result[key]; !exists {
-				result[key] = []any{}
+			prefixedKey := MetadataFieldPrefix + key
+			if _, exists := result[prefixedKey]; !exists {
+				result[prefixedKey] = []any{}
 			}
 		}
 	}
@@ -115,6 +127,7 @@ func GetAllMetadataWithoutValues(sources []Source) map[string][]any {
 }
 
 // GetAllMetadataKeys returns all metadata keys collected from sources with deduplication.
+// Keys are prefixed with "metadata." for use in filter conditions.
 func GetAllMetadataKeys(sources []Source) []string {
 	allMetadata := GetAllMetadataWithoutValues(sources)
 	result := make([]string, 0)

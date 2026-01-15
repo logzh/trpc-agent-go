@@ -27,6 +27,7 @@ import (
 
 const (
 	defaultChannelBufferSize = 256
+
 	// defaultModelName is the model name used when only WithModel is set
 	// without WithModels.
 	defaultModelName = "__default__"
@@ -47,6 +48,36 @@ const (
 	// TimelineFilterCurrentInvocation only includes messages within the current invocation session
 	// Suitable for scenarios requiring isolation between different invocation cycles in long-running sessions
 	TimelineFilterCurrentInvocation = processor.TimelineFilterCurrentInvocation
+
+	// ReasoningContentModeKeepAll keeps all reasoning_content in history.
+	// Use this for debugging or when you need to retain thinking chains.
+	ReasoningContentModeKeepAll = processor.ReasoningContentModeKeepAll
+	// ReasoningContentModeDiscardPreviousTurns discards reasoning_content from
+	// messages that belong to previous request turns. Messages within the current
+	// request retain their reasoning_content (for tool call scenarios).
+	// This is the default mode, recommended for DeepSeek models.
+	ReasoningContentModeDiscardPreviousTurns = processor.ReasoningContentModeDiscardPreviousTurns
+	// ReasoningContentModeDiscardAll discards all reasoning_content from history.
+	// Use this for maximum bandwidth savings when reasoning history is not needed.
+	ReasoningContentModeDiscardAll = processor.ReasoningContentModeDiscardAll
+)
+
+// MessageFilterMode is the mode for filtering messages.
+type MessageFilterMode int
+
+const (
+	// FullContext Includes all messages with prefix matching (including historical messages).
+	// equivalent to TimelineFilterAll + BranchFilterModePrefix.
+	FullContext MessageFilterMode = iota
+	// RequestContext includes only messages from the current request cycle that match the branch prefix.
+	// equivalent to TimelineFilterCurrentRequest + BranchFilterModePrefix.
+	RequestContext
+	// IsolatedRequest includes only messages from the current request cycle that exactly match the branch.
+	// equivalent to TimelineFilterCurrentRequest + BranchFilterModeExact.
+	IsolatedRequest
+	// IsolatedInvocation includes only messages from current invocation session that exactly match the branch,
+	// equivalent to TimelineFilterCurrentInvocation + BranchFilterModeExact.
+	IsolatedInvocation
 )
 
 var (
@@ -57,6 +88,15 @@ var (
 		// that downstream agents see a consolidated user message stream unless
 		// explicitly opted into preserving assistant/tool roles.
 		PreserveSameBranch: false,
+		// Default to disable memory preloading (use tools instead).
+		// PreloadMemory configuration values:
+		//   - 0 (default): Disable preloading (use tools instead).
+		//   - N > 0: Load the most recent N memories.
+		//   - -1: Load all memories.
+		//     WARNING: Loading all memories may significantly increase token usage
+		//     and API costs, especially for users with many stored memories.
+		//     Consider using a positive limit (e.g., 10-50) for production use.
+		PreloadMemory: 0,
 	}
 )
 
@@ -78,6 +118,13 @@ type Options struct {
 	// GlobalInstruction is the global instruction for the agent.
 	// It will be used for all agents in the agent tree.
 	GlobalInstruction string
+	// ModelInstructions maps model.Info().Name to a model-specific instruction.
+	// When present, it overrides Instruction for matching models.
+	ModelInstructions map[string]string
+	// ModelGlobalInstructions maps model.Info().Name to a model-specific system
+	// prompt.
+	// When present, it overrides GlobalInstruction for matching models.
+	ModelGlobalInstructions map[string]string
 	// GenerationConfig contains the generation configuration.
 	GenerationConfig model.GenerationConfig
 	// ChannelBufferSize is the buffer size for event channels (default: 256).
@@ -136,10 +183,26 @@ type Options struct {
 	// AddSessionSummary controls whether to prepend the current branch summary
 	// as a system message when available (default: false).
 	AddSessionSummary bool
-
 	// MaxHistoryRuns sets the maximum number of history messages when AddSessionSummary is false.
 	// When 0 (default), no limit is applied.
 	MaxHistoryRuns int
+	// summaryFormatter allows custom formatting of session summary content.
+	// When nil (default), uses the default formatSummaryContent function.
+	summaryFormatter func(summary string) string
+
+	// MaxLLMCalls is an optional upper bound on the number of LLM calls
+	// allowed per invocation for this agent. When the value is:
+	//   - > 0: the limit is enforced per invocation.
+	//   - <= 0: no limit is applied (default, preserves existing behavior).
+	MaxLLMCalls int
+
+	// MaxToolIterations is an optional upper bound on how many tool-call
+	// iterations are allowed per invocation for this agent. A "tool iteration"
+	// is defined as an assistant response that contains tool calls and reaches
+	// the FunctionCallResponseProcessor. When the value is:
+	//   - > 0: the limit is enforced per invocation.
+	//   - <= 0: no limit is applied (default, preserves existing behavior).
+	MaxToolIterations int
 
 	// PreserveSameBranch controls whether the content request processor
 	// should preserve original roles (assistant/tool) for events that
@@ -173,12 +236,29 @@ type Options struct {
 	// again when building the tools list for each invocation.
 	RefreshToolSetsOnRun bool
 
-	// SkillsRepository enables Agent Skills if non-nil.
-	SkillsRepository          skill.Repository
+	// skillsRepository enables agent skills when non-nil.
+	skillsRepository skill.Repository
+	// skillsToolingGuidance overrides the built-in skills guidance block.
+	skillsToolingGuidance *string
+	// skillRunAllowedCommands restricts skill_run to allowlisted commands.
+	skillRunAllowedCommands []string
+	// skillRunDeniedCommands rejects denylisted commands for skill_run.
+	skillRunDeniedCommands    []string
 	messageTimelineFilterMode string
 	messageBranchFilterMode   string
 
+	// ReasoningContentMode controls how reasoning_content is handled in
+	// multi-turn conversations. This is particularly important for DeepSeek
+	// models where reasoning_content should be discarded from previous turns.
+	ReasoningContentMode string
+
 	toolFilter tool.FilterFunc
+
+	// PreloadMemory sets the number of memories to preload into system prompt.
+	// When > 0, the specified number of most recent memories are loaded.
+	// When 0 (default), no memories are preloaded (use tools instead).
+	// When < 0, all memories are loaded.
+	PreloadMemory int
 }
 
 // WithModel sets the model to use.
@@ -220,10 +300,46 @@ func WithGlobalInstruction(instruction string) Option {
 	}
 }
 
+// WithModelInstructions sets model-specific instruction overrides.
+// Key: model.Info().Name, Value: instruction text.
+func WithModelInstructions(instructions map[string]string) Option {
+	return func(opts *Options) {
+		opts.ModelInstructions = cloneStringMap(instructions)
+	}
+}
+
+// WithModelGlobalInstructions sets model-specific system prompt overrides.
+// Key: model.Info().Name, Value: system prompt text.
+func WithModelGlobalInstructions(prompts map[string]string) Option {
+	return func(opts *Options) {
+		opts.ModelGlobalInstructions = cloneStringMap(prompts)
+	}
+}
+
 // WithGenerationConfig sets the generation configuration.
 func WithGenerationConfig(config model.GenerationConfig) Option {
 	return func(opts *Options) {
 		opts.GenerationConfig = config
+	}
+}
+
+// WithMaxLLMCalls sets the optional upper bound on the number of LLM calls
+// allowed per invocation for this agent. When limit is:
+//   - > 0: the limit is enforced per invocation.
+//   - <= 0: no limit is applied (default behavior).
+func WithMaxLLMCalls(limit int) Option {
+	return func(opts *Options) {
+		opts.MaxLLMCalls = limit
+	}
+}
+
+// WithMaxToolIterations sets the optional upper bound on how many tool-call
+// iterations are allowed per invocation for this agent. When limit is:
+//   - > 0: the limit is enforced per invocation.
+//   - <= 0: no limit is applied (default behavior).
+func WithMaxToolIterations(limit int) Option {
+	return func(opts *Options) {
+		opts.MaxToolIterations = limit
 	}
 }
 
@@ -275,7 +391,43 @@ func WithRefreshToolSetsOnRun(refresh bool) Option {
 // and on-demand content according to session state.
 func WithSkills(repo skill.Repository) Option {
 	return func(opts *Options) {
-		opts.SkillsRepository = repo
+		opts.skillsRepository = repo
+	}
+}
+
+// WithSkillsToolingGuidance overrides the tooling/workspace guidance
+// block appended to the skills overview in the system message.
+//
+// Behavior:
+//   - Not configured: use the built-in default guidance.
+//   - Configured with empty string: omit the guidance block.
+//   - Configured with non-empty string: append the provided text.
+func WithSkillsToolingGuidance(
+	guidance string,
+) Option {
+	return func(opts *Options) {
+		text := guidance
+		opts.skillsToolingGuidance = &text
+	}
+}
+
+// WithSkillRunAllowedCommands restricts skill_run to a single,
+// allowlisted command (no shell syntax) when non-empty.
+func WithSkillRunAllowedCommands(cmds ...string) Option {
+	return func(opts *Options) {
+		opts.skillRunAllowedCommands = append(
+			[]string(nil), cmds...,
+		)
+	}
+}
+
+// WithSkillRunDeniedCommands rejects a single, denylisted command (no shell
+// syntax) when non-empty.
+func WithSkillRunDeniedCommands(cmds ...string) Option {
+	return func(opts *Options) {
+		opts.skillRunDeniedCommands = append(
+			[]string(nil), cmds...,
+		)
 	}
 }
 
@@ -371,6 +523,32 @@ func WithDefaultTransferMessage(msg string) Option {
 	}
 }
 
+// WithStructuredOutputJSONSchema sets a JSON schema structured output for normal runs.
+//
+// Unlike WithOutputSchema, this uses the model-native response_format json_schema mechanism
+// (when supported by the provider) and can be used together with tools/toolsets.
+//
+// name should be a short identifier for the schema. Some providers (e.g. OpenAI) require it.
+func WithStructuredOutputJSONSchema(name string, schema map[string]any, strict bool, description string) Option {
+	return func(opts *Options) {
+		if schema == nil {
+			return
+		}
+		if name == "" {
+			name = "output"
+		}
+		opts.StructuredOutput = &model.StructuredOutput{
+			Type: model.StructuredOutputJSONSchema,
+			JSONSchema: &model.JSONSchemaConfig{
+				Name:        name,
+				Schema:      schema,
+				Strict:      strict,
+				Description: description,
+			},
+		}
+	}
+}
+
 // WithStructuredOutputJSON sets a JSON schema structured output for normal runs.
 // The schema is constructed automatically from the provided example type.
 // Provide a typed zero-value pointer like: new(MyStruct) or (*MyStruct)(nil) and we infer the type.
@@ -390,6 +568,9 @@ func WithStructuredOutputJSON(examplePtr any, strict bool, description string) O
 		gen := jsonschema.New()
 		schema := gen.Generate(t.Elem())
 		name := t.Elem().Name()
+		if name == "" {
+			name = "output"
+		}
 		opts.StructuredOutput = &model.StructuredOutput{
 			Type: model.StructuredOutputJSONSchema,
 			JSONSchema: &model.JSONSchemaConfig{
@@ -510,9 +691,83 @@ func WithMessageBranchFilterMode(mode string) Option {
 	}
 }
 
+// WithReasoningContentMode controls how reasoning_content is handled in
+// multi-turn conversations. This is particularly important for DeepSeek models
+// where reasoning_content should be discarded from previous request turns.
+//
+// Available modes:
+//   - ReasoningContentModeDiscardPreviousTurns: Discard reasoning_content from
+//     previous requests, keep for current request (default, recommended).
+//   - ReasoningContentModeKeepAll: Keep all reasoning_content (for debugging).
+//   - ReasoningContentModeDiscardAll: Discard all reasoning_content from history.
+func WithReasoningContentMode(mode string) Option {
+	return func(opts *Options) {
+		opts.ReasoningContentMode = mode
+	}
+}
+
+// WithSummaryFormatter sets a custom formatter for session summary content.
+// This allows users to customize how summaries are presented to the model.
+// Example:
+//
+//	llmagent.WithSummaryFormatter(func(summary string) string {
+//	    return fmt.Sprintf("## Previous Context\n\n%s", summary)
+//	})
+func WithSummaryFormatter(formatter func(summary string) string) Option {
+	return func(opts *Options) {
+		opts.summaryFormatter = formatter
+	}
+}
+
 // WithToolFilter sets the tool filter function.
 func WithToolFilter(filter tool.FilterFunc) Option {
 	return func(opts *Options) {
 		opts.toolFilter = filter
 	}
+}
+
+// WithMessageFilterMode sets the message filter mode.
+func WithMessageFilterMode(mode MessageFilterMode) Option {
+	return func(opts *Options) {
+		switch mode {
+		case FullContext:
+			opts.messageBranchFilterMode = BranchFilterModePrefix
+			opts.messageTimelineFilterMode = TimelineFilterAll
+		case RequestContext:
+			opts.messageBranchFilterMode = BranchFilterModePrefix
+			opts.messageTimelineFilterMode = TimelineFilterCurrentRequest
+		case IsolatedRequest:
+			opts.messageBranchFilterMode = BranchFilterModeExact
+			opts.messageTimelineFilterMode = TimelineFilterCurrentRequest
+		case IsolatedInvocation:
+			opts.messageBranchFilterMode = BranchFilterModeExact
+			opts.messageTimelineFilterMode = TimelineFilterCurrentInvocation
+		default:
+			panic("invalid option value")
+		}
+	}
+}
+
+// WithPreloadMemory sets the number of memories to preload into system prompt.
+//   - Set to 0 (default) to disable preloading (use tools instead).
+//   - Set to N (N > 0) to load the most recent N memories.
+//   - Set to -1 to load all memories.
+//     WARNING: Loading all memories may significantly increase token usage
+//     and API costs, especially for users with many stored memories.
+//     Consider using a positive limit (e.g., 10-50) for production use.
+func WithPreloadMemory(limit int) Option {
+	return func(opts *Options) {
+		opts.PreloadMemory = limit
+	}
+}
+
+func cloneStringMap(src map[string]string) map[string]string {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }

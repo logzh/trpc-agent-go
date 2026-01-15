@@ -325,7 +325,7 @@ func TestContentRequestProcessor_getSessionSummaryMessageWithTime(t *testing.T) 
 			includeContents: BranchFilterModePrefix,
 			expectedMsg: &model.Message{
 				Role:    model.RoleSystem,
-				Content: "Test summary content",
+				Content: NewContentRequestProcessor().formatSummary("Test summary content"),
 			},
 			expectedTime: time.Date(2023, 1, 1, 12, 0, 0, 0, time.UTC),
 		},
@@ -346,9 +346,40 @@ func TestContentRequestProcessor_getSessionSummaryMessageWithTime(t *testing.T) 
 			includeContents: BranchFilterModeAll,
 			expectedMsg: &model.Message{
 				Role:    model.RoleSystem,
-				Content: "Full session summary",
+				Content: NewContentRequestProcessor().formatSummary("Full session summary"),
 			},
 			expectedTime: time.Date(2023, 1, 1, 13, 0, 0, 0, time.UTC),
+		},
+		{
+			// Test prefix aggregation: when events have custom filterKeys like
+			// "test-filter/user-messages" but invocation's eventFilterKey is "test-filter",
+			// the processor should aggregate all summaries with matching prefix.
+			name: "prefix aggregation with custom filterKeys",
+			session: &session.Session{
+				Summaries: map[string]*session.Summary{
+					"test-filter/user-messages": {
+						Summary:   "User messages summary",
+						UpdatedAt: time.Date(2023, 1, 1, 12, 0, 0, 0, time.UTC),
+					},
+					"test-filter/tool-calls": {
+						Summary:   "Tool calls summary",
+						UpdatedAt: time.Date(2023, 1, 1, 14, 0, 0, 0, time.UTC),
+					},
+					"other-filter/misc": {
+						Summary:   "Other summary (should not be included)",
+						UpdatedAt: time.Date(2023, 1, 1, 15, 0, 0, 0, time.UTC),
+					},
+				},
+			},
+			includeContents: BranchFilterModePrefix,
+			// The aggregated summary should contain both matching summaries.
+			// Note: map iteration order is not guaranteed, so we check for non-nil
+			// and verify the latest timestamp.
+			expectedMsg: &model.Message{
+				Role: model.RoleSystem,
+				// Content will be checked separately due to non-deterministic order.
+			},
+			expectedTime: time.Date(2023, 1, 1, 14, 0, 0, 0, time.UTC),
 		},
 	}
 
@@ -368,7 +399,14 @@ func TestContentRequestProcessor_getSessionSummaryMessageWithTime(t *testing.T) 
 			} else {
 				assert.NotNil(t, msg)
 				assert.Equal(t, tt.expectedMsg.Role, msg.Role)
-				assert.Equal(t, tt.expectedMsg.Content, msg.Content)
+				// For prefix aggregation test, check content contains expected parts.
+				if tt.name == "prefix aggregation with custom filterKeys" {
+					assert.Contains(t, msg.Content, "User messages summary")
+					assert.Contains(t, msg.Content, "Tool calls summary")
+					assert.NotContains(t, msg.Content, "Other summary")
+				} else if tt.expectedMsg.Content != "" {
+					assert.Equal(t, tt.expectedMsg.Content, msg.Content)
+				}
 			}
 			assert.Equal(t, tt.expectedTime, updatedAt)
 		})
@@ -566,7 +604,7 @@ func TestContentRequestProcessor_ConcurrentSummariesAccess(t *testing.T) {
 	// Test single read
 	msg, updatedAt := p.getSessionSummaryMessage(inv)
 	assert.NotNil(t, msg, "Should get summary message")
-	assert.Equal(t, "Initial summary", msg.Content)
+	assert.Equal(t, NewContentRequestProcessor().formatSummary("Initial summary"), msg.Content)
 	assert.Equal(t, baseTime, updatedAt)
 
 	// Test single write
@@ -580,7 +618,7 @@ func TestContentRequestProcessor_ConcurrentSummariesAccess(t *testing.T) {
 	// Test read after write
 	msg, updatedAt = p.getSessionSummaryMessage(inv)
 	assert.NotNil(t, msg, "Should get updated summary message")
-	assert.Equal(t, "Updated summary", msg.Content)
+	assert.Equal(t, NewContentRequestProcessor().formatSummary("Updated summary"), msg.Content)
 	assert.Equal(t, baseTime.Add(time.Second), updatedAt)
 
 	// Test with minimal concurrency (2 goroutines only)
@@ -1131,6 +1169,7 @@ func TestNewContentRequestProcessor(t *testing.T) {
 		TimelineFilterMode: "all",
 		AddSessionSummary:  false,
 		MaxHistoryRuns:     0,
+		PreloadMemory:      0, // Default to disable preloading.
 	}
 
 	tests := []struct {
@@ -1170,6 +1209,7 @@ func TestNewContentRequestProcessor(t *testing.T) {
 				TimelineFilterMode: TimelineFilterCurrentRequest,
 				AddSessionSummary:  false,
 				MaxHistoryRuns:     0,
+				PreloadMemory:      0,
 			},
 		},
 
@@ -2097,9 +2137,10 @@ func TestContentRequestProcessor_shouldIncludeEvent(t *testing.T) {
 	sinceTime := baseTime.Add(-time.Hour)
 
 	tests := []struct {
-		name     string
-		setup    func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time)
-		expected bool
+		name                string
+		setup               func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time)
+		expected            bool
+		isInvocationMessage bool
 	}{
 		{
 			name: "nil response",
@@ -2183,6 +2224,30 @@ func TestContentRequestProcessor_shouldIncludeEvent(t *testing.T) {
 			expected: false,
 		},
 		{
+			name: "timestamp equal since when not zero time",
+			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
+				p := &ContentRequestProcessor{}
+				evt := event.Event{
+					RequestID:    "123",
+					InvocationID: "123",
+					Version:      event.CurrentVersion,
+					Response: &model.Response{
+						Choices: []model.Choice{
+							{
+								Message: model.Message{
+									Content: "content",
+								},
+							},
+						},
+					},
+					Timestamp: sinceTime,
+				}
+				inv := &agent.Invocation{InvocationID: "123", RunOptions: agent.RunOptions{RequestID: "123"}}
+				return p, evt, inv, "", false, sinceTime
+			},
+			expected: false,
+		},
+		{
 			name: "TimelineFilterCurrentRequest with different request ID",
 			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
 				p := &ContentRequestProcessor{
@@ -2235,6 +2300,41 @@ func TestContentRequestProcessor_shouldIncludeEvent(t *testing.T) {
 				return p, evt, inv, "", true, baseTime
 			},
 			expected: true,
+		},
+		{
+			name: "TimelineFilterCurrentRequest with same request ID",
+			setup: func() (*ContentRequestProcessor, event.Event, *agent.Invocation, string, bool, time.Time) {
+				p := &ContentRequestProcessor{
+					TimelineFilterMode: TimelineFilterCurrentRequest,
+				}
+				evt := event.Event{
+					Version: event.CurrentVersion,
+					Response: &model.Response{
+						Choices: []model.Choice{
+							{
+								Message: model.Message{
+									Role:    model.RoleUser,
+									Content: "content",
+								},
+							},
+						},
+					},
+					Timestamp:    baseTime,
+					RequestID:    "req1",
+					InvocationID: "inv1",
+				}
+				inv := &agent.Invocation{
+					InvocationID: "inv1",
+					RunOptions:   agent.RunOptions{RequestID: "req1"},
+					Message: model.Message{
+						Role:    model.RoleUser,
+						Content: "content",
+					},
+				}
+				return p, evt, inv, "", true, baseTime
+			},
+			expected:            true,
+			isInvocationMessage: true,
 		},
 		{
 			name: "TimelineFilterCurrentInvocation with same invocation ID",
@@ -2366,7 +2466,8 @@ func TestContentRequestProcessor_shouldIncludeEvent(t *testing.T) {
 				}
 				return p, evt, inv, "", true, baseTime
 			},
-			expected: true,
+			expected:            true,
+			isInvocationMessage: true,
 		},
 		{
 			name: "BranchFilterModeExact with different filter key",
@@ -2482,10 +2583,887 @@ func TestContentRequestProcessor_shouldIncludeEvent(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			p, evt, inv, filter, isZeroTime, since := tt.setup()
-			result := p.shouldIncludeEvent(evt, inv, filter, isZeroTime, since)
+			result, isInvocationMessage := p.shouldIncludeEvent(evt, inv, filter, isZeroTime, since)
 			if result != tt.expected {
 				t.Errorf("shouldIncludeEvent() = %v, want %v", result, tt.expected)
 			}
+			if isInvocationMessage != tt.isInvocationMessage {
+				t.Errorf("shouldIncludeEvent() = %v, want %v", isInvocationMessage, tt.isInvocationMessage)
+			}
 		})
 	}
+}
+
+func TestInsertInvocationMessage(t *testing.T) {
+	createInvocation := func(id, requestID, content string) *agent.Invocation {
+		return &agent.Invocation{
+			InvocationID: id,
+			RunOptions: agent.RunOptions{
+				RequestID: requestID,
+			},
+			Message: model.Message{
+				Role:    model.RoleUser,
+				Content: content,
+			},
+		}
+	}
+
+	createEvent := func(requestID, invocationID string, message *model.Message) event.Event {
+		evt := event.Event{
+			InvocationID: invocationID,
+			RequestID:    requestID,
+			Response:     &model.Response{},
+		}
+		if message != nil {
+			evt.Response = &model.Response{
+				Choices: []model.Choice{
+					{Message: *message},
+				},
+			}
+		}
+		return evt
+	}
+
+	tests := []struct {
+		name       string
+		events     []event.Event
+		invocation *agent.Invocation
+		wantEvents []event.Event
+		wantLength int
+	}{
+		{
+			name:       "empty content should return original events unchanged",
+			events:     []event.Event{createEvent("req1", "inv1", nil)},
+			invocation: createInvocation("inv1", "req1", ""),
+			wantEvents: []event.Event{createEvent("req1", "inv1", nil)},
+			wantLength: 1,
+		},
+		{
+			name:       "empty events slice with non-empty content should insert new event",
+			events:     []event.Event{},
+			invocation: createInvocation("inv1", "req1", "Hello"),
+			wantEvents: []event.Event{createEvent("req1", "inv1", &model.Message{
+				Role:    model.RoleUser,
+				Content: "Hello",
+			})},
+			wantLength: 1,
+		},
+		{
+			name: "should append to end when no matching requestID and invocationID found",
+			events: []event.Event{
+				createEvent("req1", "inv1", nil),
+				createEvent("req1", "inv2", nil),
+			},
+			invocation: createInvocation("inv3", "req1", "New message"),
+			wantLength: 3,
+		},
+		{
+			name: "should insert at correct position when match found",
+			events: []event.Event{
+				createEvent("req1", "inv1", nil),
+				createEvent("req1", "inv2", nil),
+				createEvent("req1", "inv3", nil),
+			},
+			invocation: createInvocation("inv2", "req1", "Inserted message"),
+			wantEvents: []event.Event{
+				createEvent("req1", "inv1", nil),
+				createEvent("req1", "inv2", &model.Message{
+					Role:    model.RoleUser,
+					Content: "Inserted message",
+				}),
+				createEvent("req1", "inv2", nil),
+				createEvent("req1", "inv3", nil),
+			},
+			wantLength: 4,
+		},
+		{
+			name: "should handle multiple requestIDs correctly",
+			events: []event.Event{
+				createEvent("req1", "inv1", nil),
+				createEvent("req2", "inv3", nil),
+				createEvent("req1", "inv2", nil),
+			},
+			invocation: createInvocation("inv2", "req1", "Message for inv2"),
+			wantEvents: []event.Event{
+				createEvent("req1", "inv1", nil),
+				createEvent("req2", "inv3", nil),
+				createEvent("req1", "inv2", &model.Message{
+					Role:    model.RoleUser,
+					Content: "Message for inv2",
+				}),
+				createEvent("req1", "inv2", nil),
+			},
+			wantLength: 4,
+		},
+		{
+			name:       "nil events slice should be handled",
+			events:     nil,
+			invocation: createInvocation("inv1", "req1", "Test message"),
+			wantLength: 1,
+			wantEvents: []event.Event{
+				createEvent("req1", "inv1", &model.Message{
+					Role:    model.RoleUser,
+					Content: "Test message",
+				}),
+			},
+		},
+	}
+
+	processor := &ContentRequestProcessor{}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var inputEvents []event.Event
+			if tt.events != nil {
+				inputEvents = make([]event.Event, len(tt.events))
+				copy(inputEvents, tt.events)
+			}
+
+			got := processor.insertInvocationMessage(inputEvents, tt.invocation)
+
+			if len(got) != tt.wantLength {
+				t.Errorf("insertInvocationMessage() length = %d, want %d", len(got), tt.wantLength)
+			}
+
+			if tt.wantEvents != nil {
+				if len(got) != len(tt.wantEvents) {
+					t.Errorf("insertInvocationMessage() got %d events, want %d", len(got), len(tt.wantEvents))
+				} else {
+					for i, evt := range got {
+						wantEvt := tt.wantEvents[i]
+						if evt.InvocationID != wantEvt.InvocationID || evt.RequestID != wantEvt.RequestID {
+							t.Errorf("event at index %d mismatch", i)
+						}
+						if !reflect.DeepEqual(evt.Response, wantEvt.Response) {
+							t.Errorf("event at index %d mismatch", i)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestContentRequestProcessor_getCurrentInvocationMessages(t *testing.T) {
+	baseTime := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// Helper to create tool call event
+	createToolCallEvent := func(invocationID, author, toolCallID string, ts time.Time) event.Event {
+		return event.Event{
+			Author:       author,
+			InvocationID: invocationID,
+			Timestamp:    ts,
+			Version:      event.CurrentVersion,
+			Response: &model.Response{
+				Choices: []model.Choice{
+					{
+						Message: model.Message{
+							Role: model.RoleAssistant,
+							ToolCalls: []model.ToolCall{
+								{
+									ID: toolCallID,
+									Function: model.FunctionDefinitionParam{
+										Name:      "test_tool",
+										Arguments: []byte(`{"arg":"value"}`),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	// Helper to create tool result event
+	createToolResultEvent := func(invocationID, author, toolID, content string, ts time.Time) event.Event {
+		return event.Event{
+			Author:       author,
+			InvocationID: invocationID,
+			Timestamp:    ts,
+			Version:      event.CurrentVersion,
+			Response: &model.Response{
+				Object: model.ObjectTypeToolResponse,
+				Choices: []model.Choice{
+					{
+						Message: model.Message{
+							Role:    model.RoleTool,
+							ToolID:  toolID,
+							Content: content,
+						},
+					},
+				},
+			},
+		}
+	}
+
+	// Helper to create assistant event
+	createAssistantEvent := func(invocationID, author, content string, ts time.Time) event.Event {
+		return event.Event{
+			Author:       author,
+			InvocationID: invocationID,
+			Timestamp:    ts,
+			Version:      event.CurrentVersion,
+			Response: &model.Response{
+				Choices: []model.Choice{
+					{
+						Message: model.Message{
+							Role:    model.RoleAssistant,
+							Content: content,
+						},
+					},
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		name            string
+		sessionEvents   []event.Event
+		invocationID    string
+		agentName       string
+		invMessage      string
+		expectedCount   int
+		expectedContent []string
+	}{
+		{
+			name:          "nil session returns nil",
+			sessionEvents: nil,
+			invocationID:  "inv1",
+			expectedCount: 0,
+		},
+		{
+			name: "filters events by invocation ID",
+			sessionEvents: []event.Event{
+				createAssistantEvent("inv1", "agent1", "message from inv1", baseTime),
+				createAssistantEvent("inv2", "agent1", "message from inv2", baseTime.Add(time.Second)),
+				createAssistantEvent("inv1", "agent1", "another from inv1", baseTime.Add(2*time.Second)),
+			},
+			invocationID:    "inv1",
+			agentName:       "agent1",
+			expectedCount:   2,
+			expectedContent: []string{"message from inv1", "another from inv1"},
+		},
+		{
+			name: "includes tool call and tool result from current invocation",
+			sessionEvents: []event.Event{
+				createToolCallEvent("inv1", "agent1", "call1", baseTime),
+				createToolResultEvent("inv1", "agent1", "call1", "tool result", baseTime.Add(time.Second)),
+			},
+			invocationID:  "inv1",
+			agentName:     "agent1",
+			expectedCount: 2,
+		},
+		{
+			name: "excludes partial events",
+			sessionEvents: []event.Event{
+				createAssistantEvent("inv1", "agent1", "complete message", baseTime),
+				{
+					Author:       "agent1",
+					InvocationID: "inv1",
+					Timestamp:    baseTime.Add(time.Second),
+					Version:      event.CurrentVersion,
+					Response: &model.Response{
+						IsPartial: true,
+						Choices: []model.Choice{
+							{
+								Delta: model.Message{
+									Role:    model.RoleAssistant,
+									Content: "partial",
+								},
+							},
+						},
+					},
+				},
+			},
+			invocationID:    "inv1",
+			agentName:       "agent1",
+			expectedCount:   1,
+			expectedContent: []string{"complete message"},
+		},
+		{
+			name: "excludes events with nil response",
+			sessionEvents: []event.Event{
+				createAssistantEvent("inv1", "agent1", "valid message", baseTime),
+				{
+					Author:       "agent1",
+					InvocationID: "inv1",
+					Timestamp:    baseTime.Add(time.Second),
+					Version:      event.CurrentVersion,
+					Response:     nil,
+				},
+			},
+			invocationID:    "inv1",
+			agentName:       "agent1",
+			expectedCount:   1,
+			expectedContent: []string{"valid message"},
+		},
+		{
+			name: "inserts invocation message when not present",
+			sessionEvents: []event.Event{
+				createAssistantEvent("inv1", "agent1", "assistant reply", baseTime),
+			},
+			invocationID:    "inv1",
+			agentName:       "agent1",
+			invMessage:      "user query",
+			expectedCount:   2,
+			expectedContent: []string{"user query", "assistant reply"},
+		},
+		{
+			name: "does not duplicate invocation message if already present",
+			sessionEvents: []event.Event{
+				{
+					Author:       "user",
+					InvocationID: "inv1",
+					Timestamp:    baseTime,
+					Version:      event.CurrentVersion,
+					Response: &model.Response{
+						Choices: []model.Choice{
+							{
+								Message: model.Message{
+									Role:    model.RoleUser,
+									Content: "user query",
+								},
+							},
+						},
+					},
+				},
+				createAssistantEvent("inv1", "agent1", "assistant reply", baseTime.Add(time.Second)),
+			},
+			invocationID:    "inv1",
+			agentName:       "agent1",
+			invMessage:      "user query",
+			expectedCount:   2,
+			expectedContent: []string{"user query", "assistant reply"},
+		},
+		{
+			name: "full ReAct loop scenario - tool calls visible",
+			sessionEvents: []event.Event{
+				createToolCallEvent("inv1", "subagent", "tc1", baseTime),
+				createToolResultEvent("inv1", "subagent", "tc1", "result1", baseTime.Add(time.Second)),
+				createAssistantEvent("inv1", "subagent", "thinking...", baseTime.Add(2*time.Second)),
+				createToolCallEvent("inv1", "subagent", "tc2", baseTime.Add(3*time.Second)),
+				createToolResultEvent("inv1", "subagent", "tc2", "result2", baseTime.Add(4*time.Second)),
+			},
+			invocationID:  "inv1",
+			agentName:     "subagent",
+			expectedCount: 5,
+		},
+		{
+			name: "converts foreign agent events",
+			sessionEvents: []event.Event{
+				createAssistantEvent("inv1", "other_agent", "foreign message", baseTime),
+				createAssistantEvent("inv1", "my_agent", "my message", baseTime.Add(time.Second)),
+			},
+			invocationID:  "inv1",
+			agentName:     "my_agent",
+			expectedCount: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewContentRequestProcessor()
+
+			var sess *session.Session
+			if tt.sessionEvents != nil {
+				sess = &session.Session{
+					Events:  tt.sessionEvents,
+					EventMu: sync.RWMutex{},
+				}
+			}
+
+			inv := &agent.Invocation{
+				InvocationID: tt.invocationID,
+				AgentName:    tt.agentName,
+				Session:      sess,
+				Message: model.Message{
+					Role:    model.RoleUser,
+					Content: tt.invMessage,
+				},
+			}
+
+			messages := p.getCurrentInvocationMessages(inv)
+
+			assert.Len(t, messages, tt.expectedCount, "unexpected message count")
+
+			if len(tt.expectedContent) > 0 {
+				for i, expected := range tt.expectedContent {
+					if i < len(messages) {
+						assert.Equal(t, expected, messages[i].Content,
+							"message %d content mismatch", i)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestContentRequestProcessor_getCurrentInvocationMessages_IsolatedSubagent(t *testing.T) {
+	// This test specifically validates the fix for isolated subagent tool history.
+	// When a subagent runs with include_contents=none (isolated mode), it should
+	// still see its own tool calls and results within the current invocation.
+	baseTime := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// Simulate a session with events from both parent and subagent invocations
+	sess := &session.Session{
+		EventMu: sync.RWMutex{},
+		Events: []event.Event{
+			// Parent invocation events (should be excluded)
+			{
+				Author:       "parent_agent",
+				InvocationID: "parent_inv",
+				Timestamp:    baseTime,
+				Version:      event.CurrentVersion,
+				Response: &model.Response{
+					Choices: []model.Choice{
+						{Message: model.Message{Role: model.RoleAssistant, Content: "parent message"}},
+					},
+				},
+			},
+			// Subagent's first tool call
+			{
+				Author:       "subagent",
+				InvocationID: "subagent_inv",
+				Timestamp:    baseTime.Add(time.Second),
+				Version:      event.CurrentVersion,
+				Response: &model.Response{
+					Choices: []model.Choice{
+						{
+							Message: model.Message{
+								Role: model.RoleAssistant,
+								ToolCalls: []model.ToolCall{
+									{
+										ID: "tool_call_1",
+										Function: model.FunctionDefinitionParam{
+											Name:      "search",
+											Arguments: []byte(`{"query":"test"}`),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			// Subagent's first tool result
+			{
+				Author:       "subagent",
+				InvocationID: "subagent_inv",
+				Timestamp:    baseTime.Add(2 * time.Second),
+				Version:      event.CurrentVersion,
+				Response: &model.Response{
+					Object: model.ObjectTypeToolResponse,
+					Choices: []model.Choice{
+						{
+							Message: model.Message{
+								Role:    model.RoleTool,
+								ToolID:  "tool_call_1",
+								Content: "search result",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	p := NewContentRequestProcessor()
+	inv := &agent.Invocation{
+		InvocationID: "subagent_inv",
+		AgentName:    "subagent",
+		Session:      sess,
+		Message: model.Message{
+			Role:    model.RoleUser,
+			Content: "do something",
+		},
+	}
+
+	messages := p.getCurrentInvocationMessages(inv)
+
+	// Should have: user message + tool call + tool result = 3 messages
+	// (or 2 if user message is inserted differently)
+	assert.GreaterOrEqual(t, len(messages), 2, "should include tool call and result")
+
+	// Verify tool call is present
+	hasToolCall := false
+	hasToolResult := false
+	for _, msg := range messages {
+		if len(msg.ToolCalls) > 0 {
+			hasToolCall = true
+		}
+		if msg.Role == model.RoleTool && msg.ToolID != "" {
+			hasToolResult = true
+		}
+	}
+
+	assert.True(t, hasToolCall, "should include tool call message")
+	assert.True(t, hasToolResult, "should include tool result message")
+}
+
+func TestContentRequestProcessor_getCurrentInvocationMessages_ReasoningContentDiscardPreviousTurns(t *testing.T) {
+	baseTime := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	sess := &session.Session{
+		EventMu: sync.RWMutex{},
+		Events: []event.Event{
+			{
+				Author:       "agent1",
+				RequestID:    "req1",
+				InvocationID: "inv1",
+				Timestamp:    baseTime,
+				Version:      event.CurrentVersion,
+				Response: &model.Response{
+					Choices: []model.Choice{
+						{
+							Message: model.Message{
+								Role:             model.RoleAssistant,
+								Content:          "step1",
+								ReasoningContent: "think1",
+							},
+						},
+					},
+				},
+			},
+			{
+				Author:       "agent1",
+				RequestID:    "req2",
+				InvocationID: "inv1",
+				Timestamp:    baseTime.Add(time.Second),
+				Version:      event.CurrentVersion,
+				Response: &model.Response{
+					Choices: []model.Choice{
+						{
+							Message: model.Message{
+								Role:             model.RoleAssistant,
+								Content:          "step2",
+								ReasoningContent: "think2",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	p := NewContentRequestProcessor()
+	inv := &agent.Invocation{
+		InvocationID: "inv1",
+		AgentName:    "agent1",
+		Session:      sess,
+		RunOptions: agent.RunOptions{
+			RequestID: "req2",
+		},
+	}
+
+	messages := p.getCurrentInvocationMessages(inv)
+	assert.Len(t, messages, 2)
+	assert.Equal(t, "", messages[0].ReasoningContent, "previous turn reasoning should be discarded")
+	assert.Equal(t, "think2", messages[1].ReasoningContent, "current turn reasoning should be preserved")
+}
+
+func TestContentRequestProcessor_ProcessReasoningContent(t *testing.T) {
+	tests := []struct {
+		name             string
+		mode             string
+		msg              model.Message
+		messageRequestID string
+		currentRequestID string
+		wantReasoning    string
+	}{
+		{
+			name: "keep_all mode preserves reasoning content",
+			mode: ReasoningContentModeKeepAll,
+			msg: model.Message{
+				Role:             model.RoleAssistant,
+				Content:          "final answer",
+				ReasoningContent: "thinking process",
+			},
+			messageRequestID: "req-1",
+			currentRequestID: "req-2",
+			wantReasoning:    "thinking process",
+		},
+		{
+			name: "default mode (empty) uses discard_previous_turns behavior",
+			mode: "",
+			msg: model.Message{
+				Role:             model.RoleAssistant,
+				Content:          "final answer",
+				ReasoningContent: "thinking process",
+			},
+			messageRequestID: "req-1",
+			currentRequestID: "req-2",
+			wantReasoning:    "", // Previous request's reasoning is discarded.
+		},
+		{
+			name: "default mode (empty) keeps current request reasoning",
+			mode: "",
+			msg: model.Message{
+				Role:             model.RoleAssistant,
+				Content:          "final answer",
+				ReasoningContent: "thinking process",
+			},
+			messageRequestID: "req-1",
+			currentRequestID: "req-1",
+			wantReasoning:    "thinking process", // Current request's reasoning is kept.
+		},
+		{
+			name: "discard_all mode removes all reasoning content",
+			mode: ReasoningContentModeDiscardAll,
+			msg: model.Message{
+				Role:             model.RoleAssistant,
+				Content:          "final answer",
+				ReasoningContent: "thinking process",
+			},
+			messageRequestID: "req-1",
+			currentRequestID: "req-1",
+			wantReasoning:    "",
+		},
+		{
+			name: "discard_previous_turns keeps current request reasoning",
+			mode: ReasoningContentModeDiscardPreviousTurns,
+			msg: model.Message{
+				Role:             model.RoleAssistant,
+				Content:          "final answer",
+				ReasoningContent: "current thinking",
+			},
+			messageRequestID: "req-1",
+			currentRequestID: "req-1",
+			wantReasoning:    "current thinking",
+		},
+		{
+			name: "discard_previous_turns removes previous request reasoning",
+			mode: ReasoningContentModeDiscardPreviousTurns,
+			msg: model.Message{
+				Role:             model.RoleAssistant,
+				Content:          "final answer",
+				ReasoningContent: "old thinking",
+			},
+			messageRequestID: "req-1",
+			currentRequestID: "req-2",
+			wantReasoning:    "",
+		},
+		{
+			name: "user message is not processed",
+			mode: ReasoningContentModeDiscardAll,
+			msg: model.Message{
+				Role:             model.RoleUser,
+				Content:          "user message",
+				ReasoningContent: "should not be touched",
+			},
+			messageRequestID: "req-1",
+			currentRequestID: "req-2",
+			wantReasoning:    "should not be touched",
+		},
+		{
+			name: "empty reasoning content is unchanged",
+			mode: ReasoningContentModeDiscardAll,
+			msg: model.Message{
+				Role:             model.RoleAssistant,
+				Content:          "final answer",
+				ReasoningContent: "",
+			},
+			messageRequestID: "req-1",
+			currentRequestID: "req-2",
+			wantReasoning:    "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &ContentRequestProcessor{
+				ReasoningContentMode: tt.mode,
+			}
+			result := p.processReasoningContent(tt.msg, tt.messageRequestID, tt.currentRequestID)
+			assert.Equal(t, tt.wantReasoning, result.ReasoningContent,
+				"processReasoningContent() reasoning = %v, want %v",
+				result.ReasoningContent, tt.wantReasoning)
+		})
+	}
+}
+
+func TestContentRequestProcessor_WithReasoningContentMode(t *testing.T) {
+	tests := []struct {
+		name         string
+		mode         string
+		expectedMode string
+	}{
+		{
+			name:         "set keep_all mode",
+			mode:         ReasoningContentModeKeepAll,
+			expectedMode: ReasoningContentModeKeepAll,
+		},
+		{
+			name:         "set discard_previous_turns mode",
+			mode:         ReasoningContentModeDiscardPreviousTurns,
+			expectedMode: ReasoningContentModeDiscardPreviousTurns,
+		},
+		{
+			name:         "set discard_all mode",
+			mode:         ReasoningContentModeDiscardAll,
+			expectedMode: ReasoningContentModeDiscardAll,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewContentRequestProcessor(
+				WithReasoningContentMode(tt.mode),
+			)
+			assert.Equal(t, tt.expectedMode, p.ReasoningContentMode,
+				"WithReasoningContentMode() mode = %v, want %v",
+				p.ReasoningContentMode, tt.expectedMode)
+		})
+	}
+}
+
+func TestContentRequestProcessor_GetIncrementMessagesWithReasoningContent(t *testing.T) {
+	baseTime := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// Helper to create an assistant event with reasoning content.
+	createAssistantEvent := func(
+		requestID, content, reasoning string,
+		timestamp time.Time,
+	) event.Event {
+		return event.Event{
+			Author:    "assistant",
+			RequestID: requestID,
+			FilterKey: "test-filter",
+			Timestamp: timestamp,
+			Version:   event.CurrentVersion,
+			Response: &model.Response{
+				Choices: []model.Choice{
+					{
+						Message: model.Message{
+							Role:             model.RoleAssistant,
+							Content:          content,
+							ReasoningContent: reasoning,
+						},
+					},
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		name                 string
+		mode                 string
+		events               []event.Event
+		currentRequestID     string
+		expectedReasonings   []string
+		expectedMessageCount int
+	}{
+		{
+			name: "keep_all preserves all reasoning",
+			mode: ReasoningContentModeKeepAll,
+			events: []event.Event{
+				createAssistantEvent("req-1", "answer1", "thinking1", baseTime.Add(time.Second)),
+				createAssistantEvent("req-2", "answer2", "thinking2", baseTime.Add(2*time.Second)),
+			},
+			currentRequestID:     "req-2",
+			expectedReasonings:   []string{"thinking1", "thinking2"},
+			expectedMessageCount: 2,
+		},
+		{
+			name: "discard_previous_turns keeps only current request reasoning",
+			mode: ReasoningContentModeDiscardPreviousTurns,
+			events: []event.Event{
+				createAssistantEvent("req-1", "answer1", "thinking1", baseTime.Add(time.Second)),
+				createAssistantEvent("req-2", "answer2", "thinking2", baseTime.Add(2*time.Second)),
+			},
+			currentRequestID:     "req-2",
+			expectedReasonings:   []string{"", "thinking2"},
+			expectedMessageCount: 2,
+		},
+		{
+			name: "discard_all removes all reasoning",
+			mode: ReasoningContentModeDiscardAll,
+			events: []event.Event{
+				createAssistantEvent("req-1", "answer1", "thinking1", baseTime.Add(time.Second)),
+				createAssistantEvent("req-2", "answer2", "thinking2", baseTime.Add(2*time.Second)),
+			},
+			currentRequestID:     "req-2",
+			expectedReasonings:   []string{"", ""},
+			expectedMessageCount: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sess := &session.Session{
+				Events: tt.events,
+			}
+
+			inv := agent.NewInvocation(
+				agent.WithInvocationEventFilterKey("test-filter"),
+				agent.WithInvocationSession(sess),
+				agent.WithInvocationRunOptions(agent.RunOptions{
+					RequestID: tt.currentRequestID,
+				}),
+			)
+
+			p := NewContentRequestProcessor(
+				WithReasoningContentMode(tt.mode),
+			)
+
+			messages := p.getIncrementMessages(inv, time.Time{})
+
+			assert.Equal(t, tt.expectedMessageCount, len(messages),
+				"expected %d messages, got %d", tt.expectedMessageCount, len(messages))
+
+			for i, msg := range messages {
+				if i < len(tt.expectedReasonings) {
+					assert.Equal(t, tt.expectedReasonings[i], msg.ReasoningContent,
+						"message %d: expected reasoning %q, got %q",
+						i, tt.expectedReasonings[i], msg.ReasoningContent)
+				}
+			}
+		})
+	}
+}
+
+func TestWithSummaryFormatter(t *testing.T) {
+	// Test that WithSummaryFormatter option sets the SummaryFormatter field.
+	formatter := func(summary string) string {
+		return "Custom: " + summary
+	}
+	p := NewContentRequestProcessor(WithSummaryFormatter(formatter))
+	assert.NotNil(t, p.SummaryFormatter, "SummaryFormatter should be set")
+
+	// Verify the custom formatter is used.
+	result := p.formatSummary("test summary")
+	assert.Equal(t, "Custom: test summary", result,
+		"formatSummary should use custom formatter")
+}
+
+func TestContentRequestProcessor_FormatSummary_CustomFormatter(t *testing.T) {
+	// Test custom formatter is invoked when calling formatSummary.
+	formatter := func(summary string) string {
+		return "[CUSTOM] " + summary + " [END]"
+	}
+	p := NewContentRequestProcessor(WithSummaryFormatter(formatter))
+
+	result := p.formatSummary("test content")
+	expected := "[CUSTOM] test content [END]"
+	assert.Equal(t, expected, result,
+		"custom formatter should wrap summary with custom markers")
+}
+
+func TestContentRequestProcessor_FormatSummary_DefaultFormatter(t *testing.T) {
+	// Test that default formatter is used when SummaryFormatter is nil.
+	p := NewContentRequestProcessor()
+	assert.Nil(t, p.SummaryFormatter,
+		"SummaryFormatter should be nil by default")
+
+	summary := "test summary"
+	result := p.formatSummary(summary)
+
+	// Default formatter wraps with specific format.
+	assert.Contains(t, result, "test summary",
+		"default formatter should contain original summary")
+	assert.Contains(t, result,
+		"Here is a brief summary of your previous interactions",
+		"default formatter should contain header")
+	assert.Contains(t, result, "<summary_of_previous_interactions>",
+		"default formatter should use XML tags")
 }

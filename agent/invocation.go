@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
 	"trpc.group/trpc-go/trpc-agent-go/artifact"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/internal/util"
@@ -41,6 +42,14 @@ const (
 
 	// EventFilterKeyDelimiter is the delimiter for event filter key
 	EventFilterKeyDelimiter = "/"
+
+	// flusherStateKey is the invocation state key used by flush.Attach.
+	flusherStateKey = "__flush_session__"
+	// barrierStateKey is the invocation state key used by internal barrier flag.
+	barrierStateKey = "__graph_barrier__"
+	// appenderStateKey is the invocation state key used by internal appender
+	// attachment (see internal/state/appender).
+	appenderStateKey = "__append_event__"
 )
 
 // TransferInfo contains information about a pending agent transfer.
@@ -75,6 +84,9 @@ type Invocation struct {
 	// TransferInfo contains information about a pending agent transfer.
 	TransferInfo *TransferInfo
 
+	// Plugins provides runner-scoped hooks applied to this invocation.
+	Plugins PluginManager
+
 	// StructuredOutput defines how the model should produce structured output for this invocation.
 	StructuredOutput *model.StructuredOutput
 	// StructuredOutputType is the Go type to unmarshal the final JSON into.
@@ -85,9 +97,9 @@ type Invocation struct {
 	// ArtifactService is the service for managing artifacts.
 	ArtifactService artifact.Service
 
-	// noticeChanMap is used to signal when events are written to the session.
-	noticeChanMap map[string]chan any
-	noticeMu      *sync.Mutex
+	// noticeChannels is used to signal when events are written to the session.
+	noticeChannels map[string]chan any
+	noticeMu       *sync.Mutex
 
 	// eventFilterKey is used to filter events for flow or agent
 	eventFilterKey string
@@ -100,8 +112,39 @@ type Invocation struct {
 	state   map[string]any
 	stateMu sync.RWMutex
 
+	// MaxLLMCalls is an optional upper bound on the number of LLM calls
+	// allowed for this invocation. When the value is:
+	//   - > 0: the limit is enforced for this invocation.
+	//   - <= 0: no limit is applied (default, preserves existing behavior).
+	//
+	// Typical usage:
+	//   - LLMAgent copies its per-agent limits into these fields in setupInvocation.
+	//   - Other agent implementations may set them explicitly when constructing
+	//     invocations. If left at zero, IncLLMCallCount/IncToolIteration are no-ops.
+	MaxLLMCalls int
+
+	// MaxToolIterations is an optional upper bound on how many tool-call
+	// iterations are allowed for this invocation. A "tool iteration" is defined
+	// as an assistant response that contains tool calls and triggers the
+	// FunctionCallResponseProcessor. When the value is:
+	//   - > 0: the limit is enforced for this invocation.
+	//   - <= 0: no limit is applied (default, preserves existing behavior).
+	MaxToolIterations int
+
 	// timingInfo stores timing information for the first LLM call in this invocation.
 	timingInfo *model.TimingInfo
+
+	// llmCallCount tracks how many LLM calls have been made in this invocation.
+	// This is used together with MaxLLMCalls to enforce a per-invocation limit.
+	// Note: counters are invocation-scoped. When child invocations are created
+	// via Clone (for example, in transfer_to_agent or AgentTool), the counters
+	// start from zero for each invocation.
+	llmCallCount int
+
+	// toolIterationCount tracks how many tool call iterations have been processed
+	// in this invocation. This is used together with MaxToolIterations
+	// to guard against unbounded tool_call -> LLM -> tool_call loops.
+	toolIterationCount int
 }
 
 // DefaultWaitNoticeTimeoutErr is the default error returned when a wait notice times out.
@@ -137,6 +180,20 @@ type RunOption func(*RunOptions)
 func WithRuntimeState(state map[string]any) RunOption {
 	return func(opts *RunOptions) {
 		opts.RuntimeState = state
+	}
+}
+
+// WithAgent sets the agent instance for this run only.
+func WithAgent(a Agent) RunOption {
+	return func(opts *RunOptions) {
+		opts.Agent = a
+	}
+}
+
+// WithAgentByName sets the agent name that should be resolved for this run.
+func WithAgentByName(name string) RunOption {
+	return func(opts *RunOptions) {
+		opts.AgentByName = name
 	}
 }
 
@@ -187,11 +244,19 @@ func WithKnowledgeConditionedFilter(filter *searchfilter.UniversalFilterConditio
 // Runner uses this history to auto-seed an empty Session (once) and to
 // populate `invocation.Message` via RunWithMessages for compatibility. The
 // content processor itself does not read this field; it derives messages from
-// Session events (and may fall back to a single `invocation.Message` when the
-// Session is empty).
+// Session events and may fall back to a single `invocation.Message` when the
+// Session is empty.
 func WithMessages(messages []model.Message) RunOption {
 	return func(opts *RunOptions) {
 		opts.Messages = messages
+	}
+}
+
+// WithInjectedContextMessages appends per-run messages that are injected into the
+// model request context but are not persisted into the session transcript.
+func WithInjectedContextMessages(messages []model.Message) RunOption {
+	return func(opts *RunOptions) {
+		opts.InjectedContextMessages = append(opts.InjectedContextMessages, messages...)
 	}
 }
 
@@ -205,10 +270,80 @@ func WithResume(enabled bool) RunOption {
 	}
 }
 
+// WithGraphEmitFinalModelResponses controls whether graph-based agents emit
+// final (Done=true) model responses as events.
+//
+// When disabled (default), graph Large Language Model (LLM) nodes only emit
+// streaming chunks (Done=false), which matches the pre-#901 behavior.
+func WithGraphEmitFinalModelResponses(enabled bool) RunOption {
+	return func(opts *RunOptions) {
+		opts.GraphEmitFinalModelResponses = enabled
+	}
+}
+
+// WithStreamMode sets StreamMode selection for this run.
+//
+// When StreamModeMessages is present, graph-based Large Language Model (LLM)
+// nodes will also emit their final (Done=true) model responses by default.
+// If you need to override that behavior, call WithGraphEmitFinalModelResponses
+// after WithStreamMode.
+func WithStreamMode(modes ...StreamMode) RunOption {
+	return func(opts *RunOptions) {
+		opts.StreamModeEnabled = true
+		if len(modes) == 0 {
+			opts.StreamModes = nil
+			return
+		}
+		copied := make([]StreamMode, len(modes))
+		copy(copied, modes)
+		opts.StreamModes = copied
+		for _, mode := range copied {
+			if mode == StreamModeMessages {
+				opts.GraphEmitFinalModelResponses = true
+				break
+			}
+		}
+	}
+}
+
 // WithRequestID sets the request id for the RunOptions.
 func WithRequestID(requestID string) RunOption {
 	return func(opts *RunOptions) {
 		opts.RequestID = requestID
+	}
+}
+
+// WithDetachedCancel enables running a job that ignores parent context
+// cancellation.
+//
+// When enabled, Runner will remove the cancellation signal from the
+// execution context while still preserving context values and enforcing
+// timeouts and deadlines.
+func WithDetachedCancel(enabled bool) RunOption {
+	return func(opts *RunOptions) {
+		opts.DetachedCancel = enabled
+	}
+}
+
+// WithMaxRunDuration sets the maximum duration for a single run.
+//
+// Runner will enforce the smaller of:
+//   - the parent context deadline (if any)
+//   - MaxRunDuration (if > 0)
+func WithMaxRunDuration(d time.Duration) RunOption {
+	return func(opts *RunOptions) {
+		opts.MaxRunDuration = d
+	}
+}
+
+// WithSpanAttributes sets custom span attributes for the RunOptions.
+func WithSpanAttributes(attrs ...attribute.KeyValue) RunOption {
+	return func(opts *RunOptions) {
+		if len(attrs) == 0 {
+			opts.SpanAttributes = nil
+			return
+		}
+		opts.SpanAttributes = append([]attribute.KeyValue(nil), attrs...)
 	}
 }
 
@@ -239,6 +374,34 @@ func WithModel(m model.Model) RunOption {
 func WithModelName(name string) RunOption {
 	return func(opts *RunOptions) {
 		opts.ModelName = name
+	}
+}
+
+// WithStream enables or disables streaming for this specific run.
+//
+// When set, it overrides the agent's default Stream setting for this Run.
+func WithStream(stream bool) RunOption {
+	return func(opts *RunOptions) {
+		opts.Stream = &stream
+	}
+}
+
+// WithInstruction sets the instruction for this specific run.
+// If set, it temporarily overrides the agent's instruction for this request
+// only. This does not modify the agent instance.
+func WithInstruction(instruction string) RunOption {
+	return func(opts *RunOptions) {
+		opts.Instruction = instruction
+	}
+}
+
+// WithGlobalInstruction sets the global instruction (system prompt) for this
+// specific run.
+// If set, it temporarily overrides the agent's global instruction for this
+// request only. This does not modify the agent instance.
+func WithGlobalInstruction(instruction string) RunOption {
+	return func(opts *RunOptions) {
+		opts.GlobalInstruction = instruction
 	}
 }
 
@@ -284,6 +447,23 @@ func WithModelName(name string) RunOption {
 func WithToolFilter(filter tool.FilterFunc) RunOption {
 	return func(opts *RunOptions) {
 		opts.ToolFilter = filter
+	}
+}
+
+// WithToolExecutionFilter sets which tools the framework will execute.
+//
+// This is different from WithToolFilter:
+//   - WithToolFilter controls which tools are visible to the model.
+//   - WithToolExecutionFilter controls which tool calls are auto-executed
+//     after the model requests them.
+//
+// When the filter returns false for a tool, the tool call is not executed
+// and the run ends after emitting the assistant tool_call response. The
+// caller can then execute the tool externally and provide a RoleTool
+// message with the tool result to continue.
+func WithToolExecutionFilter(filter tool.FilterFunc) RunOption {
+	return func(opts *RunOptions) {
+		opts.ToolExecutionFilter = filter
 	}
 }
 
@@ -366,6 +546,11 @@ type RunOptions struct {
 	// `invocation.Message` when no events exist).
 	Messages []model.Message
 
+	// InjectedContextMessages allows callers to inject additional context messages
+	// into the model request for this run. These messages are not persisted into
+	// session events and therefore must be provided on every run if needed.
+	InjectedContextMessages []model.Message
+
 	// Resume indicates whether this run should attempt to resume from existing
 	// session context before making a new model call. When true, flows may
 	// inspect the latest session events (for example, assistant messages with
@@ -373,8 +558,45 @@ type RunOptions struct {
 	// LLM request.
 	Resume bool
 
+	// GraphEmitFinalModelResponses controls event emission for graph-based
+	// Large Language Model (LLM) nodes.
+	//
+	// When false (default), graph LLM nodes only emit streaming chunks
+	// (Done=false).
+	//
+	// When true, graph LLM nodes also emit the final model response
+	// (Done=true). In that mode, callers should be prepared to receive
+	// assistant messages from intermediate nodes.
+	//
+	// When enabled, Runner may omit echoing the final assistant message
+	// in its runner-completion event to avoid duplicates.
+	GraphEmitFinalModelResponses bool
+
+	// StreamModeEnabled indicates whether the caller explicitly configured
+	// StreamModes for this run.
+	StreamModeEnabled bool
+
+	// StreamModes selects which categories of events are forwarded to callers.
+	//
+	// When StreamModeEnabled is false, runners should not apply any stream
+	// filtering and preserve the existing behavior.
+	StreamModes []StreamMode
+
 	// RequestID is the request id of the request.
 	RequestID string
+
+	// DetachedCancel controls whether Runner ignores parent context
+	// cancellation for this run.
+	DetachedCancel bool
+
+	// MaxRunDuration bounds the total execution time for this run.
+	// When set, Runner enforces the smaller of:
+	//   - the parent context deadline (if any)
+	//   - MaxRunDuration
+	MaxRunDuration time.Duration
+
+	// SpanAttributes carries custom span attributes for this run.
+	SpanAttributes []attribute.KeyValue
 
 	// A2ARequestOptions contains A2A client request options that will be passed to
 	// A2A agent's SendMessage and StreamMessage calls. This allows callers to pass
@@ -389,6 +611,12 @@ type RunOptions struct {
 	// Key: agent type, Value: agent-specific config.
 	CustomAgentConfigs map[string]any
 
+	// Agent overrides the runner's default agent for this run.
+	Agent Agent
+
+	// AgentByName instructs the runner to resolve an agent by name for this run.
+	AgentByName string
+
 	// Model is the model to use for this specific run.
 	// If set, it temporarily overrides the agent's default model for this request only.
 	// This allows per-request model switching without affecting other concurrent requests.
@@ -398,6 +626,23 @@ type RunOptions struct {
 	// The agent will look up the model by name from its registered models.
 	// If both Model and ModelName are set, Model takes precedence.
 	ModelName string
+
+	// Stream overrides GenerationConfig.Stream for this run when non-nil.
+	//
+	// This is useful when you want to switch between streaming and
+	// non-streaming responses per request without rebuilding the agent.
+	Stream *bool
+
+	// Instruction overrides the agent's instruction for this run.
+	// If set, it temporarily overrides the agent's instruction for this request
+	// only.
+	Instruction string
+
+	// GlobalInstruction overrides the agent's global instruction (system prompt)
+	// for this run.
+	// If set, it temporarily overrides the agent's global instruction for
+	// this request only.
+	GlobalInstruction string
 
 	// ToolFilter is a custom function to filter tools for this run.
 	// If set, only tools for which the filter returns true will be available to the model.
@@ -419,14 +664,29 @@ type RunOptions struct {
 	//       return t.Declaration().Name == "calculator"
 	//   })
 	ToolFilter tool.FilterFunc
+
+	// ToolExecutionFilter controls which tools are executed by the
+	// framework when the model returns tool calls.
+	//
+	// This is different from ToolFilter:
+	//   - ToolFilter controls which tools are sent to (and callable by) the
+	//     model.
+	//   - ToolExecutionFilter controls which tool calls are auto-executed by
+	//     the framework after the model requests them.
+	//
+	// When this filter is set and returns false for a tool, the tool call
+	// is not executed by the agent. The run stops after emitting the
+	// assistant tool_call response so the caller can execute the tool
+	// externally and later provide tool results (RoleTool messages).
+	ToolExecutionFilter tool.FilterFunc
 }
 
 // NewInvocation create a new invocation
 func NewInvocation(invocationOpts ...InvocationOptions) *Invocation {
 	inv := &Invocation{
-		InvocationID:  uuid.NewString(),
-		noticeMu:      &sync.Mutex{},
-		noticeChanMap: make(map[string]chan any),
+		InvocationID:   uuid.NewString(),
+		noticeMu:       &sync.Mutex{},
+		noticeChannels: make(map[string]chan any),
 	}
 
 	for _, opt := range invocationOpts {
@@ -456,10 +716,12 @@ func (inv *Invocation) Clone(invocationOpts ...InvocationOptions) *Invocation {
 		RunOptions:      inv.RunOptions,
 		MemoryService:   inv.MemoryService,
 		ArtifactService: inv.ArtifactService,
+		Plugins:         inv.Plugins,
 		noticeMu:        inv.noticeMu,
-		noticeChanMap:   inv.noticeChanMap,
+		noticeChannels:  inv.noticeChannels,
 		eventFilterKey:  inv.eventFilterKey,
 		parent:          inv,
+		state:           inv.cloneState(),
 	}
 
 	for _, opt := range invocationOpts {
@@ -481,6 +743,25 @@ func (inv *Invocation) Clone(invocationOpts ...InvocationOptions) *Invocation {
 	}
 
 	return newInv
+}
+
+func (inv *Invocation) cloneState() map[string]any {
+	if inv == nil || inv.state == nil {
+		return nil
+	}
+	inv.stateMu.RLock()
+	defer inv.stateMu.RUnlock()
+	copied := make(map[string]any)
+	if holder, ok := inv.state[flusherStateKey]; ok {
+		copied[flusherStateKey] = holder
+	}
+	if barrier, ok := inv.state[barrierStateKey]; ok {
+		copied[barrierStateKey] = barrier
+	}
+	if holder, ok := inv.state[appenderStateKey]; ok {
+		copied[appenderStateKey] = holder
+	}
+	return copied
 }
 
 // GetEventFilterKey get event filter key.
@@ -518,8 +799,15 @@ func EmitEvent(ctx context.Context, inv *Invocation, ch chan<- *event.Event,
 		agentName = inv.AgentName
 		requestID = inv.RunOptions.RequestID
 	}
-	log.Tracef("[agent.EmitEvent]queue monitoring:RequestID: %s channel capacity: %d, current length: %d, branch: %s, agent name:%s",
-		requestID, cap(ch), len(ch), e.Branch, agentName)
+	log.Tracef(
+		"[agent.EmitEvent]queue monitoring:RequestID: %s channel capacity: "+
+			"%d, current length: %d, branch: %s, agent name:%s",
+		requestID,
+		cap(ch),
+		len(ch),
+		e.Branch,
+		agentName,
+	)
 	return event.EmitEvent(ctx, ch, e)
 }
 
@@ -625,6 +913,46 @@ func (inv *Invocation) GetOrCreateTimingInfo() *model.TimingInfo {
 	return inv.timingInfo
 }
 
+// IncLLMCallCount increments the LLM call counter for this invocation and
+// enforces the optional MaxLLMCalls limit. When the limit is not set or
+// non-positive, no restriction is applied. When the limit is exceeded, a
+// StopError is returned so callers can terminate the flow early.
+func (inv *Invocation) IncLLMCallCount() error {
+	if inv == nil {
+		return nil
+	}
+	limit := inv.MaxLLMCalls
+	if limit <= 0 {
+		// No limit configured, preserve existing behavior.
+		return nil
+	}
+	inv.llmCallCount++
+	if inv.llmCallCount > limit {
+		return NewStopError(
+			fmt.Sprintf("max LLM calls (%d) exceeded", limit),
+		)
+	}
+	return nil
+}
+
+// IncToolIteration increments the tool iteration counter and reports whether
+// the MaxToolIterations limit has been exceeded. A "tool iteration" is
+// defined as an assistant response that contains tool calls and triggers the
+// FunctionCallResponseProcessor. When the limit is not set or non-positive,
+// this method always returns false, preserving existing behavior.
+func (inv *Invocation) IncToolIteration() bool {
+	if inv == nil {
+		return false
+	}
+	limit := inv.MaxToolIterations
+	if limit <= 0 {
+		// No limit configured, preserve existing behavior.
+		return false
+	}
+	inv.toolIterationCount++
+	return inv.toolIterationCount > limit
+}
+
 // DeleteState removes a value from the invocation state.
 //
 // Example:
@@ -662,8 +990,13 @@ func (inv *Invocation) AddNoticeChannelAndWait(ctx context.Context, key string, 
 	select {
 	case <-ch:
 	case <-time.After(timeout):
-		log.Infof("[AddNoticeChannelAndWait]: Wait for notification message timeout. key: %s, timeout: %d(s)",
-			key, int64(timeout/time.Second))
+		log.InfofContext(
+			ctx,
+			"[AddNoticeChannelAndWait]: Wait for notification message "+
+				"timeout. key: %s, timeout: %d(s)",
+			key,
+			int64(timeout/time.Second),
+		)
 		return NewWaitNoticeTimeoutError(fmt.Sprintf("Timeout waiting for completion of event %s", key))
 	case <-ctx.Done():
 		return ctx.Err()
@@ -674,21 +1007,25 @@ func (inv *Invocation) AddNoticeChannelAndWait(ctx context.Context, key string, 
 // AddNoticeChannel add a new notice channel
 func (inv *Invocation) AddNoticeChannel(ctx context.Context, key string) chan any {
 	if inv == nil || inv.noticeMu == nil {
-		log.Error("noticeMu is uninitialized, please use agent.NewInvocation or Clone method to create Invocation")
+		log.ErrorContext(
+			ctx,
+			"noticeMu is uninitialized, please use agent.NewInvocation or "+
+				"Clone method to create Invocation",
+		)
 		return nil
 	}
 	inv.noticeMu.Lock()
 	defer inv.noticeMu.Unlock()
 
-	if ch, ok := inv.noticeChanMap[key]; ok {
+	if ch, ok := inv.noticeChannels[key]; ok {
 		return ch
 	}
 
 	ch := make(chan any)
-	if inv.noticeChanMap == nil {
-		inv.noticeChanMap = make(map[string]chan any)
+	if inv.noticeChannels == nil {
+		inv.noticeChannels = make(map[string]chan any)
 	}
-	inv.noticeChanMap[key] = ch
+	inv.noticeChannels[key] = ch
 
 	return ch
 }
@@ -696,20 +1033,42 @@ func (inv *Invocation) AddNoticeChannel(ctx context.Context, key string) chan an
 // NotifyCompletion notify completion signal to waiting task
 func (inv *Invocation) NotifyCompletion(ctx context.Context, key string) error {
 	if inv == nil || inv.noticeMu == nil {
-		log.Error("noticeMu is uninitialized, please use agent.NewInvocation or Clone method to create Invocation")
-		return fmt.Errorf("noticeMu is uninitialized, please use agent.NewInvocation or Clone method to create Invocation key:%s", key)
+		log.ErrorContext(
+			ctx,
+			"noticeMu is uninitialized, please use agent.NewInvocation or "+
+				"Clone method to create Invocation",
+		)
+		return fmt.Errorf(
+			"noticeMu is uninitialized, please use agent.NewInvocation or "+
+				"Clone method to create Invocation key:%s",
+			key,
+		)
 	}
 	inv.noticeMu.Lock()
 	defer inv.noticeMu.Unlock()
 
-	ch, ok := inv.noticeChanMap[key]
+	ch, ok := inv.noticeChannels[key]
+	// channel not found, create a new one and close it.
+	// May involve notification followed by waiting.
 	if !ok {
-		log.Warnf("notice channel not found for %s", key)
-		return fmt.Errorf("notice channel not found for %s", key)
+		ch = make(chan any)
+		if inv.noticeChannels == nil {
+			inv.noticeChannels = make(map[string]chan any)
+		}
+		inv.noticeChannels[key] = ch
+		close(ch)
+		return nil
 	}
 
-	close(ch)
-	delete(inv.noticeChanMap, key)
+	// channel found, close it if it's not closed
+	select {
+	case _, isOpen := <-ch:
+		if isOpen {
+			close(ch)
+		}
+	default:
+		close(ch)
+	}
 
 	return nil
 }
@@ -719,16 +1078,27 @@ func (inv *Invocation) NotifyCompletion(ctx context.Context, key string) error {
 // upon completion to prevent resource leaks.
 func (inv *Invocation) CleanupNotice(ctx context.Context) {
 	if inv == nil || inv.noticeMu == nil {
-		log.Error("noticeMu is uninitialized, please use agent.NewInvocation or Clone method to create Invocation")
+		log.ErrorContext(
+			ctx,
+			"noticeMu is uninitialized, please use agent.NewInvocation or "+
+				"Clone method to create Invocation",
+		)
 		return
 	}
 	inv.noticeMu.Lock()
 	defer inv.noticeMu.Unlock()
 
-	for _, ch := range inv.noticeChanMap {
-		close(ch)
+	for _, ch := range inv.noticeChannels {
+		select {
+		case _, isOpen := <-ch:
+			if isOpen {
+				close(ch)
+			}
+		default:
+			close(ch)
+		}
 	}
-	inv.noticeChanMap = nil
+	inv.noticeChannels = nil
 }
 
 // GetCustomAgentConfig retrieves configuration for a specific custom agent type.

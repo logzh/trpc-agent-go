@@ -2,92 +2,104 @@
 
 ## Overview
 
-Memory is the memory management system in the tRPC-Agent-Go framework. It
-provides persistent memory and context management for Agents. By integrating
-the memory service, session management, and memory tools, the Memory system
-helps Agents remember user information, maintain conversation context, and
-offer personalized responses across multi-turn dialogs.
+The Memory module is the memory management system in the tRPC-Agent-Go
+framework, providing Agents with persistent memory and context management
+capabilities. By integrating memory services, session management, and memory
+tools, the Memory system helps Agents remember user information, maintain
+dialog context, and provide personalized response experiences across multiple
+conversations.
 
-## ⚠️ Breaking Changes Notice
+### Positioning
 
-**Important**: The memory integration approach has been updated to provide better separation of concerns and explicit control. This is a **breaking change** that affects how memory services are integrated with Agents.
+Memory manages long-term user information with isolation dimension
+`<appName, userID>`. It can be understood as a "personal profile" gradually
+accumulated around a single user.
 
-### What Changed
+In cross-session scenarios, Memory enables the system to retain key user
+information, avoiding repetitive information gathering in each session.
 
-- **Removed**: `llmagent.WithMemory(memoryService)` - automatic memory tool registration
-- **Added**: Two-step integration approach:
-  1. `llmagent.WithTools(memoryService.Tools())` - manual tool registration
-  2. `runner.WithMemoryService(memoryService)` - service management in runner
+It is suitable for recording stable, reusable facts such as "user name is
+John", "occupation is backend engineer", "prefers concise answers", "commonly
+used language is English", and directly using this information in subsequent
+interactions.
 
-### Migration Guide
+### Two Memory Modes
 
-**Before (old approach)**:
+Memory supports two modes for creating and managing memories. Choose based on your scenario:
 
-```go
-llmAgent := llmagent.New(
-    "memory-assistant",
-    llmagent.WithMemory(memoryService), // ❌ No longer supported
-)
-```
+Auto Mode is available in versions >= 1.2.0 and is recommended as the default choice.
 
-**After (new approach)**:
+| Aspect              | Agentic Mode (Tools)                           | Auto Mode (Extractor)                                     |
+| ------------------- | ---------------------------------------------- | --------------------------------------------------------- |
+| **How it works**    | Agent decides when to call memory tools        | System extracts memories automatically from conversations |
+| **User experience** | Visible - user sees tool calls                 | Transparent - memories created silently in background     |
+| **Control**         | Agent has full control over what to remember   | Extractor decides based on conversation analysis          |
+| **Available tools** | All 6 tools                                    | Search tool (search), optional load tool (load)           |
+| **Processing**      | Synchronous - during response generation       | Asynchronous - background workers after response          |
+| **Best for**        | Precise control, user-driven memory management | Natural conversations, hands-off memory building          |
 
-```go
-llmAgent := llmagent.New(
-    "memory-assistant",
-    llmagent.WithTools(memoryService.Tools()), // ✅ Step 1: Register tools
-)
+**Selection Guide**:
 
-runner := runner.NewRunner(
-    "app",
-    llmAgent,
-    runner.WithMemoryService(memoryService), // ✅ Step 2: Set service
-)
-```
+- **Agentic Mode**: Agent automatically decides when to call memory tools based on conversation content (e.g., when user mentions personal information or preferences), user sees tool calls, suitable for scenarios requiring precise control over memory content
+- **Auto Mode (>= 1.2.0, recommended)**: Natural conversation flow, system passively learns about users, simplified UX
 
-### Benefits of the New Approach
+## Core Values
 
-- **Explicit Control**: Applications have full control over which tools to register
-- **Better Separation**: Clear separation between framework and business logic
-- **Service Management**: Memory service is managed at the appropriate level (runner)
-- **No Automatic Injection**: Framework doesn't automatically inject tools or prompts, which can be used as needed.
+- **Context Continuity**: Maintain user history across sessions, avoiding
+  repetitive questioning and input.
+- **Personalized Service**: Provide customized responses and suggestions based
+  on long-term user profiles and preferences.
+- **Knowledge Accumulation**: Transform facts and experiences from
+  conversations into reusable knowledge.
+- **Persistent Storage**: Support multiple storage backends to ensure data
+  safety and reliability.
 
-### Usage Pattern
+## Use Cases
 
-The Memory system follows this pattern:
+The Memory module is suitable for scenarios requiring cross-session user
+information and context retention:
 
-1. Create the Memory Service: configure the storage backend (in-memory or
-   Redis).
-2. Register memory tools: manually register memory tools with the Agent using
-   `llmagent.WithTools(memoryService.Tools())`.
-3. Set memory service in runner: configure the memory service in the runner
-   using `runner.WithMemoryService(memoryService)`.
-4. Agent auto-invocation: the Agent manages memory automatically via registered
-   memory tools.
-5. Session persistence: memory persists across sessions and supports
-   multi-turn dialogs.
+### Use Case 1: Personalized Customer Service Agent
 
-This provides:
+**Requirement**: Customer service Agent needs to remember user information,
+historical issues, and preferences for consistent service.
 
-- Intelligent memory: automatic storage and retrieval based on conversation
-  context.
-- Multi-turn dialogues: maintain dialog state and memory continuity.
-- Flexible storage: supports multiple backends such as in-memory and Redis.
-- Tool integration: memory management tools are registered manually for explicit control.
-- Session management: supports creating, switching, and resetting sessions.
+**Implementation**:
 
-### Agent Integration
+- First conversation: Agent uses `memory_add` to record name, company, contact
+- Record user preferences like "prefers concise answers", "technical
+  background"
+- Subsequent sessions: Agent uses `memory_load` to load user info, no repeated
+  questions needed
+- After resolving issues: Use `memory_update` to update issue status
 
-Memory integrates with Agents as follows:
+### Use Case 2: Learning Companion Agent
 
-- Manual tool registration: memory tools are explicitly registered using
-  `llmagent.WithTools(memoryService.Tools())`.
-- Service management: memory service is managed at the runner level using
-  `runner.WithMemoryService(memoryService)`.
-- Tool invocation: the Agent uses memory tools to store, retrieve, and manage
-  information.
-- Explicit control: applications have full control over which tools to register
-  and how to use them.
+**Requirement**: Educational Agent needs to track student learning progress,
+knowledge mastery, and interests.
+
+**Implementation**:
+
+- Use `memory_add` to record mastered knowledge points
+- Use topic tags for categorization: `["math", "geometry"]`,
+  `["programming", "Python"]`
+- Use `memory_search` to query related knowledge, avoid repeated teaching
+- Adjust teaching strategies based on memories, provide personalized learning
+  paths
+
+### Use Case 3: Project Management Agent
+
+**Requirement**: Project management Agent needs to track project information,
+team members, and task progress.
+
+**Implementation**:
+
+- Record key project info: `memory_add("Project X uses Go language",
+["project", "tech-stack"])`
+- Record team member roles: `memory_add("John Doe is backend lead",
+["team", "role"])`
+- Use `memory_search` to quickly find relevant information
+- After project completion: Use `memory_clear` to clear temporary information
 
 ## Quick Start
 
@@ -105,7 +117,10 @@ export OPENAI_API_KEY="your-openai-api-key"
 export OPENAI_BASE_URL="your-openai-base-url"
 ```
 
-### Minimal Example
+### Agentic Mode Configuration (Optional)
+
+In Agentic mode, the Agent automatically decides when to call memory tools
+based on conversation content to manage memories. Configuration involves three steps:
 
 ```go
 package main
@@ -114,7 +129,6 @@ import (
     "context"
     "log"
 
-    // Core components.
     "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
     memoryinmemory "trpc.group/trpc-go/trpc-agent-go/memory/inmemory"
     "trpc.group/trpc-go/trpc-agent-go/model"
@@ -126,13 +140,11 @@ import (
 func main() {
     ctx := context.Background()
 
-    // 1. Create the memory service.
+    // Step 1: Create memory service.
     memoryService := memoryinmemory.NewMemoryService()
 
-    // 2. Create the LLM model.
+    // Step 2: Create Agent and register memory tools.
     modelInstance := openai.New("deepseek-chat")
-
-    // 3. Create the Agent and register memory tools.
     llmAgent := llmagent.New(
         "memory-assistant",
         llmagent.WithModel(modelInstance),
@@ -143,7 +155,7 @@ func main() {
         llmagent.WithTools(memoryService.Tools()), // Register memory tools.
     )
 
-    // 4. Create the Runner with memory service.
+    // Step 3: Create Runner with memory service.
     sessionService := inmemory.NewSessionService()
     appRunner := runner.NewRunner(
         "memory-chat",
@@ -151,8 +163,9 @@ func main() {
         runner.WithSessionService(sessionService),
         runner.WithMemoryService(memoryService), // Set memory service.
     )
+    defer appRunner.Close()
 
-    // 5. Run a dialog (the Agent uses memory tools automatically).
+    // Run a dialog (the Agent uses memory tools automatically).
     log.Println("🧠 Starting memory-enabled chat...")
     message := model.NewUserMessage(
         "Hi, my name is John, and I like programming",
@@ -161,11 +174,118 @@ func main() {
     if err != nil {
         log.Fatalf("Failed to run agent: %v", err)
     }
-
-    // 6. Handle responses ...
+    // Handle responses ...
     _ = eventChan
 }
 ```
+
+**Conversation example**:
+
+```
+User: My name is Alice and I work at TechCorp.
+
+Agent: Nice to meet you, Alice! I'll remember that you work at TechCorp.
+
+🔧 Tool call: memory_add
+   Args: {"memory": "User's name is Alice, works at TechCorp", "topics": ["name", "work"]}
+✅ Memory added successfully.
+
+Agent: I've saved that information. How can I help you today?
+```
+
+### Auto Mode Configuration (>= 1.2.0, Recommended)
+
+In Auto mode, an LLM-based extractor analyzes conversations and automatically
+creates memories. **The only difference from Agentic mode is in Step 1: add an Extractor**.
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "time"
+
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/memory/extractor"
+    memoryinmemory "trpc.group/trpc-go/trpc-agent-go/memory/inmemory"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+    "trpc.group/trpc-go/trpc-agent-go/runner"
+    "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
+)
+
+func main() {
+    ctx := context.Background()
+
+    // Step 1: Create memory service (configure Extractor to enable auto mode).
+    extractorModel := openai.New("deepseek-chat")
+    memExtractor := extractor.NewExtractor(extractorModel)
+    memoryService := memoryinmemory.NewMemoryService(
+        memoryinmemory.WithExtractor(memExtractor), // Key: configure extractor.
+        // Optional: configure async workers.
+        memoryinmemory.WithAsyncMemoryNum(1), // Configure number of async memory worker.
+        memoryinmemory.WithMemoryQueueSize(10), // Configure memory queue size.
+        memoryinmemory.WithMemoryJobTimeout(30*time.Second), // Configure memory extraction job timeout.
+    )
+    defer memoryService.Close()
+
+    // Step 2: Create Agent and register memory tools.
+    // Note: With Extractor configured, Tools() exposes Search by default.
+    // Load can be enabled explicitly.
+    chatModel := openai.New("deepseek-chat")
+    llmAgent := llmagent.New(
+        "memory-assistant",
+        llmagent.WithModel(chatModel),
+        llmagent.WithDescription("An assistant with automatic memory."),
+        llmagent.WithTools(memoryService.Tools()), // Search by default; Load is optional.
+    )
+
+    // Step 3: Create Runner with memory service.
+    // Runner triggers auto extraction after responses.
+    sessionService := inmemory.NewSessionService()
+    appRunner := runner.NewRunner(
+        "memory-chat",
+        llmAgent,
+        runner.WithSessionService(sessionService),
+        runner.WithMemoryService(memoryService),
+    )
+    defer appRunner.Close()
+
+    // Run a dialog (system extracts memories automatically in background).
+    log.Println("🧠 Starting auto memory chat...")
+    message := model.NewUserMessage(
+        "Hi, my name is John, and I like programming",
+    )
+    eventChan, err := appRunner.Run(ctx, "user123", "session456", message)
+    if err != nil {
+        log.Fatalf("Failed to run agent: %v", err)
+    }
+    // Handle responses ...
+    _ = eventChan
+}
+```
+
+**Conversation example**:
+
+```
+User: My name is Alice and I work at TechCorp.
+
+Agent: Nice to meet you, Alice! It's great to connect with someone from TechCorp.
+       How can I help you today?
+
+(Background: Extractor analyzes conversation and creates memory automatically)
+```
+
+### Configuration Comparison
+
+| Step                | Agentic Mode                        | Auto Mode                              |
+| ------------------- | ----------------------------------- | -------------------------------------- |
+| **Step 1**          | `NewMemoryService()`                | `NewMemoryService(WithExtractor(ext))` |
+| **Step 2**          | `WithTools(memoryService.Tools())`  | `WithTools(memoryService.Tools())`     |
+| **Step 3**          | `WithMemoryService(memoryService)`  | `WithMemoryService(memoryService)`     |
+| **Available tools** | add/update/delete/clear/search/load | search (default) / load (optional)     |
+| **Memory creation** | Agent actively calls tools          | Background auto extraction             |
 
 ## Core Concepts
 
@@ -188,10 +308,10 @@ memory/
 
 ### Integrate with Agent
 
-Use a two-step approach to integrate the Memory Service with an Agent:
+Use a **two-step approach** to integrate the Memory Service with an Agent:
 
-1. Register memory tools with the Agent using `llmagent.WithTools(memoryService.Tools())`
-2. Set the memory service in the runner using `runner.WithMemoryService(memoryService)`
+1. **Register tools**: Use `llmagent.WithTools(memoryService.Tools())` to register memory tools with the Agent
+2. **Set service**: Use `runner.WithMemoryService(memoryService)` to set the memory service in the Runner
 
 ```go
 import (
@@ -201,25 +321,22 @@ import (
     "trpc.group/trpc-go/trpc-agent-go/runner"
 )
 
-// Create the memory service.
+// Step 1: Create memory service
 memoryService := memoryinmemory.NewMemoryService()
 
-// Create the Agent and register memory tools.
+// Step 2: Create Agent and register memory tools
 llmAgent := llmagent.New(
     "memory-assistant",
     llmagent.WithModel(modelInstance),
     llmagent.WithDescription("An assistant with memory capabilities."),
-    llmagent.WithInstruction(
-        "Remember important user info and recall it when needed.",
-    ),
-    llmagent.WithTools(memoryService.Tools()), // Register memory tools.
+    llmagent.WithTools(memoryService.Tools()), // Explicitly register tools
 )
 
-// Create the runner with memory service.
+// Step 3: Create Runner and set memory service
 appRunner := runner.NewRunner(
     "memory-chat",
     llmAgent,
-    runner.WithMemoryService(memoryService), // Set memory service.
+    runner.WithMemoryService(memoryService), // Set service at Runner level
 )
 ```
 
@@ -287,23 +404,54 @@ runner := runner.NewRunner(
 
 ### Memory Tool Configuration
 
-By default, the following tools are enabled. Others can be toggled via
-configuration.
+The memory service provides 6 tools. Common tools are enabled by default, while dangerous operations require manual enabling.
+
+#### Tool List
+
+| Tool            | Function       | Agentic Mode    | Auto Extraction Mode | Description                                    |
+| --------------- | -------------- | --------------- | -------------------- | ---------------------------------------------- |
+| `memory_add`    | Add new memory | ✅ Default      | ❌ Unavailable       | Create new memory entry                        |
+| `memory_update` | Update memory  | ✅ Default      | ❌ Unavailable       | Modify existing memory                         |
+| `memory_search` | Search memory  | ✅ Default      | ✅ Default           | Find by keywords                               |
+| `memory_load`   | Load memories  | ✅ Default      | ⚙️ Configurable      | Load recent memories                           |
+| `memory_delete` | Delete memory  | ⚙️ Configurable | ❌ Unavailable       | Delete single memory                           |
+| `memory_clear`  | Clear memories | ⚙️ Configurable | ❌ Unavailable       | Delete all memories (not exposed in Auto mode) |
+
+**Notes**:
+
+- **Agentic Mode**: Agent actively calls tools to manage memory, all tools are configurable
+  - Default enabled tools: `memory_add`, `memory_update`, `memory_search`, `memory_load`
+  - Default disabled tools: `memory_delete`, `memory_clear`
+- **Auto Mode**: LLM extractor handles write operations in background. Tools() exposes Search by default; Load can be enabled.
+  - Default enabled tools: `memory_search`
+  - Default disabled tools: `memory_load`
+  - Not exposed tools: `memory_add`, `memory_update`, `memory_delete`, `memory_clear`
+- **Default**: Available immediately when service is created, no extra configuration needed
+- **Configurable**: Can be enabled/disabled via `WithToolEnabled()`
+- **Unavailable**: Tool cannot be used in this mode
+
+#### Enable/Disable Tools
+
+Note: In Auto mode, `WithToolEnabled()` only affects whether `memory_search` and
+`memory_load` are exposed via `Tools()`. `memory_add`, `memory_update`,
+`memory_delete`, and `memory_clear` are not exposed to the Agent.
 
 ```go
-// Default enabled tools: add, update, search, load.
-// Default disabled tools: delete, clear.
-memoryService := memoryinmemory.NewMemoryService()
+// Scenario 1: User manageable (allow single deletion)
+memoryService := memoryinmemory.NewMemoryService(
+    memoryinmemory.WithToolEnabled(memory.DeleteToolName, true),
+)
 
-// Enable disabled tools.
+// Scenario 2: Admin privileges (allow clearing all)
 memoryService := memoryinmemory.NewMemoryService(
     memoryinmemory.WithToolEnabled(memory.DeleteToolName, true),
     memoryinmemory.WithToolEnabled(memory.ClearToolName, true),
 )
 
-// Disable enabled tools.
+// Scenario 3: Read-only assistant (query only)
 memoryService := memoryinmemory.NewMemoryService(
     memoryinmemory.WithToolEnabled(memory.AddToolName, false),
+    memoryinmemory.WithToolEnabled(memory.UpdateToolName, false),
 )
 ```
 
@@ -315,6 +463,10 @@ memoryService := memoryinmemory.NewMemoryService(
   implement custom tools or extend the service with policy options (e.g. allow/overwrite/ignore).
 
 ### Custom Tool Implementation
+
+Note: In Auto mode, `Tools()` only exposes `memory_search` and `memory_load`.
+If you need to expose tools like `memory_clear`, use Agentic mode or call
+`ClearMemories()` from your application code.
 
 You can override default tools with custom implementations. See
 `memory/tool/tool.go` for reference on how to implement custom tools.
@@ -365,8 +517,96 @@ memoryService := memoryinmemory.NewMemoryService(
 
 ## Full Example
 
-Below is a complete example showing how to create an Agent with memory
-capabilities.
+Below is a complete interactive chat example demonstrating memory capabilities in action.
+
+### Run the Example
+
+```bash
+# View help
+cd examples/memory
+go run . -h
+
+# Use default config (in-memory storage + streaming)
+go run .
+
+# Use Redis storage
+export REDIS_ADDR=localhost:6379
+go run . -memory redis
+
+# Use MySQL storage (with soft delete)
+export MYSQL_HOST=localhost
+export MYSQL_PASSWORD=password
+go run . -memory mysql -soft-delete
+
+# Use PostgreSQL storage
+export PG_HOST=localhost
+export PG_PASSWORD=password
+go run . -memory postgres -soft-delete
+
+# Non-streaming mode
+go run . -streaming=false
+```
+
+### Interactive Demo
+
+```bash
+$ go run .
+🧠 Multi Turn Chat with Memory
+Model: deepseek-chat
+Memory Service: inmemory
+In-memory
+Streaming: true
+Available tools: memory_add, memory_update, memory_search, memory_load
+(memory_delete, memory_clear disabled by default, and can be enabled or customized)
+==================================================
+✅ Memory chat ready! Session: memory-session-1765504626
+
+💡 Special commands:
+   /memory   - Show user memories
+   /new      - Start a new session
+   /exit     - End the conversation
+
+👤 You: Hi, my name is John and I like coffee.
+🤖 Assistant: Hi John! Nice to meet you. I've made a note that you like coffee. It's great to know your preferences - I'll remember this for our future conversations. Is there anything specific about coffee that you enjoy, or anything else you'd like me to know about you?
+🔧 Memory tool calls initiated:
+   • memory_add (ID: call_00_wE9FAqaLEPtWcqgF3tQqRoLn)
+     Args: {"memory": "John likes coffee.", "topics": ["preferences", "food-drink"]}
+
+🔄 Executing memory tools...
+✅ Memory tool response (ID: call_00_wE9FAqaLEPtWcqgF3tQqRoLn): {"message":"Memory added successfully","memory":"John likes coffee.","topics":["preferences","food-drink"]}
+I see you're a coffee enthusiast! What brings you here today, John? Are you looking for coffee recommendations, or is there something else I can help you with?
+
+👤 You: /new
+🆕 Started new memory session!
+   Previous: memory-session-1765504626
+   Current:  memory-session-1765504664
+   (Memory and conversation history have been reset)
+
+👤 You: What do I like?
+🤖 Assistant: I'll search through my memories to recall what you like. Let me check what information I have stored about your preferences.
+🔧 Memory tool calls initiated:
+   • memory_search (ID: call_00_CCn57ylCDDQ7iaL88d2JScvl)
+     Args: {"query": "likes preferences favorite enjoy"}
+
+🔄 Executing memory tools...
+✅ Memory tool response (ID: call_00_CCn57ylCDDQ7iaL88d2JScvl): {"query":"likes preferences favorite enjoy","results":[{"id":"47f1de6c1318d41001a17a46ebb9f9984b6e89e5ac549aedbf34d7744e8862e0","memory":"John likes coffee.","topics":["preferences","food-drink"],"created":"2025-12-12T09:57:12.456153047+08:00"}],"count":1}
+Based on my memories, I know that **you like coffee**. That's the only preference I have recorded so far.
+
+To give you a more complete answer about your likes, I'd need to learn more about you! Could you tell me about some of your other interests, hobbies, or preferences? For example:
+- What foods or drinks do you enjoy?
+- What hobbies or activities do you like?
+- What kind of music, movies, or books do you prefer?
+- Are there any particular topics or subjects you're interested in?
+
+The more you share with me, the better I'll be able to remember and help you in the future!
+
+👤 You: /exit
+👋 Goodbye!
+```
+
+### Code Example
+
+For full code, see [examples/memory](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/memory). Core implementation:
 
 ```go
 package main
@@ -374,6 +614,7 @@ package main
 import (
     "context"
     "flag"
+    "fmt"
     "log"
     "os"
 
@@ -381,6 +622,8 @@ import (
     "trpc.group/trpc-go/trpc-agent-go/memory"
     memoryinmemory "trpc.group/trpc-go/trpc-agent-go/memory/inmemory"
     memoryredis "trpc.group/trpc-go/trpc-agent-go/memory/redis"
+    memorymysql "trpc.group/trpc-go/trpc-agent-go/memory/mysql"
+    memorypostgres "trpc.group/trpc-go/trpc-agent-go/memory/postgres"
     "trpc.group/trpc-go/trpc-agent-go/model"
     "trpc.group/trpc-go/trpc-agent-go/model/openai"
     "trpc.group/trpc-go/trpc-agent-go/runner"
@@ -389,381 +632,298 @@ import (
 
 func main() {
     var (
-        memServiceName = flag.String(
-            "memory", "inmemory", "Memory service type (inmemory, redis)",
-        )
-        redisAddr = flag.String(
-            "redis-addr", "localhost:6379", "Redis server address",
-        )
-        modelName = flag.String("model", "deepseek-chat", "Model name")
+        memType    = flag.String("memory", "inmemory", "Memory service type")
+        streaming  = flag.Bool("streaming", true, "Enable streaming")
+        softDelete = flag.Bool("soft-delete", false, "Enable soft delete")
+        modelName  = flag.String("model", "deepseek-chat", "Model name")
     )
-
     flag.Parse()
 
     ctx := context.Background()
 
-    // 1. Create the memory service (based on flags).
-    var memoryService memory.Service
-    var err error
-
-    switch *memServiceName {
-    case "redis":
-        redisURL := fmt.Sprintf("redis://%s", *redisAddr)
-        memoryService, err = memoryredis.NewService(
-            memoryredis.WithRedisClientURL(redisURL),
-            memoryredis.WithToolEnabled(memory.DeleteToolName, true),
-            memoryredis.WithCustomTool(
-                memory.ClearToolName, customClearMemoryTool,
-            ),
-        )
-        if err != nil {
-            log.Fatalf("Failed to create redis memory service: %v", err)
-        }
-    default: // inmemory.
-        memoryService = memoryinmemory.NewMemoryService(
-            memoryinmemory.WithToolEnabled(memory.DeleteToolName, true),
-            memoryinmemory.WithCustomTool(
-                memory.ClearToolName, customClearMemoryTool,
-            ),
-        )
+    // 1. Create memory service
+    memoryService, err := createMemoryService(*memType, *softDelete)
+    if err != nil {
+        log.Fatalf("Failed to create memory service: %v", err)
     }
 
-    // 2. Create the LLM model.
+    // 2. Create model
     modelInstance := openai.New(*modelName)
 
-    // 3. Create the Agent and register memory tools.
+    // 3. Create Agent
     genConfig := model.GenerationConfig{
         MaxTokens:   intPtr(2000),
         Temperature: floatPtr(0.7),
-        Stream:      true,
+        Stream:      *streaming,
     }
 
     llmAgent := llmagent.New(
         "memory-assistant",
         llmagent.WithModel(modelInstance),
         llmagent.WithDescription(
-            "An assistant with memory. I can remember key info about you "+
-                "and recall it when needed.",
+            "A helpful AI assistant with memory capabilities. "+
+            "I can remember important information about you and "+
+            "recall it when needed.",
         ),
         llmagent.WithGenerationConfig(genConfig),
-        llmagent.WithTools(memoryService.Tools()), // Register memory tools.
+        llmagent.WithTools(memoryService.Tools()),
     )
 
-    // 4. Create the Runner with memory service.
+    // 4. Create Runner
     sessionService := inmemory.NewSessionService()
     appRunner := runner.NewRunner(
         "memory-chat",
         llmAgent,
         runner.WithSessionService(sessionService),
-        runner.WithMemoryService(memoryService), // Set memory service.
+        runner.WithMemoryService(memoryService),
     )
+    defer appRunner.Close()
 
-    // 5. Run a dialog (the Agent uses memory tools automatically).
+    // 5. Run chat
     log.Println("🧠 Starting memory-enabled chat...")
-    message := model.NewUserMessage(
-        "Hi, my name is John, and I like programming",
-    )
-    eventChan, err := appRunner.Run(ctx, "user123", "session456", message)
-    if err != nil {
-        log.Fatalf("Failed to run agent: %v", err)
+    // ... handle user input and responses
+}
+
+func createMemoryService(memType string, softDelete bool) (
+    memory.Service, error) {
+
+    switch memType {
+    case "redis":
+        redisAddr := os.Getenv("REDIS_ADDR")
+        if redisAddr == "" {
+            redisAddr = "localhost:6379"
+        }
+        return memoryredis.NewService(
+            memoryredis.WithRedisClientURL(
+                fmt.Sprintf("redis://%s", redisAddr),
+            ),
+            memoryredis.WithToolEnabled(memory.DeleteToolName, false),
+        )
+
+    case "mysql":
+        dsn := buildMySQLDSN()
+        return memorymysql.NewService(
+            memorymysql.WithMySQLClientDSN(dsn),
+            memorymysql.WithSoftDelete(softDelete),
+            memorymysql.WithToolEnabled(memory.DeleteToolName, false),
+        )
+
+    case "postgres":
+        return memorypostgres.NewService(
+            memorypostgres.WithHost(getEnv("PG_HOST", "localhost")),
+            memorypostgres.WithPort(getEnvInt("PG_PORT", 5432)),
+            memorypostgres.WithUser(getEnv("PG_USER", "postgres")),
+            memorypostgres.WithPassword(getEnv("PG_PASSWORD", "")),
+            memorypostgres.WithDatabase(getEnv("PG_DATABASE", "postgres")),
+            memorypostgres.WithSoftDelete(softDelete),
+            memorypostgres.WithToolEnabled(memory.DeleteToolName, false),
+        )
+
+    default: // inmemory
+        return memoryinmemory.NewMemoryService(
+            memoryinmemory.WithToolEnabled(memory.DeleteToolName, false),
+        ), nil
     }
-
-    // 6. Handle responses ...
-    _ = eventChan
 }
 
-// Custom clear tool.
-func customClearMemoryTool() tool.Tool {
-    // ... implementation ...
-    return nil
+func buildMySQLDSN() string {
+    host := getEnv("MYSQL_HOST", "localhost")
+    port := getEnv("MYSQL_PORT", "3306")
+    user := getEnv("MYSQL_USER", "root")
+    password := getEnv("MYSQL_PASSWORD", "")
+    database := getEnv("MYSQL_DATABASE", "trpc_agent_go")
+
+    return fmt.Sprintf(
+        "%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4",
+        user, password, host, port, database,
+    )
 }
 
-// Helpers.
-func intPtr(i int) *int   { return &i }
-func floatPtr(f float64) *float64 { return &f }
-```
+func getEnv(key, defaultVal string) string {
+    if val := os.Getenv(key); val != "" {
+        return val
+    }
+    return defaultVal
+}
 
-The environment variables are configured as follows:
-
-```bash
-# OpenAI API configuration
-export OPENAI_API_KEY="your-openai-api-key"
-export OPENAI_BASE_URL="your-openai-base-url"
-```
-
-### Command-line Flags
-
-```bash
-# Choose components via flags when running the example.
-go run main.go -memory inmemory
-go run main.go -memory redis -redis-addr localhost:6379
-
-# Flags:
-# -memory: memory service type (inmemory, redis, mysql, postgres), default is inmemory.
-# -redis-addr: Redis server address, default is localhost:6379.
-# -mysql-dsn: MySQL Data Source Name (DSN), required when using MySQL.
-# -postgres-dsn: PostgreSQL connection string, required when using PostgreSQL.
-# -soft-delete: Enable soft delete for MySQL/PostgreSQL memory service (default false).
-# -model: model name, default is deepseek-chat.
+func intPtr(i int) *int             { return &i }
+func floatPtr(f float64) *float64   { return &f }
 ```
 
 ## Storage Backends
 
 ### In-Memory Storage
 
-In-memory storage is suitable for development and testing:
+**Use case**: Development, testing, rapid prototyping
 
 ```go
 import memoryinmemory "trpc.group/trpc-go/trpc-agent-go/memory/inmemory"
 
-// Create in-memory service
-memoryService := memoryinmemory.NewMemoryService(
-    memoryinmemory.WithMemoryLimit(100), // Set memory limit
-    memoryinmemory.WithToolEnabled(memory.DeleteToolName, true), // Enable delete tool
-)
+memoryService := memoryinmemory.NewMemoryService()
 ```
 
-**Features:**
+**Configuration options**:
 
-- ✅ Zero configuration, ready to use
-- ✅ High performance, no network overhead
-- ❌ No data persistence, lost on restart
-- ❌ No distributed deployment support
+- `WithMemoryLimit(limit int)`: Set memory limit per user
+- `WithCustomTool(toolName, creator)`: Register custom tool implementation
+- `WithToolEnabled(toolName, enabled)`: Enable/disable specific tool
+
+**Features**: Zero config, high performance, no persistence
 
 ### Redis Storage
 
-Redis storage is suitable for production and distributed applications:
+**Use case**: Production, high concurrency, distributed deployment
 
 ```go
 import memoryredis "trpc.group/trpc-go/trpc-agent-go/memory/redis"
 
-// Create Redis memory service
 redisService, err := memoryredis.NewService(
     memoryredis.WithRedisClientURL("redis://localhost:6379"),
-    memoryredis.WithMemoryLimit(1000), // Set memory limit
-    memoryredis.WithToolEnabled(memory.DeleteToolName, true), // Enable delete tool
 )
-if err != nil {
-    log.Fatalf("Failed to create redis memory service: %v", err)
-}
 ```
 
-**Features:**
+**Configuration options**:
 
-- ✅ Data persistence, survives restarts
-- ✅ High performance for high concurrency
-- ✅ Distributed deployment support
-- ✅ Cluster and sentinel mode support
-- ⚙️ Requires Redis server
+- `WithRedisClientURL(url)`: Redis connection URL (recommended)
+- `WithRedisInstance(name)`: Use pre-registered Redis instance
+- `WithMemoryLimit(limit)`: Memory limit per user
+- `WithCustomTool(toolName, creator)`: Register custom tool
+- `WithToolEnabled(toolName, enabled)`: Enable/disable tool
+- `WithExtraOptions(...options)`: Extra options passed to Redis client
 
-**Redis Configuration Options:**
-
-- `WithRedisClientURL(url string)`: Set Redis connection URL
-- `WithRedisInstance(name string)`: Use pre-registered Redis instance
-- `WithMemoryLimit(limit int)`: Set maximum memories per user
-- `WithToolEnabled(toolName string, enabled bool)`: Enable or disable specific tools
-- `WithCustomTool(toolName string, creator ToolCreator)`: Use custom tool implementation
+**Note**: `WithRedisClientURL` takes priority over `WithRedisInstance`
 
 ### MySQL Storage
 
-MySQL storage is suitable for production environments requiring relational databases:
+**Use case**: Production, ACID guarantees, complex queries
 
 ```go
 import memorymysql "trpc.group/trpc-go/trpc-agent-go/memory/mysql"
 
-// Create MySQL memory service
+dsn := "user:password@tcp(localhost:3306)/dbname?parseTime=true"
 mysqlService, err := memorymysql.NewService(
-    memorymysql.WithMySQLClientDSN("user:password@tcp(localhost:3306)/dbname?parseTime=true"),
-    memorymysql.WithMemoryLimit(1000), // Set memory limit
-    memorymysql.WithTableName("memories"), // Custom table name (optional)
-    memorymysql.WithToolEnabled(memory.DeleteToolName, true), // Enable delete tool
+    memorymysql.WithMySQLClientDSN(dsn),
+    memorymysql.WithSoftDelete(true),
 )
-if err != nil {
-    log.Fatalf("Failed to create mysql memory service: %v", err)
-}
 ```
 
-**Features:**
+**Configuration options**:
 
-- ✅ Data persistence with ACID transaction guarantees
-- ✅ Relational database with complex query support
-- ✅ Master-slave replication and clustering support
-- ✅ Automatic table creation
-- ✅ Comprehensive monitoring and management tools
-- ⚙️ Requires MySQL server (5.7+ or 8.0+)
+- `WithMySQLClientDSN(dsn)`: MySQL DSN connection string (recommended, requires `parseTime=true`)
+- `WithMySQLInstance(name)`: Use pre-registered MySQL instance
+- `WithSoftDelete(enabled)`: Enable soft delete (default false)
+- `WithTableName(name)`: Custom table name (default "memories")
+- `WithMemoryLimit(limit)`: Memory limit per user
+- `WithCustomTool(toolName, creator)`: Register custom tool
+- `WithToolEnabled(toolName, enabled)`: Enable/disable tool
+- `WithExtraOptions(...options)`: Extra options passed to MySQL client
+- `WithSkipDBInit(skip)`: Skip table initialization (for users without DDL permissions)
 
-**MySQL Configuration Options:**
-
-- `WithMySQLClientDSN(dsn string)`: Set MySQL Data Source Name (DSN)
-- `WithMySQLInstance(name string)`: Use pre-registered MySQL instance
-- `WithTableName(name string)`: Custom table name (default "memories"). Panics if invalid.
-- `WithMemoryLimit(limit int)`: Set maximum memories per user
-- `WithSoftDelete(enabled bool)`: Enable soft delete (default false). When enabled, delete operations set `deleted_at` and queries filter out soft-deleted rows.
-- `WithToolEnabled(toolName string, enabled bool)`: Enable or disable specific tools
-- `WithCustomTool(toolName string, creator ToolCreator)`: Use custom tool implementation
-
-**Note:** The table is automatically created when the service is initialized. If table creation fails, the service will panic.
-
-**DSN Format:**
+**DSN example**:
 
 ```
-[username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN]
+root:password@tcp(localhost:3306)/memory_db?parseTime=true&charset=utf8mb4
 ```
 
-**Common DSN Parameters:**
-
-- `parseTime=true`: Parse DATE and DATETIME to time.Time (required)
-- `charset=utf8mb4`: Character set
-- `loc=Local`: Location for time.Time values
-- `timeout=10s`: Connection timeout
-
-**Table Schema:**
-
-MySQL memory service automatically creates the following table structure on initialization:
+**Table schema** (auto-created):
 
 ```sql
-CREATE TABLE IF NOT EXISTS memories (
+CREATE TABLE memories (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     app_name VARCHAR(255) NOT NULL,
     user_id VARCHAR(255) NOT NULL,
     memory_id VARCHAR(64) NOT NULL,
     memory_data JSON NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    deleted_at TIMESTAMP NULL DEFAULT NULL,
-    INDEX idx_app_user (app_name, user_id),
-    UNIQUE INDEX idx_app_user_memory (app_name, user_id, memory_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP NULL,
+    UNIQUE INDEX (app_name, user_id, memory_id)
+)
 ```
 
-**Start MySQL with Docker:**
-
-```bash
-# Start MySQL container
-docker run -d --name mysql-memory \
-  -e MYSQL_ROOT_PASSWORD=password \
-  -e MYSQL_DATABASE=memory_db \
-  -p 3306:3306 \
-  mysql:8.0
-
-# Wait for MySQL to be ready
-docker exec mysql-memory mysqladmin ping -h localhost -u root -ppassword
-
-# Use MySQL memory service
-go run main.go -memory mysql -mysql-dsn "root:password@tcp(localhost:3306)/memory_db?parseTime=true"
-```
-
-**Register MySQL Instance (Optional):**
+**Resource cleanup**: Call `Close()` method to release database connection:
 
 ```go
-import (
-    storage "trpc.group/trpc-go/trpc-agent-go/storage/mysql"
-    memorymysql "trpc.group/trpc-go/trpc-agent-go/memory/mysql"
-)
-
-// Register MySQL instance
-storage.RegisterMySQLInstance("my-mysql",
-    storage.WithClientBuilderDSN("user:password@tcp(localhost:3306)/dbname?parseTime=true"),
-)
-
-// Use registered instance
-mysqlService, err := memorymysql.NewService(
-    memorymysql.WithMySQLInstance("my-mysql"),
-)
+defer mysqlService.Close()
 ```
 
 ### PostgreSQL Storage
 
-PostgreSQL storage is suitable for production environments requiring relational databases with JSONB support:
+**Use case**: Production, advanced JSONB features
 
 ```go
 import memorypostgres "trpc.group/trpc-go/trpc-agent-go/memory/postgres"
 
-// Create PostgreSQL memory service
 postgresService, err := memorypostgres.NewService(
-    memorypostgres.WithPostgresConnString("postgres://user:password@localhost:5432/dbname"),
-    memorypostgres.WithMemoryLimit(1000), // Set memory limit
-    memorypostgres.WithTableName("memories"), // Custom table name (optional)
-    memorypostgres.WithSoftDelete(true), // Enable soft delete
-    memorypostgres.WithToolEnabled(memory.DeleteToolName, true), // Enable delete tool
+    memorypostgres.WithHost("localhost"),
+    memorypostgres.WithPort(5432),
+    memorypostgres.WithUser("postgres"),
+    memorypostgres.WithPassword("password"),
+    memorypostgres.WithDatabase("dbname"),
+    memorypostgres.WithSoftDelete(true),
 )
-if err != nil {
-    log.Fatalf("Failed to create postgres memory service: %v", err)
-}
 ```
 
-**Features:**
+**Configuration options**:
 
-- ✅ Data persistence with ACID transaction guarantees
-- ✅ Relational database with complex query support
-- ✅ JSONB support for efficient JSON operations
-- ✅ Master-slave replication and clustering support
-- ✅ Automatic table creation
-- ✅ Comprehensive monitoring and management tools
-- ✅ Optional soft delete support
-- ⚙️ Requires PostgreSQL server (12+)
+- `WithHost/WithPort/WithUser/WithPassword/WithDatabase`: Connection parameters
+- `WithSSLMode(mode)`: SSL mode (default "disable")
+- `WithPostgresInstance(name)`: Use pre-registered PostgreSQL instance
+- `WithSoftDelete(enabled)`: Enable soft delete (default false)
+- `WithTableName(name)`: Custom table name (default "memories")
+- `WithSchema(schema)`: Specify database schema (default is public)
+- `WithMemoryLimit(limit)`: Memory limit per user
+- `WithCustomTool(toolName, creator)`: Register custom tool
+- `WithToolEnabled(toolName, enabled)`: Enable/disable tool
+- `WithExtraOptions(...options)`: Extra options passed to PostgreSQL client
+- `WithSkipDBInit(skip)`: Skip table initialization (for users without DDL permissions)
 
-**PostgreSQL Configuration Options:**
+**Note**: Direct connection parameters take priority over `WithPostgresInstance`
 
-- `WithPostgresConnString(connString string)`: Set PostgreSQL connection string
-- `WithPostgresInstance(name string)`: Use pre-registered PostgreSQL instance
-- `WithTableName(name string)`: Custom table name (default "memories"). Panics if invalid.
-- `WithMemoryLimit(limit int)`: Set maximum memories per user
-- `WithSoftDelete(enabled bool)`: Enable soft delete (default false). When enabled, delete operations set `deleted_at` and queries filter out soft-deleted rows.
-- `WithToolEnabled(toolName string, enabled bool)`: Enable or disable specific tools
-- `WithCustomTool(toolName string, creator ToolCreator)`: Use custom tool implementation
-
-**Note:** The table is automatically created when the service is initialized. If table creation fails, the service will panic.
-
-**Connection String Format:**
-
-```
-postgres://[user[:password]@][netloc][:port][/dbname][?param1=value1&...]
-```
-
-**Common Connection String Parameters:**
-
-- `sslmode=disable`: Disable SSL (for local development)
-- `sslmode=require`: Require SSL connection
-- `connect_timeout=10`: Connection timeout in seconds
-
-**Table Schema:**
-
-PostgreSQL memory service automatically creates the following table structure on initialization:
+**Table schema** (auto-created):
 
 ```sql
-CREATE TABLE IF NOT EXISTS memories (
+CREATE TABLE memories (
     id BIGSERIAL PRIMARY KEY,
     app_name VARCHAR(255) NOT NULL,
     user_id VARCHAR(255) NOT NULL,
     memory_id VARCHAR(64) NOT NULL,
     memory_data JSONB NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    deleted_at TIMESTAMP NULL DEFAULT NULL,
-    CONSTRAINT idx_app_user_memory UNIQUE (app_name, user_id, memory_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_app_user ON memories(app_name, user_id);
-CREATE INDEX IF NOT EXISTS idx_deleted_at ON memories(deleted_at);
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP NULL,
+    UNIQUE (app_name, user_id, memory_id)
+)
 ```
 
-**Start PostgreSQL with Docker:**
+**Resource cleanup**: Call `Close()` method to release database connection:
 
-```bash
-# Start PostgreSQL container
-docker run -d --name postgres-memory \
-  -e POSTGRES_USER=postgres \
-  -e POSTGRES_PASSWORD=password \
-  -e POSTGRES_DB=memory_db \
-  -p 5432:5432 \
-  postgres:15-alpine
+```go
+defer postgresService.Close()
+```
 
-# Wait for PostgreSQL to be ready
-docker exec postgres-memory pg_isready -U postgres
+### Backend Comparison
 
-# Use PostgreSQL memory service
-go run main.go -memory postgres -postgres-dsn "postgres://postgres:password@localhost:5432/memory_db"
+| Feature           | InMemory  | Redis            | MySQL      | PostgreSQL        |
+| ----------------- | --------- | ---------------- | ---------- | ----------------- |
+| **Persistence**   | ❌        | ✅               | ✅         | ✅                |
+| **Distributed**   | ❌        | ✅               | ✅         | ✅                |
+| **Transactions**  | ❌        | Partial          | ✅ ACID    | ✅ ACID           |
+| **Queries**       | Simple    | Medium           | SQL        | SQL               |
+| **JSON**          | ❌        | Basic            | JSON       | JSONB             |
+| **Performance**   | Very High | High             | Med-High   | Med-High          |
+| **Configuration** | Zero      | Simple           | Medium     | Medium            |
+| **Soft Delete**   | ❌        | ❌               | ✅         | ✅                |
+| **Use Case**      | Dev/Test  | High Concurrency | Enterprise | Advanced Features |
+
+**Selection guide**:
+
+```
+Development/Testing → InMemory (zero config, fast)
+High Concurrency → Redis (memory-level performance)
+ACID Requirements → MySQL/PostgreSQL (transaction guarantees)
+Complex JSON → PostgreSQL (JSONB indexing and queries)
+Audit Trail → MySQL/PostgreSQL (soft delete support)
 ```
 
 **Register PostgreSQL Instance (Optional):**
@@ -806,3 +966,345 @@ postgresService, err := memorypostgres.NewService(
 - **Production (Data Integrity)**: Use MySQL storage when ACID guarantees and complex queries are needed
 - **Production (PostgreSQL)**: Use PostgreSQL storage when JSONB support and advanced PostgreSQL features are needed
 - **Hybrid Deployment**: Choose different storage backends based on different application scenarios
+
+## FAQ
+
+### Difference between Memory and Session
+
+Memory and Session solve different problems:
+
+| Dimension     | Memory                           | Session                               |
+| ------------- | -------------------------------- | ------------------------------------- |
+| **Purpose**   | Long-term user profile           | Temporary conversation context        |
+| **Isolation** | `<appName, userID>`              | `<appName, userID, sessionID>`        |
+| **Lifecycle** | Persists across sessions         | Valid within a single session         |
+| **Content**   | User profile, preferences, facts | Conversation history, messages        |
+| **Data Size** | Small (tens to hundreds)         | Large (tens to thousands of messages) |
+| **Use Case**  | "Remember who the user is"       | "Remember what was said"              |
+
+**Example**:
+
+```go
+// Memory: persists across sessions
+memory.AddMemory(ctx, userKey, "User is a backend engineer", []string{"occupation"})
+
+// Session: valid only within a session
+session.AddMessage(ctx, sessionKey, userMessage("What's the weather today?"))
+session.AddMessage(ctx, sessionKey, agentMessage("It's sunny today"))
+
+// New session: Memory retained, Session reset
+```
+
+### Memory ID Idempotency
+
+Memory ID is generated from SHA256 hash of "content + topics". Same content produces the same ID:
+
+```go
+// First add
+memory.AddMemory(ctx, userKey, "User likes programming", []string{"hobby"})
+// Generated ID: abc123...
+
+// Second add with same content
+memory.AddMemory(ctx, userKey, "User likes programming", []string{"hobby"})
+// Same ID: abc123..., overwrites, refreshes updated_at
+```
+
+**Implications**:
+
+- ✅ **Natural deduplication**: Avoids redundant storage
+- ✅ **Idempotent operations**: Repeated additions don't create multiple records
+- ⚠️ **Overwrite update**: Cannot append same content (add timestamp or sequence number if append is needed)
+
+### Search Function Limitations
+
+Memory uses **token matching**, not semantic search:
+
+**English tokenization**: lowercase → filter stopwords (a, the, is, etc.) → split by spaces
+
+```go
+// Can find
+Memory: "User likes programming"
+Search: "programming" ✅ Match
+
+// Cannot find
+Memory: "User likes programming"
+Search: "coding" ❌ No match (semantically similar but different words)
+```
+
+**Chinese tokenization**: uses bigrams
+
+```go
+Memory: "用户喜欢编程"
+Search: "编程" ✅ Match ("编程" in bigrams)
+Search: "写代码" ❌ No match (different words)
+```
+
+**Limitations**:
+
+- All backends perform filtering and sorting in **application layer** (O(n) complexity)
+- Performance affected by data volume
+- No semantic similarity search
+
+**Recommendations**:
+
+- Use explicit keywords and topic tags to improve hit rate
+- Consider integrating vector database for semantic search (requires custom implementation)
+
+### Soft Delete Considerations
+
+**Support status**:
+
+- ✅ MySQL, PostgreSQL: support soft delete
+- ❌ InMemory, Redis: not supported (hard delete only)
+
+**Soft delete configuration**:
+
+```go
+mysqlService, err := memorymysql.NewService(
+    memorymysql.WithMySQLClientDSN("..."),
+    memorymysql.WithSoftDelete(true), // Enable soft delete
+)
+```
+
+**Behavior differences**:
+
+| Operation | Hard Delete       | Soft Delete                              |
+| --------- | ----------------- | ---------------------------------------- |
+| Delete    | Immediate removal | Set `deleted_at` field                   |
+| Query     | Not visible       | Auto-filtered (WHERE deleted_at IS NULL) |
+| Recovery  | Cannot recover    | Can manually clear `deleted_at`          |
+| Storage   | Saves space       | Occupies space                           |
+
+**Migration trap**:
+
+```go
+// ⚠️ Migrating from soft-delete backend to non-supporting backend
+// Soft-deleted records will be lost!
+
+// Migrating from MySQL (soft delete) to Redis (hard delete)
+// Need to manually handle soft-deleted records
+```
+
+## Best Practices
+
+### Production Environment Configuration
+
+```go
+// ✅ Recommended configuration
+postgresService, err := memorypostgres.NewService(
+    // Use environment variables for sensitive info
+    memorypostgres.WithHost(os.Getenv("DB_HOST")),
+    memorypostgres.WithUser(os.Getenv("DB_USER")),
+    memorypostgres.WithPassword(os.Getenv("DB_PASSWORD")),
+    memorypostgres.WithDatabase(os.Getenv("DB_NAME")),
+
+    // Enable soft delete (for recovery)
+    memorypostgres.WithSoftDelete(true),
+
+    // Reasonable limit
+    memorypostgres.WithMemoryLimit(1000),
+)
+```
+
+### Error Handling
+
+```go
+// ✅ Complete error handling
+err := memoryService.AddMemory(ctx, userKey, content, topics)
+if err != nil {
+    if strings.Contains(err.Error(), "limit exceeded") {
+        // Handle limit: clean old memories or reject
+        log.Warnf("Memory limit exceeded for user %s", userKey.UserID)
+    } else {
+        return fmt.Errorf("failed to add memory: %w", err)
+    }
+}
+```
+
+### Tool Enabling Strategy
+
+```go
+// Scenario 1: Read-only assistant
+readOnlyService := memoryinmemory.NewMemoryService(
+    memoryinmemory.WithToolEnabled(memory.LoadToolName, true),
+    memoryinmemory.WithToolEnabled(memory.SearchToolName, true),
+    memoryinmemory.WithToolEnabled(memory.AddToolName, false),
+    memoryinmemory.WithToolEnabled(memory.UpdateToolName, false),
+)
+
+// Scenario 2: Regular user
+userService := memoryinmemory.NewMemoryService(
+    memoryinmemory.WithToolEnabled(memory.DeleteToolName, true),
+    // clear disabled (prevent accidental deletion)
+)
+
+// Scenario 3: Admin
+adminService := memoryinmemory.NewMemoryService(
+    memoryinmemory.WithToolEnabled(memory.DeleteToolName, true),
+    memoryinmemory.WithToolEnabled(memory.ClearToolName, true),
+)
+```
+
+## Advanced Configuration
+
+### Auto Mode Configuration Options (>= 1.2.0)
+
+| Option                     | Description                            | Default        |
+| -------------------------- | -------------------------------------- | -------------- |
+| `WithExtractor(extractor)` | Enable auto mode with LLM extractor    | nil (disabled) |
+| `WithAsyncMemoryNum(n)`    | Number of background worker goroutines | 1              |
+| `WithMemoryQueueSize(n)`   | Size of memory job queue               | 10             |
+| `WithMemoryJobTimeout(d)`  | Timeout for each extraction job        | 30s            |
+
+### Extraction Checkers (>= 1.3.0)
+
+Checkers control when memory extraction should be triggered. By default, extraction happens on every conversation turn. Use checkers to optimize extraction frequency and reduce LLM costs.
+
+#### Available Checkers
+
+| Checker                 | Description                                               | Example                                          |
+| ----------------------- | --------------------------------------------------------- | ------------------------------------------------ |
+| `CheckMessageThreshold` | Triggers when accumulated messages exceed threshold       | `CheckMessageThreshold(5)` - when messages > 5   |
+| `CheckTimeInterval`     | Triggers when time since last extraction exceeds interval | `CheckTimeInterval(3*time.Minute)` - every 3 min |
+| `ChecksAll`             | Combines checkers with AND logic                          | All checkers must pass                           |
+| `ChecksAny`             | Combines checkers with OR logic                           | Any checker passing triggers extraction          |
+
+#### Checker Configuration Examples
+
+```go
+// Example 1: Extract when messages > 5 OR every 3 minutes (OR logic).
+memExtractor := extractor.NewExtractor(
+    extractorModel,
+    extractor.WithCheckersAny(
+        extractor.CheckMessageThreshold(5),
+        extractor.CheckTimeInterval(3*time.Minute),
+    ),
+)
+
+// Example 2: Extract when messages > 10 AND every 5 minutes (AND logic).
+memExtractor := extractor.NewExtractor(
+    extractorModel,
+    extractor.WithChecker(extractor.CheckMessageThreshold(10)),
+    extractor.WithChecker(extractor.CheckTimeInterval(5*time.Minute)),
+)
+```
+
+#### ExtractionContext
+
+The `ExtractionContext` provides information for checker decisions:
+
+```go
+type ExtractionContext struct {
+    UserKey       memory.UserKey  // User identifier.
+    Messages      []model.Message // Accumulated messages since last extraction.
+    LastExtractAt *time.Time      // Last extraction timestamp, nil if never extracted.
+}
+```
+
+**Note**: `Messages` contains all accumulated messages since the last successful extraction. When a checker returns `false`, messages are accumulated and will be included in the next extraction. This ensures no conversation context is lost when using turn-based or time-based checkers.
+
+### Tool Control
+
+In auto extraction mode, `WithToolEnabled` controls all 6 tools, but they serve different purposes:
+
+**Front-end Tools** (exposed via `Tools()` for agent to call):
+
+| Tool            | Default | Description                   |
+| --------------- | ------- | ----------------------------- |
+| `memory_search` | ✅ On   | Search memories by query      |
+| `memory_load`   | ❌ Off  | Load all or recent N memories |
+
+**Back-end Tools** (used by extractor in background, not exposed to agent):
+
+| Tool            | Default | Description                            |
+| --------------- | ------- | -------------------------------------- |
+| `memory_add`    | ✅ On   | Add new memories (extractor uses this) |
+| `memory_update` | ✅ On   | Update existing memories               |
+| `memory_delete` | ✅ On   | Delete memories                        |
+| `memory_clear`  | ❌ Off  | Clear all user memories (dangerous)    |
+
+**Configuration Examples**:
+
+```go
+memoryService := memoryinmemory.NewMemoryService(
+    memoryinmemory.WithExtractor(memExtractor),
+    // Front-end: enable memory_load for agent to call.
+    memoryinmemory.WithToolEnabled(memory.LoadToolName, true),
+    // Back-end: disable memory_delete so extractor cannot delete.
+    memoryinmemory.WithToolEnabled(memory.DeleteToolName, false),
+    // Back-end: enable memory_clear for extractor (use with caution).
+    memoryinmemory.WithToolEnabled(memory.ClearToolName, true),
+)
+```
+
+**Note**: `WithToolEnabled` can be called before or after `WithExtractor` - the order does not matter.
+
+### Comparison: Agentic Mode vs Auto Mode
+
+| Tool            | Agentic Mode (no extractor)             | Auto Mode (with extractor)                 |
+| --------------- | --------------------------------------- | ------------------------------------------ |
+| `memory_add`    | ✅ Agent calls via `Tools()`            | ✅ Extractor uses in background            |
+| `memory_update` | ✅ Agent calls via `Tools()`            | ✅ Extractor uses in background            |
+| `memory_search` | ✅ Agent calls via `Tools()`            | ✅ Agent calls via `Tools()`               |
+| `memory_load`   | ✅ Agent calls via `Tools()`            | ⚙️ Agent calls via `Tools()` if enabled    |
+| `memory_delete` | ⚙️ Agent calls via `Tools()` if enabled | ✅ Extractor uses in background            |
+| `memory_clear`  | ⚙️ Agent calls via `Tools()` if enabled | ⚙️ Extractor uses in background if enabled |
+
+### Memory Preloading
+
+Both modes support preloading memories into the system prompt:
+
+```go
+llmAgent := llmagent.New(
+    "assistant",
+    llmagent.WithModel(model),
+    llmagent.WithTools(memoryService.Tools()),
+    // Preload options:
+    // llmagent.WithPreloadMemory(0),   // Disable preloading (default).
+    // llmagent.WithPreloadMemory(10),  // Load 10 most recent.
+    // llmagent.WithPreloadMemory(-1),  // Load all.
+    //                                  // ⚠️ WARNING: Loading all memories may significantly
+    //                                  //     increase token usage and API costs, especially
+    //                                  //     for users with many stored memories. Consider
+    //                                  //     using a positive limit for production use.
+    // llmagent.WithPreloadMemory(10),  // Load 10 most recent (recommended for production).
+)
+```
+
+When preloading is enabled, memories are automatically injected into the
+system prompt, giving the Agent context about the user without explicit
+tool calls.
+
+**⚠️ Important Note**: Setting the configuration to `-1` loads all memories,
+which may significantly increase **Token Usage** and **API Costs**. By default,
+preloading is disabled (`0`), and we recommend using positive limits (e.g., `10-50`)
+to balance performance and cost.
+
+### Hybrid Approach
+
+You can combine both approaches:
+
+1. Use Auto mode for passive learning (background extraction)
+2. Enable search tool for explicit memory queries
+3. Preload memories for immediate context
+
+```go
+// Auto extraction + search tool + preloading.
+memoryService := memoryinmemory.NewMemoryService(
+    memoryinmemory.WithExtractor(extractor),
+)
+
+llmAgent := llmagent.New(
+    "assistant",
+    llmagent.WithModel(model),
+    llmagent.WithTools(memoryService.Tools()),  // Search by default; Load is optional.
+    llmagent.WithPreloadMemory(10),             // Preload recent memories.
+)
+```
+
+## References
+
+- [Memory Module Source](https://github.com/trpc-group/trpc-agent-go/tree/main/memory)
+- [Agentic Mode Example](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/memory)
+- [Auto Mode Example](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/memory/auto)
+- [API Documentation](https://pkg.go.dev/trpc.group/trpc-go/trpc-agent-go/memory)

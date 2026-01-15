@@ -67,6 +67,10 @@ skills/
 export OPENAI_API_KEY="your-api-key"
 # 可选：指定技能根目录（容器执行器会只读挂载）
 export SKILLS_ROOT=/path/to/skills
+# 可选：也支持传入 HTTP(S) URL（例如 .zip/.tar.gz/.tgz/.tar 压缩包）
+# export SKILLS_ROOT=https://example.com/skills.zip
+# 可选：覆盖 URL 根目录的本地缓存目录
+# export SKILLS_CACHE_DIR=/path/to/cache
 ```
 
 ### 2) 启用 Skills
@@ -98,10 +102,12 @@ agent := llmagent.New(
 - 工具自动注册：开启 `WithSkills` 后，`skill_load`、
   `skill_select_docs`、`skill_list_docs` 与 `skill_run`
   会自动出现在工具列表中，无需手动添加。
-- 自动提示注入：框架会在系统消息中加入简洁的“工具使用指引”，
-  引导模型在合适时机先 `skill_load`，需要时用 `skill_select_docs`
-  选择文档，再 `skill_run`（参见源码
-  的指引文案拼接逻辑）。
+- 默认提示指引：框架会在系统消息里，在 `Available skills:` 列表后追加一段
+  `Tooling and workspace guidance:` 指引文本。
+  - 关闭该指引（减少提示词占用）：`llmagent.WithSkillsToolingGuidance("")`。
+  - 或用自定义文本替换：`llmagent.WithSkillsToolingGuidance("...")`。
+  - 如果你关闭它，请在自己的指令里说明何时使用 `skill_load`、
+    `skill_select_docs` 和 `skill_run`。
   - 加载器： [tool/skill/load.go](https://github.com/trpc-group/trpc-agent-go/blob/main/tool/skill/load.go)
   - 运行器： [tool/skill/run.go](https://github.com/trpc-group/trpc-agent-go/blob/main/tool/skill/run.go)
 
@@ -174,12 +180,13 @@ https://github.com/anthropics/skills
 - `include_all_docs`（可选）：为 true 时包含所有文档
 
 行为：
-- 写入临时会话键（本轮有效）：
+- 写入会话临时键（同一会话内可跨轮保留）：
   - `temp:skill:loaded:<name>` = "1"
   - `temp:skill:docs:<name>` = "*" 或 JSON 字符串数组
 - 请求处理器读取这些键，把 `SKILL.md` 正文与文档注入到系统消息
 
-说明：可多次调用以新增或替换文档。
+说明：可多次调用以新增或替换文档；这些键写在会话状态里，同一会话
+内可跨轮生效（键本身只存技能名/文档名，不存正文）。
 
 ### `skill_select_docs`（选择文档）
 
@@ -213,7 +220,7 @@ https://github.com/anthropics/skills
 
 输入：
 - `skill`（必填）：技能名
-- `command`（必填）：Shell 命令（通过 `bash -lc` 执行）
+- `command`（必填）：Shell 命令（默认通过 `bash -lc` 执行）
 - `cwd`（可选）：相对技能根目录的工作路径
 - `env`（可选）：环境变量映射
 - `output_files`（可选，传统收集方式）：通配符列表
@@ -248,6 +255,23 @@ https://github.com/anthropics/skills
 - `omit_inline_content`（可选）：与 `save_as_artifacts` 配合，
   为 true 时不返回文件内容，仅保留文件名/MIME 信息。
 - `artifact_prefix`（可选）：与 `save_as_artifacts` 配合的前缀。
+
+可选的安全限制（白名单）：
+- 环境变量 `TRPC_AGENT_SKILL_RUN_ALLOWED_COMMANDS`：
+  - 逗号/空格分隔的命令名列表（如 `ls,cat,ifconfig`）
+  - 启用后 `skill_run` 会拒绝管道/重定向/分号等 Shell 语法，
+    并仅允许执行白名单中的“单条命令”
+  - 因为不再经过 Shell 解析，诸如 `> out/x.txt`、heredoc、
+    `$OUTPUT_DIR` 变量展开等写法将不可用；建议改为调用脚本，
+    或使用 `outputs` 收集输出文件
+- 代码侧也可通过 `llmagent.WithSkillRunAllowedCommands(...)` 配置。
+
+可选的安全限制（黑名单）：
+- 环境变量 `TRPC_AGENT_SKILL_RUN_DENIED_COMMANDS`：
+  - 逗号/空格分隔的命令名列表
+  - 启用后同样会拒绝 Shell 语法（仅允许“单条命令”），并拒绝
+    执行黑名单中的命令名
+- 代码侧也可通过 `llmagent.WithSkillRunDeniedCommands(...)` 配置。
 
 输出：
 - `stdout`、`stderr`、`exit_code`、`timed_out`、`duration_ms`
@@ -310,8 +334,8 @@ https://github.com/anthropics/skills
   提示词既昂贵又易泄漏。三层信息模型让“知道有何能力”与“在
   需要时获得细节/执行脚本”解耦，从而减少上下文开销并提升安全。
 - 注入与状态：通过事件中的 `StateDelta` 将加载选择以键值形式
-  写入临时会话，下一轮请求处理器据此拼接系统消息，形成“概览 →
-  正文/文档”的渐进式上下文。
+  写入会话状态的 `temp:*` 命名空间，后续每轮请求处理器据此拼接
+  系统消息，形成“概览 → 正文/文档”的渐进式上下文。
 - 执行隔离：脚本以工作区为边界，输出文件由通配符精确收集，避免
   将脚本源码或非必要文件带入模型上下文。
 

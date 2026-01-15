@@ -84,11 +84,11 @@ func TestRunner_EnqueueSummaryJob_Calls(t *testing.T) {
 		assert.Len(t, mockSessionService.enqueueSummaryJobCalls, 0, "Should not call EnqueueSummaryJob for non-qualifying events")
 	})
 
-	t.Run("calls EnqueueSummaryJob for events with state delta", func(t *testing.T) {
+	t.Run("does not call EnqueueSummaryJob for events with state delta only", func(t *testing.T) {
 		// Create mock session service
 		mockSessionService := &mockSessionService{}
 
-		// Create a mock agent that generates events with state delta
+		// Create a mock agent that generates events with state delta only (no response)
 		stateDeltaAgent := &stateDeltaMockAgent{name: "state-delta-agent"}
 
 		// Create runner with mock session service
@@ -107,11 +107,9 @@ func TestRunner_EnqueueSummaryJob_Calls(t *testing.T) {
 		// Wait a bit for async processing
 		time.Sleep(100 * time.Millisecond)
 
-		// Verify EnqueueSummaryJob was called once; full-session will be cascaded by worker.
-		require.Len(t, mockSessionService.enqueueSummaryJobCalls, 1, "Should call EnqueueSummaryJob once for state delta events")
-		onlyCall := mockSessionService.enqueueSummaryJobCalls[0]
-		assert.Equal(t, "test-filter", onlyCall.filterKey, "Call should use event's FilterKey")
-		assert.False(t, onlyCall.force, "Call should not force")
+		// Verify EnqueueSummaryJob was NOT called for state delta only events
+		// because the new logic only triggers summary for assistant responses
+		require.Len(t, mockSessionService.enqueueSummaryJobCalls, 0, "Should not call EnqueueSummaryJob for state delta only events")
 	})
 
 	t.Run("handles EnqueueSummaryJob errors gracefully", func(t *testing.T) {
@@ -142,6 +140,64 @@ func TestRunner_EnqueueSummaryJob_Calls(t *testing.T) {
 		// Verify EnqueueSummaryJob was still called once despite error
 		assert.Len(t, errorSessionService.enqueueSummaryJobCalls, 1, "Should still call EnqueueSummaryJob once even when it returns error")
 	})
+}
+
+// traceIDKey is the context key for trace ID in tests.
+type traceIDKeyType string
+
+const traceIDKey traceIDKeyType = "trace-id"
+
+func TestRunner_EnqueueSummaryJob_ContextValuePreserved(t *testing.T) {
+	// Create a context-capturing session service
+	contextCapturingService := &contextCapturingSessionService{
+		mockSessionService: &mockSessionService{},
+		done:               make(chan struct{}),
+	}
+
+	// Create a mock agent that generates qualifying events
+	mockAgent := &mockAgent{name: "test-agent"}
+
+	// Create runner with context-capturing session service
+	runner := NewRunner("test-app", mockAgent, WithSessionService(contextCapturingService))
+
+	// Create context with trace ID value
+	ctx := context.WithValue(context.Background(), traceIDKey, "trace-12345")
+
+	userID := "test-user"
+	sessionID := "test-session"
+
+	// Run the runner with qualifying event
+	_, err := RunWithMessages(ctx, runner, userID, sessionID, []model.Message{
+		{Role: model.RoleUser, Content: "Hello"},
+	})
+	require.NoError(t, err)
+
+	// Wait for async processing to complete and context to be captured
+	select {
+	case <-contextCapturingService.done:
+		// Context was captured
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for context to be captured")
+	}
+
+	// Verify the context value was preserved and passed to EnqueueSummaryJob
+	assert.Equal(t, "trace-12345", contextCapturingService.capturedTraceID, "Context value should be preserved and passed to EnqueueSummaryJob")
+}
+
+// contextCapturingSessionService captures the context passed to EnqueueSummaryJob.
+type contextCapturingSessionService struct {
+	*mockSessionService
+	capturedTraceID any
+	done            chan struct{}
+}
+
+func (c *contextCapturingSessionService) EnqueueSummaryJob(ctx context.Context, sess *session.Session, filterKey string, force bool) error {
+	// Capture the trace ID from context
+	c.capturedTraceID = ctx.Value(traceIDKey)
+	close(c.done)
+
+	// Call parent to record the call
+	return c.mockSessionService.EnqueueSummaryJob(ctx, sess, filterKey, force)
 }
 
 // nonQualifyingMockAgent generates non-qualifying events (partial responses).
@@ -350,7 +406,7 @@ func (m *mockSessionService) EnqueueSummaryJob(ctx context.Context, sess *sessio
 	return nil
 }
 
-func (m *mockSessionService) GetSessionSummaryText(ctx context.Context, sess *session.Session) (string, bool) {
+func (m *mockSessionService) GetSessionSummaryText(ctx context.Context, sess *session.Session, opts ...session.SummaryOption) (string, bool) {
 	return "", false
 }
 

@@ -237,6 +237,31 @@ type ResponseError struct {
 
 ## OpenAI Model
 
+### Model Name Parameter
+
+When creating an OpenAI model instance using `openai.New(name string, opts ...Option)`, the first parameter is the actual model name that gets sent to the OpenAI API, as the **specific model identifier** that tells the API which language model to use.
+
+Since the framework supports different models compatible with the OpenAI API, you can obtain the base URL, API key, and model name from various model providers:
+
+**1. OpenAI Official**
+
+- Base URL: `https://api.openai.com/v1`
+- Model Names: `gpt-4o`, `gpt-4o-mini`, etc.
+
+**2. DeepSeek**
+
+- Base URL: `https://api.deepseek.com`
+- Model Names: `deepseek-chat`, `deepseek-reasoner`
+
+**3. Tencent Hunyuan**
+
+- Base URL: `https://api.hunyuan.cloud.tencent.com/v1`
+- Model Names: `hunyuan-2.0-thinking-20251109`, `hunyuan-2.0-instruct-20251111`, etc.
+
+**4. Other Providers**
+
+- **Qwen**: Base URL `https://dashscope.aliyuncs.com/compatible-mode/v1`, Model Names: various qwen models
+
 The OpenAI Model is used to interface with OpenAI and its compatible platforms. It supports streaming output, multimodal and advanced parameter configuration, and provides rich callback mechanisms, batch processing and retry capabilities. It also allows for flexible setting of custom HTTP headers.
 
 ### Configuration Method
@@ -639,8 +664,14 @@ eventChan, err := runner.Run(ctx, userID, sessionID, reasoningMessage,
 
 - `agent.RunOptions.Model`: Directly specify a model instance
 - `agent.RunOptions.ModelName`: Specify a pre-registered model name
+- `agent.RunOptions.Stream`: Override whether responses are streamed (use `agent.WithStream(...)`)
+- `agent.RunOptions.Instruction`: Override instruction for this request only (use `agent.WithInstruction(...)`)
+- `agent.RunOptions.GlobalInstruction`: Override global instruction (system prompt) for this request only (use `agent.WithGlobalInstruction(...)`)
 - Priority: `Model` > `ModelName` > Agent default model
 - If the model specified by `ModelName` is not found, it falls back to the Agent's default model
+
+You can set streaming per request using `agent.WithStream(true)` or
+`agent.WithStream(false)`.
 
 ##### Agent-level vs Per-request Comparison
 
@@ -678,6 +709,11 @@ eventChan, err := runner.Run(ctx, userID, sessionID, reasoningMessage,
 - **Higher Priority**: Per-request model settings take precedence over the Agent's default model
 - **No Side Effects**: Does not affect other concurrent requests or subsequent requests
 - **Flexible Combination**: Can be used in combination with agent-level switching
+
+**Model-specific Prompts (LLMAgent)**:
+
+- Use `llmagent.WithModelInstructions` / `llmagent.WithModelGlobalInstructions` to override prompts by `model.Info().Name` when the Agent switches models; it falls back to the Agent defaults when no mapping exists.
+- For a runnable example, see [examples/model/promptmap](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/promptmap).
 
 ##### Usage Example
 
@@ -883,6 +919,22 @@ For a complete interactive example, see [examples/model/batch](https://github.co
 
 The retry mechanism is an automatic error recovery technique that automatically retries failed requests. This feature is provided by the underlying OpenAI SDK, with the framework passing retry parameters to the SDK through configuration options.
 
+##### Timeouts and deadlines
+
+Request lifecycle is bounded by two independent limits:
+
+- The **caller context deadline** (for example, Runner max duration, or `context.WithTimeout`).
+- The **OpenAI request timeout** configured by `openaiopt.WithRequestTimeout`.
+
+The effective budget is the earlier one:
+
+- effective_deadline = min(ctx_deadline, request_timeout)
+
+Important notes:
+
+- `github.com/openai/openai-go` does not hardcode timeout by default. If you observe timeout in logs, it typically comes from an upstream deadline (gateway/caller context) or from your own `WithRequestTimeout` configuration.
+- If you expect long-running calls (streaming, large prompts, tools, or reasoning models), configure `WithRequestTimeout` to match your service deadline and service level objective (SLO).
+
 ##### Core Features
 
 - **Automatic Retry**: SDK automatically handles retryable errors
@@ -1082,6 +1134,87 @@ Notes for authentication variants:
   `Authorization: Bearer ...` under the hood.
 - Azure/OpenAI‑compatible that use `api-key`: omit `WithAPIKey` and set
   `openaiopt.WithHeader("api-key", "<key>")` instead.
+
+##### Logging raw HTTP request and response
+
+You can use `openaiopt.WithMiddleware` to log the underlying HTTP request and
+response. Be careful about secrets (API keys, Authorization headers) and body
+consumption.
+
+Key points:
+
+- Reading `req.Body` or `resp.Body` consumes the stream, so you must restore it.
+- Do not read `resp.Body` for streaming responses (for example,
+  `Content-Type: text/event-stream`); skip body logging to avoid blocking
+  or breaking the stream.
+
+```go
+import (
+    "bytes"
+    "io"
+    "net/http"
+    "strings"
+
+    openaiopt "github.com/openai/openai-go/option"
+    "trpc.group/trpc-go/trpc-agent-go/log"
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+)
+
+const streamContentType = "text/event-stream"
+
+llm := openai.New("deepseek-chat",
+    openai.WithOpenAIOptions(
+        openaiopt.WithMiddleware(
+            func(
+                req *http.Request,
+                next openaiopt.MiddlewareNext,
+            ) (*http.Response, error) {
+                // 1. Read req.Body.
+                bodyBytes, err := io.ReadAll(req.Body)
+                if err != nil {
+                    return nil, err
+                }
+                // 2. Log req.Body.
+                log.DebugfContext(
+                    req.Context(),
+                    "Middleware req: %+v",
+                    string(bodyBytes),
+                )
+
+                // 3. Restore req.Body (critical step).
+                req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+                resp, err := next(req)
+                if err != nil || resp == nil {
+                    return resp, err
+                }
+
+                // 4. Skip body logging for streaming responses.
+                contentType := resp.Header.Get("Content-Type")
+                if strings.Contains(contentType, streamContentType) {
+                    return resp, nil
+                }
+
+                // 5. Read resp.Body.
+                respBodyBytes, err := io.ReadAll(resp.Body)
+                if err != nil {
+                    return resp, err
+                }
+                // 6. Log resp.Body.
+                log.DebugfContext(
+                    req.Context(),
+                    "Middleware rsp: %+v",
+                    string(respBodyBytes),
+                )
+
+                // 7. Restore resp.Body (critical step).
+                resp.Body = io.NopCloser(bytes.NewBuffer(respBodyBytes))
+                return resp, nil
+            },
+        ),
+    ),
+)
+```
 
 ##### 3. Custom http.RoundTripper (advanced)
 
@@ -1784,6 +1917,11 @@ eventChan, err := runner.Run(ctx, userID, sessionID, visionMessage,
 - **No Side Effects**: Does not affect other concurrent requests or subsequent requests
 - **Flexible Combination**: Can be used in combination with agent-level switching
 
+**Model-specific Prompts (LLMAgent)**:
+
+- Use `llmagent.WithModelInstructions` / `llmagent.WithModelGlobalInstructions` to override prompts by `model.Info().Name` when the Agent switches models; it falls back to the Agent defaults when no mapping exists.
+- For a runnable example, see [examples/model/promptmap](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/promptmap).
+
 ##### Usage Example
 
 For a complete interactive example, see [examples/model/switch](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/switch), which demonstrates both agent-level and per-request switching approaches.
@@ -1836,7 +1974,7 @@ llm := anthropic.New("claude-sonnet-4-0",
 
 If you need to set headers conditionally (e.g., only for certain paths or depending on context values), you can use middleware:
 
-```go
+````go
 import (
     anthropicopt "github.com/anthropics/anthropic-sdk-go/option"
     "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
@@ -1862,7 +2000,7 @@ import (
 	    ),
 	)
 	```
-	
+
 ##### 3. Using Custom `http.RoundTripper`
 
 For injecting headers at the HTTP transport layer, ideal for scenarios requiring proxying, TLS, custom monitoring, and other capabilities.
@@ -1887,7 +2025,7 @@ llm := anthropic.New("claude-sonnet-4-0",
         anthropic.WithHTTPClientTransport(headerRoundTripper{base: http.DefaultTransport}),
     ),
 )
-```
+````
 
 Regarding **"per-request" headers**:
 

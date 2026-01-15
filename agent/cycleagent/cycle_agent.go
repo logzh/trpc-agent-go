@@ -175,7 +175,11 @@ func (a *CycleAgent) runSubAgent(
 	subAgentCtx := agent.NewInvocationContext(ctx, subInvocation)
 
 	// Run the sub-agent.
-	subEventChan, err := subAgent.Run(subAgentCtx, subInvocation)
+	subEventChan, err := agent.RunWithPlugins(
+		subAgentCtx,
+		subInvocation,
+		subAgent,
+	)
 	if err != nil {
 		// Send error event and escalate.
 		agent.EmitEvent(ctx, invocation, eventChan, event.NewErrorEvent(
@@ -193,6 +197,9 @@ func (a *CycleAgent) runSubAgent(
 			*fullRespEvent = subEvent
 		}
 		if err := event.EmitEvent(ctx, eventChan, subEvent); err != nil {
+			return true
+		}
+		if subEvent != nil && subEvent.Error != nil {
 			return true
 		}
 
@@ -280,7 +287,8 @@ func (a *CycleAgent) Run(ctx context.Context, invocation *agent.Invocation) (<-c
 	// Setup invocation.
 	a.setupInvocation(invocation)
 
-	go func() {
+	runCtx := agent.CloneContext(ctx)
+	go func(ctx context.Context) {
 		defer close(eventChan)
 
 		// Handle before agent callbacks.
@@ -310,7 +318,7 @@ func (a *CycleAgent) Run(ctx context.Context, invocation *agent.Invocation) (<-c
 
 		// Handle after agent callbacks.
 		a.handleAfterAgentCallbacks(ctx, invocation, eventChan, fullRespEvent)
-	}()
+	}(runCtx)
 
 	return eventChan, nil
 }

@@ -23,7 +23,9 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/graph"
 	"trpc.group/trpc-go/trpc-agent-go/log"
+	"trpc.group/trpc-go/trpc-agent-go/memory"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/session"
 )
 
 // Content inclusion options.
@@ -44,6 +46,28 @@ const (
 	// TimelineFilterCurrentInvocation only includes messages within the current invocation session
 	// Suitable for scenarios requiring isolation between different invocation cycles in long-running sessions
 	TimelineFilterCurrentInvocation = "invocation"
+)
+
+// Reasoning content mode constants control how reasoning_content is handled in
+// multi-turn conversations. This is particularly important for models like
+// DeepSeek that output reasoning_content (thinking chain) alongside the final
+// content.
+const (
+	// ReasoningContentModeKeepAll keeps all reasoning_content in history.
+	// Use this for debugging or when you need to retain thinking chains.
+	ReasoningContentModeKeepAll = "keep_all"
+
+	// ReasoningContentModeDiscardPreviousTurns discards reasoning_content from
+	// messages that belong to previous request turns. Messages within the current
+	// request retain their reasoning_content (for tool call scenarios where the
+	// model needs to reference its previous reasoning). This is the default mode
+	// and recommended for DeepSeek models according to their API documentation.
+	// Reference: https://api-docs.deepseek.com/guides/thinking_mode#tool-calls
+	ReasoningContentModeDiscardPreviousTurns = "discard_previous_turns"
+
+	// ReasoningContentModeDiscardAll discards all reasoning_content from history.
+	// Use this for maximum bandwidth savings when reasoning history is not needed.
+	ReasoningContentModeDiscardAll = "discard_all"
 )
 
 // ContentRequestProcessor implements content processing logic for agent requests.
@@ -67,6 +91,18 @@ type ContentRequestProcessor struct {
 	PreserveSameBranch bool
 	// TimelineFilterMode controls whether to append history messages to the request.
 	TimelineFilterMode string
+	// ReasoningContentMode controls how reasoning_content is handled in multi-turn
+	// conversations. Default is ReasoningContentModeDiscardPreviousTurns, which is
+	// recommended for DeepSeek thinking mode.
+	ReasoningContentMode string
+	// PreloadMemory sets the number of memories to preload into system prompt.
+	// When > 0, the specified number of most recent memories are loaded.
+	// When 0, no memories are preloaded (use tools instead).
+	// When < 0 (default), all memories are loaded.
+	PreloadMemory int
+	// SummaryFormatter allows custom formatting of session summary content.
+	// When nil (default), uses the default formatSummaryContent function.
+	SummaryFormatter func(summary string) string
 }
 
 // ContentOption is a functional option for configuring the ContentRequestProcessor.
@@ -125,6 +161,41 @@ func WithPreserveSameBranch(preserve bool) ContentOption {
 	}
 }
 
+// WithReasoningContentMode sets how reasoning_content is handled in multi-turn
+// conversations. This is particularly important for DeepSeek models where
+// reasoning_content should be discarded from previous request turns.
+//
+// Available modes:
+//   - ReasoningContentModeDiscardPreviousTurns: Discard reasoning_content from
+//     previous requests, keep for current request (default, recommended).
+//   - ReasoningContentModeKeepAll: Keep all reasoning_content.
+//   - ReasoningContentModeDiscardAll: Discard all reasoning_content from history.
+func WithReasoningContentMode(mode string) ContentOption {
+	return func(p *ContentRequestProcessor) {
+		p.ReasoningContentMode = mode
+	}
+}
+
+// WithPreloadMemory sets the number of memories to preload into system prompt.
+//   - Set to 0 (default) to disable preloading (use tools instead).
+//   - Set to N (N > 0) to load the most recent N memories.
+//   - Set to -1 to load all memories.
+//     WARNING: Loading all memories may significantly increase token usage
+//     and API costs, especially for users with many stored memories.
+//     Consider using a positive limit (e.g., 10-50) for production use.
+func WithPreloadMemory(limit int) ContentOption {
+	return func(p *ContentRequestProcessor) {
+		p.PreloadMemory = limit
+	}
+}
+
+// WithSummaryFormatter sets a custom formatter for session summary content.
+func WithSummaryFormatter(formatter func(summary string) string) ContentOption {
+	return func(p *ContentRequestProcessor) {
+		p.SummaryFormatter = formatter
+	}
+}
+
 const (
 	mergedUserSeparator = "\n\n"
 	contextPrefix       = "For context:"
@@ -142,6 +213,8 @@ func NewContentRequestProcessor(opts ...ContentOption) *ContentRequestProcessor 
 		PreserveSameBranch: false,
 		// Default to append history message.
 		TimelineFilterMode: TimelineFilterAll,
+		// Default to disable memory preloading (use tools instead).
+		PreloadMemory: 0,
 	}
 
 	// Apply options.
@@ -161,7 +234,10 @@ func (p *ContentRequestProcessor) ProcessRequest(
 	ch chan<- *event.Event,
 ) {
 	if req == nil {
-		log.Errorf("Content request processor: request is nil")
+		log.ErrorfContext(
+			ctx,
+			"Content request processor: request is nil",
+		)
 		return
 	}
 
@@ -183,20 +259,25 @@ func (p *ContentRequestProcessor) ProcessRequest(
 	}
 	skipHistory := includeMode == "none"
 
+	p.injectInjectedContextMessages(invocation, req)
+
 	// Append per-filter messages from session events when allowed.
 	needToAddInvocationMessage := true
-	if !skipHistory && invocation.Session != nil {
+	if invocation.Session != nil {
 		var messages []model.Message
 		var summaryUpdatedAt time.Time
-		if p.AddSessionSummary && p.TimelineFilterMode == TimelineFilterAll {
+		// Skip session summary when include_contents=none, but still get current
+		// invocation's events (tool calls/results) to maintain ReAct loop context.
+		if !skipHistory && p.AddSessionSummary && p.TimelineFilterMode == TimelineFilterAll {
 			// Add session summary as a system message if enabled and available.
 			// Also get the summary's UpdatedAt to ensure consistency with incremental messages.
 			if msg, updatedAt := p.getSessionSummaryMessage(invocation); msg != nil {
-				// Merge existing system messages first, then merge summary into the single system message.
-				req.Messages = p.mergeSystemMessages(req.Messages)
-				if len(req.Messages) > 0 && req.Messages[0].Role == model.RoleSystem {
-					// Merge summary into the existing system message.
-					req.Messages[0].Content += "\n\n" + msg.Content
+				// Insert summary as a separate system message after the first system message.
+				systemMsgIndex := findSystemMessageIndex(req.Messages)
+				if systemMsgIndex >= 0 {
+					// Insert summary as a new system message after the first system message.
+					req.Messages = append(req.Messages[:systemMsgIndex+1],
+						append([]model.Message{*msg}, req.Messages[systemMsgIndex+1:]...)...)
 				} else {
 					// No system message exists, prepend new system message.
 					req.Messages = append([]model.Message{*msg}, req.Messages...)
@@ -204,15 +285,43 @@ func (p *ContentRequestProcessor) ProcessRequest(
 				summaryUpdatedAt = updatedAt
 			}
 		}
-		messages = p.getIncrementMessages(invocation, summaryUpdatedAt)
+
+		// Preload memories into system prompt if configured.
+		// PreloadMemory: 0 = disabled, -1 = all, N > 0 = most recent N.
+		if p.PreloadMemory != 0 && invocation.MemoryService != nil {
+			if memMsg := p.getPreloadMemoryMessage(ctx, invocation); memMsg != nil {
+				// Insert memory as a system message after the first system message.
+				systemMsgIndex := findSystemMessageIndex(req.Messages)
+				if systemMsgIndex >= 0 {
+					req.Messages = append(req.Messages[:systemMsgIndex+1],
+						append([]model.Message{*memMsg}, req.Messages[systemMsgIndex+1:]...)...)
+				} else {
+					req.Messages = append([]model.Message{*memMsg}, req.Messages...)
+				}
+			}
+		}
+
+		if skipHistory {
+			// When include_contents=none, only get events from current invocation
+			// to preserve tool call history within the current ReAct loop.
+			// This fixes the infinite loop issue where the agent doesn't see its
+			// own tool calls when running as an isolated subgraph.
+			messages = p.getCurrentInvocationMessages(invocation)
+		} else {
+			messages = p.getIncrementMessages(invocation, summaryUpdatedAt)
+		}
 		req.Messages = append(req.Messages, messages...)
-		needToAddInvocationMessage = summaryUpdatedAt.IsZero() && len(messages) == 0
+		needToAddInvocationMessage = len(messages) == 0
 	}
 
 	if invocation.Message.Content != "" && needToAddInvocationMessage {
 		req.Messages = append(req.Messages, invocation.Message)
-		log.Debugf("Content request processor: added invocation message with role %s (no session or empty session)",
-			invocation.Message.Role)
+		log.DebugfContext(
+			ctx,
+			"Content request processor: added invocation message with "+
+				"role %s (no session or empty session)",
+			invocation.Message.Role,
+		)
 	}
 
 	// Send a preprocessing event.
@@ -221,6 +330,19 @@ func (p *ContentRequestProcessor) ProcessRequest(
 		invocation.AgentName,
 		event.WithObject(model.ObjectTypePreprocessingContent),
 	))
+}
+
+// injectInjectedContextMessages inserts per-run context messages into the request
+// before session-derived history is appended.
+func (p *ContentRequestProcessor) injectInjectedContextMessages(invocation *agent.Invocation, req *model.Request) {
+	if invocation == nil || req == nil {
+		return
+	}
+	messages := invocation.RunOptions.InjectedContextMessages
+	if len(messages) == 0 {
+		return
+	}
+	req.Messages = append(req.Messages, messages...)
 }
 
 // getSessionSummaryMessage returns the current-branch session summary as a
@@ -238,15 +360,69 @@ func (p *ContentRequestProcessor) getSessionSummaryMessage(inv *agent.Invocation
 		return nil, time.Time{}
 	}
 	filter := inv.GetEventFilterKey()
-	// For IncludeContentsAll, prefer the full-session summary under empty filter key.
+	// For BranchFilterModeAll, prefer the full-session summary under empty filter key.
 	if p.BranchFilterMode == BranchFilterModeAll {
 		filter = ""
 	}
+
+	// Try exact match first.
 	sum := inv.Session.Summaries[filter]
-	if sum == nil || sum.Summary == "" {
-		return nil, time.Time{}
+	if sum != nil && sum.Summary != "" {
+		content := p.formatSummary(sum.Summary)
+		return &model.Message{Role: model.RoleSystem, Content: content}, sum.UpdatedAt
 	}
-	return &model.Message{Role: model.RoleSystem, Content: sum.Summary}, sum.UpdatedAt
+
+	// For BranchFilterModePrefix, aggregate summaries with matching prefix.
+	// This handles the case where events have custom filterKeys (e.g., "app/user-messages")
+	// but the invocation's eventFilterKey is the app prefix (e.g., "app").
+	if p.BranchFilterMode == BranchFilterModePrefix && filter != "" {
+		summaryText, updatedAt := p.aggregatePrefixSummaries(inv.Session.Summaries, filter)
+		if summaryText != "" {
+			content := p.formatSummary(summaryText)
+			return &model.Message{Role: model.RoleSystem, Content: content}, updatedAt
+		}
+	}
+	return nil, time.Time{}
+}
+
+// aggregatePrefixSummaries aggregates all summaries whose keys have the given prefix.
+func (p *ContentRequestProcessor) aggregatePrefixSummaries(
+	summaries map[string]*session.Summary,
+	prefix string,
+) (string, time.Time) {
+	var parts []string
+	var latestTime time.Time
+	filterPrefix := prefix + agent.EventFilterKeyDelimiter
+
+	for key, sum := range summaries {
+		if sum == nil || sum.Summary == "" {
+			continue
+		}
+		// Check if key matches prefix (key starts with "prefix/" or key equals prefix).
+		keyWithDelim := key + agent.EventFilterKeyDelimiter
+		if key == prefix || strings.HasPrefix(keyWithDelim, filterPrefix) {
+			parts = append(parts, sum.Summary)
+			if sum.UpdatedAt.After(latestTime) {
+				latestTime = sum.UpdatedAt
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return "", time.Time{}
+	}
+	return strings.Join(parts, "\n\n"), latestTime
+}
+
+// formatSummary applies custom formatter if available, otherwise uses default.
+func (p *ContentRequestProcessor) formatSummary(summary string) string {
+	if p.SummaryFormatter != nil {
+		return p.SummaryFormatter(summary)
+	}
+	// Default format.
+	return fmt.Sprintf("Here is a brief summary of your previous interactions:\n\n"+
+		"<summary_of_previous_interactions>\n%s\n</summary_of_previous_interactions>\n\n"+
+		"Note: this information is from previous interactions and may be outdated. "+
+		"You should ALWAYS prefer information from this conversation over the past summary.\n", summary)
 }
 
 // getHistoryMessages gets history messages for the current filter, potentially truncated by MaxHistoryRuns.
@@ -257,20 +433,37 @@ func (p *ContentRequestProcessor) getIncrementMessages(inv *agent.Invocation, si
 	}
 	isZeroTime := since.IsZero()
 	filter := inv.GetEventFilterKey()
+	var includedInvocationMessage bool
 
 	var events []event.Event
 	inv.Session.EventMu.RLock()
 	for _, evt := range inv.Session.Events {
-		if !p.shouldIncludeEvent(evt, inv, filter, isZeroTime, since) {
+		shouldInclude, isInvocationMessage := p.shouldIncludeEvent(evt, inv, filter, isZeroTime, since)
+		if !shouldInclude {
 			continue
+		}
+		if isInvocationMessage {
+			includedInvocationMessage = true
 		}
 		events = append(events, evt)
 	}
 	inv.Session.EventMu.RUnlock()
 
+	// insert invocation message
+	if !includedInvocationMessage && inv.Message.Content != "" {
+		events = p.insertInvocationMessage(events, inv)
+	}
+
 	resultEvents := p.rearrangeLatestFuncResp(events)
 	resultEvents = p.rearrangeAsyncFuncRespHist(resultEvents)
-	// Convert events to messages.
+
+	// Get current request ID for reasoning content filtering.
+	currentRequestID := ""
+	if inv != nil && inv.RunOptions.RequestID != "" {
+		currentRequestID = inv.RunOptions.RequestID
+	}
+
+	// Convert events to messages with reasoning content handling.
 	var messages []model.Message
 	for _, evt := range resultEvents {
 		// Convert foreign events or keep as-is.
@@ -280,7 +473,10 @@ func (p *ContentRequestProcessor) getIncrementMessages(inv *agent.Invocation, si
 		}
 		if len(ev.Choices) > 0 {
 			for _, choice := range ev.Choices {
-				messages = append(messages, choice.Message)
+				msg := choice.Message
+				// Apply reasoning content stripping based on mode.
+				msg = p.processReasoningContent(msg, evt.RequestID, currentRequestID)
+				messages = append(messages, msg)
 			}
 		}
 	}
@@ -295,6 +491,130 @@ func (p *ContentRequestProcessor) getIncrementMessages(inv *agent.Invocation, si
 		messages = messages[startIdx:]
 	}
 	return messages
+}
+
+// processReasoningContent applies reasoning content stripping based on the
+// configured mode and request boundaries.
+func (p *ContentRequestProcessor) processReasoningContent(
+	msg model.Message,
+	messageRequestID string,
+	currentRequestID string,
+) model.Message {
+	// Only process assistant messages with reasoning content.
+	if msg.Role != model.RoleAssistant || msg.ReasoningContent == "" {
+		return msg
+	}
+
+	switch p.ReasoningContentMode {
+	case ReasoningContentModeDiscardAll:
+		// Discard all reasoning_content.
+		msg.ReasoningContent = ""
+	case ReasoningContentModeKeepAll:
+		// Keep all reasoning_content: do nothing.
+	default:
+		// ReasoningContentModeDiscardPreviousTurns or empty (default):
+		// Discard reasoning_content from previous requests only.
+		// Current request messages retain their reasoning_content.
+		if messageRequestID != currentRequestID {
+			msg.ReasoningContent = ""
+		}
+	}
+	return msg
+}
+
+// getCurrentInvocationMessages gets messages only from the current invocation.
+// This is used when include_contents=none to preserve tool call history within
+// the current ReAct loop while isolating from parent/other branch history.
+func (p *ContentRequestProcessor) getCurrentInvocationMessages(inv *agent.Invocation) []model.Message {
+	if inv.Session == nil {
+		return nil
+	}
+
+	var events []event.Event
+	inv.Session.EventMu.RLock()
+	for _, evt := range inv.Session.Events {
+		// Only include events from current invocation
+		if evt.InvocationID != inv.InvocationID {
+			continue
+		}
+		// Skip invalid events
+		if evt.Response == nil || evt.IsPartial || !evt.IsValidContent() {
+			continue
+		}
+		events = append(events, evt)
+	}
+	inv.Session.EventMu.RUnlock()
+
+	// insert invocation message if not already included
+	var hasInvocationMessage bool
+	for _, evt := range events {
+		if invocationMessageEqual(inv.Message, evt.Choices[0].Message) {
+			hasInvocationMessage = true
+			break
+		}
+	}
+	if !hasInvocationMessage && inv.Message.Content != "" {
+		events = p.insertInvocationMessage(events, inv)
+	}
+
+	resultEvents := p.rearrangeLatestFuncResp(events)
+	resultEvents = p.rearrangeAsyncFuncRespHist(resultEvents)
+
+	// Get current request ID for reasoning content filtering.
+	currentRequestID := ""
+	if inv != nil && inv.RunOptions.RequestID != "" {
+		currentRequestID = inv.RunOptions.RequestID
+	}
+
+	// Convert events to messages with reasoning content handling.
+	var messages []model.Message
+	for _, evt := range resultEvents {
+		// Convert foreign events or keep as-is (consistent with getIncrementMessages).
+		ev := evt
+		if p.isOtherAgentReply(inv.AgentName, inv.Branch, &ev) {
+			ev = p.convertForeignEvent(&ev)
+		}
+		if len(ev.Choices) > 0 {
+			for _, choice := range ev.Choices {
+				msg := choice.Message
+				msg = p.processReasoningContent(msg, evt.RequestID, currentRequestID)
+				messages = append(messages, msg)
+			}
+		}
+	}
+
+	messages = p.mergeUserMessages(messages)
+	return messages
+}
+
+func (p *ContentRequestProcessor) insertInvocationMessage(
+	events []event.Event, inv *agent.Invocation) []event.Event {
+	if inv.Message.Content == "" {
+		return events
+	}
+	userMsgEvent := event.NewResponseEvent(inv.InvocationID, "user", &model.Response{
+		Choices: []model.Choice{
+			{Message: inv.Message},
+		},
+	})
+	userMsgEvent.RequestID = inv.RunOptions.RequestID
+	if len(events) == 0 {
+		return []event.Event{*userMsgEvent}
+	}
+	insertIndex := -1
+	for index, evt := range events {
+		if evt.RequestID == inv.RunOptions.RequestID && evt.InvocationID == inv.InvocationID {
+			insertIndex = index
+			break
+		}
+	}
+	if insertIndex == -1 {
+		return append(events, *userMsgEvent)
+	}
+	events = append(events, event.Event{})
+	copy(events[insertIndex+1:], events[insertIndex:])
+	events[insertIndex] = *userMsgEvent
+	return events
 }
 
 func (p *ContentRequestProcessor) mergeUserMessages(
@@ -350,70 +670,34 @@ func (p *ContentRequestProcessor) mergeUserMessages(
 	return merged
 }
 
-// mergeSystemMessages merges all consecutive system messages at the beginning of the message list
-// into a single system message to ensure API compatibility.
-func (p *ContentRequestProcessor) mergeSystemMessages(messages []model.Message) []model.Message {
-	if len(messages) == 0 {
-		return messages
-	}
-
-	var systemContents []string
-	var result []model.Message
-
-	// Collect all system messages at the beginning
-	for _, msg := range messages {
-		if msg.Role == model.RoleSystem {
-			systemContents = append(systemContents, msg.Content)
-		} else {
-			break
-		}
-	}
-
-	// If we have system messages, merge them into one
-	if len(systemContents) > 0 {
-		mergedContent := strings.Join(systemContents, "\n\n")
-		mergedSystemMsg := model.Message{
-			Role:    model.RoleSystem,
-			Content: mergedContent,
-		}
-		result = append(result, mergedSystemMsg)
-	}
-
-	// Add the remaining non-system messages
-	startIdx := len(systemContents)
-	if startIdx < len(messages) {
-		result = append(result, messages[startIdx:]...)
-	}
-
-	return result
-}
-
 func (p *ContentRequestProcessor) shouldIncludeEvent(evt event.Event, inv *agent.Invocation, filter string,
-	isZeroTime bool, since time.Time) bool {
+	isZeroTime bool, since time.Time) (bool, bool) {
 	if evt.Response == nil || evt.IsPartial || !evt.IsValidContent() {
-		return false
+		return false, false
 	}
 
-	if !isZeroTime && evt.Timestamp.Before(since) {
-		return false
+	// check is invocation message
+	if inv.RunOptions.RequestID == evt.RequestID &&
+		len(evt.Choices) > 0 &&
+		invocationMessageEqual(inv.Message, evt.Choices[0].Message) {
+		return true, true
+	}
+
+	// Use strict After so events stamped exactly at summary UpdatedAt are
+	// treated as already summarized and not re-sent.
+	if !isZeroTime && !evt.Timestamp.After(since) {
+		return false, false
 	}
 
 	// Check timeline filter
 	switch p.TimelineFilterMode {
 	case TimelineFilterCurrentRequest:
 		if inv.RunOptions.RequestID != evt.RequestID {
-			return false
+			return false, false
 		}
 	case TimelineFilterCurrentInvocation:
 		if evt.InvocationID != inv.InvocationID {
-			if !evt.IsUserMessage() {
-				return false
-			}
-			// User messages are usually sent from the runner append to the session, so in most cases, the invocationID is not equal.
-			// Therefore, to prevent the loss of user messages, we need to make further judgments
-			if inv.RunOptions.RequestID != evt.RequestID || evt.Choices[0].Message.Content != inv.Message.Content {
-				return false
-			}
+			return false, false
 		}
 	default:
 	}
@@ -422,16 +706,26 @@ func (p *ContentRequestProcessor) shouldIncludeEvent(evt event.Event, inv *agent
 	switch p.BranchFilterMode {
 	case BranchFilterModeExact:
 		if evt.FilterKey != filter {
-			return false
+			return false, false
 		}
 	case BranchFilterModePrefix:
 		if !evt.Filter(filter) {
-			return false
+			return false, false
 		}
 	default:
 	}
 
-	return true
+	return true, false
+}
+
+func invocationMessageEqual(invMsg model.Message, evtMsg model.Message) bool {
+	if invMsg.Role == "" {
+		if evtMsg.Role != model.RoleUser {
+			return false
+		}
+		return invMsg.Content == evtMsg.Content
+	}
+	return model.MessagesEqual(invMsg, evtMsg)
 }
 
 // isOtherAgentReply checks whether the event is a reply from another agent.
@@ -703,4 +997,58 @@ func toMap(ids []string) map[string]bool {
 		m[id] = true
 	}
 	return m
+}
+
+// getPreloadMemoryMessage returns preloaded memories as a system message if available.
+func (p *ContentRequestProcessor) getPreloadMemoryMessage(
+	ctx context.Context,
+	inv *agent.Invocation,
+) *model.Message {
+	if inv.MemoryService == nil || inv.Session == nil {
+		return nil
+	}
+	userKey := memory.UserKey{
+		AppName: inv.Session.AppName,
+		UserID:  inv.Session.UserID,
+	}
+	// Validate user key.
+	if userKey.AppName == "" || userKey.UserID == "" {
+		return nil
+	}
+	// Handle PreloadMemory: 0 = disabled, -1 = all, N > 0 = most recent N.
+	if p.PreloadMemory == 0 {
+		// PreloadMemory = 0 means disabled, return nil.
+		return nil
+	}
+	// PreloadMemory = -1 means all memories, use 0 for ReadMemories (no limit).
+	// PreloadMemory = N > 0 means most recent N memories.
+	// Here we use max to handle the case when PreloadMemory is negative.
+	limit := max(p.PreloadMemory, 0)
+	memories, err := inv.MemoryService.ReadMemories(ctx, userKey, limit)
+	if err != nil {
+		log.WarnfContext(ctx, "Failed to preload memories: %v", err)
+		return nil
+	}
+	if len(memories) == 0 {
+		return nil
+	}
+	return &model.Message{
+		Role:    model.RoleSystem,
+		Content: formatMemoryContent(memories),
+	}
+}
+
+// formatMemoryContent formats memories for system prompt injection.
+func formatMemoryContent(memories []*memory.Entry) string {
+	var sb strings.Builder
+	sb.WriteString("## User Memories\n\n")
+	sb.WriteString("The following are memories about the user:\n\n")
+	for _, mem := range memories {
+		if mem == nil || mem.Memory == nil {
+			continue
+		}
+		fmt.Fprintf(&sb, "ID: %s\n", mem.ID)
+		fmt.Fprintf(&sb, "Memory: %s\n\n", mem.Memory.Memory)
+	}
+	return sb.String()
 }
