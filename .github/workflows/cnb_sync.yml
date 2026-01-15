@@ -11,7 +11,8 @@ jobs:
     steps:
       - uses: actions/checkout@v3
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # 建议设为 0，拉取所有分支和历史，避免同步不全
+          lfs: true # 关键点：开启 LFS 文件的拉取
           
       - name: get repo name
         id: repo-name
