@@ -20,6 +20,10 @@ jobs:
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
           echo "name=$REPO_NAME" >> $GITHUB_OUTPUT
 
+      # 在同步之前，确保 LFS 对象在本地路径中
+      - name: Ensure LFS objects are present
+        run: git lfs pull
+  
       - name: Sync to CNB Repository
         run: |
           docker run --rm \
