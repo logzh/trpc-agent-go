@@ -21,11 +21,15 @@ RUN apt-get update && apt-get install -y git git-lfs wget unzip openssh-server z
    go install golang.org/x/tools/cmd/goimports@latest && \
    curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin ${GOLANGCI_LINT_VERSION}
 
-# 安装 oh-my-zsh 并配置 git 插件
+# 安装 oh-my-zsh 并配置插件（git, zsh-autosuggestions, zsh-syntax-highlighting）
 RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended && \
+    git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions && \
+    git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting && \
     if ! grep -q "plugins=(git" /root/.zshrc; then \
-        sed -i 's/^plugins=(/plugins=(git /' /root/.zshrc || \
-        sed -i '/^plugins=/c\plugins=(git)' /root/.zshrc; \
+        sed -i 's/^plugins=(/plugins=(git zsh-autosuggestions zsh-syntax-highlighting /' /root/.zshrc || \
+        sed -i '/^plugins=/c\plugins=(git zsh-autosuggestions zsh-syntax-highlighting)' /root/.zshrc; \
+    else \
+        sed -i 's/plugins=(git/plugins=(git zsh-autosuggestions zsh-syntax-highlighting/' /root/.zshrc; \
     fi && \
     chsh -s $(which zsh)
 
