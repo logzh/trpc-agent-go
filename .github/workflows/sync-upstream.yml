@@ -1,0 +1,129 @@
+name: Sync from Upstream
+
+on:
+  schedule:
+    # 每天 UTC 时间 02:00 检查一次（北京时间 10:00）
+    - cron: '0 2 * * *'
+  workflow_dispatch: # 允许手动触发
+
+permissions:
+  contents: write # 需要写入权限来推送代码
+  issues: write # 需要创建 Issue 的权限
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 拉取所有历史记录
+          token: ${{ secrets.GITHUB_TOKEN }}
+          lfs: true
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/trpc-group/trpc-agent-go.git || git remote set-url upstream https://github.com/trpc-group/trpc-agent-go.git
+
+      - name: Fetch upstream
+        run: git fetch upstream
+
+      - name: Check if there are updates
+        id: check-updates
+        run: |
+          # 获取当前分支（通常是 main 或 master）
+          CURRENT_BRANCH=$(git branch --show-current)
+          if [ -z "$CURRENT_BRANCH" ]; then
+            CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          fi
+          
+          # 如果没有当前分支，使用 main 作为默认值
+          if [ "$CURRENT_BRANCH" = "HEAD" ]; then
+            CURRENT_BRANCH="main"
+          fi
+          
+          echo "current_branch=$CURRENT_BRANCH" >> $GITHUB_OUTPUT
+          
+          # 检查 upstream/master 是否存在
+          if git ls-remote --heads upstream master | grep -q master; then
+            UPSTREAM_BRANCH="master"
+          elif git ls-remote --heads upstream main | grep -q main; then
+            UPSTREAM_BRANCH="main"
+          else
+            echo "::error::Cannot find master or main branch in upstream"
+            exit 1
+          fi
+          
+          echo "upstream_branch=$UPSTREAM_BRANCH" >> $GITHUB_OUTPUT
+          
+          # 检查是否有更新
+          git fetch upstream $UPSTREAM_BRANCH
+          LOCAL_COMMIT=$(git rev-parse $CURRENT_BRANCH)
+          UPSTREAM_COMMIT=$(git rev-parse upstream/$UPSTREAM_BRANCH)
+          
+          # 保存 commit 信息（在合并前保存，因为合并后本地 commit 会改变）
+          echo "local_commit=$LOCAL_COMMIT" >> $GITHUB_OUTPUT
+          echo "upstream_commit=$UPSTREAM_COMMIT" >> $GITHUB_OUTPUT
+          
+          if [ "$LOCAL_COMMIT" = "$UPSTREAM_COMMIT" ]; then
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+            echo "No updates available"
+          else
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+            echo "Updates available: $LOCAL_COMMIT -> $UPSTREAM_COMMIT"
+            
+            # 获取更新的 commit 信息
+            COMMIT_COUNT=$(git rev-list --count $LOCAL_COMMIT..$UPSTREAM_COMMIT)
+            echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+            
+            # 获取更新的 commit 列表（最多 10 个）
+            COMMIT_LIST=$(git log --oneline $LOCAL_COMMIT..$UPSTREAM_COMMIT | head -10)
+            echo "commit_list<<EOF" >> $GITHUB_OUTPUT
+            echo "$COMMIT_LIST" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Merge upstream changes
+        if: steps.check-updates.outputs.has_updates == 'true'
+        run: |
+          CURRENT_BRANCH="${{ steps.check-updates.outputs.current_branch }}"
+          UPSTREAM_BRANCH="${{ steps.check-updates.outputs.upstream_branch }}"
+          
+          # 切换到当前分支
+          git checkout $CURRENT_BRANCH
+          
+          # 合并上游更改（使用 --no-edit 避免打开编辑器）
+          git merge upstream/$UPSTREAM_BRANCH --no-edit || {
+            echo "::warning::Merge conflict detected. Please resolve manually."
+            exit 1
+          }
+
+      - name: Push changes
+        if: steps.check-updates.outputs.has_updates == 'true'
+        id: push-changes
+        run: |
+          CURRENT_BRANCH="${{ steps.check-updates.outputs.current_branch }}"
+          git push origin $CURRENT_BRANCH
+          echo "pushed=true" >> $GITHUB_OUTPUT
+
+      - name: Get latest commit after merge
+        if: steps.check-updates.outputs.has_updates == 'true' && steps.push-changes.outputs.pushed == 'true'
+        id: latest-commit
+        run: |
+          CURRENT_BRANCH="${{ steps.check-updates.outputs.current_branch }}"
+          LATEST_COMMIT=$(git rev-parse $CURRENT_BRANCH)
+          echo "latest_commit=$LATEST_COMMIT" >> $GITHUB_OUTPUT
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ "${{ steps.check-updates.outputs.has_updates }}" = "true" ]; then
+            echo "::notice::Successfully synced from upstream"
+          else
+            echo "::notice::No updates available from upstream"
+          fi
