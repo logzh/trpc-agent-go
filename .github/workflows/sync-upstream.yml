@@ -90,21 +90,35 @@ jobs:
 
       - name: Merge upstream changes
         if: steps.check-updates.outputs.has_updates == 'true'
+        id: merge-upstream
         run: |
           CURRENT_BRANCH="${{ steps.check-updates.outputs.current_branch }}"
           UPSTREAM_BRANCH="${{ steps.check-updates.outputs.upstream_branch }}"
           
           # 切换到当前分支
-          git checkout $CURRENT_BRANCH
+          git checkout "$CURRENT_BRANCH"
           
-          # 合并上游更改（使用 --no-edit 避免打开编辑器）
-          git merge upstream/$UPSTREAM_BRANCH --no-edit || {
+          # 合并上游更改（避免快进，允许在提交前调整内容）
+          git merge upstream/$UPSTREAM_BRANCH --no-commit --no-ff || {
             echo "::warning::Merge conflict detected. Please resolve manually."
             exit 1
           }
 
+          # 保持本地 workflows 文件，避免 GITHUB_TOKEN 推送被拒绝
+          git restore --source=HEAD --staged --worktree .github/workflows || true
+
+          # 如果没有非 workflow 变更，跳过提交与推送
+          if git diff --cached --quiet && git diff --quiet; then
+            echo "::notice::No non-workflow changes to sync"
+            git merge --abort
+            exit 0
+          fi
+
+          git commit -m "chore: sync upstream"
+          echo "did_commit=true" >> $GITHUB_OUTPUT
+
       - name: Push changes
-        if: steps.check-updates.outputs.has_updates == 'true'
+        if: steps.check-updates.outputs.has_updates == 'true' && steps.merge-upstream.outputs.did_commit == 'true'
         id: push-changes
         run: |
           CURRENT_BRANCH="${{ steps.check-updates.outputs.current_branch }}"
@@ -122,8 +136,12 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          if [ "${{ steps.check-updates.outputs.has_updates }}" = "true" ]; then
+          if [ "${{ steps.check-updates.outputs.has_updates }}" != "true" ]; then
+            echo "::notice::No updates available from upstream"
+          elif [ "${{ steps.merge-upstream.outputs.did_commit }}" != "true" ]; then
+            echo "::notice::Updates only affected workflow files; sync skipped"
+          elif [ "${{ steps.push-changes.outputs.pushed }}" = "true" ]; then
             echo "::notice::Successfully synced from upstream"
           else
-            echo "::notice::No updates available from upstream"
+            echo "::warning::Upstream updates detected but not pushed"
           fi
