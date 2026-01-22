@@ -520,6 +520,16 @@ func (e *Executor) processResumeCommand(execState, initialState State) State {
 			execState[StateKeyResumeMap] = cmd.ResumeMap
 		}
 		delete(execState, StateKeyCommand)
+		return execState
+	}
+	if cmd, ok := initialState[StateKeyCommand].(*ResumeCommand); ok {
+		if cmd.Resume != nil {
+			execState[ResumeChannel] = cmd.Resume
+		}
+		if cmd.ResumeMap != nil {
+			execState[StateKeyResumeMap] = cmd.ResumeMap
+		}
+		delete(execState, StateKeyCommand)
 	}
 	return execState
 }
@@ -1207,41 +1217,6 @@ func (e *Executor) createTask(nodeID string, state State, step int) *Task {
 	node, exists := e.graph.Node(nodeID)
 	if !exists {
 		return nil
-	}
-
-	log.Debugf(
-		"🔧 createTask: creating task for nodeID='%s', step=%d",
-		nodeID,
-		step,
-	)
-	stateKeys := make([]string, 0, len(state))
-	for k := range state {
-		stateKeys = append(stateKeys, k)
-	}
-	log.Debugf(
-		"🔧 createTask: state has %d keys: %v",
-		len(state),
-		stateKeys,
-	)
-
-	// Log key state values that we're interested in tracking
-	// State prepared for task
-
-	if stepCountVal, exists := state[StateFieldStepCount]; exists {
-		log.Debugf(
-			"🔧 createTask: state contains step_count=%v (type: %T)",
-			stepCountVal,
-			stepCountVal,
-		)
-	}
-
-	// Special logging for final node to track the counter issue
-	if nodeID == "final" {
-		log.Debugf(
-			"🔧 createTask: FINAL NODE - counter=%v, step_count=%v",
-			state[StateFieldCounter],
-			state[StateFieldStepCount],
-		)
 	}
 
 	return &Task{
@@ -2189,8 +2164,14 @@ func (e *Executor) executeNodeFunction(
 		tmp[StateKeyCurrentNodeID] = nodeID
 		input = tmp
 	}
-	input[StateKeyToolCallbacks] = node.toolCallbacks
-	input[StateKeyModelCallbacks] = node.modelCallbacks
+	// Only inject node-level callbacks if configured to avoid overwriting
+	// state-level callbacks with nil.
+	if node.toolCallbacks != nil {
+		input[StateKeyToolCallbacks] = node.toolCallbacks
+	}
+	if node.modelCallbacks != nil {
+		input[StateKeyModelCallbacks] = node.modelCallbacks
+	}
 
 	return node.Function(ctx, input)
 }
