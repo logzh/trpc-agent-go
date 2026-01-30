@@ -112,6 +112,10 @@ Key points:
 - Tools are auto‑registered with `WithSkills`: `skill_load`,
   `skill_select_docs`, `skill_list_docs`, and `skill_run` show up
   automatically; no manual wiring required.
+- Note: when `WithCodeExecutor` is set, LLMAgent will (by default) try to
+  execute Markdown fenced code blocks in model responses. If you only need
+  the executor for `skill_run`, disable this behavior with
+  `llmagent.WithEnableCodeExecutionResponseProcessor(false)`.
 - By default, the framework appends a small `Tooling and workspace guidance:`
   block after the `Available skills:` list in the system message.
   - Disable it (to save prompt tokens): `llmagent.WithSkillsToolingGuidance("")`.
@@ -301,15 +305,23 @@ Input:
 - `save_as_artifacts` (optional, legacy path): persist files collected
   via `output_files` and return `artifact_files` in the result
 - `omit_inline_content` (optional): omit `output_files[*].content` and
-  `primary_output.content` (metadata only). Use `output_files[*].ref`
-  with `read_file` when you need the content later.
+  `primary_output.content` (metadata only). Non-text outputs never
+  inline content. Use `output_files[*].ref` with `read_file` when you
+  need text content later.
 - `artifact_prefix` (optional): prefix for the legacy artifact path
   - If the Artifact service is not configured, `skill_run` keeps
     returning `output_files` and reports a `warnings` entry.
 
+Guidance:
+- Prefer using `skill_run` only for commands explicitly required by the
+  selected skill docs (for example, `SKILL.md`).
+- Avoid using `skill_run` for generic shell exploration.
+- Prefer using `skill_list_docs` and `skill_select_docs` to inspect
+  skill docs, then use file tools to read the selected content.
+
 Optional safety restriction (allowlist):
 - Env var `TRPC_AGENT_SKILL_RUN_ALLOWED_COMMANDS`:
-  - Comma/space-separated command names (for example, `ls,cat,ifconfig`)
+  - Comma/space-separated command names (for example, `python3,ffmpeg`)
   - When set, `skill_run` rejects shell syntax (pipes/redirections/
     separators) and only allows a single allowlisted command
   - Because the command is no longer parsed by a shell, patterns like
@@ -336,8 +348,9 @@ Output:
   `truncated`
   - `ref` is a stable `workspace://<name>` reference that can be passed
     to other tools
-  - When `omit_inline_content=true`, `content` is empty. Use `ref` with
-    `read_file` to fetch content on demand.
+  - For non-text files, `content` is always empty.
+  - When `omit_inline_content=true`, `content` is empty for all files.
+    Use `ref` with `read_file` to fetch text content on demand.
   - `size_bytes` is the file size on disk; `truncated=true` means the
     collected content hit internal caps (for example, 4 MiB/file).
 - `warnings` (optional): non-fatal notes (for example, when artifact

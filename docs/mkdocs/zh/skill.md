@@ -112,6 +112,10 @@ agent := llmagent.New(
 - 工具自动注册：开启 `WithSkills` 后，`skill_load`、
   `skill_select_docs`、`skill_list_docs` 与 `skill_run`
   会自动出现在工具列表中，无需手动添加。
+- 注意：当你同时设置了 `WithCodeExecutor` 时，LLMAgent 默认会尝试执行
+  模型回复里的 Markdown 围栏代码块。如果你只是为了给 `skill_run` 提供运行时，
+  不希望自动执行代码块，可以加上
+  `llmagent.WithEnableCodeExecutionResponseProcessor(false)`。
 - 默认提示指引：框架会在系统消息里，在 `Available skills:` 列表后追加一段
   `Tooling and workspace guidance:` 指引文本。
   - 关闭该指引（减少提示词占用）：`llmagent.WithSkillsToolingGuidance("")`。
@@ -307,14 +311,22 @@ agent := llmagent.New(
   `artifact_files`。
 - `omit_inline_content`（可选）：为 true 时不返回
   `output_files[*].content` 与 `primary_output.content`（只返回元信息）。
-  需要内容时，可用 `output_files[*].ref` 配合 `read_file` 按需读取。
+  非文本输出的 `content` 也会始终为空。需要文本内容时，可用
+  `output_files[*].ref` 配合 `read_file` 按需读取。
 - `artifact_prefix`（可选）：与 `save_as_artifacts` 配合的前缀。
   - 若未配置制品服务（Artifact service），`skill_run` 会继续
     返回 `output_files`，并在 `warnings` 中给出提示。
 
+建议：
+- 建议 `skill_run` 尽量只用于执行 Skill 文档里描述的流程
+  （例如 `SKILL.md` 明确要求的命令）。
+- 不建议用 `skill_run` 做通用的 Shell 探索。
+- 优先使用 `skill_list_docs` / `skill_select_docs` 读取 Skill 文档，
+  再用文件工具按需查看选中的内容。
+
 可选的安全限制（白名单）：
 - 环境变量 `TRPC_AGENT_SKILL_RUN_ALLOWED_COMMANDS`：
-  - 逗号/空格分隔的命令名列表（如 `ls,cat,ifconfig`）
+  - 逗号/空格分隔的命令名列表（如 `python3,ffmpeg`）
   - 启用后 `skill_run` 会拒绝管道/重定向/分号等 Shell 语法，
     并仅允许执行白名单中的“单条命令”
   - 因为不再经过 Shell 解析，诸如 `> out/x.txt`、heredoc、
@@ -338,8 +350,9 @@ agent := llmagent.New(
 - `output_files`：文件列表（`name`、`ref`、`content`、`mime_type`、
   `size_bytes`、`truncated`）
   - `ref` 是稳定的 `workspace://<name>` 引用，可传给其它工具使用
-  - 当 `omit_inline_content=true` 时，`content` 为空。可用 `ref` 配合
-    `read_file` 按需读取内容。
+  - 非文本文件的 `content` 始终为空。
+  - 当 `omit_inline_content=true` 时，所有文件的 `content` 为空。可用
+    `ref` 配合 `read_file` 按需读取文本内容。
   - `size_bytes` 表示磁盘上的文件大小；`truncated=true` 表示收集内容触发了
     内部上限（例如 4 MiB/文件）。
 - `warnings`（可选）：非致命提示（例如制品保存被跳过）
