@@ -8,16 +8,23 @@ replace (
 	trpc.group/trpc-go/trpc-agent-go/memory/pgvector => ../../memory/pgvector
 	trpc.group/trpc-go/trpc-agent-go/memory/postgres => ../../memory/postgres
 	trpc.group/trpc-go/trpc-agent-go/memory/redis => ../../memory/redis
+	trpc.group/trpc-go/trpc-agent-go/memory/sqlite => ../../memory/sqlite
+	trpc.group/trpc-go/trpc-agent-go/memory/sqlitevec => ../../memory/sqlitevec
 	trpc.group/trpc-go/trpc-agent-go/storage/mysql => ../../storage/mysql
 	trpc.group/trpc-go/trpc-agent-go/storage/postgres => ../../storage/postgres
 )
 
 require (
+	github.com/asg017/sqlite-vec-go-bindings v0.1.6
+	github.com/mattn/go-sqlite3 v1.14.32
+	github.com/ncruces/go-sqlite3 v0.17.1
 	trpc.group/trpc-go/trpc-agent-go v1.1.1
 	trpc.group/trpc-go/trpc-agent-go/memory/mysql v1.1.1
 	trpc.group/trpc-go/trpc-agent-go/memory/pgvector v1.1.1
 	trpc.group/trpc-go/trpc-agent-go/memory/postgres v1.1.1
 	trpc.group/trpc-go/trpc-agent-go/memory/redis v1.1.1
+	trpc.group/trpc-go/trpc-agent-go/memory/sqlite v1.1.1
+	trpc.group/trpc-go/trpc-agent-go/memory/sqlitevec v1.1.1
 )
 
 require (
@@ -36,10 +43,12 @@ require (
 	github.com/jackc/pgx/v5 v5.7.2 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/lib/pq v1.10.9 // indirect
+	github.com/ncruces/julianday v1.0.0 // indirect
 	github.com/openai/openai-go v1.12.0 // indirect
 	github.com/panjf2000/ants/v2 v2.10.0 // indirect
 	github.com/pgvector/pgvector-go v0.2.3 // indirect
 	github.com/redis/go-redis/v9 v9.11.0 // indirect
+	github.com/tetratelabs/wazero v1.7.3 // indirect
 	github.com/tidwall/gjson v1.14.4 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect

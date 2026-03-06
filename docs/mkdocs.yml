@@ -24,7 +24,15 @@ nav:
       - Artifact: artifact.md
       - Skill: skill.md
       - Tool: tool.md
-      - Session: session.md
+      - Session:
+          - Overview: session/index.md
+          - Session Summary: session/summary.md
+          - Memory Session: session/inmemory.md
+          - SQLite Session: session/sqlite.md
+          - Redis Session: session/redis.md
+          - MySQL Session: session/mysql.md
+          - PostgreSQL Session: session/postgres.md
+          - ClickHouse Session: session/clickhouse.md
       - Knowledge:
           - Overview: knowledge/index.md
           - Embedder: knowledge/embedder.md
@@ -46,6 +54,7 @@ nav:
       - Event: event.md
       - Evaluation: evaluation.md
   - Server:
+    - Gateway: gateway.md
     - AG-UI: agui.md
     - A2A: a2a.md
   - Observability: observability.md
@@ -83,7 +92,15 @@ plugins:
                 - Artifact: artifact.md
                 - Skill: skill.md
                 - Tool: tool.md
-                - Session: session.md
+                - Session:
+                    - Overview: session/index.md
+                    - Session Summary: session/summary.md
+                    - Memory Session: session/inmemory.md
+                    - SQLite Session: session/sqlite.md
+                    - Redis Session: session/redis.md
+                    - MySQL Session: session/mysql.md
+                    - PostgreSQL Session: session/postgres.md
+                    - ClickHouse Session: session/clickhouse.md
                 - Knowledge:
                     - 概述: knowledge/index.md
                     - Embedder: knowledge/embedder.md
@@ -105,6 +122,7 @@ plugins:
                 - Event: event.md
                 - Evaluation: evaluation.md
             - 服务:
+              - Gateway: gateway.md
               - AG-UI: agui.md
               - A2A: a2a.md
             - 可观测: observability.md

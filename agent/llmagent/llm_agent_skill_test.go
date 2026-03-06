@@ -400,3 +400,62 @@ func TestLLMAgent_WithSkillsLoadedContentInToolResults_WiresProcessor(
 	}
 	require.True(t, saw)
 }
+
+func TestLLMAgent_WithMaxLoadedSkills_WiresProcessor(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"a", "b", "c", "d"} {
+		sdir := filepath.Join(dir, name)
+		require.NoError(t, os.MkdirAll(sdir, 0o755))
+		data := "---\nname: " + name + "\n" +
+			"description: " + name + "\n---\n" +
+			"body\n"
+		err := os.WriteFile(
+			filepath.Join(sdir, "SKILL.md"),
+			[]byte(data),
+			0o644,
+		)
+		require.NoError(t, err)
+	}
+
+	repo, err := skill.NewFSRepository(dir)
+	require.NoError(t, err)
+
+	const maxSkills = 3
+
+	opts := &Options{}
+	WithSkills(repo)(opts)
+	WithSkillLoadMode(SkillLoadModeSession)(opts)
+	WithMaxLoadedSkills(maxSkills)(opts)
+
+	procs := buildRequestProcessors("tester", opts)
+	var srp *processor.SkillsRequestProcessor
+	for _, p := range procs {
+		if v, ok := p.(*processor.SkillsRequestProcessor); ok {
+			srp = v
+		}
+	}
+	require.NotNil(t, srp)
+
+	sess := &session.Session{}
+	inv := agent.NewInvocation(agent.WithInvocationSession(sess))
+	inv.AgentName = "tester"
+	for _, name := range []string{"a", "b", "c", "d"} {
+		sess.SetState(
+			skill.LoadedKey("tester", name),
+			[]byte("1"),
+		)
+	}
+
+	req := &model.Request{Messages: nil}
+	srp.ProcessRequest(context.Background(), inv, req, nil)
+
+	v, ok := sess.GetState(skill.LoadedKey("tester", "d"))
+	require.True(t, ok)
+	require.Empty(t, v)
+
+	for _, name := range []string{"a", "b", "c"} {
+		v, ok = sess.GetState(skill.LoadedKey("tester", name))
+		require.True(t, ok)
+		require.Equal(t, []byte("1"), v)
+	}
+}

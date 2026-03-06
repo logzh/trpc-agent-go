@@ -30,6 +30,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/internal/state/barrier"
 	itelemetry "trpc.group/trpc-go/trpc-agent-go/internal/telemetry"
 	"trpc.group/trpc-go/trpc-agent-go/log"
+	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/telemetry/trace"
 )
@@ -55,7 +56,8 @@ func defaultMaxConcurrency() int {
 	return maxConcurrency
 }
 
-// Executor executes a graph with the given initial state using Pregel-style BSP execution.
+// Executor executes a graph with the given initial state using the configured
+// execution engine (default: Pregel-style BSP).
 //
 // Runtime isolation principle:
 //   - Executor is designed to be reusable across concurrent runs.
@@ -70,6 +72,7 @@ type Executor struct {
 	channelBufferSize     int
 	maxSteps              int
 	maxConcurrency        int
+	executionEngine       ExecutionEngine
 	stepTimeout           time.Duration
 	nodeTimeout           time.Duration
 	checkpointSaveTimeout time.Duration
@@ -102,6 +105,10 @@ type ExecutorOptions struct {
 	CheckpointSaveTimeout time.Duration
 	// CheckpointSaver is the checkpoint saver for persisting graph state.
 	CheckpointSaver CheckpointSaver
+	// ExecutionEngine controls how the graph is scheduled and executed.
+	//
+	// The default is ExecutionEngineBSP.
+	ExecutionEngine ExecutionEngine
 	// DefaultRetryPolicies are applied to nodes without explicit policies.
 	DefaultRetryPolicies []RetryPolicy
 }
@@ -157,6 +164,15 @@ func WithCheckpointSaveTimeout(timeout time.Duration) ExecutorOption {
 	}
 }
 
+// WithExecutionEngine sets the execution engine for scheduling.
+//
+// The default is ExecutionEngineBSP.
+func WithExecutionEngine(engine ExecutionEngine) ExecutorOption {
+	return func(opts *ExecutorOptions) {
+		opts.ExecutionEngine = engine
+	}
+}
+
 // WithDefaultRetryPolicy sets executor-level retry policies used by nodes
 // that do not define their own. Policies are evaluated in order.
 func WithDefaultRetryPolicy(policies ...RetryPolicy) ExecutorOption {
@@ -179,10 +195,17 @@ func NewExecutor(graph *Graph, opts ...ExecutorOption) (*Executor, error) {
 		MaxConcurrency:        defaultMaxConcurrency(),
 		StepTimeout:           defaultStepTimeout,
 		CheckpointSaveTimeout: defaultCheckpointSaveTimeout,
+		ExecutionEngine:       ExecutionEngineBSP,
 	}
 	// Apply function options.
 	for _, opt := range opts {
 		opt(&options)
+	}
+	if options.ExecutionEngine == "" {
+		options.ExecutionEngine = ExecutionEngineBSP
+	}
+	if err := options.ExecutionEngine.validate(); err != nil {
+		return nil, err
 	}
 	maxConcurrency := options.MaxConcurrency
 	if maxConcurrency <= 0 {
@@ -200,6 +223,7 @@ func NewExecutor(graph *Graph, opts ...ExecutorOption) (*Executor, error) {
 		channelBufferSize:     options.ChannelBufferSize,
 		maxSteps:              options.MaxSteps,
 		maxConcurrency:        maxConcurrency,
+		executionEngine:       options.ExecutionEngine,
 		stepTimeout:           options.StepTimeout,
 		nodeTimeout:           nodeTimeout,
 		checkpointSaveTimeout: options.CheckpointSaveTimeout,
@@ -232,7 +256,7 @@ type Step struct {
 	UpdatedChannels map[string]bool // UpdatedChannels is the updated channels of the step.
 }
 
-// Execute executes the graph with the given initial state using Pregel-style BSP execution.
+// Execute executes the graph with the given initial state.
 func (e *Executor) Execute(
 	ctx context.Context,
 	initialState State,
@@ -241,6 +265,7 @@ func (e *Executor) Execute(
 	if invocation == nil {
 		return nil, errors.New("invocation is nil")
 	}
+	agent.GetOrCreateStreamHub(invocation)
 	startTime := time.Now()
 	// Create event channel.
 	eventChan := make(chan *event.Event, e.channelBufferSize)
@@ -267,8 +292,15 @@ func (e *Executor) Execute(
 					WithPregelEventInvocationID(invocation.InvocationID),
 					WithPregelEventStepNumber(-1),
 					WithPregelEventError(workflow.Error.Error()),
+					WithPregelEventResponseError(
+						model.ResponseErrorFromError(
+							workflow.Error,
+							model.ErrorTypeFlowError,
+						),
+					),
 				))
 			}
+			agent.GetOrCreateStreamHub(invocation).CloseAll(ctx.Err())
 			close(eventChan)
 			itelemetry.TraceWorkflow(span, workflow)
 			span.End()
@@ -286,6 +318,12 @@ func (e *Executor) Execute(
 				WithPregelEventInvocationID(invocation.InvocationID),
 				WithPregelEventStepNumber(-1),
 				WithPregelEventError(err.Error()),
+				WithPregelEventResponseError(
+					model.ResponseErrorFromError(
+						err,
+						model.ErrorTypeFlowError,
+					),
+				),
 			))
 		}
 	}(runCtx)
@@ -300,6 +338,9 @@ func (e *Executor) executeGraph(
 	eventChan chan<- *event.Event,
 	startTime time.Time,
 ) error {
+	if err := e.executionEngine.validate(); err != nil {
+		return err
+	}
 	interruptState := graphInterruptFromContext(ctx)
 	ctx, extInterrupt := newExternalInterruptWatcher(ctx, interruptState)
 	if extInterrupt != nil {
@@ -360,14 +401,28 @@ func (e *Executor) executeGraph(
 		startStep = resumedStep + 1
 	}
 
-	stepsExecuted, err := e.runBspLoop(
-		ctx,
-		invocation,
-		execCtx,
-		&checkpointConfig,
-		startStep,
-		extInterrupt,
-	)
+	var stepsExecuted int
+	var err error
+	switch e.executionEngine {
+	case ExecutionEngineDAG:
+		stepsExecuted, err = e.runDagLoop(
+			ctx,
+			invocation,
+			execCtx,
+			&checkpointConfig,
+			startStep,
+			extInterrupt,
+		)
+	default:
+		stepsExecuted, err = e.runBspLoop(
+			ctx,
+			invocation,
+			execCtx,
+			&checkpointConfig,
+			startStep,
+			extInterrupt,
+		)
+	}
 	if err != nil {
 		return err
 	}
@@ -2451,9 +2506,18 @@ func (e *Executor) handleCachedResult(
 	nodeCtx *nodeExecutionContext,
 ) error {
 	// Run after node callbacks on cache hit.
-	if res, err := e.runAfterCallbacks(
-		ctx, invocation, nodeCtx.mergedCallbacks, nodeCtx.callbackCtx,
-		nodeCtx.stateCopy, result, execCtx, t.NodeID, nodeCtx.nodeType, step,
+	if res, _, err := e.runAfterCallbacks(
+		ctx,
+		invocation,
+		nodeCtx.mergedCallbacks,
+		nodeCtx.callbackCtx,
+		nodeCtx.stateCopy,
+		result,
+		nil,
+		execCtx,
+		t.NodeID,
+		nodeCtx.nodeType,
+		step,
 	); err != nil {
 		return err
 	} else if res != nil {
@@ -2537,7 +2601,23 @@ func (e *Executor) executeTaskWithRetry(
 		}
 		shouldRetry, retryErr := e.evaluateRetryDecision(ctx, invocation, execCtx, t, step, nodeCtx, retryCtx)
 		if !shouldRetry {
-			return retryErr
+			if IsInterruptError(retryErr) {
+				return retryErr
+			}
+			if !errors.Is(retryErr, err) {
+				return retryErr
+			}
+			return e.finalizeFailedExecution(
+				ctx,
+				invocation,
+				execCtx,
+				t,
+				result,
+				retryErr,
+				err,
+				step,
+				nodeCtx,
+			)
 		}
 
 		attempt++
@@ -2563,9 +2643,18 @@ func (e *Executor) finalizeSuccessfulExecution(
 	nodeCtx *nodeExecutionContext,
 ) error {
 	// Run after node callbacks on success.
-	if res, aerr := e.runAfterCallbacks(
-		ctx, invocation, nodeCtx.mergedCallbacks, nodeCtx.callbackCtx, nodeCtx.stateCopy, result,
-		execCtx, t.NodeID, nodeCtx.nodeType, step,
+	if res, _, aerr := e.runAfterCallbacks(
+		ctx,
+		invocation,
+		nodeCtx.mergedCallbacks,
+		nodeCtx.callbackCtx,
+		nodeCtx.stateCopy,
+		result,
+		nil,
+		execCtx,
+		t.NodeID,
+		nodeCtx.nodeType,
+		step,
 	); aerr != nil {
 		return aerr
 	} else if res != nil {
@@ -2617,6 +2706,114 @@ func (e *Executor) finalizeSuccessfulExecution(
 	// Emit node completion event for the overall node run (no cache hit).
 	e.emitNodeCompleteEvent(ctx, invocation, execCtx, t.NodeID, nodeCtx.nodeType, step, nodeCtx.nodeStart, false)
 	if err := e.emitNodeBarrierAndWait(ctx, invocation, execCtx, t.NodeID, step); err != nil {
+		return fmt.Errorf("emit node barrier: %w", err)
+	}
+	return nil
+}
+
+func (e *Executor) finalizeFailedExecution(
+	ctx context.Context,
+	invocation *agent.Invocation,
+	execCtx *ExecutionContext,
+	t *Task,
+	result any,
+	retryErr error,
+	nodeErr error,
+	step int,
+	nodeCtx *nodeExecutionContext,
+) error {
+	if nodeCtx == nil || nodeCtx.mergedCallbacks == nil {
+		return retryErr
+	}
+
+	res, overridden, aerr := e.runAfterCallbacks(
+		ctx,
+		invocation,
+		nodeCtx.mergedCallbacks,
+		nodeCtx.callbackCtx,
+		nodeCtx.stateCopy,
+		result,
+		nodeErr,
+		execCtx,
+		t.NodeID,
+		nodeCtx.nodeType,
+		step,
+	)
+	if aerr != nil {
+		return aerr
+	}
+	if !overridden {
+		return retryErr
+	}
+	return e.finalizeRecoveredExecution(
+		ctx,
+		invocation,
+		execCtx,
+		t,
+		res,
+		step,
+		nodeCtx,
+	)
+}
+
+func (e *Executor) finalizeRecoveredExecution(
+	ctx context.Context,
+	invocation *agent.Invocation,
+	execCtx *ExecutionContext,
+	t *Task,
+	result any,
+	step int,
+	nodeCtx *nodeExecutionContext,
+) error {
+	e.syncResumeState(execCtx, nodeCtx.stateCopy)
+
+	routed, herr := e.handleNodeResult(
+		ctx,
+		invocation,
+		execCtx,
+		t,
+		result,
+		step,
+	)
+	if herr != nil {
+		return herr
+	}
+
+	e.updateVersionsSeen(execCtx, t.NodeID, t.Triggers)
+
+	if !routed {
+		if err := e.processConditionalEdges(
+			ctx,
+			invocation,
+			execCtx,
+			t.NodeID,
+			step,
+		); err != nil {
+			return fmt.Errorf(
+				"conditional edge processing failed for node %s: %w",
+				t.NodeID,
+				err,
+			)
+		}
+	}
+
+	e.emitNodeCompleteEvent(
+		ctx,
+		invocation,
+		execCtx,
+		t.NodeID,
+		nodeCtx.nodeType,
+		step,
+		nodeCtx.nodeStart,
+		false,
+	)
+	if err := e.emitNodeBarrierAndWait(
+		ctx,
+		invocation,
+		execCtx,
+		t.NodeID,
+		step,
+	); err != nil {
 		return fmt.Errorf("emit node barrier: %w", err)
 	}
 	return nil
@@ -2926,25 +3123,74 @@ func (e *Executor) runAfterCallbacks(
 	cbCtx *NodeCallbackContext,
 	stateCopy State,
 	result any,
+	nodeErr error,
 	execCtx *ExecutionContext,
 	nodeID string,
 	nodeType NodeType,
 	step int,
-) (any, error) {
+) (any, bool, error) {
 	if callbacks == nil {
-		return nil, nil
+		return nil, false, nil
 	}
-	customResult, err := callbacks.RunAfterNode(ctx, cbCtx, stateCopy, result, nil)
+	customResult, overridden, err := runAfterNodeCallbacks(
+		ctx,
+		callbacks,
+		cbCtx,
+		stateCopy,
+		result,
+		nodeErr,
+	)
 	if err != nil {
 		callbacks.RunOnNodeError(ctx, cbCtx, stateCopy, err)
 		e.syncResumeState(execCtx, stateCopy)
 		e.emitNodeErrorEvent(ctx, invocation, execCtx, nodeID, nodeType, step, err)
 		if berr := e.emitNodeBarrierAndWait(ctx, invocation, execCtx, nodeID, step); berr != nil {
-			return nil, fmt.Errorf("emit node barrier: %w", berr)
+			return nil, false, fmt.Errorf("emit node barrier: %w", berr)
 		}
-		return nil, fmt.Errorf("after node callback failed for node %s: %w", nodeID, err)
+		return nil, false, fmt.Errorf(
+			"after node callback failed for node %s: %w",
+			nodeID,
+			err,
+		)
 	}
-	return customResult, nil
+	return customResult, overridden, nil
+}
+
+func runAfterNodeCallbacks(
+	ctx context.Context,
+	callbacks *NodeCallbacks,
+	callbackCtx *NodeCallbackContext,
+	state State,
+	result any,
+	nodeErr error,
+) (any, bool, error) {
+	if callbacks == nil {
+		return result, false, nil
+	}
+
+	currentResult := result
+	var overridden bool
+	for _, cb := range callbacks.AfterNode {
+		if cb == nil {
+			continue
+		}
+		customResult, err := cb(
+			ctx,
+			callbackCtx,
+			state,
+			currentResult,
+			nodeErr,
+		)
+		if err != nil {
+			return nil, false, err
+		}
+		if customResult == nil {
+			continue
+		}
+		overridden = true
+		currentResult = customResult
+	}
+	return currentResult, overridden, nil
 }
 
 // mergeNodeCallbacks merges global and per-node callbacks.
@@ -3119,6 +3365,12 @@ func (e *Executor) emitNodeErrorEvent(
 		WithNodeEventNodeType(nodeType),
 		WithNodeEventStepNumber(step),
 		WithNodeEventError(err.Error()),
+		WithNodeEventResponseError(
+			model.ResponseErrorFromError(
+				err,
+				model.ErrorTypeFlowError,
+			),
+		),
 	}
 	if len(extra) > 0 {
 		opts = append(opts, extra...)

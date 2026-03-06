@@ -340,7 +340,7 @@ func (p *FunctionCallResponseProcessor) executeSingleToolCallSequential(
 	index int,
 	toolCall model.ToolCall,
 ) (*event.Event, error) {
-	_, span := trace.Tracer.Start(ctx, itelemetry.NewExecuteToolSpanName(toolCall.Function.Name))
+	ctx, span := trace.Tracer.Start(ctx, itelemetry.NewExecuteToolSpanName(toolCall.Function.Name))
 	defer span.End()
 	startTime := time.Now()
 	ctx, choices, modifiedArgs, shouldIgnoreError, err := p.executeToolCall(
@@ -386,7 +386,13 @@ func (p *FunctionCallResponseProcessor) executeSingleToolCallSequential(
 		if tl, ok := tools[toolCall.Function.Name]; ok {
 			// Use the first choice as the canonical tool result for state
 			// delta.
-			p.attachStateDelta(tl, modifiedArgs, &choices[0], toolEvent)
+			p.attachStateDelta(
+				invocation,
+				tl,
+				modifiedArgs,
+				&choices[0],
+				toolEvent,
+			)
 		}
 	}
 
@@ -503,7 +509,7 @@ func (p *FunctionCallResponseProcessor) runParallelToolCall(
 	}()
 
 	// Trace the tool execution for observability.
-	_, span := trace.Tracer.Start(ctx, itelemetry.NewExecuteToolSpanName(tc.Function.Name))
+	ctx, span := trace.Tracer.Start(ctx, itelemetry.NewExecuteToolSpanName(tc.Function.Name))
 	defer span.End()
 	startTime := time.Now()
 	// Execute the tool (streamable or callable) with callbacks.
@@ -583,14 +589,15 @@ func (p *FunctionCallResponseProcessor) runParallelToolCall(
 		}
 	}
 	// Attach state delta if the tool provides it.
-	if err == nil {
-		if tl, ok := tools[tc.Function.Name]; ok {
-			// Use the first choice as the canonical tool result for state
-			// delta.
-			p.attachStateDelta(
-				tl, modifiedArgs, &choices[0], toolCallResponseEvent,
-			)
-		}
+	if tl, ok := tools[tc.Function.Name]; ok {
+		// Use the first choice as the canonical tool result for state delta.
+		p.attachStateDelta(
+			invocation,
+			tl,
+			modifiedArgs,
+			&choices[0],
+			toolCallResponseEvent,
+		)
 	}
 	itelemetry.TraceToolCall(span, sess, decl, modifiedArgs, toolCallResponseEvent, err)
 	itelemetry.ReportExecuteToolMetrics(ctx, itelemetry.ExecuteToolAttributes{
@@ -610,7 +617,11 @@ func (p *FunctionCallResponseProcessor) runParallelToolCall(
 
 // attachStateDelta copies tool-provided state delta to the event.
 func (p *FunctionCallResponseProcessor) attachStateDelta(
-	tl tool.Tool, args []byte, choice *model.Choice, ev *event.Event,
+	inv *agent.Invocation,
+	tl tool.Tool,
+	args []byte,
+	choice *model.Choice,
+	ev *event.Event,
 ) {
 	if tl == nil || choice == nil || ev == nil {
 		return
@@ -619,15 +630,27 @@ func (p *FunctionCallResponseProcessor) attachStateDelta(
 	if nameTool, ok := tl.(*itool.NamedTool); ok {
 		original = nameTool.Original()
 	}
-	type stateDeltaProvider interface {
-		StateDelta([]byte, []byte) map[string][]byte
-	}
-	sdp, ok := original.(stateDeltaProvider)
-	if !ok {
-		return
-	}
 	b := []byte(choice.Message.Content)
-	delta := sdp.StateDelta(args, b)
+	toolCallID := choice.Message.ToolID
+
+	type stateDeltaProvider interface {
+		StateDelta(string, []byte, []byte) map[string][]byte
+	}
+	type invocationStateDeltaProvider interface {
+		StateDeltaForInvocation(
+			*agent.Invocation,
+			string,
+			[]byte,
+			[]byte,
+		) map[string][]byte
+	}
+
+	var delta map[string][]byte
+	if isdp, ok := original.(invocationStateDeltaProvider); ok {
+		delta = isdp.StateDeltaForInvocation(inv, toolCallID, args, b)
+	} else if sdp, ok := original.(stateDeltaProvider); ok {
+		delta = sdp.StateDelta(toolCallID, args, b)
+	}
 	if len(delta) == 0 {
 		return
 	}
@@ -803,6 +826,7 @@ func (p *FunctionCallResponseProcessor) executeToolCall(
 	}
 
 	// Marshal the result to JSON for the default tool message.
+	// Note: mcpToolResult implements MarshalJSON to only marshal Content for backward compatibility.
 	resultBytes, err := json.Marshal(result)
 	if err != nil {
 		// Marshal failures (for example, NaN in floats) do not
@@ -1115,6 +1139,7 @@ func (p *FunctionCallResponseProcessor) runAfterToolCallbacks(
 		Arguments:   toolCall.Function.Arguments,
 		Result:      toolResult,
 		Error:       toolErr,
+		Meta:        extractMetaFromResult(toolResult),
 	}
 	afterResult, err := p.toolCallbacks.RunAfterTool(ctx, args)
 	if err != nil {
@@ -1134,6 +1159,22 @@ func (p *FunctionCallResponseProcessor) runAfterToolCallbacks(
 		toolResult = afterResult.CustomResult
 	}
 	return ctx, toolResult, nil
+}
+
+// extractMetaFromResult extracts metadata from tool result.
+// For MCP mcpToolResult, returns the Meta field.
+func extractMetaFromResult(result any) map[string]any {
+	if result == nil {
+		return nil
+	}
+	// Check for our wrapped mcpToolResult type (from tool/mcp package)
+	type metaGetter interface {
+		GetMeta() map[string]any
+	}
+	if mg, ok := result.(metaGetter); ok {
+		return mg.GetMeta()
+	}
+	return nil
 }
 
 // executeToolWithCallbacks executes a tool with before/after callbacks.

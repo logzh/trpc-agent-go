@@ -79,6 +79,47 @@ func (m *mockCallableTool) Call(ctx context.Context, args []byte) (any, error) {
 	return m.callFn(ctx, args)
 }
 
+type mockInvocationStateDeltaTool struct {
+	declaration *tool.Declaration
+	delta       map[string][]byte
+}
+
+func (m *mockInvocationStateDeltaTool) Declaration() *tool.Declaration {
+	if m.declaration != nil {
+		return m.declaration
+	}
+	return &tool.Declaration{Name: "mock"}
+}
+
+func (m *mockInvocationStateDeltaTool) StateDeltaForInvocation(
+	_ *agent.Invocation,
+	_ string,
+	_ []byte,
+	_ []byte,
+) map[string][]byte {
+	return m.delta
+}
+
+type mockStateDeltaTool struct {
+	declaration *tool.Declaration
+	delta       map[string][]byte
+}
+
+func (m *mockStateDeltaTool) Declaration() *tool.Declaration {
+	if m.declaration != nil {
+		return m.declaration
+	}
+	return &tool.Declaration{Name: "mock"}
+}
+
+func (m *mockStateDeltaTool) StateDelta(
+	_ string,
+	_ []byte,
+	_ []byte,
+) map[string][]byte {
+	return m.delta
+}
+
 func TestExecuteToolCall_MapsSubAgentToTransfer(t *testing.T) {
 	ctx := context.Background()
 	p := NewFunctionCallResponseProcessor(false, nil)
@@ -126,6 +167,47 @@ func TestExecuteToolCall_MapsSubAgentToTransfer(t *testing.T) {
 	require.NoError(t, json.Unmarshal(capturedArgs, &got))
 	assert.Equal(t, "weather-agent", got.AgentName)
 	assert.Equal(t, "What's the weather like in Tokyo?", got.Message)
+}
+
+func TestFunctionCallResponseProcessor_AttachStateDelta(t *testing.T) {
+	const (
+		deltaKey1 = "k1"
+		deltaVal1 = "v1"
+		deltaKey2 = "k2"
+		deltaVal2 = "v2"
+	)
+
+	p := &FunctionCallResponseProcessor{}
+	inv := &agent.Invocation{AgentName: "tester"}
+	args := []byte(`{"ok":true}`)
+	choice := &model.Choice{
+		Message: model.Message{
+			ToolID:   "call-1",
+			Content:  `{"result":"ok"}`,
+			ToolName: "tool",
+			Role:     model.RoleTool,
+		},
+	}
+
+	ev := &event.Event{}
+	tl := &mockInvocationStateDeltaTool{
+		declaration: &tool.Declaration{Name: "tool"},
+		delta: map[string][]byte{
+			deltaKey1: []byte(deltaVal1),
+		},
+	}
+	p.attachStateDelta(inv, tl, args, choice, ev)
+	require.Equal(t, []byte(deltaVal1), ev.StateDelta[deltaKey1])
+
+	ev2 := &event.Event{}
+	tl2 := &mockStateDeltaTool{
+		declaration: &tool.Declaration{Name: "tool"},
+		delta: map[string][]byte{
+			deltaKey2: []byte(deltaVal2),
+		},
+	}
+	p.attachStateDelta(inv, tl2, args, choice, ev2)
+	require.Equal(t, []byte(deltaVal2), ev2.StateDelta[deltaKey2])
 }
 
 func TestExecuteToolCall(t *testing.T) {
@@ -2116,7 +2198,7 @@ func (d *deltaTool) Declaration() *tool.Declaration {
 func (d *deltaTool) Call(ctx context.Context, _ []byte) (any, error) {
 	return "ok", nil
 }
-func (d *deltaTool) StateDelta(_ []byte, _ []byte) map[string][]byte {
+func (d *deltaTool) StateDelta(_ string, _ []byte, _ []byte) map[string][]byte {
 	return map[string][]byte{"x": []byte("y")}
 }
 
@@ -2130,7 +2212,7 @@ func (e *errorDeltaTool) Call(_ context.Context, _ []byte) (any, error) {
 	return nil, errors.New("boom")
 }
 
-func (e *errorDeltaTool) StateDelta(_ []byte, _ []byte) map[string][]byte {
+func (e *errorDeltaTool) StateDelta(_ string, _ []byte, _ []byte) map[string][]byte {
 	return map[string][]byte{"x": []byte("y")}
 }
 
@@ -3644,4 +3726,58 @@ func TestExecuteSingleToolCallSequential_SetsTransferTag(t *testing.T) {
 	require.NotNil(t, evt)
 	require.Equal(t, event.TransferTag, evt.Tag)
 	require.Equal(t, transfer.TransferToolName, evt.Response.Choices[0].Message.ToolName)
+}
+
+// mockMetaGetter is a test type that implements the GetMeta interface.
+type mockMetaGetter struct {
+	meta map[string]any
+}
+
+func (m *mockMetaGetter) GetMeta() map[string]any {
+	return m.meta
+}
+
+// mockNonMetaGetter is a test type that does not implement GetMeta.
+type mockNonMetaGetter struct {
+	value string
+}
+
+func TestExtractMetaFromResult_Nil(t *testing.T) {
+	meta := extractMetaFromResult(nil)
+	assert.Nil(t, meta)
+}
+
+func TestExtractMetaFromResult_NonMetaGetter(t *testing.T) {
+	// Test with a type that does not implement GetMeta
+	result := &mockNonMetaGetter{value: "test"}
+	meta := extractMetaFromResult(result)
+	assert.Nil(t, meta)
+}
+
+func TestExtractMetaFromResult_WithMetaGetter(t *testing.T) {
+	// Test with a type that implements GetMeta
+	expectedMeta := map[string]any{
+		"tokenCount": 42,
+		"model":      "gpt-4",
+	}
+	result := &mockMetaGetter{meta: expectedMeta}
+	meta := extractMetaFromResult(result)
+	assert.NotNil(t, meta)
+	assert.Equal(t, expectedMeta["tokenCount"], meta["tokenCount"])
+	assert.Equal(t, expectedMeta["model"], meta["model"])
+}
+
+func TestExtractMetaFromResult_WithNilMeta(t *testing.T) {
+	// Test with a MetaGetter that returns nil meta
+	result := &mockMetaGetter{meta: nil}
+	meta := extractMetaFromResult(result)
+	assert.Nil(t, meta)
+}
+
+func TestExtractMetaFromResult_WithEmptyMeta(t *testing.T) {
+	// Test with a MetaGetter that returns empty map
+	result := &mockMetaGetter{meta: map[string]any{}}
+	meta := extractMetaFromResult(result)
+	assert.NotNil(t, meta)
+	assert.Empty(t, meta)
 }
