@@ -21,6 +21,7 @@ Background references:
 - 🧾 `skill_list_docs` to list available docs
 - 🏃 `skill_run` to execute commands, returning stdout/stderr and
   output files
+- ⌨️ `skill_exec` plus session tools for interactive stdin/TTY flows
 - 🗂️ Output file collection via glob patterns with MIME detection
 - 🧩 Pluggable local or container workspace executors (local by default)
 - 🧱 Declarative `inputs`/`outputs`: map inputs and collect/inline/
@@ -79,10 +80,11 @@ loaded content.
 
 Session summary note: if you enable session summary injection
 (`WithAddSessionSummary(true)`) and a summary is present, the framework
-**skips** this fallback by default to avoid re-inflating the prompt with
-summarized content. In that setup, if the tool result messages were
-summarized away, the model will need to call `skill_load` again to see
-the full body/docs.
+prefers to **skip** this fallback to avoid re-inflating the prompt with
+summarized content. If the matching tool result messages are still
+available, the fallback stays suppressed; if summary compaction removes
+them, the fallback is re-enabled so the model still sees the full
+body/docs.
 
 Enable tool-result materialization with:
 `llmagent.WithSkillsLoadedContentInToolResults(true)`.
@@ -876,6 +878,8 @@ Input:
 - `skill` (required)
 - `command` (required; by default runs via `bash -c`)
 - `cwd`, `env` (optional)
+- `stdin` (optional): one-shot stdin text passed to the command
+- `editor_text` (optional): text used for CLIs that launch `$EDITOR`
 - `output_files` (optional, legacy collection): glob patterns (e.g.,
   `out/*.txt`). Patterns are workspace‑relative; env‑style prefixes
   like `$OUTPUT_DIR/*.txt` are also accepted and normalized to
@@ -1004,6 +1008,42 @@ Typical flow:
    - Legacy: use `output_files` globs
    - Declarative: use `outputs` to drive collect/inline/save
    - Use `inputs` to stage upstream files when needed
+
+### Interactive skill sessions
+
+Declaration:
+- [tool/skill/exec.go](https://github.com/trpc-group/trpc-agent-go/blob/main/tool/skill/exec.go)
+
+Tools:
+- `skill_exec`: start a session-oriented command in the skill workspace
+- `skill_write_stdin`: write incremental stdin to a running session
+- `skill_poll_session`: fetch more terminal output or the final result
+- `skill_kill_session`: terminate and remove a session
+
+Guidance:
+- Prefer `skill_run` for one-shot commands.
+- Prefer `skill_exec` when the command may prompt for input, present a
+  numbered selection, or keep running between turns.
+- Prefer `editor_text` on `skill_run` or `skill_exec` for `$EDITOR`
+  workflows instead of trying to drive a full-screen editor via stdin.
+
+`skill_exec` reuses the same workspace, `inputs`, `outputs`,
+`save_as_artifacts`, `omit_inline_content`, `artifact_prefix`, `stdin`,
+and `editor_text` behavior as `skill_run`, but returns session state:
+- `status`: `running` or `exited`
+- `session_id`: stable id for follow-up calls
+- `output`: most recent terminal output seen during that call
+- `interaction`: best-effort hint when the process appears to be waiting
+  for more input
+- `result`: when the session exits, the final `skill_run`-style output
+
+Typical interactive flow:
+1) Call `skill_exec`
+2) Inspect `output` / `interaction`
+3) Use `skill_write_stdin` or `skill_poll_session` until `status`
+   becomes `exited`
+4) Read `result` and collected outputs, or call `skill_kill_session`
+   to stop the session
 
 Examples:
 
