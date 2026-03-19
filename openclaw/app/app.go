@@ -47,6 +47,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/internal/admin"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/internal/cron"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/internal/debugrecorder"
+	"trpc.group/trpc-go/trpc-agent-go/openclaw/internal/deps"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/internal/gateway"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/internal/octool"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/internal/outbound"
@@ -66,8 +67,9 @@ const (
 
 	defaultOpenAIModel = "gpt-5"
 
-	defaultSkillsDir = "skills"
-	defaultAgentsDir = ".agents"
+	defaultSkillsDir        = "skills"
+	defaultAgentsDir        = ".agents"
+	defaultBundledSkillsDir = "bundled-skills"
 
 	csvDelimiter = ","
 
@@ -78,6 +80,14 @@ const (
 		"Keep replies concise."
 
 	openClawToolingGuidance = "For general local shell work, use " +
+		"read_document or read_spreadsheet first for common PDF, " +
+		"DOCX, text, CSV, and spreadsheet uploads already in the " +
+		"chat. Only fall back to " +
+		"exec_command when those tools cannot satisfy the task. " +
+		"Do not call exec_command just to print OPENCLAW_* upload " +
+		"vars or inspect recent upload metadata when a matching " +
+		"chat file is already available. For general local shell " +
+		"work, use " +
 		"exec_command. For interactive follow-up input, use " +
 		"write_stdin and kill_session when needed. Use message " +
 		"to send to the current chat or an explicit target. " +
@@ -195,6 +205,8 @@ func Main(args []string) int {
 			return runDoctor(args[1:])
 		case subcmdInspect:
 			return runInspect(args[1:])
+		case subcmdBootstrap:
+			return runBootstrap(args[1:])
 		}
 	}
 
@@ -276,6 +288,84 @@ func logStartupLines(lines []startupLogLine) {
 	}
 }
 
+func runtimeStartupLines(
+	opts runOptions,
+	stateDir string,
+	channels []channel.Channel,
+	needsModel bool,
+) []startupLogLine {
+	return []startupLogLine{
+		{text: fmt.Sprintf("App name: %s", strings.TrimSpace(opts.AppName))},
+		{text: configStartupSummary(opts.ConfigPath)},
+		{text: fmt.Sprintf(
+			"State dir: %s",
+			startupPathSummary(stateDir),
+		)},
+		{text: fmt.Sprintf(
+			"Channels: %s",
+			channelStartupSummary(channels),
+		)},
+		{text: fmt.Sprintf(
+			"Model: %s",
+			modelStartupSummary(opts, needsModel),
+		)},
+		{text: fmt.Sprintf(
+			"Storage: session=%s memory=%s",
+			strings.TrimSpace(opts.SessionBackend),
+			strings.TrimSpace(opts.MemoryBackend),
+		)},
+	}
+}
+
+func configStartupSummary(configPath string) string {
+	path := strings.TrimSpace(configPath)
+	if path == "" {
+		return "Config: built-in defaults and CLI flags"
+	}
+	return fmt.Sprintf("Config: %s", startupPathSummary(path))
+}
+
+func startupPathSummary(path string) string {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return ""
+	}
+	absPath, err := filepath.Abs(trimmed)
+	if err != nil {
+		return trimmed
+	}
+	return absPath
+}
+
+func channelStartupSummary(channels []channel.Channel) string {
+	ids := channelIDs(channels)
+	if len(ids) == 0 {
+		return "none"
+	}
+	return strings.Join(ids, ", ")
+}
+
+func modelStartupSummary(
+	opts runOptions,
+	needsModel bool,
+) string {
+	if !needsModel {
+		return "disabled"
+	}
+	mode := strings.ToLower(strings.TrimSpace(opts.ModelMode))
+	if mode == "" {
+		mode = modeOpenAI
+	}
+	if mode != modeOpenAI {
+		return mode
+	}
+	modelName := strings.TrimSpace(opts.OpenAIModel)
+	if modelName == "" {
+		return mode
+	}
+	return fmt.Sprintf("%s/%s", mode, modelName)
+}
+
 func gatewayStartupLines(
 	httpAddr string,
 	gwSrv *gateway.Server,
@@ -284,6 +374,10 @@ func gatewayStartupLines(
 		{text: fmt.Sprintf("Gateway listening on %s", httpAddr)},
 		{text: fmt.Sprintf("Health:   GET  %s", gwSrv.HealthPath())},
 		{text: fmt.Sprintf("Messages: POST %s", gwSrv.MessagesPath())},
+		{text: fmt.Sprintf(
+			"Stream:   POST %s",
+			gwSrv.MessagesStreamPath(),
+		)},
 		{text: fmt.Sprintf(
 			"Status:   GET  %s?request_id=...",
 			gwSrv.StatusPath(),
@@ -334,6 +428,7 @@ func adminStartupLines(
 // default OpenClaw runner + channel wiring.
 type Runtime struct {
 	Gateway  Gateway
+	A2A      A2ASurface
 	Admin    AdminSurface
 	Channels []channel.Channel
 
@@ -597,6 +692,13 @@ func NewRuntime(
 		MessagesPath: gwSrv.MessagesPath(),
 		StatusPath:   gwSrv.StatusPath(),
 		CancelPath:   gwSrv.CancelPath(),
+	}
+	rt.A2A, err = newA2ASurface(ag, r, opts)
+	if err != nil {
+		return nil, &exitError{
+			Code: 1,
+			Err:  fmt.Errorf("create a2a failed: %w", err),
+		}
 	}
 
 	debugDir := filepath.Join(resolvedStateDir, defaultDebugRecorderDir)
@@ -951,12 +1053,31 @@ func run(ctx context.Context, args []string) error {
 	)
 	gw.SetPersonaStore(personaStore)
 
+	a2aSurface, err := newA2ASurface(ag, r, opts)
+	if err != nil {
+		return &exitError{
+			Code: 1,
+			Err:  fmt.Errorf("create a2a failed: %w", err),
+		}
+	}
+
+	httpHandler, err := buildRuntimeHTTPHandler(
+		gwSrv.Handler(),
+		a2aSurface,
+	)
+	if err != nil {
+		return &exitError{
+			Code: 1,
+			Err:  fmt.Errorf("build runtime handler failed: %w", err),
+		}
+	}
+
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 
 	httpSrv := &http.Server{
 		Addr:              opts.HTTPAddr,
-		Handler:           gwSrv.Handler(),
+		Handler:           httpHandler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	var (
@@ -1058,7 +1179,15 @@ func run(ctx context.Context, args []string) error {
 	}
 	errCh := make(chan error, workerCount)
 
+	logStartupLines(runtimeStartupLines(
+		opts,
+		resolvedStateDir,
+		channels,
+		needsModel,
+	))
 	logStartupLines(gatewayStartupLines(httpSrv.Addr, gwSrv))
+	logStartupLines(a2aStartupLines(a2aSurface))
+	logStartupLines(toolDepsStartupLines(openClawTools.deps))
 	go func() {
 		//nolint:gosec
 		errCh <- httpSrv.ListenAndServe()
@@ -1504,7 +1633,7 @@ func newAgent(
 
 	cwd, _ := os.Getwd()
 	roots := resolveSkillRoots(cwd, cfg)
-	bundledRoot := filepath.Join(cwd, appName, defaultSkillsDir)
+	bundledRoot := resolveBundledSkillsRoot(cwd, cfg.StateDir)
 	repo, err := ocskills.NewRepository(
 		roots,
 		ocskills.WithDebug(cfg.SkillsDebug),
@@ -1770,6 +1899,7 @@ type openClawToolsBundle struct {
 	execMgr  *octool.Manager
 	router   *outbound.Router
 	cronTool *cron.Tool
+	deps     *deps.Report
 }
 
 func buildOpenClawTools(
@@ -1780,15 +1910,27 @@ func buildOpenClawTools(
 		return openClawToolsBundle{}
 	}
 
-	mgr := octool.NewManager()
+	mgr := octool.NewManager(
+		octool.WithBaseEnv(deps.ToolEnv(stateDir)),
+	)
 	router := outbound.NewRouter()
 	cronTool := cron.NewTool(nil)
 	var uploadStore *uploads.Store
 	if store, err := uploads.NewStore(stateDir); err == nil {
 		uploadStore = store
 	}
+	var depsReport *deps.Report
+	if sources, err := deps.SourcesForProfiles(deps.DefaultProfiles()); err ==
+		nil {
+		report, err := deps.InspectStartup(stateDir, sources)
+		if err == nil {
+			depsReport = &report
+		}
+	}
 
 	tools := []tool.Tool{
+		octool.NewReadDocumentTool(uploadStore),
+		octool.NewReadSpreadsheetTool(uploadStore),
 		octool.NewExecCommandTool(mgr, uploadStore),
 		octool.NewWriteStdinTool(mgr),
 		octool.NewKillSessionTool(mgr),
@@ -1800,6 +1942,7 @@ func buildOpenClawTools(
 		execMgr:  mgr,
 		router:   router,
 		cronTool: cronTool,
+		deps:     depsReport,
 	}
 }
 
@@ -1817,14 +1960,15 @@ func resolveSkillRoots(cwd string, cfg agentConfig) []string {
 		defaultSkillsDir,
 	)
 	managedSkills := filepath.Join(cfg.StateDir, defaultSkillsDir)
-	bundledSkills := filepath.Join(cwd, appName, defaultSkillsDir)
+	bundledSkills := resolveBundledSkillsRoot(cwd, cfg.StateDir)
 
 	roots := make([]string, 0, 6+len(cfg.SkillsExtraDirs))
 	roots = append(roots, workspaceSkills)
 	roots = append(roots, projectAgentsSkills)
 	roots = append(roots, personalAgentsSkills)
 	roots = append(roots, managedSkills)
-	if bundledSkills != workspaceSkills {
+	if bundledSkills != workspaceSkills &&
+		bundledSkills != managedSkills {
 		roots = append(roots, bundledSkills)
 	}
 	roots = append(roots, cfg.SkillsExtraDirs...)
@@ -1857,6 +2001,25 @@ func dirExists(path string) bool {
 	return st.IsDir()
 }
 
+func resolveBundledSkillsRoot(cwd, stateDir string) string {
+	installedBundled := filepath.Join(
+		stateDir,
+		defaultBundledSkillsDir,
+	)
+	if dirExists(installedBundled) {
+		return installedBundled
+	}
+
+	repoBundled := filepath.Join(cwd, appName, defaultSkillsDir)
+	if dirExists(repoBundled) {
+		return repoBundled
+	}
+	if strings.TrimSpace(stateDir) != "" {
+		return installedBundled
+	}
+	return repoBundled
+}
+
 func resolveStateDir(raw string) (string, error) {
 	s := strings.TrimSpace(raw)
 	if s != "" {
@@ -1866,7 +2029,7 @@ func resolveStateDir(raw string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".trpc-agent-go", appName), nil
+	return filepath.Join(home, ".trpc-agent-go-github", appName), nil
 }
 
 func maybeEnableDebugRecorder(

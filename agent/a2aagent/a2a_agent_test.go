@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
 	tracesdk "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -34,6 +35,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	semconvtrace "trpc.group/trpc-go/trpc-agent-go/telemetry/semconv/trace"
+	teletrace "trpc.group/trpc-go/trpc-agent-go/telemetry/trace"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
@@ -385,9 +387,8 @@ func TestWrapEventChannelWithTelemetry_AccumulatesTokenUsage(t *testing.T) {
 	tp := tracesdk.NewTracerProvider(tracesdk.WithSpanProcessor(spanRecorder))
 	ctx, span := tp.Tracer("test").Start(context.Background(), "wrap")
 	sdkSpan := span
-
 	originalChan := make(chan *event.Event, 2)
-	wrappedChan := (&A2AAgent{}).wrapEventChannelWithTelemetry(ctx, &agent.Invocation{}, originalChan, sdkSpan, &itelemetry.InvokeAgentTracker{})
+	wrappedChan := (&A2AAgent{}).wrapEventChannelWithTelemetry(ctx, &agent.Invocation{}, originalChan, sdkSpan, &itelemetry.InvokeAgentTracker{}, true)
 
 	partialEvent := &event.Event{
 		Response: &model.Response{
@@ -435,6 +436,21 @@ func TestWrapEventChannelWithTelemetry_AccumulatesTokenUsage(t *testing.T) {
 	if !hasAttr(attrs, attribute.Int(semconvtrace.KeyGenAIUsageOutputTokens, finalEvent.Response.Usage.CompletionTokens)) {
 		t.Fatalf("expected output token usage to be recorded, attrs=%v", attrs)
 	}
+}
+
+func useSpanRecorder(t *testing.T) *tracetest.SpanRecorder {
+	recorder := tracetest.NewSpanRecorder()
+	provider := tracesdk.NewTracerProvider(tracesdk.WithSpanProcessor(recorder))
+	originalProvider := teletrace.TracerProvider
+	originalTracer := teletrace.Tracer
+	teletrace.TracerProvider = provider
+	teletrace.Tracer = provider.Tracer("a2a-agent-disable-tracing-test")
+	t.Cleanup(func() {
+		_ = provider.Shutdown(context.Background())
+		teletrace.TracerProvider = originalProvider
+		teletrace.Tracer = originalTracer
+	})
+	return recorder
 }
 
 func TestA2AAgent_shouldUseStreaming(t *testing.T) {
@@ -697,6 +713,19 @@ func TestA2AAgent_Run_ErrorCases(t *testing.T) {
 			tc.validateFunc(t, eventChan, err)
 		})
 	}
+}
+
+func TestA2AAgent_Run_DisableTracingSkipsSpanCreation(t *testing.T) {
+	recorder := useSpanRecorder(t)
+	a2aAgent := &A2AAgent{name: "test-agent"}
+	invocation := &agent.Invocation{
+		RunOptions: agent.RunOptions{
+			DisableTracing: true,
+		},
+	}
+	_, err := a2aAgent.Run(context.Background(), invocation)
+	require.Error(t, err)
+	require.Empty(t, recorder.Ended())
 }
 
 func TestWithTransferStateKey(t *testing.T) {
@@ -1110,6 +1139,51 @@ func TestUserIDHeaderInRequest(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestA2AAgent_Run_RecordsStreamTraceAttribute(t *testing.T) {
+	originalTracer := teletrace.Tracer
+	defer func() {
+		teletrace.Tracer = originalTracer
+	}()
+
+	spanRecorder := tracetest.NewSpanRecorder()
+	tp := tracesdk.NewTracerProvider(tracesdk.WithSpanProcessor(spanRecorder))
+	defer func() {
+		_ = tp.Shutdown(context.Background())
+	}()
+	teletrace.Tracer = tp.Tracer("test")
+
+	a := &A2AAgent{
+		name:            "remote-agent",
+		description:     "remote test agent",
+		enableStreaming: boolPtr(true),
+	}
+
+	stream := false
+	_, err := a.Run(context.Background(), &agent.Invocation{
+		InvocationID: "test-invocation",
+		Message:      model.Message{Role: model.RoleUser, Content: "hello"},
+		RunOptions: agent.RunOptions{
+			Stream: &stream,
+		},
+	})
+	require.Error(t, err)
+
+	spans := spanRecorder.Ended()
+	require.Len(t, spans, 1)
+
+	found := false
+	for _, attr := range spans[0].Attributes() {
+		if string(attr.Key) == semconvtrace.KeyGenAIRequestIsStream {
+			found = true
+			require.False(t, attr.Value.AsBool())
+			break
+		}
+	}
+	require.True(t, found, "expected stream trace attribute to be recorded")
+	require.True(t, hasAttr(spans[0].Attributes(), attribute.String(semconvtrace.KeyGenAIAgentName, "remote-agent")))
+	require.True(t, hasAttr(spans[0].Attributes(), attribute.String(semconvtrace.KeyGenAIAgentID, "remote-agent")))
 }
 
 // Helper function to create bool pointer

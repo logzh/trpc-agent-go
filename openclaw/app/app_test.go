@@ -41,6 +41,7 @@ import (
 
 	occhannel "trpc.group/trpc-go/trpc-agent-go/openclaw/channel"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/gwclient"
+	"trpc.group/trpc-go/trpc-agent-go/openclaw/gwproto"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/internal/cron"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/internal/debugrecorder"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/internal/gateway"
@@ -167,6 +168,23 @@ func TestNewRuntime_BuildsGatewayHandler(t *testing.T) {
 	require.NotEmpty(t, rt.Gateway.StatusPath)
 	require.NotEmpty(t, rt.Gateway.CancelPath)
 	require.Empty(t, rt.Channels)
+}
+
+func TestNewRuntime_A2AConfigErrorExitCode(t *testing.T) {
+	t.Parallel()
+
+	_, err := NewRuntime(context.Background(), []string{
+		"-mode", modeMock,
+		"-state-dir", t.TempDir(),
+		"-skills-root", t.TempDir(),
+		"-a2a",
+	})
+	require.Error(t, err)
+
+	var exitErr *exitError
+	require.True(t, errors.As(err, &exitErr))
+	require.Equal(t, 1, exitErr.Code)
+	require.ErrorContains(t, exitErr.Err, "create a2a failed")
 }
 
 func TestNewRuntime_DebugRecorderEnabled_Smoke(t *testing.T) {
@@ -668,6 +686,12 @@ func TestMain_InspectDispatches(t *testing.T) {
 	require.Equal(t, 0, Main([]string{subcmdInspect}))
 }
 
+func TestMain_BootstrapDispatches(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, 2, Main([]string{subcmdBootstrap}))
+}
+
 func TestRun_TelegramProxyErrorExitCode(t *testing.T) {
 	t.Parallel()
 
@@ -969,6 +993,43 @@ func TestRun_Smoke(t *testing.T) {
 		"-enable-openclaw-tools",
 	})
 	require.NoError(t, err)
+}
+
+func TestRun_WithA2A_Smoke(t *testing.T) {
+	dir := t.TempDir()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	time.AfterFunc(50*time.Millisecond, cancel)
+
+	err := run(ctx, []string{
+		"-http-addr", "127.0.0.1:0",
+		"-mode", modeMock,
+		"-state-dir", dir,
+		"-skills-root", t.TempDir(),
+		"-a2a",
+		"-a2a-host", "http://127.0.0.1:18080/a2a",
+		"-a2a-user-id-header", "X-Caller-User",
+	})
+	require.NoError(t, err)
+}
+
+func TestRun_A2AConfigErrorExitCode(t *testing.T) {
+	t.Parallel()
+
+	err := run(context.Background(), []string{
+		"-http-addr", "127.0.0.1:0",
+		"-mode", modeMock,
+		"-state-dir", t.TempDir(),
+		"-skills-root", t.TempDir(),
+		"-a2a",
+	})
+	require.Error(t, err)
+
+	var exitErr *exitError
+	require.True(t, errors.As(err, &exitErr))
+	require.Equal(t, 1, exitErr.Code)
+	require.ErrorContains(t, exitErr.Err, "create a2a failed")
 }
 
 func TestRun_DebugRecorderEnabled_Smoke(t *testing.T) {
@@ -1331,7 +1392,11 @@ func TestResolveStateDir_DefaultHome(t *testing.T) {
 
 	got, err := resolveStateDir("")
 	require.NoError(t, err)
-	require.Equal(t, filepath.Join(home, ".trpc-agent-go", appName), got)
+	require.Equal(
+		t,
+		filepath.Join(home, ".trpc-agent-go-github", appName),
+		got,
+	)
 }
 
 func TestMaybeEnableDebugRecorder_Disabled(t *testing.T) {
@@ -1600,10 +1665,43 @@ func TestResolveSkillRoots_IncludesExpectedRoots(t *testing.T) {
 	require.Contains(
 		t,
 		roots,
-		filepath.Join(cwd, appName, defaultSkillsDir),
+		filepath.Join(stateDir, defaultBundledSkillsDir),
 	)
 	require.Contains(t, roots, "extra1")
 	require.Contains(t, roots, "extra2")
+}
+
+func TestResolveSkillRoots_UsesInstalledBundledSkills(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cwd := t.TempDir()
+	stateDir := t.TempDir()
+	installedBundled := filepath.Join(
+		stateDir,
+		defaultBundledSkillsDir,
+	)
+	require.NoError(t, os.MkdirAll(installedBundled, 0o700))
+
+	roots := resolveSkillRoots(cwd, agentConfig{StateDir: stateDir})
+	require.Contains(t, roots, installedBundled)
+	require.NotContains(
+		t,
+		roots,
+		filepath.Join(cwd, appName, defaultSkillsDir),
+	)
+}
+
+func TestResolveBundledSkillsRoot_RepoFallback(t *testing.T) {
+	cwd := t.TempDir()
+	repoBundled := filepath.Join(cwd, appName, defaultSkillsDir)
+	require.NoError(t, os.MkdirAll(repoBundled, 0o700))
+
+	require.Equal(
+		t,
+		repoBundled,
+		resolveBundledSkillsRoot(cwd, t.TempDir()),
+	)
 }
 
 type stubGateway struct{}
@@ -1738,6 +1836,7 @@ func TestGatewayStartupLines(t *testing.T) {
 			{text: "Gateway listening on 127.0.0.1:18080"},
 			{text: "Health:   GET  /healthz"},
 			{text: "Messages: POST /v1/gateway/messages"},
+			{text: "Stream:   POST /v1/gateway/messages:stream"},
 			{text: "Status:   GET  /v1/gateway/status?request_id=..."},
 			{text: "Cancel:   POST /v1/gateway/cancel"},
 		},
@@ -1777,6 +1876,76 @@ func TestAdminStartupLines(t *testing.T) {
 	)
 
 	require.Nil(t, adminStartupLines("127.0.0.1:19789", nil))
+}
+
+func TestRuntimeStartupLines(t *testing.T) {
+	t.Parallel()
+
+	lines := runtimeStartupLines(
+		runOptions{
+			AppName:        "openclaw-stdin",
+			ConfigPath:     "openclaw.yaml",
+			ModelMode:      modeMock,
+			SessionBackend: sessionBackendInMemory,
+			MemoryBackend:  memoryBackendInMemory,
+		},
+		"/tmp/state",
+		[]occhannel.Channel{
+			&stubChannel{id: "stdin"},
+			&stubChannel{id: "telegram"},
+		},
+		true,
+	)
+	require.Equal(t,
+		[]startupLogLine{
+			{text: "App name: openclaw-stdin"},
+			{text: "Config: " + filepath.Join(
+				mustGetwd(t),
+				"openclaw.yaml",
+			)},
+			{text: "State dir: /tmp/state"},
+			{text: "Channels: stdin, telegram"},
+			{text: "Model: mock"},
+			{text: "Storage: session=inmemory memory=inmemory"},
+		},
+		lines,
+	)
+}
+
+func TestRuntimeStartupLinesWithoutConfigFile(t *testing.T) {
+	t.Parallel()
+
+	lines := runtimeStartupLines(
+		runOptions{
+			AppName:        "openclaw",
+			ModelMode:      modeOpenAI,
+			OpenAIModel:    "gpt-5",
+			SessionBackend: sessionBackendSQLite,
+			MemoryBackend:  memoryBackendSQLite,
+		},
+		"/tmp/state",
+		nil,
+		false,
+	)
+	require.Equal(t,
+		[]startupLogLine{
+			{text: "App name: openclaw"},
+			{text: "Config: built-in defaults and CLI flags"},
+			{text: "State dir: /tmp/state"},
+			{text: "Channels: none"},
+			{text: "Model: disabled"},
+			{text: "Storage: session=sqlite memory=sqlite"},
+		},
+		lines,
+	)
+}
+
+func mustGetwd(t *testing.T) string {
+	t.Helper()
+
+	wd, err := os.Getwd()
+	require.NoError(t, err)
+	return wd
 }
 
 type toolProviderCfg struct {
@@ -2007,6 +2176,52 @@ func TestInProcGatewayClient_SendMessage_StatusError(t *testing.T) {
 	require.Equal(t, wantErr, err.Error())
 }
 
+func TestInProcGatewayClient_StreamMessage_OK(t *testing.T) {
+	t.Parallel()
+
+	srv, err := gateway.New(&inProcGWTestRunner{
+		reply:     "ok",
+		requestID: "req-1",
+	})
+	require.NoError(t, err)
+
+	c := newInProcGatewayClient(srv, appName, nil, nil, "")
+	stream, err := c.StreamMessage(context.Background(), gwclient.MessageRequest{
+		From: "u1",
+		Text: "hi",
+	})
+	require.NoError(t, err)
+
+	var events []gwclient.StreamEvent
+	for evt := range stream {
+		events = append(events, evt)
+	}
+	require.Len(t, events, 5)
+	require.Equal(t, gwproto.StreamEventTypeRunStarted, events[0].Type)
+	require.Equal(t, gwproto.StreamEventTypeRunProgress, events[1].Type)
+	require.Equal(t, gwproto.StreamEventTypeMessageDelta, events[2].Type)
+	require.Equal(t, gwproto.StreamEventTypeMessageCompleted, events[3].Type)
+	require.Equal(t, gwproto.StreamEventTypeRunCompleted, events[4].Type)
+}
+
+func TestInProcGatewayClient_StreamMessage_StatusError(t *testing.T) {
+	t.Parallel()
+
+	srv, err := gateway.New(&inProcGWTestRunner{})
+	require.NoError(t, err)
+
+	c := newInProcGatewayClient(srv, appName, nil, nil, "")
+	_, err = c.StreamMessage(context.Background(), gwclient.MessageRequest{
+		Text: "hi",
+	})
+	require.Error(t, err)
+	require.Equal(
+		t,
+		"gwclient: status 400: invalid_request: missing user_id or from",
+		err.Error(),
+	)
+}
+
 func TestInProcGatewayClient_NilServerFails(t *testing.T) {
 	t.Parallel()
 
@@ -2020,6 +2235,13 @@ func TestInProcGatewayClient_NilServerFails(t *testing.T) {
 	require.Equal(t, errNilGatewayServer, err.Error())
 
 	_, err = c.Cancel(context.Background(), "req-1")
+	require.Error(t, err)
+	require.Equal(t, errNilGatewayServer, err.Error())
+
+	_, err = c.StreamMessage(context.Background(), gwclient.MessageRequest{
+		From: "u1",
+		Text: "hi",
+	})
 	require.Error(t, err)
 	require.Equal(t, errNilGatewayServer, err.Error())
 }
