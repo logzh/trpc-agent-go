@@ -11,6 +11,7 @@
 package anthropic
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -29,7 +30,16 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
-const functionToolType = "function"
+const (
+	functionToolType       = "function"
+	claudeMythosPreview    = "claude-mythos-preview"
+	claudeOpus47           = "claude-opus-4-7"
+	claudeOpus46           = "claude-opus-4-6"
+	claudeOpus46Alias      = "claude-4.6-opus"
+	claudeSonnet46         = "claude-sonnet-4-6"
+	claudeSonnet46Alias    = "claude-4.6-sonnet"
+	defaultThinkingDisplay = anthropic.ThinkingConfigAdaptiveDisplaySummarized
+)
 
 // Model implements the model.Model interface for Anthropic API.
 type Model struct {
@@ -116,6 +126,54 @@ func (m *Model) Info() model.Info {
 	}
 }
 
+func (m *Model) runChatRequestCallback(
+	ctx context.Context,
+	chatRequest *anthropic.MessageNewParams,
+) {
+	if m.chatRequestCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat request callback")
+	m.chatRequestCallback(ctx, chatRequest)
+}
+
+func (m *Model) runChatResponseCallback(
+	ctx context.Context,
+	chatRequest *anthropic.MessageNewParams,
+	chatResponse *anthropic.Message,
+) {
+	if m.chatResponseCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat response callback")
+	m.chatResponseCallback(ctx, chatRequest, chatResponse)
+}
+
+func (m *Model) runChatChunkCallback(
+	ctx context.Context,
+	chatRequest *anthropic.MessageNewParams,
+	chatChunk *anthropic.MessageStreamEventUnion,
+) {
+	if m.chatChunkCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat chunk callback")
+	m.chatChunkCallback(ctx, chatRequest, chatChunk)
+}
+
+func (m *Model) runChatStreamCompleteCallback(
+	ctx context.Context,
+	chatRequest *anthropic.MessageNewParams,
+	chatResponse *anthropic.Message,
+	streamErr error,
+) {
+	if m.chatStreamCompleteCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat stream complete callback")
+	m.chatStreamCompleteCallback(ctx, chatRequest, chatResponse, streamErr)
+}
+
 // GenerateContent generates content from the model.
 func (m *Model) GenerateContent(
 	ctx context.Context,
@@ -132,13 +190,14 @@ func (m *Model) GenerateContent(
 	if err != nil {
 		return nil, fmt.Errorf("build chat request: %w", err)
 	}
+	// Execute callback synchronously before starting the goroutine
+	// to avoid a race where the runner and HTTP handler finish
+	// (closing the SSE writer) while the callback is still running.
+	m.runChatRequestCallback(ctx, chatRequest)
 	// Send chat request and handle response.
 	responseChan := make(chan *model.Response, m.channelBufferSize)
 	go func() {
 		defer close(responseChan)
-		if m.chatRequestCallback != nil {
-			m.chatRequestCallback(ctx, chatRequest)
-		}
 		if request.Stream {
 			m.handleStreamingResponse(ctx, *chatRequest, responseChan)
 			return
@@ -249,10 +308,75 @@ func (m *Model) buildChatRequest(request *model.Request) (*anthropic.MessageNewP
 	if len(request.Stop) > 0 {
 		chatRequest.StopSequences = append(chatRequest.StopSequences, request.Stop...)
 	}
-	if request.ThinkingEnabled != nil && *request.ThinkingEnabled && request.ThinkingTokens != nil {
-		chatRequest.Thinking = anthropic.ThinkingConfigParamOfEnabled(int64(*request.ThinkingTokens))
+	if err := m.applyThinkingConfig(chatRequest, request); err != nil {
+		return nil, err
 	}
 	return chatRequest, nil
+}
+
+func (m *Model) applyThinkingConfig(
+	chatRequest *anthropic.MessageNewParams,
+	request *model.Request,
+) error {
+	if request.ThinkingEnabled == nil {
+		return nil
+	}
+	if !*request.ThinkingEnabled {
+		if isClaudeMythosPreview(m.name) {
+			return fmt.Errorf("anthropic: thinking cannot be disabled for model %s", m.name)
+		}
+		if !supportsAdaptiveThinking(m.name) {
+			return nil
+		}
+		disabled := anthropic.NewThinkingConfigDisabledParam()
+		chatRequest.Thinking = anthropic.ThinkingConfigParamUnion{OfDisabled: &disabled}
+		return nil
+	}
+	if supportsAdaptiveThinking(m.name) {
+		chatRequest.Thinking = newAdaptiveThinkingConfig()
+		if request.ReasoningEffort != nil {
+			chatRequest.OutputConfig.Effort = anthropic.OutputConfigEffort(*request.ReasoningEffort)
+		}
+		return nil
+	}
+	if request.ThinkingTokens == nil {
+		return nil
+	}
+	chatRequest.Thinking = anthropic.ThinkingConfigParamOfEnabled(int64(*request.ThinkingTokens))
+	return nil
+}
+
+func newAdaptiveThinkingConfig() anthropic.ThinkingConfigParamUnion {
+	return anthropic.ThinkingConfigParamUnion{
+		OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{
+			Display: defaultThinkingDisplay,
+		},
+	}
+}
+
+func supportsAdaptiveThinking(modelName string) bool {
+	return modelNameMatches(
+		modelName,
+		claudeMythosPreview,
+		claudeOpus47,
+		claudeOpus46,
+		claudeOpus46Alias,
+		claudeSonnet46,
+		claudeSonnet46Alias,
+	)
+}
+
+func isClaudeMythosPreview(modelName string) bool {
+	return modelNameMatches(modelName, claudeMythosPreview)
+}
+
+func modelNameMatches(modelName string, targets ...string) bool {
+	for _, target := range targets {
+		if modelName == target || strings.HasPrefix(modelName, target+"-") {
+			return true
+		}
+	}
+	return false
 }
 
 // applyCacheControl applies independent cache control breakpoints.
@@ -392,9 +516,7 @@ func (m *Model) handleNonStreamingResponse(
 		m.sendErrorResponse(ctx, responseChan, model.ErrorTypeAPIError, err)
 		return
 	}
-	if m.chatResponseCallback != nil {
-		m.chatResponseCallback(ctx, &chatRequest, message)
-	}
+	m.runChatResponseCallback(ctx, &chatRequest, message)
 	// Build final response payload.
 	now := time.Now()
 	response := &model.Response{
@@ -448,22 +570,26 @@ func (m *Model) handleStreamingResponse(
 	stream := m.client.Messages.NewStreaming(ctx, chatRequest, m.anthropicRequestOptions...)
 	defer stream.Close()
 	// Accumulator to build final response.
-	acc := anthropic.Message{}
+	acc := newStreamingMessageAccumulator()
+	var (
+		finalResponse *model.Response
+		streamErr     error
+	)
+
+loop:
 	for stream.Next() {
 		chunk := stream.Current()
 		// Accumulate into accumulator.
 		if err := acc.Accumulate(chunk); err != nil {
-			m.sendErrorResponse(ctx, responseChan, model.ErrorTypeStreamError, err)
-			return
+			streamErr = err
+			break
 		}
-		if m.chatChunkCallback != nil {
-			m.chatChunkCallback(ctx, &chatRequest, &chunk)
-		}
+		m.runChatChunkCallback(ctx, &chatRequest, &chunk)
 		// Build partial response.
-		response, err := buildStreamingPartialResponse(acc, chunk)
+		response, err := buildStreamingPartialResponse(acc.Message(), chunk)
 		if err != nil {
-			m.sendErrorResponse(ctx, responseChan, model.ErrorTypeStreamError, err)
-			return
+			streamErr = err
+			break
 		}
 		if response == nil {
 			continue
@@ -472,28 +598,174 @@ func (m *Model) handleStreamingResponse(
 		select {
 		case responseChan <- response:
 		case <-ctx.Done():
-			return
+			streamErr = ctx.Err()
+			break loop
 		}
 	}
+	if streamErr == nil {
+		streamErr = stream.Err()
+	}
+	if streamErr == nil {
+		if err := acc.Finalize(); err != nil {
+			streamErr = err
+		} else {
+			finalResponse = buildStreamingFinalResponse(acc.Message())
+		}
+	}
+	var callbackAcc *anthropic.Message
+	if streamErr == nil {
+		finalAcc := acc.Message()
+		callbackAcc = &finalAcc
+	}
+	m.runChatStreamCompleteCallback(ctx, &chatRequest, callbackAcc, streamErr)
 	// Propagate stream error.
-	if err := stream.Err(); err != nil {
-		m.sendErrorResponse(ctx, responseChan, model.ErrorTypeStreamError, err)
+	if streamErr != nil {
+		m.sendErrorResponse(ctx, responseChan, model.ErrorTypeStreamError, streamErr)
 		return
 	}
-	// Emit final response built from the accumulator.
-	finalResponse := buildStreamingFinalResponse(acc)
 	select {
 	case responseChan <- finalResponse:
 	case <-ctx.Done():
 	}
-	// Call the stream complete callback after final response is sent.
-	if m.chatStreamCompleteCallback != nil {
-		var callbackAcc *anthropic.Message
-		if stream.Err() == nil {
-			callbackAcc = &acc
-		}
-		m.chatStreamCompleteCallback(ctx, &chatRequest, callbackAcc, stream.Err())
+}
+
+type streamingMessageAccumulator struct {
+	message             anthropic.Message
+	inputDeltaStartedAt []bool
+	finalized           bool
+}
+
+func newStreamingMessageAccumulator() *streamingMessageAccumulator {
+	return &streamingMessageAccumulator{}
+}
+
+func (a *streamingMessageAccumulator) Message() anthropic.Message {
+	if a == nil {
+		return anthropic.Message{}
 	}
+	return a.message
+}
+
+func (a *streamingMessageAccumulator) Accumulate(event anthropic.MessageStreamEventUnion) error {
+	if a == nil {
+		return errors.New("accumulate: cannot accumulate into nil accumulator")
+	}
+	switch event := event.AsAny().(type) {
+	case anthropic.MessageStartEvent:
+		a.message = event.Message
+		a.inputDeltaStartedAt = make([]bool, len(a.message.Content))
+		a.finalized = false
+	case anthropic.MessageDeltaEvent:
+		a.message.StopReason = event.Delta.StopReason
+		a.message.StopSequence = event.Delta.StopSequence
+		a.message.Usage.OutputTokens = event.Usage.OutputTokens
+	case anthropic.MessageStopEvent:
+		return a.finalize()
+	case anthropic.ContentBlockStartEvent:
+		var block anthropic.ContentBlockUnion
+		if err := block.UnmarshalJSON([]byte(event.ContentBlock.RawJSON())); err != nil {
+			return err
+		}
+		a.message.Content = append(a.message.Content, block)
+		a.inputDeltaStartedAt = append(a.inputDeltaStartedAt, false)
+	case anthropic.ContentBlockDeltaEvent:
+		block, started, err := a.lastContentBlock()
+		if err != nil {
+			return fmt.Errorf("received event of type %s but %w", event.Type, err)
+		}
+		switch delta := event.Delta.AsAny().(type) {
+		case anthropic.TextDelta:
+			block.Text += delta.Text
+		case anthropic.InputJSONDelta:
+			appendInputJSONDelta(block, started, delta.PartialJSON)
+		case anthropic.ThinkingDelta:
+			block.Thinking += delta.Thinking
+		case anthropic.SignatureDelta:
+			block.Signature += delta.Signature
+		case anthropic.CitationsDelta:
+			citation := anthropic.TextCitationUnion{}
+			if err := citation.UnmarshalJSON([]byte(delta.Citation.RawJSON())); err != nil {
+				return fmt.Errorf("could not unmarshal citation delta into citation type: %w", err)
+			}
+			block.Citations = append(block.Citations, citation)
+		}
+	case anthropic.ContentBlockStopEvent:
+		block, _, err := a.lastContentBlock()
+		if err != nil {
+			return fmt.Errorf("received event of type %s but %w", event.Type, err)
+		}
+		if err := refreshContentBlockRawJSON(block); err != nil {
+			return fmt.Errorf("error converting content block to JSON: %w", err)
+		}
+	}
+	return nil
+}
+
+func (a *streamingMessageAccumulator) Finalize() error {
+	if a == nil {
+		return nil
+	}
+	return a.finalize()
+}
+
+func (a *streamingMessageAccumulator) lastContentBlock() (*anthropic.ContentBlockUnion, *bool, error) {
+	if len(a.message.Content) == 0 {
+		return nil, nil, errors.New("no content block")
+	}
+	last := len(a.message.Content) - 1
+	return &a.message.Content[last], &a.inputDeltaStartedAt[last], nil
+}
+
+func (a *streamingMessageAccumulator) finalize() error {
+	if a == nil || a.finalized {
+		return nil
+	}
+	if err := finalizeStreamingMessage(&a.message); err != nil {
+		return err
+	}
+	a.finalized = true
+	return nil
+}
+
+func appendInputJSONDelta(block *anthropic.ContentBlockUnion, started *bool, partial string) {
+	if block == nil || started == nil || partial == "" {
+		return
+	}
+	if !*started {
+		// Treat the first streamed input delta as authoritative to avoid
+		// concatenating a complete start-event value with a second JSON value.
+		block.Input = bytes.Clone([]byte(partial))
+		*started = true
+		return
+	}
+	block.Input = append(block.Input, partial...)
+}
+
+func finalizeStreamingMessage(message *anthropic.Message) error {
+	if message == nil {
+		return nil
+	}
+	for i := range message.Content {
+		if err := refreshContentBlockRawJSON(&message.Content[i]); err != nil {
+			return err
+		}
+	}
+	raw, err := json.Marshal(message)
+	if err != nil {
+		return err
+	}
+	return message.UnmarshalJSON(raw)
+}
+
+func refreshContentBlockRawJSON(block *anthropic.ContentBlockUnion) error {
+	if block == nil {
+		return nil
+	}
+	raw, err := json.Marshal(block)
+	if err != nil {
+		return err
+	}
+	return block.UnmarshalJSON(raw)
 }
 
 // buildStreamingPartialResponse builds a partial streaming response for a chunk.

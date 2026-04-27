@@ -11,7 +11,10 @@
 package app
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"io"
@@ -19,6 +22,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -28,7 +33,9 @@ import (
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/claudecode"
+	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/internal/skillprofile"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
 	meminmemory "trpc.group/trpc-go/trpc-agent-go/memory/inmemory"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -39,21 +46,131 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/skill"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 
+	"trpc.group/trpc-go/trpc-agent-go/openclaw/admin"
 	occhannel "trpc.group/trpc-go/trpc-agent-go/openclaw/channel"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/gwclient"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/gwproto"
+	"trpc.group/trpc-go/trpc-agent-go/openclaw/internal/conversationscope"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/internal/cron"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/internal/debugrecorder"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/internal/gateway"
+	"trpc.group/trpc-go/trpc-agent-go/openclaw/internal/memoryfile"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/internal/outbound"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/internal/persona"
 	tgapi "trpc.group/trpc-go/trpc-agent-go/openclaw/internal/telegram"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/internal/uploads"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/registry"
+	langfuseobs "trpc.group/trpc-go/trpc-agent-go/telemetry/langfuse"
 )
 
 type captureRequestModel struct {
 	got *model.Request
+}
+
+type stubRuntimeAgent struct{}
+
+type stubAdminPromptsProvider struct{}
+
+type stubAdminRuntimeLifecycleProvider struct {
+	status admin.RuntimeLifecycleStatus
+}
+
+func (stubRuntimeAgent) Run(
+	context.Context,
+	*agent.Invocation,
+) (<-chan *event.Event, error) {
+	ch := make(chan *event.Event)
+	close(ch)
+	return ch, nil
+}
+
+func (stubRuntimeAgent) Tools() []tool.Tool {
+	return nil
+}
+
+func (stubAdminPromptsProvider) PromptsStatus() (
+	admin.PromptsStatus,
+	error,
+) {
+	return admin.PromptsStatus{}, nil
+}
+
+func (stubAdminPromptsProvider) SavePromptInline(
+	string,
+	string,
+) error {
+	return nil
+}
+
+func (stubAdminPromptsProvider) SavePromptRuntime(
+	string,
+	string,
+) error {
+	return nil
+}
+
+func (stubAdminPromptsProvider) SavePromptFile(
+	string,
+	string,
+	string,
+) error {
+	return nil
+}
+
+func (stubAdminPromptsProvider) CreatePromptFile(
+	string,
+	string,
+	string,
+) error {
+	return nil
+}
+
+func (stubAdminPromptsProvider) DeletePromptFile(
+	string,
+	string,
+) error {
+	return nil
+}
+
+func (p stubAdminRuntimeLifecycleProvider) RuntimeLifecycleStatus() (
+	admin.RuntimeLifecycleStatus,
+	error,
+) {
+	return p.status, nil
+}
+
+func (stubAdminRuntimeLifecycleProvider) RuntimeLifecycleVersions() (
+	admin.RuntimeLifecycleVersionIndex,
+	error,
+) {
+	return admin.RuntimeLifecycleVersionIndex{}, nil
+}
+
+func (stubAdminRuntimeLifecycleProvider) RuntimeLifecycleChangelog(
+	string,
+) (admin.RuntimeLifecycleChangelog, error) {
+	return admin.RuntimeLifecycleChangelog{}, nil
+}
+
+func (p stubAdminRuntimeLifecycleProvider) RequestRuntimeLifecycleAction(
+	admin.RuntimeLifecycleActionRequest,
+) (admin.RuntimeLifecycleActionResult, error) {
+	return admin.RuntimeLifecycleActionResult{
+		Status:  p.status,
+		Started: true,
+	}, nil
+}
+
+func (stubRuntimeAgent) Info() agent.Info {
+	return agent.Info{Name: "stub"}
+}
+
+func (stubRuntimeAgent) SubAgents() []agent.Agent {
+	return nil
+}
+
+func (stubRuntimeAgent) FindSubAgent(string) agent.Agent {
+	return nil
 }
 
 func (m *captureRequestModel) GenerateContent(
@@ -138,6 +255,250 @@ func joinSystemMessages(req *model.Request) string {
 	return strings.Join(parts, "\n\n")
 }
 
+func joinAllMessageContent(req *model.Request) string {
+	if req == nil {
+		return ""
+	}
+	parts := make([]string, 0, len(req.Messages))
+	for _, msg := range req.Messages {
+		if msg.Role == model.RoleUser {
+			continue
+		}
+		parts = append(parts, msg.Content)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func TestRuntimePromptControllerUpdatesAgentPrompts(
+	t *testing.T,
+) {
+	mdl := &captureRequestModel{}
+	agt := llmagent.New(
+		"test",
+		llmagent.WithModel(mdl),
+		llmagent.WithInstruction("old instruction"),
+		llmagent.WithGlobalInstruction("old system"),
+	)
+	ctrl := newRuntimePromptController(
+		agt,
+		"old instruction",
+		"old system",
+	)
+	require.NotNil(t, ctrl)
+
+	ctrl.SetPrompts("new instruction", "new system")
+	snapshot := ctrl.Snapshot()
+	require.Equal(t, "new instruction", snapshot.Instruction)
+	require.Equal(t, "new system", snapshot.SystemPrompt)
+
+	req := runAgentAndCapture(
+		t,
+		agt,
+		mdl,
+		session.NewSession("app", "user", "sess"),
+	)
+	system := joinSystemMessages(req)
+	require.Contains(t, system, "new instruction")
+	require.Contains(t, system, "new system")
+	require.NotContains(t, system, "old instruction")
+	require.NotContains(t, system, "old system")
+}
+
+func TestRuntimePromptControllerCompatibilityGuards(t *testing.T) {
+	t.Parallel()
+
+	require.Nil(
+		t,
+		newRuntimePromptController(nil, "instruction", "system"),
+	)
+	require.Nil(
+		t,
+		newRuntimePromptController(
+			stubRuntimeAgent{},
+			"instruction",
+			"system",
+		),
+	)
+
+	var nilCtrl *RuntimePromptController
+	nilCtrl.SetInstruction("instruction")
+	nilCtrl.SetSystemPrompt("system")
+	nilCtrl.SetPrompts("instruction", "system")
+	require.Equal(t, PromptSnapshot{}, nilCtrl.Snapshot())
+
+	ctrl := &RuntimePromptController{agent: stubRuntimeAgent{}}
+	ctrl.SetInstruction("instruction")
+	ctrl.SetSystemPrompt("system")
+	ctrl.SetPrompts("instruction", "system")
+	require.Equal(t, PromptSnapshot{}, ctrl.Snapshot())
+}
+
+func TestRuntimePromptControllerIndividualSetters(t *testing.T) {
+	t.Parallel()
+
+	mdl := &captureRequestModel{}
+	agt := llmagent.New(
+		"test",
+		llmagent.WithModel(mdl),
+		llmagent.WithInstruction("old instruction"),
+		llmagent.WithGlobalInstruction("old system"),
+	)
+	ctrl := newRuntimePromptController(
+		agt,
+		"old instruction",
+		"old system",
+	)
+	require.NotNil(t, ctrl)
+
+	ctrl.SetInstruction("new instruction")
+	ctrl.SetSystemPrompt("new system")
+
+	req := runAgentAndCapture(
+		t,
+		agt,
+		mdl,
+		session.NewSession("app", "user", "sess"),
+	)
+	system := joinSystemMessages(req)
+	require.Contains(t, system, "new instruction")
+	require.Contains(t, system, "new system")
+}
+
+func TestRuntimePromptControllerMethod(t *testing.T) {
+	t.Parallel()
+
+	ctrl := &RuntimePromptController{}
+	sessSvc := sessioninmemory.NewSessionService()
+	rt := &Runtime{
+		prompts: ctrl,
+		appName: "openclaw",
+		session: sessSvc,
+	}
+	require.Same(t, ctrl, rt.PromptController())
+	require.Equal(t, "openclaw", rt.AppName())
+	require.Same(t, sessSvc, rt.SessionService())
+
+	var nilRuntime *Runtime
+	require.Nil(t, nilRuntime.PromptController())
+	require.Empty(t, nilRuntime.AppName())
+	require.Nil(t, nilRuntime.SessionService())
+}
+
+func TestRuntimeConfigureAdmin(t *testing.T) {
+	t.Parallel()
+
+	rt := &Runtime{
+		adminCfg: &admin.Config{
+			AdminAddr: "127.0.0.1:8081",
+			AdminURL:  "http://127.0.0.1:8081",
+		},
+	}
+
+	rt.ConfigureAdmin(func(cfg *admin.Config) {
+		cfg.Prompts = stubAdminPromptsProvider{}
+	})
+
+	require.NotNil(t, rt.adminCfg)
+	require.NotNil(t, rt.Admin.Handler)
+	require.Equal(t, "127.0.0.1:8081", rt.Admin.Addr)
+	require.Equal(t, "http://127.0.0.1:8081", rt.Admin.URL)
+	require.NotNil(t, rt.adminCfg.Prompts)
+}
+
+func TestRuntimeConfigureAdminPreservesRuntimeConfigProvider(t *testing.T) {
+	t.Parallel()
+
+	cfgPath := writeAdminRuntimeConfigTestFile(t, "")
+	opts := adminRuntimeConfigTestOptions(cfgPath)
+	rt := &Runtime{
+		adminCfg: &admin.Config{
+			AdminAddr: "127.0.0.1:8081",
+			AdminURL:  "http://127.0.0.1:8081",
+		},
+	}
+	setRuntimeAdminOptions(rt, buildAdminOptions(opts))
+	t.Cleanup(func() {
+		clearRuntimeAdminOptions(rt)
+	})
+
+	rt.ConfigureAdmin(func(cfg *admin.Config) {
+		cfg.Prompts = stubAdminPromptsProvider{}
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	rr := httptest.NewRecorder()
+	rt.Admin.Handler.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Contains(t, rr.Body.String(), cfgPath)
+}
+
+func TestRuntimeAddAdminOptionsPreservesExistingProviders(t *testing.T) {
+	t.Parallel()
+
+	cfgPath := writeAdminRuntimeConfigTestFile(t, "")
+	opts := adminRuntimeConfigTestOptions(cfgPath)
+	rt := &Runtime{
+		adminCfg: &admin.Config{
+			AdminAddr: "127.0.0.1:8081",
+			AdminURL:  "http://127.0.0.1:8081",
+		},
+	}
+	setRuntimeAdminOptions(rt, buildAdminOptions(opts))
+	t.Cleanup(func() {
+		clearRuntimeAdminOptions(rt)
+	})
+
+	rt.AddAdminOptions(admin.WithRuntimeLifecycleProvider(
+		stubAdminRuntimeLifecycleProvider{
+			status: admin.RuntimeLifecycleStatus{
+				CurrentVersion: "v0.0.70",
+			},
+		},
+	))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	rr := httptest.NewRecorder()
+	rt.Admin.Handler.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Contains(t, rr.Body.String(), cfgPath)
+
+	req = httptest.NewRequest(http.MethodGet, "/runtime-control", nil)
+	rr = httptest.NewRecorder()
+	rt.Admin.Handler.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Contains(t, rr.Body.String(), "Runtime Control")
+	require.Contains(t, rr.Body.String(), "v0.0.70")
+}
+
+func TestRuntimeConfigureAdminNoAdminConfig(t *testing.T) {
+	t.Parallel()
+
+	rt := &Runtime{}
+	rt.ConfigureAdmin(func(cfg *admin.Config) {
+		cfg.AppName = "ignored"
+	})
+	rt.AddAdminOptions(nil)
+	require.Nil(t, rt.adminCfg)
+	require.Empty(t, rt.Admin)
+
+	var nilRuntime *Runtime
+	nilRuntime.applyAdminConfig(admin.Config{})
+}
+
+func findToolDeclaration(
+	tools []tool.Tool,
+	name string,
+) *tool.Declaration {
+	for _, item := range tools {
+		decl := item.Declaration()
+		if decl == nil || decl.Name != name {
+			continue
+		}
+		return decl
+	}
+	return nil
+}
+
 func TestRun_ParseErrorExitCode(t *testing.T) {
 	t.Parallel()
 
@@ -168,6 +529,221 @@ func TestNewRuntime_BuildsGatewayHandler(t *testing.T) {
 	require.NotEmpty(t, rt.Gateway.StatusPath)
 	require.NotEmpty(t, rt.Gateway.CancelPath)
 	require.Empty(t, rt.Channels)
+}
+
+func TestNewRuntime_MemoryBackendFile_DisablesStructuredMemory(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	rt, err := NewRuntime(context.Background(), []string{
+		"-mode", modeMock,
+		"-state-dir", t.TempDir(),
+		"-skills-root", t.TempDir(),
+		"-memory-backend", memoryBackendFile,
+		"-memory-auto",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = rt.Close()
+	})
+	require.Nil(t, rt.memorySvc)
+	require.Nil(t, memoryServiceTools(nil))
+}
+
+func TestFileMemoryStoreForBackend_FileOnly(t *testing.T) {
+	t.Parallel()
+
+	root, err := memoryfile.DefaultRoot(t.TempDir())
+	require.NoError(t, err)
+	store, err := memoryfile.NewStore(root)
+	require.NoError(t, err)
+
+	require.Same(
+		t,
+		store,
+		fileMemoryStoreForBackend(memoryBackendFile, store),
+	)
+	require.Nil(
+		t,
+		fileMemoryStoreForBackend(memoryBackendInMemory, store),
+	)
+	require.Nil(
+		t,
+		fileMemoryStoreForBackend(memoryBackendSQLite, store),
+	)
+}
+
+func TestBuildOpenClawTools_HidesMemoryFileEnvWithoutFileBackend(t *testing.T) {
+	t.Parallel()
+
+	bundle := buildOpenClawTools(true, t.TempDir(), nil, nil)
+	decl := findToolDeclaration(bundle.tools, "exec_command")
+	require.NotNil(t, decl)
+	require.NotContains(t, decl.Description, "OPENCLAW_MEMORY_FILE")
+}
+
+func TestBuildOpenClawTools_ExposesMemoryFileEnvForFileBackend(t *testing.T) {
+	t.Parallel()
+
+	root, err := memoryfile.DefaultRoot(t.TempDir())
+	require.NoError(t, err)
+	store, err := memoryfile.NewStore(root)
+	require.NoError(t, err)
+
+	bundle := buildOpenClawTools(true, t.TempDir(), nil, store)
+	decl := findToolDeclaration(bundle.tools, "exec_command")
+	require.NotNil(t, decl)
+	require.Contains(t, decl.Description, "OPENCLAW_MEMORY_FILE")
+}
+
+func TestBuildOpenClawTools_IncludesConversationHistoryTool(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	bundle := buildOpenClawTools(true, t.TempDir(), nil, nil)
+	decl := findToolDeclaration(bundle.tools, "conversation_history")
+	require.NotNil(t, decl)
+	require.Contains(
+		t,
+		decl.Description,
+		"current conversation session",
+	)
+}
+
+func TestBuildOpenClawTools_IncludesSubagentTools(t *testing.T) {
+	t.Parallel()
+
+	bundle := buildOpenClawTools(true, t.TempDir(), nil, nil)
+	require.NotNil(
+		t,
+		findToolDeclaration(bundle.tools, "subagents_spawn"),
+	)
+	require.NotNil(
+		t,
+		findToolDeclaration(bundle.tools, "subagents_list"),
+	)
+	require.NotNil(
+		t,
+		findToolDeclaration(bundle.tools, "subagents_get"),
+	)
+	require.NotNil(
+		t,
+		findToolDeclaration(bundle.tools, "subagents_cancel"),
+	)
+	require.NotNil(
+		t,
+		findToolDeclaration(bundle.tools, "sessions_spawn"),
+	)
+	require.NotNil(
+		t,
+		findToolDeclaration(bundle.tools, "sessions_list"),
+	)
+	require.NotNil(
+		t,
+		findToolDeclaration(bundle.tools, "sessions_get"),
+	)
+	require.NotNil(
+		t,
+		findToolDeclaration(bundle.tools, "sessions_cancel"),
+	)
+}
+
+func TestNewRuntime_ExposesSubagentService(t *testing.T) {
+	t.Parallel()
+
+	rt, err := NewRuntime(context.Background(), []string{
+		"-mode", modeMock,
+		"-state-dir", t.TempDir(),
+		"-skills-root", t.TempDir(),
+		"-enable-openclaw-tools",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = rt.Close()
+	})
+
+	require.NotNil(t, rt.SubagentService())
+}
+
+func TestRuntimeSubagentServiceNilReceiver(t *testing.T) {
+	t.Parallel()
+
+	var rt *Runtime
+	require.Nil(t, rt.SubagentService())
+}
+
+func TestNewRuntimeStores_CreatesAllStores(t *testing.T) {
+	t.Parallel()
+
+	stores, err := newRuntimeStores(t.TempDir())
+	require.NoError(t, err)
+	require.NotNil(t, stores.uploads)
+	require.NotNil(t, stores.personas)
+	require.NotNil(t, stores.memoryFiles)
+}
+
+func TestNewRuntimeStores_EmptyStateDirReturnsError(t *testing.T) {
+	t.Parallel()
+
+	_, err := newRuntimeStores(" ")
+	require.Error(t, err)
+}
+
+func TestNewRuntime_RuntimeStoresErrorExitCode(t *testing.T) {
+	t.Parallel()
+
+	stateFile := filepath.Join(t.TempDir(), "state-file")
+	require.NoError(t, os.WriteFile(stateFile, []byte("x"), 0o600))
+
+	_, err := NewRuntime(context.Background(), []string{
+		"-mode", modeMock,
+		"-state-dir", stateFile,
+		"-skills-root", t.TempDir(),
+	})
+	require.Error(t, err)
+
+	var exitErr *exitError
+	require.True(t, errors.As(err, &exitErr))
+	require.Equal(t, 1, exitErr.Code)
+	require.ErrorContains(t, exitErr.Err, "create runtime stores failed")
+}
+
+func TestRun_HTTPListenErrorPath_WithFileMemoryBackend(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	t.Cleanup(cancel)
+
+	err := run(ctx, []string{
+		"-http-addr", "127.0.0.1:-1",
+		"-mode", modeMock,
+		"-state-dir", t.TempDir(),
+		"-skills-root", t.TempDir(),
+		"-memory-backend", memoryBackendFile,
+		"-enable-openclaw-tools",
+	})
+	require.NoError(t, err)
+}
+
+func TestRun_RuntimeStoresErrorExitCode(t *testing.T) {
+	t.Parallel()
+
+	stateFile := filepath.Join(t.TempDir(), "state-file")
+	require.NoError(t, os.WriteFile(stateFile, []byte("x"), 0o600))
+
+	err := run(context.Background(), []string{
+		"-mode", modeMock,
+		"-state-dir", stateFile,
+		"-skills-root", t.TempDir(),
+	})
+	require.Error(t, err)
+
+	var exitErr *exitError
+	require.True(t, errors.As(err, &exitErr))
+	require.Equal(t, 1, exitErr.Code)
+	require.ErrorContains(t, exitErr.Err, "create runtime stores failed")
 }
 
 func TestNewRuntime_A2AConfigErrorExitCode(t *testing.T) {
@@ -866,7 +1442,7 @@ func TestRun_PromptDirWithoutMarkdownExitCode(t *testing.T) {
 func TestNewAgent_EmptyInstructionUsesDefault(t *testing.T) {
 	t.Parallel()
 
-	agt, err := newAgent(&echoModel{name: "mock"}, agentConfig{
+	agt, _, err := newAgent(&echoModel{name: "mock"}, agentConfig{
 		AppName:      "demo",
 		SkillsRoot:   t.TempDir(),
 		StateDir:     t.TempDir(),
@@ -883,7 +1459,7 @@ func TestNewAgent_SkillsToolingGuidance_ConfigApplied(t *testing.T) {
 	root := createAppTestSkill(t)
 	mdl := &captureRequestModel{}
 	guide := ""
-	agt, err := newAgent(mdl, agentConfig{
+	agt, _, err := newAgent(mdl, agentConfig{
 		AppName:            "demo",
 		SkillsRoot:         root,
 		StateDir:           t.TempDir(),
@@ -902,8 +1478,345 @@ func TestNewAgent_SkillsToolingGuidance_ConfigApplied(t *testing.T) {
 	require.NotContains(
 		t,
 		sys,
-		"Tooling and workspace guidance:",
+		"Each entry includes a path to that skill's SKILL.md on disk.",
 	)
+	// With the bare WithSkills(repo) default profile now being
+	// knowledge_only (skill_load + doc helpers, no skill_run / skill_exec),
+	// suppressing the skill protocol guidance via an explicit empty
+	// SkillsToolingGuide no longer also hides the built-in capability
+	// disclosure block. The overview thus carries the
+	// "Skill tool availability:" header describing the knowledge-only
+	// surface.
+	require.Contains(t, sys, "Skill tool availability:")
+	require.Contains(
+		t,
+		sys,
+		"This configuration supports skill discovery and "+
+			"knowledge loading only.",
+	)
+}
+
+func TestNewAgent_SkillsPrompt_DefaultsApplied(t *testing.T) {
+	t.Parallel()
+
+	root := createAppTestSkill(t)
+	mdl := &captureRequestModel{}
+	agt, _, err := newAgent(mdl, agentConfig{
+		AppName:    "demo",
+		SkillsRoot: root,
+		StateDir:   t.TempDir(),
+	}, nil, nil)
+	require.NoError(t, err)
+
+	req := runAgentAndCapture(
+		t,
+		agt,
+		mdl,
+		&session.Session{},
+	)
+	sys := joinSystemMessages(req)
+	require.Contains(t, sys, "Available skills:")
+	require.Contains(
+		t,
+		sys,
+		"Each entry includes a path to that skill's SKILL.md on disk.",
+	)
+	require.Contains(
+		t,
+		sys,
+		"you must use that skill in the same turn.",
+	)
+	require.Contains(
+		t,
+		sys,
+		"This is a blocking requirement for matching skills.",
+	)
+	require.Contains(
+		t,
+		sys,
+		"Start with one brief user-visible preamble "+
+			"about the immediate next step, then call "+
+			"`skill_load` for that skill right away",
+	)
+	require.Contains(
+		t,
+		sys,
+		"not a pause to ask what to do next",
+	)
+	require.Contains(
+		t,
+		sys,
+		"Never say that you could read or load a matching skill later",
+	)
+	require.Contains(
+		t,
+		sys,
+		"Never mention reading, loading, or using a matching "+
+			"skill unless you already called `skill_load` for "+
+			"it in this turn.",
+	)
+	require.Contains(
+		t,
+		sys,
+		"Do not answer a matching skill task from the short "+
+			"summary, prior knowledge, or partial memory.",
+	)
+	require.Contains(
+		t,
+		sys,
+		"Keep exploring nearby runtime facts, retries, "+
+			"and recovery paths",
+	)
+	require.Contains(
+		t,
+		sys,
+		"echoer/"+skill.SkillFile,
+	)
+	require.NotContains(t, sys, "Skill tool availability:")
+	require.NotContains(t, sys, "Built-in skill execution tools are unavailable")
+	require.NotContains(t, sys, "Only describe a blocker")
+}
+
+func TestNewAgent_LocalExecKeepsExecCommandButOmitsWorkspaceExec(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	root := createAppTestSkill(t)
+	agt, _, err := newAgent(&captureRequestModel{}, agentConfig{
+		AppName:         "demo",
+		SkillsRoot:      root,
+		StateDir:        t.TempDir(),
+		EnableLocalExec: true,
+	}, nil, nil)
+	require.NoError(t, err)
+
+	names := make(map[string]bool)
+	for _, tl := range agt.Tools() {
+		if decl := tl.Declaration(); decl != nil {
+			names[decl.Name] = true
+		}
+	}
+
+	require.False(t, names["workspace_exec"])
+	require.False(t, names["workspace_write_stdin"])
+	require.False(t, names["workspace_kill_session"])
+}
+
+func TestNewAgent_BrowserToolingGuidance_Applied(t *testing.T) {
+	t.Parallel()
+
+	root := createAppTestSkill(t)
+	mdl := &captureRequestModel{}
+	agt, _, err := newAgent(mdl, agentConfig{
+		AppName:    "demo",
+		SkillsRoot: root,
+		StateDir:   t.TempDir(),
+	}, []tool.Tool{
+		stubTool{name: "browser"},
+	}, nil)
+	require.NoError(t, err)
+
+	req := runAgentAndCapture(
+		t,
+		agt,
+		mdl,
+		&session.Session{},
+	)
+	sys := joinSystemMessages(req)
+	require.Contains(
+		t,
+		sys,
+		"For real browser automation, use browser.",
+	)
+}
+
+func TestNewAgent_BrowserToolingGuidance_FromToolProvider(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	typeName := strings.ReplaceAll(
+		t.Name(),
+		"/",
+		"_",
+	)
+	require.NoError(t, registry.RegisterToolProvider(
+		typeName,
+		func(
+			_ registry.ToolProviderDeps,
+			spec registry.PluginSpec,
+		) ([]tool.Tool, error) {
+			return []tool.Tool{stubTool{name: "browser"}}, nil
+		},
+	))
+
+	var node yaml.Node
+	require.NoError(t, yaml.Unmarshal([]byte("{}"), &node))
+
+	root := createAppTestSkill(t)
+	mdl := &captureRequestModel{}
+	agt, _, err := newAgent(mdl, agentConfig{
+		AppName:    "demo",
+		SkillsRoot: root,
+		StateDir:   t.TempDir(),
+		ToolProviders: []pluginSpec{{
+			Type:   typeName,
+			Config: &node,
+		}},
+	}, nil, nil)
+	require.NoError(t, err)
+
+	req := runAgentAndCapture(
+		t,
+		agt,
+		mdl,
+		&session.Session{},
+	)
+	sys := joinSystemMessages(req)
+	require.Contains(
+		t,
+		sys,
+		"For real browser automation, use browser.",
+	)
+}
+
+func TestNewAgent_OpenClawToolingGuidance_OverrideApplied(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	root := createAppTestSkill(t)
+	mdl := &captureRequestModel{}
+	guide := "Use internal runtime guidance only."
+	agt, _, err := newAgent(mdl, agentConfig{
+		AppName:              "demo",
+		SkillsRoot:           root,
+		StateDir:             t.TempDir(),
+		EnableOpenClawTools:  true,
+		OpenClawToolingGuide: &guide,
+	}, nil, nil)
+	require.NoError(t, err)
+
+	req := runAgentAndCapture(
+		t,
+		agt,
+		mdl,
+		&session.Session{},
+	)
+	content := joinAllMessageContent(req)
+	require.Contains(t, content, guide)
+	require.NotContains(
+		t,
+		content,
+		strings.TrimSpace(openClawToolingGuidance),
+	)
+}
+
+func TestNewAgent_OpenClawToolingGuidance_EmptyDisables(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	root := createAppTestSkill(t)
+	mdl := &captureRequestModel{}
+	guide := ""
+	agt, _, err := newAgent(mdl, agentConfig{
+		AppName:              "demo",
+		SkillsRoot:           root,
+		StateDir:             t.TempDir(),
+		EnableOpenClawTools:  true,
+		OpenClawToolingGuide: &guide,
+	}, nil, nil)
+	require.NoError(t, err)
+
+	req := runAgentAndCapture(
+		t,
+		agt,
+		mdl,
+		&session.Session{},
+	)
+	content := joinAllMessageContent(req)
+	require.NotContains(
+		t,
+		content,
+		strings.TrimSpace(openClawToolingGuidance),
+	)
+}
+
+func TestNewAgent_DefaultGenerationConfigStreams(t *testing.T) {
+	t.Parallel()
+
+	root := createAppTestSkill(t)
+	mdl := &captureRequestModel{}
+	agt, _, err := newAgent(mdl, agentConfig{
+		AppName:    "demo",
+		SkillsRoot: root,
+		StateDir:   t.TempDir(),
+	}, nil, nil)
+	require.NoError(t, err)
+
+	req := runAgentAndCapture(
+		t,
+		agt,
+		mdl,
+		&session.Session{},
+	)
+	require.True(t, req.GenerationConfig.Stream)
+}
+
+func TestNewAgent_GenerationConfigOverrideApplied(t *testing.T) {
+	t.Parallel()
+
+	root := createAppTestSkill(t)
+	mdl := &captureRequestModel{}
+	agt, _, err := newAgent(mdl, agentConfig{
+		AppName:    "demo",
+		SkillsRoot: root,
+		StateDir:   t.TempDir(),
+		GenerationConfig: &model.GenerationConfig{
+			Stream: false,
+		},
+	}, nil, nil)
+	require.NoError(t, err)
+
+	req := runAgentAndCapture(
+		t,
+		agt,
+		mdl,
+		&session.Session{},
+	)
+	require.False(t, req.GenerationConfig.Stream)
+}
+
+func TestNewAgent_ToolProviderErrorIsReturned(t *testing.T) {
+	t.Parallel()
+
+	typeName := strings.ReplaceAll(t.Name(), "/", "_")
+	require.NoError(t, registry.RegisterToolProvider(
+		typeName,
+		func(
+			_ registry.ToolProviderDeps,
+			spec registry.PluginSpec,
+		) ([]tool.Tool, error) {
+			return nil, errors.New("tool provider boom")
+		},
+	))
+
+	var node yaml.Node
+	require.NoError(t, yaml.Unmarshal([]byte("{}"), &node))
+
+	_, _, err := newAgent(&captureRequestModel{}, agentConfig{
+		AppName:    "demo",
+		SkillsRoot: createAppTestSkill(t),
+		StateDir:   t.TempDir(),
+		ToolProviders: []pluginSpec{{
+			Type:   typeName,
+			Config: &node,
+		}},
+	}, nil, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "tool provider boom")
 }
 
 func TestNewAgent_SkillsLoadModeTurnClearsLoadedState(t *testing.T) {
@@ -911,7 +1824,7 @@ func TestNewAgent_SkillsLoadModeTurnClearsLoadedState(t *testing.T) {
 
 	root := createAppTestSkill(t)
 	mdl := &captureRequestModel{}
-	agt, err := newAgent(mdl, agentConfig{
+	agt, _, err := newAgent(mdl, agentConfig{
 		AppName:        "demo",
 		SkillsRoot:     root,
 		StateDir:       t.TempDir(),
@@ -935,7 +1848,7 @@ func TestNewAgent_SkillsToolResults_ConfigApplied(t *testing.T) {
 
 	root := createAppTestSkill(t)
 	mdl := &captureRequestModel{}
-	agt, err := newAgent(mdl, agentConfig{
+	agt, _, err := newAgent(mdl, agentConfig{
 		AppName:           "demo",
 		SkillsRoot:        root,
 		StateDir:          t.TempDir(),
@@ -953,6 +1866,139 @@ func TestNewAgent_SkillsToolResults_ConfigApplied(t *testing.T) {
 	sys := joinSystemMessages(req)
 	require.Contains(t, sys, "Loaded skill context:")
 	require.Contains(t, sys, "[Loaded] echoer")
+}
+
+func TestNewAgent_KnowledgeOnlyProfileHidesSkillRun(t *testing.T) {
+	t.Parallel()
+
+	root := createAppTestSkill(t)
+	mdl := &captureRequestModel{}
+	agt, _, err := newAgent(mdl, agentConfig{
+		AppName:           "demo",
+		SkillsRoot:        root,
+		StateDir:          t.TempDir(),
+		SkillsToolProfile: skillprofile.KnowledgeOnly,
+	}, nil, nil)
+	require.NoError(t, err)
+
+	require.NotNil(
+		t,
+		findToolDeclaration(agt.Tools(), skillprofile.ToolLoad),
+	)
+	require.NotNil(
+		t,
+		findToolDeclaration(agt.Tools(), skillprofile.ToolListDocs),
+	)
+	require.NotNil(
+		t,
+		findToolDeclaration(agt.Tools(), skillprofile.ToolSelectDocs),
+	)
+	require.Nil(
+		t,
+		findToolDeclaration(agt.Tools(), skillprofile.ToolRun),
+	)
+	require.Nil(
+		t,
+		findToolDeclaration(agt.Tools(), skillprofile.ToolExec),
+	)
+	require.Nil(
+		t,
+		findToolDeclaration(agt.Tools(), skillprofile.ToolWriteStdin),
+	)
+	require.Nil(
+		t,
+		findToolDeclaration(agt.Tools(), skillprofile.ToolPollSession),
+	)
+	require.Nil(
+		t,
+		findToolDeclaration(agt.Tools(), skillprofile.ToolKillSession),
+	)
+	require.Contains(
+		t,
+		findToolDeclaration(agt.Tools(), skillprofile.ToolLoad).
+			Description,
+		"Before the first matching load, start with one "+
+			"brief user-visible preamble",
+	)
+}
+
+func TestNewAgent_KnowledgeOnlyProfileUsesToolingGuidance(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	root := createAppTestSkill(t)
+	mdl := &captureRequestModel{}
+	agt, _, err := newAgent(mdl, agentConfig{
+		AppName:             "demo",
+		SkillsRoot:          root,
+		StateDir:            t.TempDir(),
+		SkillsToolProfile:   skillprofile.KnowledgeOnly,
+		EnableOpenClawTools: true,
+	}, nil, nil)
+	require.NoError(t, err)
+	require.Nil(
+		t,
+		findToolDeclaration(agt.Tools(), skillprofile.ToolRun),
+	)
+
+	req := runAgentAndCapture(
+		t,
+		agt,
+		mdl,
+		&session.Session{},
+	)
+	content := joinAllMessageContent(req)
+	require.Contains(
+		t,
+		content,
+		strings.TrimSpace(openClawToolingGuidance),
+	)
+}
+
+func TestNewAgent_FullProfileUsesToolingGuidance(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name    string
+		profile string
+	}{
+		{
+			name:    "explicit full profile",
+			profile: skillprofile.Full,
+		},
+		{
+			name:    "zero-value profile defaults to knowledge-only",
+			profile: "",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := createAppTestSkill(t)
+			mdl := &captureRequestModel{}
+			agt, _, err := newAgent(mdl, agentConfig{
+				AppName:             "demo",
+				SkillsRoot:          root,
+				StateDir:            t.TempDir(),
+				SkillsToolProfile:   tc.profile,
+				EnableOpenClawTools: true,
+			}, nil, nil)
+			require.NoError(t, err)
+
+			req := runAgentAndCapture(
+				t,
+				agt,
+				mdl,
+				&session.Session{},
+			)
+			content := joinAllMessageContent(req)
+			require.Contains(
+				t,
+				content,
+				strings.TrimSpace(openClawToolingGuidance),
+			)
+		})
+	}
 }
 
 func TestRun_HTTPListenErrorPath(t *testing.T) {
@@ -1072,6 +2118,13 @@ func TestRun_WithTelegram_BaseURLOverride(t *testing.T) {
 	dir := t.TempDir()
 	token := "token"
 
+	// gotMe is signalled once the mock server receives the Telegram
+	// getMe request, which means initialisation reached the point where
+	// the base-URL override was applied. We use it to cancel the context
+	// only *after* the handshake succeeds so that the test is reliable on
+	// slow CI runners.
+	gotMe := make(chan struct{}, 1)
+
 	srv := httptest.NewServer(http.HandlerFunc(func(
 		w http.ResponseWriter,
 		r *http.Request,
@@ -1082,6 +2135,10 @@ func TestRun_WithTelegram_BaseURLOverride(t *testing.T) {
 			_, _ = io.WriteString(w,
 				`{"ok":true,"result":{"id":1,"username":"bot"}}`,
 			)
+			select {
+			case gotMe <- struct{}{}:
+			default:
+			}
 		case "/bot" + token + "/getUpdates":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{"ok":true,"result":[]}`)
@@ -1109,7 +2166,17 @@ func TestRun_WithTelegram_BaseURLOverride(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	time.AfterFunc(50*time.Millisecond, cancel)
+
+	// Cancel as soon as getMe succeeds, or bail after a generous timeout.
+	go func() {
+		select {
+		case <-gotMe:
+			// Give the server loop a moment to finish set-up.
+			time.Sleep(50 * time.Millisecond)
+		case <-time.After(5 * time.Second):
+		}
+		cancel()
+	}()
 
 	runErr := run(ctx, []string{
 		"-http-addr", "127.0.0.1:0",
@@ -1263,6 +2330,19 @@ func TestValidateAgentRunOptions(t *testing.T) {
 			agentType: agentTypeClaudeCode,
 			opts: runOptions{
 				ToolSets: []pluginSpec{{Type: "x"}},
+			},
+			wantErr: true,
+		},
+		{
+			name:      "knowledges",
+			agentType: agentTypeClaudeCode,
+			opts: runOptions{
+				KnowledgesConfig: map[string]*yaml.Node{
+					"docs": yamlNode(t, `
+vector_store:
+  type: inmemory
+`),
+				},
 			},
 			wantErr: true,
 		},
@@ -1473,19 +2553,19 @@ func TestConfigFingerprint_Deterministic(t *testing.T) {
 }
 
 func TestParseOpenAIVariant_Explicit(t *testing.T) {
-	v, err := parseOpenAIVariant(string(openai.VariantOpenAI), "gpt-5")
+	v, err := parseOpenAIVariant(string(openai.VariantOpenAI), "")
 	require.NoError(t, err)
 	require.Equal(t, openai.VariantOpenAI, v)
 }
 
 func TestParseOpenAIVariant_Auto(t *testing.T) {
-	v, err := parseOpenAIVariant(openAIVariantAuto, "deepseek-chat")
+	v, err := parseOpenAIVariant(openAIVariantAuto, "https://api.deepseek.com/v1")
 	require.NoError(t, err)
 	require.Equal(t, openai.VariantDeepSeek, v)
 }
 
 func TestParseOpenAIVariant_Unknown(t *testing.T) {
-	_, err := parseOpenAIVariant("nope", "gpt-5")
+	_, err := parseOpenAIVariant("nope", "")
 	require.Error(t, err)
 }
 
@@ -1493,15 +2573,29 @@ func TestInferOpenAIVariant(t *testing.T) {
 	require.Equal(
 		t,
 		openai.VariantDeepSeek,
-		inferOpenAIVariant("deepseek-r1"),
+		inferOpenAIVariant("https://api.deepseek.com/v1"),
 	)
-	require.Equal(t, openai.VariantQwen, inferOpenAIVariant("qwen2.5"))
+	require.Equal(
+		t,
+		openai.VariantQwen,
+		inferOpenAIVariant("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+	)
 	require.Equal(
 		t,
 		openai.VariantHunyuan,
-		inferOpenAIVariant("hunyuan-t1"),
+		inferOpenAIVariant("https://api.hunyuan.cloud.tencent.com/v1"),
 	)
-	require.Equal(t, openai.VariantOpenAI, inferOpenAIVariant("gpt-5"))
+	require.Equal(
+		t,
+		openai.VariantOpenAI,
+		inferOpenAIVariant("https://deepseek.com/v1"),
+	)
+	require.Equal(
+		t,
+		openai.VariantOpenAI,
+		inferOpenAIVariant("https://proxy.example.com/v1"),
+	)
+	require.Equal(t, openai.VariantOpenAI, inferOpenAIVariant("deepseek-chat"))
 }
 
 func TestNewModel_Mock(t *testing.T) {
@@ -1546,6 +2640,161 @@ func TestNewModel_OpenAI(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, "gpt-5", mdl.Info().Name)
+	require.False(t, hasOpenAIRequestJSONCallback(t, mdl))
+}
+
+func TestNewModel_OpenAI_DebugRecorderWiresRequestCapture(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	mdl, err := modelFromOptions(runOptions{
+		ModelMode:            modeOpenAI,
+		OpenAIModel:          "gpt-5",
+		OpenAIVariant:        openAIVariantAuto,
+		DebugRecorderEnabled: true,
+	})
+	require.NoError(t, err)
+	require.True(t, hasOpenAIRequestJSONCallback(t, mdl))
+}
+
+func TestRecordDebugOpenAIChatRequestJSON_WritesTraceEvent(t *testing.T) {
+	t.Parallel()
+
+	const (
+		modelName = "gpt-4o"
+		userRole  = "user"
+		userText  = "hello"
+	)
+
+	rec, err := debugrecorder.New(t.TempDir(), "")
+	require.NoError(t, err)
+
+	trace, err := rec.Start(debugrecorder.TraceStart{
+		Channel: "gateway",
+	})
+	require.NoError(t, err)
+
+	ctx := debugrecorder.WithTrace(context.Background(), trace)
+	recordDebugOpenAIChatRequestJSON(
+		ctx,
+		[]byte(
+			`{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}`,
+		),
+		nil,
+	)
+	require.NoError(
+		t,
+		trace.Close(debugrecorder.TraceEnd{Status: "ok"}),
+	)
+
+	raw, err := debugrecorder.ReadEventsFile(trace.Dir())
+	require.NoError(t, err)
+
+	ev := findModelRequestEventForTest(t, raw)
+	require.Equal(
+		t,
+		debugrecorder.ProviderOpenAIChatCompletions,
+		ev.Payload.Provider,
+	)
+	require.Equal(t, modelName, ev.Payload.Request.Model)
+	require.Len(t, ev.Payload.Request.Messages, 1)
+	require.Equal(t, userRole, ev.Payload.Request.Messages[0].Role)
+	require.Equal(t, userText, ev.Payload.Request.Messages[0].Content)
+}
+
+func TestRecordDebugOpenAIChatRequestJSON_NoTraceIsNoOp(t *testing.T) {
+	t.Parallel()
+
+	recordDebugOpenAIChatRequestJSON(
+		context.Background(),
+		[]byte(`{"model":"gpt-4o"}`),
+		nil,
+	)
+}
+
+func TestRecordDebugOpenAIChatRequestJSON_InvalidJSONSkipsEvent(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	rec, err := debugrecorder.New(t.TempDir(), "")
+	require.NoError(t, err)
+
+	trace, err := rec.Start(debugrecorder.TraceStart{
+		Channel: "gateway",
+	})
+	require.NoError(t, err)
+
+	recordDebugOpenAIChatRequestJSON(
+		debugrecorder.WithTrace(context.Background(), trace),
+		[]byte("{"),
+		nil,
+	)
+	require.NoError(
+		t,
+		trace.Close(debugrecorder.TraceEnd{Status: "ok"}),
+	)
+
+	raw, err := debugrecorder.ReadEventsFile(trace.Dir())
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), debugrecorder.KindModelReq)
+}
+
+func hasOpenAIRequestJSONCallback(
+	t *testing.T,
+	mdl model.Model,
+) bool {
+	t.Helper()
+
+	openAIModel, ok := mdl.(*openai.Model)
+	require.True(t, ok)
+
+	field := reflect.ValueOf(openAIModel).
+		Elem().
+		FieldByName("chatRequestJSONCallback")
+	require.True(t, field.IsValid())
+	return !field.IsNil()
+}
+
+type modelRequestEventForTest struct {
+	Kind    string                     `json:"kind"`
+	Payload modelRequestPayloadForTest `json:"payload"`
+}
+
+type modelRequestPayloadForTest struct {
+	Provider string                  `json:"provider"`
+	Request  modelRequestBodyForTest `json:"request"`
+}
+
+type modelRequestBodyForTest struct {
+	Model    string                       `json:"model"`
+	Messages []modelRequestMessageForTest `json:"messages"`
+}
+
+type modelRequestMessageForTest struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+func findModelRequestEventForTest(
+	t *testing.T,
+	raw []byte,
+) modelRequestEventForTest {
+	t.Helper()
+
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	for scanner.Scan() {
+		var got modelRequestEventForTest
+		require.NoError(t, json.Unmarshal(scanner.Bytes(), &got))
+		if got.Kind != debugrecorder.KindModelReq {
+			continue
+		}
+		return got
+	}
+	require.NoError(t, scanner.Err())
+	t.Fatalf("model request event not found")
+	return modelRequestEventForTest{}
 }
 
 func TestNewModel_UnsupportedMode(t *testing.T) {
@@ -1963,6 +3212,25 @@ func (t stubTool) Declaration() *tool.Declaration {
 	}
 }
 
+type nilDeclTool struct{}
+
+func (t nilDeclTool) Declaration() *tool.Declaration {
+	return nil
+}
+
+func TestHasToolNamed(t *testing.T) {
+	t.Parallel()
+
+	require.True(t, hasToolNamed([]tool.Tool{
+		nilDeclTool{},
+		stubTool{name: "browser"},
+	}, "browser"))
+	require.False(t, hasToolNamed([]tool.Tool{
+		nilDeclTool{},
+		stubTool{name: "exec_command"},
+	}, "browser"))
+}
+
 func TestToolsFromProviders(t *testing.T) {
 	const typeName = "test_tool_provider"
 	require.NoError(t, registry.RegisterToolProvider(
@@ -2115,6 +3383,32 @@ func TestRuntime_Close_ReturnsRunnerCloseError(t *testing.T) {
 	require.True(t, runnerClosed)
 }
 
+func TestRuntime_Close_JoinsTelemetryShutdownError(t *testing.T) {
+	t.Parallel()
+
+	runnerErr := errors.New("runner close boom")
+	telemetryErr := errors.New("telemetry shutdown boom")
+	runnerClosed := false
+	telemetryClosed := false
+
+	rt := &Runtime{
+		runner: &stubRunner{
+			closeErr: runnerErr,
+			closed:   &runnerClosed,
+		},
+		telemetryShutdown: func(context.Context) error {
+			telemetryClosed = true
+			return telemetryErr
+		},
+	}
+
+	err := rt.Close()
+	require.ErrorIs(t, err, runnerErr)
+	require.ErrorIs(t, err, telemetryErr)
+	require.True(t, runnerClosed)
+	require.True(t, telemetryClosed)
+}
+
 func TestRuntime_Close_NilIsNoop(t *testing.T) {
 	t.Parallel()
 
@@ -2129,6 +3423,254 @@ func TestRuntime_Close_NilRunnerIsNoop(t *testing.T) {
 	require.NoError(t, rt.Close())
 }
 
+func TestShutdownTelemetryWithContext_NilContextUsesBackground(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	called := false
+	err := shutdownTelemetryWithContext(
+		nil,
+		func(ctx context.Context) error {
+			called = true
+			require.NotNil(t, ctx)
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.True(t, called)
+}
+
+func TestNewRuntime_LangfuseRequiredErrorExitCode(t *testing.T) {
+	restore := langfuseStart
+	t.Cleanup(func() {
+		langfuseStart = restore
+	})
+	langfuseStart = func(
+		context.Context,
+		...langfuseobs.Option,
+	) (func(context.Context) error, error) {
+		return nil, errors.New("langfuse boom")
+	}
+
+	cfgPath := writeTempConfig(t, `
+observability:
+  langfuse:
+    enabled: true
+    required: true
+`)
+
+	rt, err := NewRuntime(context.Background(), []string{
+		"-mode", modeMock,
+		"-state-dir", t.TempDir(),
+		"-skills-root", t.TempDir(),
+		"-config", cfgPath,
+	})
+	require.Nil(t, rt)
+	require.Error(t, err)
+
+	var exitErr *exitError
+	require.True(t, errors.As(err, &exitErr))
+	require.Equal(t, 1, exitErr.Code)
+	require.ErrorContains(t, exitErr.Err, "langfuse config failed")
+}
+
+func TestNewRuntime_WithLangfuse_Smoke(t *testing.T) {
+	restore := langfuseStart
+	t.Cleanup(func() {
+		langfuseStart = restore
+	})
+
+	startCalls := 0
+	shutdownCalls := 0
+	langfuseStart = func(
+		context.Context,
+		...langfuseobs.Option,
+	) (func(context.Context) error, error) {
+		startCalls++
+		return func(context.Context) error {
+			shutdownCalls++
+			return nil
+		}, nil
+	}
+
+	cfgPath := writeTempConfig(t, `
+observability:
+  langfuse:
+    enabled: true
+`)
+
+	rt, err := NewRuntime(context.Background(), []string{
+		"-mode", modeMock,
+		"-state-dir", t.TempDir(),
+		"-skills-root", t.TempDir(),
+		"-config", cfgPath,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, rt)
+	require.NotNil(t, rt.telemetryShutdown)
+	require.Equal(t, 1, startCalls)
+	require.NoError(t, rt.Close())
+	require.Equal(t, 1, shutdownCalls)
+}
+
+func TestNewRuntime_ClosesLangfuseOnLaterError(t *testing.T) {
+	restore := langfuseStart
+	t.Cleanup(func() {
+		langfuseStart = restore
+	})
+
+	shutdownCalls := 0
+	langfuseStart = func(
+		context.Context,
+		...langfuseobs.Option,
+	) (func(context.Context) error, error) {
+		return func(context.Context) error {
+			shutdownCalls++
+			return nil
+		}, nil
+	}
+
+	cfgPath := writeTempConfig(t, `
+channels:
+  - type: missing_channel
+observability:
+  langfuse:
+    enabled: true
+`)
+
+	rt, err := NewRuntime(context.Background(), []string{
+		"-mode", modeMock,
+		"-state-dir", t.TempDir(),
+		"-skills-root", t.TempDir(),
+		"-config", cfgPath,
+	})
+	require.Nil(t, rt)
+	require.Error(t, err)
+
+	var exitErr *exitError
+	require.True(t, errors.As(err, &exitErr))
+	require.Equal(t, 1, exitErr.Code)
+	require.ErrorContains(t, exitErr.Err, "create channels failed")
+	require.Equal(t, 1, shutdownCalls)
+}
+
+func TestRun_LangfuseRequiredErrorExitCode(t *testing.T) {
+	restore := langfuseStart
+	t.Cleanup(func() {
+		langfuseStart = restore
+	})
+	langfuseStart = func(
+		context.Context,
+		...langfuseobs.Option,
+	) (func(context.Context) error, error) {
+		return nil, errors.New("langfuse boom")
+	}
+
+	cfgPath := writeTempConfig(t, `
+observability:
+  langfuse:
+    enabled: true
+    required: true
+`)
+
+	err := run(context.Background(), []string{
+		"-http-addr", "127.0.0.1:0",
+		"-mode", modeMock,
+		"-state-dir", t.TempDir(),
+		"-skills-root", t.TempDir(),
+		"-config", cfgPath,
+	})
+	require.Error(t, err)
+
+	var exitErr *exitError
+	require.True(t, errors.As(err, &exitErr))
+	require.Equal(t, 1, exitErr.Code)
+	require.ErrorContains(t, exitErr.Err, "langfuse config failed")
+}
+
+func TestRun_WithLangfuse_Smoke(t *testing.T) {
+	restore := langfuseStart
+	t.Cleanup(func() {
+		langfuseStart = restore
+	})
+
+	startCalls := 0
+	shutdownCalls := 0
+	langfuseStart = func(
+		context.Context,
+		...langfuseobs.Option,
+	) (func(context.Context) error, error) {
+		startCalls++
+		return func(context.Context) error {
+			shutdownCalls++
+			return nil
+		}, nil
+	}
+
+	cfgPath := writeTempConfig(t, `
+observability:
+  langfuse:
+    enabled: true
+`)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	time.AfterFunc(50*time.Millisecond, cancel)
+
+	err := run(ctx, []string{
+		"-http-addr", "127.0.0.1:0",
+		"-mode", modeMock,
+		"-state-dir", t.TempDir(),
+		"-skills-root", t.TempDir(),
+		"-config", cfgPath,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, startCalls)
+	require.Equal(t, 1, shutdownCalls)
+}
+
+func TestRun_ClosesLangfuseOnLaterError(t *testing.T) {
+	restore := langfuseStart
+	t.Cleanup(func() {
+		langfuseStart = restore
+	})
+
+	shutdownCalls := 0
+	langfuseStart = func(
+		context.Context,
+		...langfuseobs.Option,
+	) (func(context.Context) error, error) {
+		return func(context.Context) error {
+			shutdownCalls++
+			return nil
+		}, nil
+	}
+
+	cfgPath := writeTempConfig(t, `
+channels:
+  - type: missing_channel
+observability:
+  langfuse:
+    enabled: true
+`)
+
+	err := run(context.Background(), []string{
+		"-http-addr", "127.0.0.1:0",
+		"-mode", modeMock,
+		"-state-dir", t.TempDir(),
+		"-skills-root", t.TempDir(),
+		"-config", cfgPath,
+	})
+	require.Error(t, err)
+
+	var exitErr *exitError
+	require.True(t, errors.As(err, &exitErr))
+	require.Equal(t, 1, exitErr.Code)
+	require.ErrorContains(t, exitErr.Err, "create channels failed")
+	require.Equal(t, 1, shutdownCalls)
+}
+
 func TestInProcGatewayClient_SendMessage_OK(t *testing.T) {
 	t.Parallel()
 
@@ -2140,6 +3682,11 @@ func TestInProcGatewayClient_SendMessage_OK(t *testing.T) {
 	srv, err := gateway.New(&inProcGWTestRunner{
 		reply:     testReply,
 		requestID: testRequestID,
+		usage: &model.Usage{
+			PromptTokens:     12000,
+			CompletionTokens: 345,
+			TotalTokens:      12345,
+		},
 	})
 	require.NoError(t, err)
 
@@ -2154,6 +3701,8 @@ func TestInProcGatewayClient_SendMessage_OK(t *testing.T) {
 	require.Equal(t, testReply, rsp.Reply)
 	require.Equal(t, testRequestID, rsp.RequestID)
 	require.NotEmpty(t, rsp.SessionID)
+	require.NotNil(t, rsp.Usage)
+	require.Equal(t, 12345, rsp.Usage.TotalTokens)
 }
 
 func TestInProcGatewayClient_SendMessage_StatusError(t *testing.T) {
@@ -2371,6 +3920,29 @@ func TestInProcGatewayClient_ForgetUser_DeletesState(t *testing.T) {
 	)
 	require.NoError(t, err)
 
+	memoryRoot, err := memoryfile.DefaultRoot(debugDir)
+	require.NoError(t, err)
+	memoryStore, err := memoryfile.NewStore(memoryRoot)
+	require.NoError(t, err)
+	memoryPath, err := memoryStore.EnsureMemory(
+		ctx,
+		appName,
+		userID,
+	)
+	require.NoError(t, err)
+	otherUserMemoryPath, err := memoryStore.EnsureMemory(
+		ctx,
+		appName,
+		"u2",
+	)
+	require.NoError(t, err)
+	otherAppMemoryPath, err := memoryStore.EnsureMemory(
+		ctx,
+		"other-app",
+		userID,
+	)
+	require.NoError(t, err)
+
 	srv, err := gateway.New(&inProcGWTestRunner{})
 	require.NoError(t, err)
 
@@ -2383,6 +3955,7 @@ func TestInProcGatewayClient_ForgetUser_DeletesState(t *testing.T) {
 		uploadStore,
 	)
 	c.SetPersonaStore(personaStore)
+	c.SetMemoryFileStore(memoryStore)
 
 	require.NoError(t, c.ForgetUser(ctx, channelName, userID))
 
@@ -2417,6 +3990,15 @@ func TestInProcGatewayClient_ForgetUser_DeletesState(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.Equal(t, persona.PresetDefault, currentPreset.ID)
+
+	_, err = os.Stat(memoryPath)
+	require.ErrorIs(t, err, os.ErrNotExist)
+
+	_, err = os.Stat(otherUserMemoryPath)
+	require.NoError(t, err)
+
+	_, err = os.Stat(otherAppMemoryPath)
+	require.NoError(t, err)
 }
 
 func TestInProcGatewayClient_ForgetUser_ClearsCronJobsOnlyOnce(
@@ -2492,6 +4074,90 @@ func TestInProcGatewayClient_ForgetUser_ClearsCronJobsOnlyOnce(
 	)
 }
 
+func TestInProcGatewayClient_ForgetUser_ClearsIndexedStorageScopes(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	ctx := context.Background()
+	srv, err := gateway.New(&inProcGWTestRunner{})
+	require.NoError(t, err)
+
+	sessSvc := sessioninmemory.NewSessionService()
+	uploadStore, err := uploads.NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	const (
+		channelName     = "demo"
+		canonicalUserID = "u1"
+		storageUserID   = "chat-scope"
+		sessionID       = "demo:thread:room-1"
+	)
+	require.NoError(
+		t,
+		conversationscope.RememberIndexedStorageUser(
+			ctx,
+			sessSvc,
+			appName,
+			canonicalUserID,
+			storageUserID,
+		),
+	)
+	_, err = sessSvc.CreateSession(
+		ctx,
+		session.Key{
+			AppName:   appName,
+			UserID:    storageUserID,
+			SessionID: sessionID,
+		},
+		nil,
+	)
+	require.NoError(t, err)
+	saved, err := uploadStore.Save(
+		ctx,
+		uploads.Scope{
+			Channel:   channelName,
+			UserID:    storageUserID,
+			SessionID: sessionID,
+		},
+		"clip.mp4",
+		[]byte("video"),
+	)
+	require.NoError(t, err)
+
+	c := newInProcGatewayClient(
+		srv,
+		appName,
+		sessSvc,
+		nil,
+		"",
+		uploadStore,
+	)
+	require.NoError(t, c.ForgetUser(ctx, channelName, canonicalUserID))
+
+	sessions, err := sessSvc.ListSessions(
+		ctx,
+		session.UserKey{
+			AppName: appName,
+			UserID:  storageUserID,
+		},
+	)
+	require.NoError(t, err)
+	require.Empty(t, sessions)
+
+	indexedStorageUsers, err := conversationscope.ListIndexedStorageUsers(
+		ctx,
+		sessSvc,
+		appName,
+		canonicalUserID,
+	)
+	require.NoError(t, err)
+	require.Empty(t, indexedStorageUsers)
+
+	_, err = os.Stat(saved.Path)
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
 func TestInProcGatewayClient_ForgetUser_ValidationErrors(t *testing.T) {
 	t.Parallel()
 
@@ -2526,6 +4192,102 @@ func TestInProcGatewayClient_ForgetUser_ValidationErrors(t *testing.T) {
 
 	c4 := newInProcGatewayClient(srv, appName, nil, nil, debugFile)
 	require.NoError(t, c4.ForgetUser(ctx, "telegram", "u1"))
+}
+
+func TestInProcGatewayClient_SetMemoryFileStore_NilReceiverIsNoop(t *testing.T) {
+	t.Parallel()
+
+	var client *inProcGatewayClient
+	client.SetMemoryFileStore(nil)
+}
+
+func TestInProcGatewayClient_ForgetUser_DeleteMemoryFilesError(t *testing.T) {
+	t.Parallel()
+
+	srv, err := gateway.New(&inProcGWTestRunner{})
+	require.NoError(t, err)
+
+	root, err := memoryfile.DefaultRoot(t.TempDir())
+	require.NoError(t, err)
+	store, err := memoryfile.NewStore(root)
+	require.NoError(t, err)
+	_, err = store.EnsureMemory(context.Background(), appName, "u1")
+	require.NoError(t, err)
+
+	c := newInProcGatewayClient(srv, appName, nil, nil, "")
+	c.SetMemoryFileStore(store)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = c.ForgetUser(ctx, "telegram", "u1")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "forget: delete user memory files")
+}
+
+func TestInProcGatewayClient_ForgetUser_DeleteMemoryFilesErrorPreservesStorageScopeIndex(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("permission-based delete failure is unreliable on windows")
+	}
+
+	ctx := context.Background()
+	srv, err := gateway.New(&inProcGWTestRunner{})
+	require.NoError(t, err)
+
+	const (
+		canonicalUserID = "u1"
+		storageUserID   = "chat-scope"
+	)
+
+	sessSvc := sessioninmemory.NewSessionService()
+	require.NoError(
+		t,
+		conversationscope.RememberIndexedStorageUser(
+			ctx,
+			sessSvc,
+			appName,
+			canonicalUserID,
+			storageUserID,
+		),
+	)
+
+	root, err := memoryfile.DefaultRoot(t.TempDir())
+	require.NoError(t, err)
+	store, err := memoryfile.NewStore(root)
+	require.NoError(t, err)
+	_, err = store.EnsureMemory(ctx, appName, storageUserID)
+	require.NoError(t, err)
+
+	scopedDir, err := store.MemoryDir(appName, storageUserID)
+	require.NoError(t, err)
+	scopedParent := filepath.Dir(scopedDir)
+	parentInfo, err := os.Stat(scopedParent)
+	require.NoError(t, err)
+	require.NoError(t, os.Chmod(scopedParent, 0o500))
+	defer func() {
+		require.NoError(t, os.Chmod(scopedParent, parentInfo.Mode().Perm()))
+	}()
+
+	c := newInProcGatewayClient(srv, appName, sessSvc, nil, "")
+	c.SetMemoryFileStore(store)
+
+	err = c.ForgetUser(ctx, "telegram", canonicalUserID)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "forget: delete user memory files")
+
+	indexedStorageUsers, err := conversationscope.ListIndexedStorageUsers(
+		ctx,
+		sessSvc,
+		appName,
+		canonicalUserID,
+	)
+	require.NoError(t, err)
+	require.Equal(t, []string{storageUserID}, indexedStorageUsers)
+
+	_, err = os.Stat(scopedDir)
+	require.NoError(t, err)
 }
 
 func TestInProcGatewayClient_ScheduledJobs(t *testing.T) {
@@ -2621,6 +4383,151 @@ func TestInProcGatewayClient_ScheduledJobs_RequireCronService(t *testing.T) {
 	)
 	require.Error(t, err)
 	require.Equal(t, errNilCronService, err.Error())
+
+	_, err = c.SetScheduledJobEnabled(
+		context.Background(),
+		"telegram",
+		"u1",
+		"100",
+		"job-1",
+		false,
+	)
+	require.Error(t, err)
+	require.Equal(t, errNilCronService, err.Error())
+
+	_, err = c.RemoveScheduledJob(
+		context.Background(),
+		"telegram",
+		"u1",
+		"100",
+		"job-1",
+	)
+	require.Error(t, err)
+	require.Equal(t, errNilCronService, err.Error())
+}
+
+func TestInProcGatewayClient_ManageScheduledJob(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 3, 6, 16, 0, 0, 0, time.UTC)
+	cronSvc, err := cron.NewService(
+		t.TempDir(),
+		&inProcGWTestRunner{},
+		nil,
+		cron.WithClock(func() time.Time { return now }),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, cronSvc.Close())
+	})
+
+	job, err := cronSvc.Add(&cron.Job{
+		Name:    "cpu report",
+		Enabled: true,
+		Schedule: cron.Schedule{
+			Kind:  cron.ScheduleKindEvery,
+			Every: "1m",
+		},
+		Message: "collect cpu",
+		UserID:  "u1",
+		Delivery: outbound.DeliveryTarget{
+			Channel: "telegram",
+			Target:  "100",
+		},
+		LastStatus: cron.StatusSucceeded,
+		LastOutput: "ok",
+	})
+	require.NoError(t, err)
+
+	srv, err := gateway.New(&inProcGWTestRunner{})
+	require.NoError(t, err)
+
+	c := newInProcGatewayClient(srv, appName, nil, nil, "")
+	c.SetCronService(cronSvc)
+
+	updated, err := c.SetScheduledJobEnabled(
+		context.Background(),
+		"telegram",
+		"u1",
+		"100",
+		job.ID,
+		false,
+	)
+	require.NoError(t, err)
+	require.False(t, updated.Enabled)
+	require.Equal(t, "collect cpu", updated.Message)
+	require.Equal(t, "ok", updated.LastOutput)
+	require.Equal(t, "telegram", updated.DeliveryChannel)
+	require.Equal(t, "100", updated.DeliveryTarget)
+
+	removed, err := c.RemoveScheduledJob(
+		context.Background(),
+		"telegram",
+		"u1",
+		"100",
+		job.ID,
+	)
+	require.NoError(t, err)
+	require.True(t, removed)
+	require.Nil(t, cronSvc.Get(job.ID))
+}
+
+func TestInProcGatewayClient_ScheduledJobScopeErrors(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 3, 6, 16, 0, 0, 0, time.UTC)
+	cronSvc, err := cron.NewService(
+		t.TempDir(),
+		&inProcGWTestRunner{},
+		nil,
+		cron.WithClock(func() time.Time { return now }),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, cronSvc.Close())
+	})
+
+	_, err = cronSvc.Add(&cron.Job{
+		Name:    "cpu report",
+		Enabled: true,
+		Schedule: cron.Schedule{
+			Kind:  cron.ScheduleKindEvery,
+			Every: "1m",
+		},
+		Message: "collect cpu",
+		UserID:  "u1",
+		Delivery: outbound.DeliveryTarget{
+			Channel: "telegram",
+			Target:  "100",
+		},
+	})
+	require.NoError(t, err)
+
+	srv, err := gateway.New(&inProcGWTestRunner{})
+	require.NoError(t, err)
+
+	c := newInProcGatewayClient(srv, appName, nil, nil, "")
+	c.SetCronService(cronSvc)
+
+	_, err = c.SetScheduledJobEnabled(
+		context.Background(),
+		"telegram",
+		"u1",
+		"999",
+		"",
+		false,
+	)
+	require.ErrorContains(t, err, errUnknownJob)
+
+	removed, err := c.RemoveScheduledJob(
+		context.Background(),
+		"telegram",
+		"u1",
+		"999",
+		"job-1",
+	)
+	require.ErrorContains(t, err, errUnknownJob)
+	require.False(t, removed)
 }
 
 func TestInProcGatewayClient_PresetPersona(t *testing.T) {
@@ -2656,8 +4563,10 @@ func TestInProcGatewayClient_PresetPersona(t *testing.T) {
 type errSessionService struct {
 	session.Service
 
-	listErr   error
-	deleteErr error
+	listErr            error
+	deleteErr          error
+	listUserStatesErr  error
+	deleteUserStateErr error
 }
 
 func (s errSessionService) ListSessions(
@@ -2680,6 +4589,27 @@ func (s errSessionService) DeleteSession(
 		return s.deleteErr
 	}
 	return s.Service.DeleteSession(ctx, key, options...)
+}
+
+func (s errSessionService) ListUserStates(
+	ctx context.Context,
+	userKey session.UserKey,
+) (session.StateMap, error) {
+	if s.listUserStatesErr != nil {
+		return nil, s.listUserStatesErr
+	}
+	return s.Service.ListUserStates(ctx, userKey)
+}
+
+func (s errSessionService) DeleteUserState(
+	ctx context.Context,
+	userKey session.UserKey,
+	key string,
+) error {
+	if s.deleteUserStateErr != nil {
+		return s.deleteUserStateErr
+	}
+	return s.Service.DeleteUserState(ctx, userKey, key)
 }
 
 type errMemoryService struct {
@@ -2742,6 +4672,83 @@ func TestInProcGatewayClient_ForgetUser_DeleteSessionError(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "forget: delete session")
 	require.Contains(t, err.Error(), "delete boom")
+}
+
+func TestInProcGatewayClient_ForgetUser_ListStorageScopesError(t *testing.T) {
+	t.Parallel()
+
+	srv, err := gateway.New(&inProcGWTestRunner{})
+	require.NoError(t, err)
+
+	sessSvc := errSessionService{
+		Service:           sessioninmemory.NewSessionService(),
+		listUserStatesErr: errors.New("user state boom"),
+	}
+	c := newInProcGatewayClient(srv, appName, sessSvc, nil, "")
+
+	err = c.ForgetUser(context.Background(), "telegram", "u1")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "forget: list storage scopes")
+	require.Contains(t, err.Error(), "user state boom")
+}
+
+func TestInProcGatewayClient_ForgetUser_DeleteStorageScopeIndexError(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	srv, err := gateway.New(&inProcGWTestRunner{})
+	require.NoError(t, err)
+
+	base := sessioninmemory.NewSessionService()
+	require.NoError(
+		t,
+		conversationscope.RememberIndexedStorageUser(
+			ctx,
+			base,
+			appName,
+			"u1",
+			"chat-scope",
+		),
+	)
+	_, err = base.CreateSession(
+		ctx,
+		session.Key{
+			AppName:   appName,
+			UserID:    "chat-scope",
+			SessionID: "demo:thread:room-1",
+		},
+		nil,
+	)
+	require.NoError(t, err)
+
+	sessSvc := errSessionService{
+		Service:            base,
+		deleteUserStateErr: errors.New("delete state boom"),
+	}
+	c := newInProcGatewayClient(srv, appName, sessSvc, nil, "")
+
+	err = c.ForgetUser(ctx, "telegram", "u1")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "forget: delete storage scope index")
+	require.Contains(t, err.Error(), "delete state boom")
+}
+
+func TestAppendUniqueUserIDs_SkipsBlanksAndDuplicates(t *testing.T) {
+	t.Parallel()
+
+	got := appendUniqueUserIDs(
+		[]string{"u1", " u1 ", " "},
+		"chat-scope",
+		"u1",
+		" chat-scope ",
+		"",
+		"chat-scope-2",
+	)
+	require.Equal(
+		t,
+		[]string{"u1", "chat-scope", "chat-scope-2"},
+		got,
+	)
 }
 
 func TestInProcGatewayClient_ForgetUser_ClearMemoriesError(t *testing.T) {
@@ -2938,6 +4945,7 @@ func (s *stubRunner) Close() error {
 type inProcGWTestRunner struct {
 	reply     string
 	requestID string
+	usage     *model.Usage
 }
 
 func (r *inProcGWTestRunner) Run(
@@ -2963,7 +4971,8 @@ func (r *inProcGWTestRunner) Run(
 			Choices: []model.Choice{
 				{Message: model.NewAssistantMessage(reply)},
 			},
-			Done: true,
+			Usage: r.usage,
+			Done:  true,
 		},
 		RequestID: requestID,
 	}

@@ -11,6 +11,8 @@
 // Package gwproto defines the JSON payloads used by the OpenClaw gateway.
 package gwproto
 
+import "encoding/json"
+
 // MessageRequest matches the gateway /messages JSON payload.
 //
 // The request supports both:
@@ -28,9 +30,13 @@ type MessageRequest struct {
 
 	ContentParts []ContentPart `json:"content_parts,omitempty"`
 
+	RequestSystemPrompt string `json:"request_system_prompt,omitempty"`
+
 	UserID    string `json:"user_id,omitempty"`
 	SessionID string `json:"session_id,omitempty"`
 	RequestID string `json:"request_id,omitempty"`
+
+	Extensions map[string]json.RawMessage `json:"extensions,omitempty"`
 }
 
 // APIError matches gateway error payloads.
@@ -39,11 +45,26 @@ type APIError struct {
 	Message string `json:"message"`
 }
 
+// Usage is a transport-safe subset of model token usage.
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+
+	// LastPromptTokens is the prompt_tokens from the most recent LLM call
+	// within the request. Unlike PromptTokens which aggregates across all
+	// LLM calls in a request (tool-call loops), this field reflects the
+	// actual context window occupancy of the final call and is used for
+	// accurate context usage display.
+	LastPromptTokens int `json:"last_prompt_tokens,omitempty"`
+}
+
 // MessageResponse matches the gateway /messages response JSON.
 type MessageResponse struct {
 	SessionID string    `json:"session_id,omitempty"`
 	RequestID string    `json:"request_id,omitempty"`
 	Reply     string    `json:"reply,omitempty"`
+	Usage     *Usage    `json:"usage,omitempty"`
 	Ignored   bool      `json:"ignored,omitempty"`
 	Error     *APIError `json:"error,omitempty"`
 }
@@ -76,12 +97,22 @@ const (
 	StreamEventTypeRunIgnored StreamEventType = "run.ignored"
 	// StreamEventTypeMessageDelta carries an incremental text delta.
 	StreamEventTypeMessageDelta StreamEventType = "message.delta"
+	// StreamEventTypePublicDelta carries an incremental public progress delta.
+	StreamEventTypePublicDelta StreamEventType = "public.delta"
+	// StreamEventTypeThoughtDelta carries an incremental thought delta.
+	StreamEventTypeThoughtDelta StreamEventType = "thought.delta"
+	// StreamEventTypePublicCompleted carries the latest public progress text.
+	StreamEventTypePublicCompleted StreamEventType = "public.completed"
+	// StreamEventTypeThoughtCompleted carries the final thought text.
+	StreamEventTypeThoughtCompleted StreamEventType = "thought.completed"
 	// StreamEventTypeMessageCompleted carries the final reply text.
 	StreamEventTypeMessageCompleted StreamEventType = "message.completed"
 	// StreamEventTypeRunProgress carries a high-level run status update.
 	StreamEventTypeRunProgress StreamEventType = "run.progress"
 	// StreamEventTypeRunCompleted marks successful stream completion.
 	StreamEventTypeRunCompleted StreamEventType = "run.completed"
+	// StreamEventTypeRunCanceled marks a request canceled by the client.
+	StreamEventTypeRunCanceled StreamEventType = "run.canceled"
 	// StreamEventTypeRunError marks a terminal stream error.
 	StreamEventTypeRunError StreamEventType = "run.error"
 
@@ -109,6 +140,7 @@ type StreamEvent struct {
 	Stage     StreamProgressStage `json:"stage,omitempty"`
 	Summary   string              `json:"summary,omitempty"`
 	ElapsedMS int64               `json:"elapsed_ms,omitempty"`
+	Usage     *Usage              `json:"usage,omitempty"`
 	Ignored   bool                `json:"ignored,omitempty"`
 	Error     *APIError           `json:"error,omitempty"`
 }

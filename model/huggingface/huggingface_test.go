@@ -12,6 +12,7 @@ package huggingface
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,6 +29,68 @@ import (
 )
 
 const ApiKey = "*****"
+
+func TestModel_CallbackPanicsAreRecovered(t *testing.T) {
+	t.Run("request callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatRequestCallback: func(ctx context.Context, req *ChatCompletionRequest) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatRequestCallback(context.Background(), &ChatCompletionRequest{})
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("response callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatResponseCallback: func(ctx context.Context, req *ChatCompletionRequest, resp *ChatCompletionResponse) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatResponseCallback(context.Background(), &ChatCompletionRequest{}, &ChatCompletionResponse{})
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("chunk callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatChunkCallback: func(ctx context.Context, req *ChatCompletionRequest, chunk *ChatCompletionChunk) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatChunkCallback(context.Background(), &ChatCompletionRequest{}, &ChatCompletionChunk{})
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("stream complete callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatStreamCompleteCallback: func(ctx context.Context, req *ChatCompletionRequest, err error) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatStreamCompleteCallback(context.Background(), &ChatCompletionRequest{}, nil)
+		})
+		assert.True(t, callbackCalled)
+	})
+}
 
 func TestNew(t *testing.T) {
 	tests := []struct {
@@ -1240,10 +1303,16 @@ func TestModel_StreamingError(t *testing.T) {
 	}))
 	defer server.Close()
 
+	callbackCalled := make(chan struct{})
+	var callbackErr error
 	m, err := New(
 		"test-model",
 		WithAPIKey("invalid-key"),
 		WithBaseURL(server.URL),
+		WithChatStreamCompleteCallback(func(ctx context.Context, req *ChatCompletionRequest, err error) {
+			callbackErr = err
+			close(callbackCalled)
+		}),
 	)
 	require.NoError(t, err)
 
@@ -1263,11 +1332,20 @@ func TestModel_StreamingError(t *testing.T) {
 	var responses []*model.Response
 	for resp := range responseChan {
 		responses = append(responses, resp)
+		if resp.Error != nil {
+			select {
+			case <-callbackCalled:
+			default:
+				t.Fatal("stream-complete callback must run before error response is emitted")
+			}
+		}
 	}
 
 	require.NotEmpty(t, responses)
 	assert.NotNil(t, responses[0].Error)
 	assert.Contains(t, responses[0].Error.Message, "Unauthorized")
+	require.Error(t, callbackErr)
+	assert.Contains(t, callbackErr.Error(), "Unauthorized")
 }
 
 // TestModel_NonStreamingError tests non-streaming request error handling
@@ -2401,20 +2479,34 @@ func TestModel_NonStreamingWithError(t *testing.T) {
 
 // TestModel_StreamingReadError tests streaming with read error
 func TestModel_StreamingReadError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		// Send one valid chunk then close connection abruptly
-		fmt.Fprint(w, `data: {"id":"test","object":"chat.completion.chunk","created":1234567890,"model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","content":"test"},"finish_reason":null}]}`+"\n\n")
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-		// Connection will be closed by server shutdown
-	}))
-
+	streamErr := errors.New("stream read error")
+	callbackCalled := make(chan struct{})
+	var callbackErr error
+	customClient := &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			header := make(http.Header)
+			header.Set("Content-Type", "text/event-stream")
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     header,
+				Body: &errAfterReadCloser{
+					reader: strings.NewReader(
+						`data: {"id":"test","object":"chat.completion.chunk","created":1234567890,"model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","content":"test"},"finish_reason":null}]}` + "\n\n",
+					),
+					err: streamErr,
+				},
+			}, nil
+		}),
+	}
 	m, err := New(
 		"test-model",
 		WithAPIKey("test-key"),
-		WithBaseURL(server.URL),
+		WithBaseURL("https://example.test"),
+		WithHTTPClient(customClient),
+		WithChatStreamCompleteCallback(func(ctx context.Context, req *ChatCompletionRequest, err error) {
+			callbackErr = err
+			close(callbackCalled)
+		}),
 	)
 	require.NoError(t, err)
 
@@ -2431,16 +2523,50 @@ func TestModel_StreamingReadError(t *testing.T) {
 	responseChan, err := m.GenerateContent(ctx, request)
 	require.NoError(t, err)
 
-	// Close server to simulate connection error
-	server.Close()
-
 	var responses []*model.Response
 	for resp := range responseChan {
 		responses = append(responses, resp)
+		if resp.Error != nil {
+			select {
+			case <-callbackCalled:
+			default:
+				t.Fatal("stream-complete callback must run before error response is emitted")
+			}
+		}
 	}
 
-	// Should receive at least one response (could be error or valid chunk)
-	require.NotEmpty(t, responses)
+	require.Len(t, responses, 2)
+	assert.Nil(t, responses[0].Error)
+	require.NotNil(t, responses[1].Error)
+	assert.Contains(t, responses[1].Error.Message, "stream read error")
+	require.ErrorIs(t, callbackErr, streamErr)
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type errAfterReadCloser struct {
+	reader *strings.Reader
+	err    error
+}
+
+func (r *errAfterReadCloser) Read(p []byte) (int, error) {
+	if r.reader.Len() > 0 {
+		return r.reader.Read(p)
+	}
+	if r.err != nil {
+		err := r.err
+		r.err = nil
+		return 0, err
+	}
+	return 0, io.EOF
+}
+
+func (r *errAfterReadCloser) Close() error {
+	return nil
 }
 
 // TestModel_TokenTailoringWithCustomConfig tests token tailoring with custom config
@@ -3886,4 +4012,105 @@ func TestGenerateContent_TokenTailoringWithUserMaxTokens(t *testing.T) {
 	require.NotNil(t, capturedRequest.MaxTokens, "MaxTokens 不应该为 nil")
 	assert.Equal(t, userMaxTokens, *capturedRequest.MaxTokens, "应该使用用户指定的 MaxTokens")
 	t.Logf("用户指定的 MaxTokens 被正确保留: %d", *capturedRequest.MaxTokens)
+}
+
+// TestChatRequestCallbackSynchronous verifies that
+// chatRequestCallback is invoked synchronously inside
+// GenerateContent, before the response goroutine starts.
+func TestChatRequestCallbackSynchronous(t *testing.T) {
+	tests := []struct {
+		name   string
+		stream bool
+	}{
+		{name: "non_streaming", stream: false},
+		{name: "streaming", stream: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					if !strings.HasSuffix(
+						r.URL.Path, "/chat/completions",
+					) {
+						http.Error(w, "not found",
+							http.StatusNotFound)
+						return
+					}
+					if tt.stream {
+						w.Header().Set("Content-Type",
+							"text/event-stream")
+						flusher, _ := w.(http.Flusher)
+						fmt.Fprint(w,
+							`data: {"id":"s","object":`+
+								`"chat.completion.chunk",`+
+								`"created":1,"model":"m",`+
+								`"choices":[{"index":0,`+
+								`"delta":{"role":"assistant",`+
+								`"content":"hi"},`+
+								`"finish_reason":"stop"}]}`+
+								"\n\n")
+						flusher.Flush()
+						fmt.Fprint(w,
+							"data: [DONE]\n\n")
+						flusher.Flush()
+						return
+					}
+					w.Header().Set("Content-Type",
+						"application/json")
+					fmt.Fprint(w,
+						`{"id":"n","object":`+
+							`"chat.completion",`+
+							`"created":1,"model":"m",`+
+							`"choices":[{"index":0,`+
+							`"message":{"role":"assistant",`+
+							`"content":"hi"},`+
+							`"finish_reason":"stop"}],`+
+							`"usage":{"prompt_tokens":1,`+
+							`"completion_tokens":1,`+
+							`"total_tokens":2}}`)
+				}))
+			defer server.Close()
+
+			var callCount int64
+			m, err := New("test-model",
+				WithAPIKey("key"),
+				WithBaseURL(server.URL),
+				WithChatRequestCallback(
+					func(_ context.Context,
+						_ *ChatCompletionRequest,
+					) {
+						callCount++
+					}),
+			)
+			require.NoError(t, err)
+
+			req := &model.Request{
+				Messages: []model.Message{
+					{Role: model.RoleUser,
+						Content: "hi"},
+				},
+				GenerationConfig: model.GenerationConfig{
+					Stream: tt.stream,
+				},
+			}
+
+			ch, err := m.GenerateContent(
+				context.Background(), req)
+			require.NoError(t, err)
+
+			// Callback must have fired synchronously
+			// before GenerateContent returned.
+			assert.Equal(t, int64(1), callCount,
+				"callback must execute exactly once "+
+					"before GenerateContent returns")
+
+			// Drain the channel to avoid goroutine leak.
+			for range ch {
+			}
+
+			// Confirm no extra invocations after drain.
+			assert.Equal(t, int64(1), callCount,
+				"callback must not be called more than once")
+		})
+	}
 }

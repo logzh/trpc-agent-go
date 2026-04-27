@@ -12,13 +12,16 @@ package app
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
+	"trpc.group/trpc-go/trpc-agent-go/internal/skillprofile"
 	"trpc.group/trpc-go/trpc-agent-go/openclaw/registry"
 )
 
@@ -84,6 +87,23 @@ a2a:
 	require.Equal(t, "sandbox subagent", opts.A2ADescription)
 }
 
+func TestParseRunOptions_MemoryBackendFileFromConfig(t *testing.T) {
+	t.Parallel()
+
+	cfgPath := writeTempConfig(
+		t,
+		"memory:\n"+
+			"  backend: file\n"+
+			"  auto:\n"+
+			"    enabled: true\n",
+	)
+
+	opts, err := parseRunOptions([]string{"-config", cfgPath})
+	require.NoError(t, err)
+	require.Equal(t, memoryBackendFile, opts.MemoryBackend)
+	require.True(t, opts.MemoryAutoEnabled)
+}
+
 func TestParseRunOptions_A2AFlags(t *testing.T) {
 	t.Parallel()
 
@@ -138,6 +158,37 @@ a2a:
 	require.False(t, opts.A2AAdvertiseTools)
 	require.Equal(t, "flag-name", opts.A2AName)
 	require.Equal(t, "flag-description", opts.A2ADescription)
+}
+
+func TestParseRunOptions_LangfuseConfig(t *testing.T) {
+	t.Parallel()
+
+	cfgPath := writeTempConfig(t, `
+observability:
+  langfuse:
+    enabled: true
+    required: true
+    ui_base_url: " http://127.0.0.1:3000/ "
+    trace_url_template: " http://127.0.0.1:3000/project/local-dev/traces/{{trace_id}} "
+    observation_leaf_value_max_bytes: 4096
+`)
+
+	opts, err := parseRunOptions([]string{"-config", cfgPath})
+	require.NoError(t, err)
+	require.True(t, opts.LangfuseEnabled)
+	require.True(t, opts.LangfuseRequired)
+	require.Equal(t, "http://127.0.0.1:3000", opts.LangfuseUIBaseURL)
+	require.Equal(
+		t,
+		"http://127.0.0.1:3000/project/local-dev/traces/{{trace_id}}",
+		opts.LangfuseTraceURLTemplate,
+	)
+	require.NotNil(t, opts.LangfuseObservationLeafValueMaxBytes)
+	require.Equal(
+		t,
+		4096,
+		*opts.LangfuseObservationLeafValueMaxBytes,
+	)
 }
 
 func TestParseRunOptions_UsesDefaultConfigPath(t *testing.T) {
@@ -219,6 +270,8 @@ agent:
   claude_env: ["A=B"]
   claude_work_dir: "/tmp/work"
   add_session_summary: false
+  enable_context_compaction: false
+  context_compaction_oversized_tool_result_max_tokens: 2048
   max_history_runs: 123
   preload_memory: 2
 `)
@@ -240,6 +293,8 @@ agent:
 		"-agent-ralph-verify-env", "X=1",
 		"-claude-bin", "/tmp/claude",
 		"-add-session-summary",
+		"-enable-context-compaction",
+		"-context-compaction-oversized-tool-result-max-tokens", "256",
 		"-max-history-runs", "9",
 		"-preload-memory", "-1",
 	})
@@ -259,8 +314,62 @@ agent:
 	require.Equal(t, "X=1", opts.RalphLoopVerifyEnv)
 	require.Equal(t, "/tmp/claude", opts.ClaudeBin)
 	require.True(t, opts.AddSessionSummary)
+	require.True(t, opts.EnableContextCompaction)
+	require.Equal(t, 256, opts.ContextCompactionOversizedToolResultMaxTokens)
 	require.Equal(t, 9, opts.MaxHistoryRuns)
 	require.Equal(t, -1, opts.PreloadMemory)
+}
+
+func TestParseRunOptions_ModelGenerationConfig_DefaultsStreamTrue(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	cfgPath := writeTempConfig(t, `
+model:
+  mode: "mock"
+  generation_config:
+    max_tokens: 256
+    temperature: 0.1
+`)
+
+	opts, err := parseRunOptions([]string{"-config", cfgPath})
+	require.NoError(t, err)
+	require.NotNil(t, opts.GenerationConfig)
+	require.True(t, opts.GenerationConfig.Stream)
+	require.Equal(t, intPtrValue(256), opts.GenerationConfig.MaxTokens)
+	require.Equal(
+		t,
+		float64PtrValue(0.1),
+		opts.GenerationConfig.Temperature,
+	)
+}
+
+func TestParseRunOptions_ModelGenerationConfig_PreservesFalseStream(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	cfgPath := writeTempConfig(t, `
+model:
+  mode: "mock"
+  generation_config:
+    stream: false
+    stop:
+      - "DONE"
+    reasoning_effort: " medium "
+`)
+
+	opts, err := parseRunOptions([]string{"-config", cfgPath})
+	require.NoError(t, err)
+	require.NotNil(t, opts.GenerationConfig)
+	require.False(t, opts.GenerationConfig.Stream)
+	require.Equal(t, []string{"DONE"}, opts.GenerationConfig.Stop)
+	require.Equal(
+		t,
+		stringPtrValue("medium"),
+		opts.GenerationConfig.ReasoningEffort,
+	)
 }
 
 func TestParseRunOptions_UnknownFieldFails(t *testing.T) {
@@ -343,6 +452,37 @@ func TestExpandEnvPlaceholders_MissingBraceIsPreserved(t *testing.T) {
 	require.Equal(t, in, out)
 }
 
+func TestResolveGenerationConfigYAML_DefaultsStreamTrue(t *testing.T) {
+	t.Parallel()
+
+	got := resolveGenerationConfigYAML(&generationConfigYAML{})
+	require.NotNil(t, got)
+	require.True(t, got.Stream)
+}
+
+func TestResolveGenerationConfigYAML_ExplicitFalseWins(t *testing.T) {
+	t.Parallel()
+
+	stream := false
+	got := resolveGenerationConfigYAML(&generationConfigYAML{
+		Stream: &stream,
+	})
+	require.NotNil(t, got)
+	require.False(t, got.Stream)
+}
+
+func intPtrValue(v int) *int {
+	return &v
+}
+
+func float64PtrValue(v float64) *float64 {
+	return &v
+}
+
+func stringPtrValue(v string) *string {
+	return &v
+}
+
 func TestExpandEnvPlaceholders_ReplacesMultiple(t *testing.T) {
 	t.Setenv("OPENCLAW_ENV_A", "A")
 	t.Setenv("OPENCLAW_ENV_B", "B")
@@ -415,6 +555,8 @@ agent:
   claude_env: ["FOO=bar","X=1"]
   claude_work_dir: "/tmp/work"
   add_session_summary: true
+  enable_context_compaction: true
+  context_compaction_oversized_tool_result_max_tokens: 4096
   max_history_runs: 50
   preload_memory: 10
   instruction: "instruction"
@@ -464,6 +606,10 @@ skills:
   extra_dirs: ["/extra1","/extra2"]
   debug: true
   allowBundled: ["gh-issues","notion"]
+  watch: false
+  watch_bundled: true
+  watch_debounce_ms: 125
+  tool_profile: "knowledge_only"
   load_mode: "session"
   max_loaded_skills: 3
   loaded_content_in_tool_results: false
@@ -484,6 +630,7 @@ skills:
 tools:
   enable_local_exec: true
   enable_openclaw_tools: true
+  openclaw_tooling_guidance: ""
   enable_parallel_tools: true
   refresh_toolsets_on_run: true
   providers:
@@ -507,6 +654,7 @@ session:
     key_prefix: "sp"
   summary:
     enabled: true
+    mode: "auto"
     policy: "all"
     event_threshold: 10
     token_threshold: 100
@@ -550,6 +698,8 @@ memory:
 	require.Equal(t, "/tmp/work", opts.ClaudeWorkDir)
 
 	require.True(t, opts.AddSessionSummary)
+	require.True(t, opts.EnableContextCompaction)
+	require.Equal(t, 4096, opts.ContextCompactionOversizedToolResultMaxTokens)
 	require.Equal(t, 50, opts.MaxHistoryRuns)
 	require.Equal(t, 10, opts.PreloadMemory)
 	require.Equal(t, "instruction", opts.AgentInstruction)
@@ -600,6 +750,14 @@ memory:
 	require.Equal(t, "/extra1,/extra2", opts.SkillsExtraDir)
 	require.True(t, opts.SkillsDebug)
 	require.Equal(t, "gh-issues,notion", opts.SkillsAllowBundled)
+	require.False(t, opts.SkillsWatch)
+	require.True(t, opts.SkillsWatchBundled)
+	require.Equal(t, 125*time.Millisecond, opts.SkillsWatchDebounce)
+	require.Equal(
+		t,
+		skillprofile.KnowledgeOnly,
+		opts.SkillsToolProfile,
+	)
 	require.Equal(t, "session", opts.SkillsLoadMode)
 	require.Equal(t, 3, opts.SkillsMaxLoaded)
 	require.False(t, opts.SkillsToolResults)
@@ -628,6 +786,8 @@ memory:
 
 	require.True(t, opts.EnableLocalExec)
 	require.True(t, opts.EnableOpenClawTools)
+	require.NotNil(t, opts.OpenClawToolingGuide)
+	require.Equal(t, "", *opts.OpenClawToolingGuide)
 	require.True(t, opts.EnableParallelTools)
 	require.True(t, opts.RefreshToolSetsOnRun)
 
@@ -648,6 +808,7 @@ memory:
 	require.NotNil(t, opts.SessionConfig)
 
 	require.True(t, opts.SessionSummaryEnabled)
+	require.Equal(t, "auto", opts.SessionSummaryMode)
 	require.Equal(t, "all", opts.SessionSummaryPolicy)
 	require.Equal(t, 10, opts.SessionSummaryEventCount)
 	require.Equal(t, 100, opts.SessionSummaryTokenCount)
@@ -752,6 +913,129 @@ skills:
 	require.Equal(t, "b,c", opts.SkillsAllowBundled)
 }
 
+func TestParseRunOptions_KnowledgesEntriesConfig(t *testing.T) {
+	t.Parallel()
+
+	cfgPath := writeTempConfig(t, `
+knowledges:
+  entries:
+    - name: "docs"
+      embedder:
+        type: "openai"
+        model: "text-embedding-3-small"
+      vector_store:
+        type: "inmemory"
+        max_results: 5
+`)
+
+	opts, err := parseRunOptions([]string{"-config", cfgPath})
+	require.NoError(t, err)
+	require.Len(t, opts.KnowledgesConfig, 1)
+	require.Contains(t, opts.KnowledgesConfig, "docs")
+	require.NotNil(t, opts.KnowledgesConfig["docs"])
+}
+
+func TestParseRunOptions_KnowledgesEntriesRequireName(t *testing.T) {
+	t.Parallel()
+
+	cfgPath := writeTempConfig(t, `
+knowledges:
+  entries:
+    - vector_store:
+        type: "inmemory"
+`)
+
+	_, err := parseRunOptions([]string{"-config", cfgPath})
+	require.Error(t, err)
+	var exitErr *exitError
+	require.True(t, errors.As(err, &exitErr))
+	require.Equal(t, 1, exitErr.Code)
+	require.Contains(t, err.Error(), "knowledges.entries[0].name is empty")
+}
+
+func TestParseRunOptions_KnowledgesEntriesRejectDuplicateNames(t *testing.T) {
+	t.Parallel()
+
+	cfgPath := writeTempConfig(t, `
+knowledges:
+  entries:
+    - name: "docs"
+      vector_store:
+        type: "inmemory"
+    - name: "docs"
+      vector_store:
+        type: "inmemory"
+`)
+
+	_, err := parseRunOptions([]string{"-config", cfgPath})
+	require.Error(t, err)
+	var exitErr *exitError
+	require.True(t, errors.As(err, &exitErr))
+	require.Equal(t, 1, exitErr.Code)
+	require.Contains(t, err.Error(), "duplicate knowledge name: docs")
+}
+
+func TestConvertKnowledgeConfigs_SkipsEntriesWithoutComponents(t *testing.T) {
+	t.Parallel()
+
+	configs, err := convertKnowledgeConfigs([]knowledgeEntryConfig{
+		{Name: "empty"},
+		{
+			Name: "docs",
+			VectorStore: &rawYAMLNode{Node: yamlNode(t, `
+type: inmemory
+max_results: 5
+`)},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, configs, 1)
+	require.NotContains(t, configs, "empty")
+	require.Contains(t, configs, "docs")
+}
+
+func TestConvertKnowledgeConfigs_EmptyEntriesReturnNil(t *testing.T) {
+	t.Parallel()
+
+	configs, err := convertKnowledgeConfigs(nil)
+	require.NoError(t, err)
+	require.Nil(t, configs)
+}
+
+func TestConvertKnowledgeConfigs_ClonesNestedNodes(t *testing.T) {
+	t.Parallel()
+
+	embedderNode := yamlNode(t, `
+type: openai
+model: text-embedding-3-small
+`)
+	vectorStoreNode := yamlNode(t, `
+type: inmemory
+max_results: 5
+`)
+
+	configs, err := convertKnowledgeConfigs([]knowledgeEntryConfig{{
+		Name:        "docs",
+		Embedder:    &rawYAMLNode{Node: embedderNode},
+		VectorStore: &rawYAMLNode{Node: vectorStoreNode},
+	}})
+	require.NoError(t, err)
+
+	mappingValue(embedderNode, "model").Value = "mutated-model"
+	mappingValue(vectorStoreNode, "max_results").Value = "99"
+
+	gotEmbedder := mappingValue(configs["docs"], "embedder")
+	gotVectorStore := mappingValue(configs["docs"], "vector_store")
+	require.Equal(t, "text-embedding-3-small", mappingValue(gotEmbedder, "model").Value)
+	require.Equal(t, "5", mappingValue(gotVectorStore, "max_results").Value)
+}
+
+func TestCloneYAMLNode_NilReturnsNil(t *testing.T) {
+	t.Parallel()
+
+	require.Nil(t, cloneYAMLNode(nil))
+}
+
 func TestParseRunOptions_DebugRecorder_ConfigApplied(t *testing.T) {
 	t.Parallel()
 
@@ -775,6 +1059,18 @@ func TestParseRunOptions_SkillsDefaults(t *testing.T) {
 
 	opts, err := parseRunOptions(nil)
 	require.NoError(t, err)
+	require.True(t, opts.SkillsWatch)
+	require.False(t, opts.SkillsWatchBundled)
+	require.Equal(
+		t,
+		defaultSkillsWatchDebounce,
+		opts.SkillsWatchDebounce,
+	)
+	require.Equal(
+		t,
+		defaultSkillsToolProfile,
+		opts.SkillsToolProfile,
+	)
 	require.Equal(t, defaultSkillsLoadMode, opts.SkillsLoadMode)
 	require.True(t, opts.SkillsToolResults)
 	require.True(t, opts.SkillsSkipFallback)
@@ -793,6 +1089,71 @@ func TestParseRunOptions_SkillsLoadMode_InvalidFails(t *testing.T) {
 	var exitErr *exitError
 	require.True(t, errors.As(err, &exitErr))
 	require.Equal(t, 2, exitErr.Code)
+}
+
+func TestParseRunOptions_SkillsToolProfile_InvalidFails(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	_, err := parseRunOptions([]string{
+		"-skills-tool-profile", "bad",
+	})
+	require.Error(t, err)
+
+	var exitErr *exitError
+	require.True(t, errors.As(err, &exitErr))
+	require.Equal(t, 2, exitErr.Code)
+}
+
+func TestParseRunOptions_SkillsToolProfile_FullAccepted(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	opts, err := parseRunOptions([]string{
+		"-skills-tool-profile", "FULL",
+	})
+	require.NoError(t, err)
+	require.Equal(t, skillprofile.Full, opts.SkillsToolProfile)
+}
+
+func TestParseRunOptions_SkillsToolProfile_ConfigInvalidFails(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	cfgPath := writeTempConfig(t, `
+skills:
+  tool_profile: "bad"
+`)
+
+	_, err := parseRunOptions([]string{"-config", cfgPath})
+	require.Error(t, err)
+
+	var exitErr *exitError
+	require.True(t, errors.As(err, &exitErr))
+	require.Equal(t, 1, exitErr.Code)
+}
+
+func TestSkillsOptionExitCode(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(
+		t,
+		2,
+		skillsOptionExitCode(map[string]struct{}{
+			flagSkillsToolProfile: {},
+		}),
+	)
+	require.Equal(
+		t,
+		2,
+		skillsOptionExitCode(map[string]struct{}{
+			flagSkillsLoadMode: {},
+		}),
+	)
+	require.Equal(t, 1, skillsOptionExitCode(map[string]struct{}{}))
 }
 
 func TestParseRunOptions_AdminDefaults(t *testing.T) {
@@ -849,4 +1210,67 @@ func writeTempConfig(t *testing.T, body string) string {
 	path := filepath.Join(dir, "openclaw.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
 	return path
+}
+
+func mappingValue(node *yaml.Node, key string) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
+		node = node.Content[0]
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+	return nil
+}
+
+func TestFinalizeRunOptions_ApproxRunesPerToken(t *testing.T) {
+	t.Parallel()
+
+	t.Run("zero is valid", func(t *testing.T) {
+		opts := &runOptions{}
+		require.NoError(t, finalizeRunOptions(opts))
+	})
+
+	t.Run("positive is valid", func(t *testing.T) {
+		opts := &runOptions{SessionSummaryApproxRunesPerToken: 2.0}
+		require.NoError(t, finalizeRunOptions(opts))
+	})
+
+	t.Run("negative is rejected", func(t *testing.T) {
+		opts := &runOptions{SessionSummaryApproxRunesPerToken: -1.0}
+		require.Error(t, finalizeRunOptions(opts))
+	})
+
+	t.Run("NaN is rejected", func(t *testing.T) {
+		opts := &runOptions{
+			SessionSummaryApproxRunesPerToken: math.NaN(),
+		}
+		require.Error(t, finalizeRunOptions(opts))
+	})
+
+	t.Run("Inf is rejected", func(t *testing.T) {
+		opts := &runOptions{
+			SessionSummaryApproxRunesPerToken: math.Inf(1),
+		}
+		require.Error(t, finalizeRunOptions(opts))
+	})
+}
+
+func TestFinalizeRunOptions_SkillsWatchDebounce(t *testing.T) {
+	t.Parallel()
+
+	opts := &runOptions{
+		SkillsWatchDebounce: -time.Millisecond,
+	}
+
+	err := finalizeRunOptions(opts)
+	require.EqualError(
+		t,
+		err,
+		"invalid skills watch debounce: -1ms",
+	)
 }

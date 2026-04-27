@@ -54,6 +54,70 @@ func TestWithMetadataHelpers(t *testing.T) {
 	require.Contains(t, e.StateDelta, MetadataKeyState)
 }
 
+func TestFinalResponseIDFromStateDelta_EdgeCases(t *testing.T) {
+	require.Empty(t, FinalResponseIDFromStateDelta(nil))
+	require.Empty(t, FinalResponseIDFromStateDelta(map[string][]byte{
+		StateKeyLastResponseID: []byte(`""`),
+	}))
+	require.Empty(t, FinalResponseIDFromStateDelta(map[string][]byte{
+		MetadataKeyCompletion: []byte("{"),
+	}))
+}
+
+func TestCompletionSnapshotOnlyMetadataHelpers(t *testing.T) {
+	stateDelta := map[string][]byte{
+		MetadataKeyCompletion: []byte(`{"finalResponseID":"resp-1"}`),
+	}
+	require.False(t, CompletionSnapshotOnlyFromStateDelta(stateDelta))
+
+	SetCompletionSnapshotOnlyInStateDelta(stateDelta, true)
+	require.True(t, CompletionSnapshotOnlyFromStateDelta(stateDelta))
+
+	var metadata CompletionMetadata
+	require.NoError(t, json.Unmarshal(stateDelta[MetadataKeyCompletion], &metadata))
+	require.True(t, metadata.SnapshotOnly)
+	require.Equal(t, "resp-1", metadata.FinalResponseID)
+}
+
+func TestCompletionSnapshotOnlyMetadataHelpers_EdgeCases(t *testing.T) {
+	require.False(t, CompletionSnapshotOnlyFromStateDelta(nil))
+	require.False(t, CompletionSnapshotOnlyFromStateDelta(map[string][]byte{}))
+	require.False(t, CompletionSnapshotOnlyFromStateDelta(map[string][]byte{
+		MetadataKeyCompletion: []byte("{"),
+	}))
+
+	stateDelta := map[string][]byte{
+		MetadataKeyCompletion: []byte("{"),
+	}
+	SetCompletionSnapshotOnlyInStateDelta(stateDelta, false)
+	var metadata CompletionMetadata
+	require.NoError(t, json.Unmarshal(stateDelta[MetadataKeyCompletion], &metadata))
+	require.False(t, metadata.SnapshotOnly)
+
+	require.NotPanics(t, func() {
+		SetCompletionSnapshotOnlyInStateDelta(nil, true)
+	})
+}
+
+func TestWithCompletionEventSnapshotOnly(t *testing.T) {
+	opts := &CompletionEventOptions{}
+	WithCompletionEventSnapshotOnly(true)(opts)
+	require.True(t, opts.SnapshotOnly)
+}
+
+func TestNodeEventEmitterMetadataHelpers(t *testing.T) {
+	stateDelta := map[string][]byte{
+		MetadataKeyNode: []byte(`{"nodeId":"n1","nodeType":"function","phase":"start"}`),
+	}
+	require.Empty(t, NodeEventEmitterFromStateDelta(stateDelta))
+
+	SetNodeEventEmitterInStateDelta(stateDelta, NodeEventEmitterExecutor)
+	require.Equal(t, NodeEventEmitterExecutor, NodeEventEmitterFromStateDelta(stateDelta))
+
+	SetNodeEventEmitterInStateDelta(nil, NodeEventEmitterAgentHelper)
+	require.Equal(t, NodeEventEmitterExecutor, NodeEventEmitterFromStateDelta(stateDelta))
+}
+
 func TestNewNodeEvents(t *testing.T) {
 	start := time.Now().Add(-time.Second).UTC()
 	end := start.Add(150 * time.Millisecond)
@@ -105,7 +169,7 @@ func TestNewNodeEvents(t *testing.T) {
 		WithNodeEventEndTime(end),
 		WithNodeEventError("boom"),
 	)
-	require.Equal(t, model.ObjectTypeError, e3.Object)
+	require.Equal(t, ObjectTypeGraphNodeError, e3.Object)
 	var meta3 NodeExecutionMetadata
 	require.NoError(t, json.Unmarshal(e3.StateDelta[MetadataKeyNode], &meta3))
 	require.Equal(t, ExecutionPhaseError, meta3.Phase)
@@ -137,7 +201,7 @@ func TestNewNodeErrorEvent_WithResponseError(t *testing.T) {
 		WithNodeEventError(errMsg),
 		WithNodeEventResponseError(&model.ResponseError{Code: &codeVal}),
 	)
-	require.Equal(t, model.ObjectTypeError, e.Object)
+	require.Equal(t, ObjectTypeGraphNodeError, e.Object)
 	require.NotNil(t, e.Response)
 	require.NotNil(t, e.Response.Error)
 	require.Equal(t, model.ErrorTypeFlowError, e.Response.Error.Type)
@@ -325,6 +389,7 @@ func TestNewGraphCompletionEvent(t *testing.T) {
 	e := NewGraphCompletionEvent(
 		WithCompletionEventInvocationID("inv"),
 		WithCompletionEventFinalState(final),
+		WithCompletionEventFinalResponseID("resp-final"),
 		WithCompletionEventTotalSteps(10),
 		WithCompletionEventTotalDuration(100*time.Millisecond),
 	)
@@ -341,6 +406,7 @@ func TestNewGraphCompletionEvent(t *testing.T) {
 	require.NoError(t, json.Unmarshal(e.StateDelta[MetadataKeyCompletion], &cm))
 	require.Equal(t, 10, cm.TotalSteps)
 	require.Equal(t, 3, cm.FinalStateKeys) // includes StateKeyLastResponse + k1 + k2
+	require.Equal(t, "resp-final", cm.FinalResponseID)
 }
 
 func TestNewGraphCompletionEvent_EncodeJSONBytes(t *testing.T) {
@@ -370,6 +436,9 @@ func TestNewGraphCompletionEvent_SerializeFinalStateSkipsInternalAndUnserializab
 		StateKeyLastResponse: "ok",
 		"keep1":              1,
 		"keep2":              map[string]any{"a": 1},
+		StateKeyMessages: []model.Message{
+			model.NewUserMessage("large history should not persist"),
+		},
 		// internal keys that must be skipped.
 		MetadataKeyNode:        []byte("x"),
 		MetadataKeyPregel:      []byte("y"),
@@ -396,6 +465,7 @@ func TestNewGraphCompletionEvent_SerializeFinalStateSkipsInternalAndUnserializab
 	// Should include keep1 and keep2, exclude internal keys and unserializable key.
 	require.Contains(t, e.StateDelta, "keep1")
 	require.Contains(t, e.StateDelta, "keep2")
+	require.NotContains(t, e.StateDelta, StateKeyMessages)
 	require.NotContains(t, e.StateDelta, MetadataKeyNode)
 	require.NotContains(t, e.StateDelta, MetadataKeyPregel)
 	require.NotContains(t, e.StateDelta, MetadataKeyChannel)
@@ -409,6 +479,10 @@ func TestNewGraphCompletionEvent_SerializeFinalStateSkipsInternalAndUnserializab
 	require.NotContains(t, e.StateDelta, StateKeyCurrentNodeID)
 	require.NotContains(t, e.StateDelta, StateKeySession)
 	require.NotContains(t, e.StateDelta, "bad")
+
+	var cm CompletionMetadata
+	require.NoError(t, json.Unmarshal(e.StateDelta[MetadataKeyCompletion], &cm))
+	require.Equal(t, 3, cm.FinalStateKeys) // StateKeyLastResponse + keep1 + keep2
 }
 
 func TestNewGraphCompletionEvent_NilFinalState(t *testing.T) {

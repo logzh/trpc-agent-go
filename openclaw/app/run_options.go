@@ -15,6 +15,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +24,8 @@ import (
 	"gopkg.in/yaml.v3"
 
 	ia2a "trpc.group/trpc-go/trpc-agent-go/internal/a2a"
+	"trpc.group/trpc-go/trpc-agent-go/internal/skillprofile"
+	"trpc.group/trpc-go/trpc-agent-go/model"
 	ocskills "trpc.group/trpc-go/trpc-agent-go/openclaw/internal/skills"
 )
 
@@ -42,6 +45,7 @@ const (
 	sessionBackendPostgres   = "postgres"
 	sessionBackendClickHouse = "clickhouse"
 
+	memoryBackendFile      = "file"
 	memoryBackendInMemory  = "inmemory"
 	memoryBackendRedis     = "redis"
 	memoryBackendSQLite    = "sqlite"
@@ -53,12 +57,19 @@ const (
 	summaryPolicyAny = "any"
 	summaryPolicyAll = "all"
 
+	summaryModeAuto   = "auto"
+	summaryModeManual = "manual"
+
 	defaultSessionSummaryEventThreshold = 20
 	defaultSkillsLoadMode               = "turn"
+	defaultSkillsToolProfile            = skillprofile.KnowledgeOnly
+	defaultSkillsWatchDebounce          = 250 * time.Millisecond
 
-	flagAddSessionSummary = "add-session-summary"
-	flagMaxHistoryRuns    = "max-history-runs"
-	flagPreloadMemory     = "preload-memory"
+	flagAddSessionSummary                             = "add-session-summary"
+	flagEnableContextCompaction                       = "enable-context-compaction"
+	flagContextCompactionOversizedToolResultMaxTokens = "context-compaction-oversized-tool-result-max-tokens"
+	flagMaxHistoryRuns                                = "max-history-runs"
+	flagPreloadMemory                                 = "preload-memory"
 
 	flagAgentInstruction       = "agent-instruction"
 	flagAgentInstructionFiles  = "agent-instruction-files"
@@ -79,11 +90,15 @@ const (
 
 	flagEnableParallelTools = "enable-parallel-tools"
 
-	flagSkillsAllowBundled = "skills-allow-bundled"
-	flagSkillsLoadMode     = "skills-load-mode"
-	flagSkillsMaxLoaded    = "skills-max-loaded"
-	flagSkillsToolResults  = "skills-loaded-content-in-tool-results"
-	flagSkillsSkipFallback = "skills-skip-fallback-on-session-summary"
+	flagSkillsAllowBundled  = "skills-allow-bundled"
+	flagSkillsWatch         = "skills-watch"
+	flagSkillsWatchBundled  = "skills-watch-bundled"
+	flagSkillsWatchDebounce = "skills-watch-debounce"
+	flagSkillsToolProfile   = "skills-tool-profile"
+	flagSkillsLoadMode      = "skills-load-mode"
+	flagSkillsMaxLoaded     = "skills-max-loaded"
+	flagSkillsToolResults   = "skills-loaded-content-in-tool-results"
+	flagSkillsSkipFallback  = "skills-skip-fallback-on-session-summary"
 
 	flagDebugRecorder     = "debug-recorder"
 	flagDebugRecorderDir  = "debug-recorder-dir"
@@ -112,6 +127,12 @@ type runOptions struct {
 	AdminAddr     string
 	AdminAutoPort bool
 
+	LangfuseEnabled                      bool
+	LangfuseRequired                     bool
+	LangfuseUIBaseURL                    string
+	LangfuseTraceURLTemplate             string
+	LangfuseObservationLeafValueMaxBytes *int
+
 	A2AEnabled        bool
 	A2AHost           string
 	A2AUserIDHeader   string
@@ -120,9 +141,11 @@ type runOptions struct {
 	A2AName           string
 	A2ADescription    string
 
-	AddSessionSummary bool
-	MaxHistoryRuns    int
-	PreloadMemory     int
+	AddSessionSummary                             bool
+	EnableContextCompaction                       bool
+	ContextCompactionOversizedToolResultMaxTokens int
+	MaxHistoryRuns                                int
+	PreloadMemory                                 int
 
 	AgentInstruction       string
 	AgentInstructionFiles  string
@@ -149,22 +172,28 @@ type runOptions struct {
 	ClaudeEnv          string
 	ClaudeWorkDir      string
 
-	ModelMode          string
-	OpenAIModel        string
-	OpenAIVariant      string
-	OpenAIBaseURL      string
-	ModelConfig        *yaml.Node
-	SkillsRoot         string
-	SkillsExtraDir     string
-	SkillsDebug        bool
-	SkillsAllowBundled string
-	SkillConfigs       map[string]ocskills.SkillConfig
-	SkillsLoadMode     string
-	SkillsMaxLoaded    int
-	SkillsToolResults  bool
-	SkillsSkipFallback bool
-	SkillsToolingGuide *string
-	StateDir           string
+	ModelMode           string
+	OpenAIModel         string
+	OpenAIVariant       string
+	OpenAIBaseURL       string
+	GenerationConfig    *model.GenerationConfig
+	ModelConfig         *yaml.Node
+	KnowledgesConfig    map[string]*yaml.Node
+	SkillsRoot          string
+	SkillsExtraDir      string
+	SkillsDebug         bool
+	SkillsAllowBundled  string
+	SkillConfigs        map[string]ocskills.SkillConfig
+	SkillsWatch         bool
+	SkillsWatchBundled  bool
+	SkillsWatchDebounce time.Duration
+	SkillsToolProfile   string
+	SkillsLoadMode      string
+	SkillsMaxLoaded     int
+	SkillsToolResults   bool
+	SkillsSkipFallback  bool
+	SkillsToolingGuide  *string
+	StateDir            string
 
 	DebugRecorderEnabled bool
 	DebugRecorderDir     string
@@ -194,16 +223,19 @@ type runOptions struct {
 	MemoryAutoMessageThreshold int
 	MemoryAutoTimeInterval     time.Duration
 
-	SessionSummaryEnabled       bool
-	SessionSummaryPolicy        string
-	SessionSummaryEventCount    int
-	SessionSummaryTokenCount    int
-	SessionSummaryIdleThreshold time.Duration
-	SessionSummaryMaxWords      int
+	SessionSummaryEnabled             bool
+	SessionSummaryMode                string
+	SessionSummaryPolicy              string
+	SessionSummaryEventCount          int
+	SessionSummaryTokenCount          int
+	SessionSummaryIdleThreshold       time.Duration
+	SessionSummaryMaxWords            int
+	SessionSummaryApproxRunesPerToken float64
 
-	EnableLocalExec     bool
-	EnableOpenClawTools bool
-	EnableParallelTools bool
+	EnableLocalExec      bool
+	EnableOpenClawTools  bool
+	OpenClawToolingGuide *string
+	EnableParallelTools  bool
 
 	enableOpenClawToolsExplicit bool
 
@@ -231,9 +263,12 @@ func parseRunOptions(args []string) (runOptions, error) {
 		OpenAIModel:   defaultOpenAIModelName(),
 		OpenAIVariant: defaultOpenAIVariant,
 
-		SkillsLoadMode:     defaultSkillsLoadMode,
-		SkillsToolResults:  true,
-		SkillsSkipFallback: true,
+		SkillsWatch:         true,
+		SkillsWatchDebounce: defaultSkillsWatchDebounce,
+		SkillsToolProfile:   defaultSkillsToolProfile,
+		SkillsLoadMode:      defaultSkillsLoadMode,
+		SkillsToolResults:   true,
+		SkillsSkipFallback:  true,
 
 		SessionBackend: sessionBackendInMemory,
 		MemoryBackend:  memoryBackendInMemory,
@@ -332,6 +367,20 @@ func parseRunOptions(args []string) (runOptions, error) {
 		flagAddSessionSummary,
 		false,
 		"Prepend session summary to the model context (optional)",
+	)
+	fs.BoolVar(
+		&opts.EnableContextCompaction,
+		flagEnableContextCompaction,
+		false,
+		"Enable prompt-side context compaction to control context window growth",
+	)
+	fs.IntVar(
+		&opts.ContextCompactionOversizedToolResultMaxTokens,
+		flagContextCompactionOversizedToolResultMaxTokens,
+		0,
+		"Truncate oversized tool results with head+tail preservation when "+
+			"context compaction is enabled (0=disable; recommended opt-in "+
+			"value is 8192). Requires --enable-context-compaction.",
 	)
 	fs.IntVar(
 		&opts.MaxHistoryRuns,
@@ -481,7 +530,7 @@ func parseRunOptions(args []string) (runOptions, error) {
 		&opts.OpenAIVariant,
 		"openai-variant",
 		defaultOpenAIVariant,
-		"OpenAI variant: auto, openai, deepseek, qwen, hunyuan",
+		"OpenAI variant: auto, openai, deepseek, qwen, hunyuan (auto uses configured base URL host)",
 	)
 	fs.StringVar(
 		&opts.OpenAIBaseURL,
@@ -530,6 +579,30 @@ func parseRunOptions(args []string) (runOptions, error) {
 		flagSkillsAllowBundled,
 		"",
 		"Comma-separated allowlist of bundled skills",
+	)
+	fs.BoolVar(
+		&opts.SkillsWatch,
+		flagSkillsWatch,
+		true,
+		"Watch local skill roots and refresh automatically",
+	)
+	fs.DurationVar(
+		&opts.SkillsWatchDebounce,
+		flagSkillsWatchDebounce,
+		defaultSkillsWatchDebounce,
+		"Debounce for automatic skill refreshes",
+	)
+	fs.BoolVar(
+		&opts.SkillsWatchBundled,
+		flagSkillsWatchBundled,
+		false,
+		"Also watch bundled skills roots for local changes",
+	)
+	fs.StringVar(
+		&opts.SkillsToolProfile,
+		flagSkillsToolProfile,
+		defaultSkillsToolProfile,
+		"Built-in skill tool profile: full|knowledge_only",
 	)
 	fs.StringVar(
 		&opts.SkillsLoadMode,
@@ -608,7 +681,7 @@ func parseRunOptions(args []string) (runOptions, error) {
 		&opts.MemoryBackend,
 		"memory-backend",
 		memoryBackendInMemory,
-		"Memory backend: inmemory|redis|sqlite|"+
+		"Memory backend: file|inmemory|redis|sqlite|"+
 			"sqlitevec(requires openclaw_sqlitevec build tag)|"+
 			"mysql|postgres|pgvector",
 	)
@@ -667,10 +740,16 @@ func parseRunOptions(args []string) (runOptions, error) {
 		"Enable session summarization (optional)",
 	)
 	fs.StringVar(
+		&opts.SessionSummaryMode,
+		"session-summary-mode",
+		"",
+		"Summary trigger mode: auto (context-window aware) or manual (explicit thresholds)",
+	)
+	fs.StringVar(
 		&opts.SessionSummaryPolicy,
 		"session-summary-policy",
 		summaryPolicyAny,
-		"Session summary gating policy: any|all",
+		"Session summary gating policy: any|all (only used in manual mode)",
 	)
 	fs.IntVar(
 		&opts.SessionSummaryEventCount,
@@ -688,13 +767,20 @@ func parseRunOptions(args []string) (runOptions, error) {
 		&opts.SessionSummaryIdleThreshold,
 		"session-summary-idle",
 		0,
-		"Summarize when time since last event exceeds duration (0 disables)",
+		"Summarize on summary checks when the checked session's last event is older than duration (0 disables)",
 	)
 	fs.IntVar(
 		&opts.SessionSummaryMaxWords,
 		"session-summary-max-words",
 		0,
 		"Max summary words (0 means no limit)",
+	)
+	fs.Float64Var(
+		&opts.SessionSummaryApproxRunesPerToken,
+		"session-summary-approx-runes-per-token",
+		0,
+		"Approximate runes per token for summary token estimation "+
+			"(0 uses framework default 4.0; set ~2.0 for Chinese-heavy content)",
 	)
 	fs.BoolVar(
 		&opts.EnableLocalExec,
@@ -772,7 +858,7 @@ func parseRunOptions(args []string) (runOptions, error) {
 
 	if err := finalizeRunOptions(&opts); err != nil {
 		return runOptions{}, &exitError{
-			Code: loadModeExitCode(setFlags),
+			Code: skillsOptionExitCode(setFlags),
 			Err:  err,
 		}
 	}
@@ -836,15 +922,17 @@ type fileConfig struct {
 
 	DebugRecorder *debugRecorderConfig `yaml:"debug_recorder,omitempty"`
 
-	HTTP     *httpConfig      `yaml:"http,omitempty"`
-	Admin    *adminConfig     `yaml:"admin,omitempty"`
-	A2A      *a2aConfig       `yaml:"a2a,omitempty"`
-	Agent    *agentRunConfig  `yaml:"agent,omitempty"`
-	Model    *modelConfig     `yaml:"model,omitempty"`
-	Gateway  *gatewayConfig   `yaml:"gateway,omitempty"`
-	Channels []filePluginSpec `yaml:"channels,omitempty"`
-	Skills   *skillsConfig    `yaml:"skills,omitempty"`
-	Tools    *toolsConfig     `yaml:"tools,omitempty"`
+	HTTP          *httpConfig          `yaml:"http,omitempty"`
+	Admin         *adminConfig         `yaml:"admin,omitempty"`
+	Observability *observabilityConfig `yaml:"observability,omitempty"`
+	A2A           *a2aConfig           `yaml:"a2a,omitempty"`
+	Agent         *agentRunConfig      `yaml:"agent,omitempty"`
+	Model         *modelConfig         `yaml:"model,omitempty"`
+	Knowledges    *knowledgesConfig    `yaml:"knowledges,omitempty"`
+	Gateway       *gatewayConfig       `yaml:"gateway,omitempty"`
+	Channels      []filePluginSpec     `yaml:"channels,omitempty"`
+	Skills        *skillsConfig        `yaml:"skills,omitempty"`
+	Tools         *toolsConfig         `yaml:"tools,omitempty"`
 
 	Session *sessionConfig `yaml:"session,omitempty"`
 	Memory  *memoryConfig  `yaml:"memory,omitempty"`
@@ -858,6 +946,18 @@ type adminConfig struct {
 	Enabled  *bool   `yaml:"enabled,omitempty"`
 	Addr     *string `yaml:"addr,omitempty"`
 	AutoPort *bool   `yaml:"auto_port,omitempty"`
+}
+
+type observabilityConfig struct {
+	Langfuse *langfuseConfig `yaml:"langfuse,omitempty"`
+}
+
+type langfuseConfig struct {
+	Enabled                      *bool   `yaml:"enabled,omitempty"`
+	Required                     *bool   `yaml:"required,omitempty"`
+	UIBaseURL                    *string `yaml:"ui_base_url,omitempty"`
+	TraceURLTemplate             *string `yaml:"trace_url_template,omitempty"`
+	ObservationLeafValueMaxBytes *int    `yaml:"observation_leaf_value_max_bytes,omitempty"`
 }
 
 type a2aConfig struct {
@@ -879,9 +979,11 @@ type debugRecorderConfig struct {
 type agentRunConfig struct {
 	Type *string `yaml:"type,omitempty"`
 
-	AddSessionSummary *bool `yaml:"add_session_summary,omitempty"`
-	MaxHistoryRuns    *int  `yaml:"max_history_runs,omitempty"`
-	PreloadMemory     *int  `yaml:"preload_memory,omitempty"`
+	AddSessionSummary                             *bool `yaml:"add_session_summary,omitempty"`
+	EnableContextCompaction                       *bool `yaml:"enable_context_compaction,omitempty"`
+	ContextCompactionOversizedToolResultMaxTokens *int  `yaml:"context_compaction_oversized_tool_result_max_tokens,omitempty"`
+	MaxHistoryRuns                                *int  `yaml:"max_history_runs,omitempty"`
+	PreloadMemory                                 *int  `yaml:"preload_memory,omitempty"`
 
 	Instruction      *string  `yaml:"instruction,omitempty"`
 	InstructionFiles []string `yaml:"instruction_files,omitempty"`
@@ -918,11 +1020,25 @@ type ralphLoopVerifyConfig struct {
 }
 
 type modelConfig struct {
-	Mode          *string      `yaml:"mode,omitempty"`
-	Name          *string      `yaml:"name,omitempty"`
-	BaseURL       *string      `yaml:"base_url,omitempty"`
-	OpenAIVariant *string      `yaml:"openai_variant,omitempty"`
-	Config        *rawYAMLNode `yaml:"config,omitempty"`
+	Mode             *string               `yaml:"mode,omitempty"`
+	Name             *string               `yaml:"name,omitempty"`
+	BaseURL          *string               `yaml:"base_url,omitempty"`
+	OpenAIVariant    *string               `yaml:"openai_variant,omitempty"`
+	GenerationConfig *generationConfigYAML `yaml:"generation_config,omitempty"`
+	Config           *rawYAMLNode          `yaml:"config,omitempty"`
+}
+
+type generationConfigYAML struct {
+	MaxTokens        *int     `yaml:"max_tokens,omitempty"`
+	Temperature      *float64 `yaml:"temperature,omitempty"`
+	TopP             *float64 `yaml:"top_p,omitempty"`
+	Stream           *bool    `yaml:"stream,omitempty"`
+	Stop             []string `yaml:"stop,omitempty"`
+	PresencePenalty  *float64 `yaml:"presence_penalty,omitempty"`
+	FrequencyPenalty *float64 `yaml:"frequency_penalty,omitempty"`
+	ReasoningEffort  *string  `yaml:"reasoning_effort,omitempty"`
+	ThinkingEnabled  *bool    `yaml:"thinking_enabled,omitempty"`
+	ThinkingTokens   *int     `yaml:"thinking_tokens,omitempty"`
 }
 
 type gatewayConfig struct {
@@ -936,12 +1052,19 @@ type skillsConfig struct {
 	ExtraDirs []string `yaml:"extra_dirs,omitempty"`
 	Debug     *bool    `yaml:"debug,omitempty"`
 
-	AllowBundled      []string `yaml:"allow_bundled,omitempty"`
-	AllowBundledCamel []string `yaml:"allowBundled,omitempty"`
-	LoadMode          *string  `yaml:"load_mode,omitempty"`
-	LoadModeCamel     *string  `yaml:"loadMode,omitempty"`
-	MaxLoadedSkills   *int     `yaml:"max_loaded_skills,omitempty"`
-	MaxLoadedCamel    *int     `yaml:"maxLoadedSkills,omitempty"`
+	AllowBundled       []string `yaml:"allow_bundled,omitempty"`
+	AllowBundledCamel  []string `yaml:"allowBundled,omitempty"`
+	Watch              *bool    `yaml:"watch,omitempty"`
+	WatchBundled       *bool    `yaml:"watch_bundled,omitempty"`
+	WatchBundledCamel  *bool    `yaml:"watchBundled,omitempty"`
+	WatchDebounceMS    *int     `yaml:"watch_debounce_ms,omitempty"`
+	WatchDebounceCamel *int     `yaml:"watchDebounceMs,omitempty"`
+	ToolProfile        *string  `yaml:"tool_profile,omitempty"`
+	ToolProfileCamel   *string  `yaml:"toolProfile,omitempty"`
+	LoadMode           *string  `yaml:"load_mode,omitempty"`
+	LoadModeCamel      *string  `yaml:"loadMode,omitempty"`
+	MaxLoadedSkills    *int     `yaml:"max_loaded_skills,omitempty"`
+	MaxLoadedCamel     *int     `yaml:"maxLoadedSkills,omitempty"`
 
 	ToolResults          *bool   `yaml:"loaded_content_in_tool_results,omitempty"`
 	ToolResultsCamel     *bool   `yaml:"loadedContentInToolResults,omitempty"`
@@ -961,10 +1084,12 @@ type skillEntryConfig struct {
 }
 
 type toolsConfig struct {
-	EnableLocalExec      *bool `yaml:"enable_local_exec,omitempty"`
-	EnableOpenClawTools  *bool `yaml:"enable_openclaw_tools,omitempty"`
-	EnableParallelTools  *bool `yaml:"enable_parallel_tools,omitempty"`
-	RefreshToolSetsOnRun *bool `yaml:"refresh_toolsets_on_run,omitempty"`
+	EnableLocalExec           *bool   `yaml:"enable_local_exec,omitempty"`
+	EnableOpenClawTools       *bool   `yaml:"enable_openclaw_tools,omitempty"`
+	OpenClawToolingGuide      *string `yaml:"openclaw_tooling_guidance,omitempty"`
+	OpenClawToolingGuideCamel *string `yaml:"openClawToolingGuidance,omitempty"`
+	EnableParallelTools       *bool   `yaml:"enable_parallel_tools,omitempty"`
+	RefreshToolSetsOnRun      *bool   `yaml:"refresh_toolsets_on_run,omitempty"`
 
 	Providers []filePluginSpec `yaml:"providers,omitempty"`
 	ToolSets  []filePluginSpec `yaml:"toolsets,omitempty"`
@@ -983,6 +1108,16 @@ type memoryConfig struct {
 	Limit   *int         `yaml:"limit,omitempty"`
 	Auto    *memoryAuto  `yaml:"auto,omitempty"`
 	Config  *rawYAMLNode `yaml:"config,omitempty"`
+}
+
+type knowledgesConfig struct {
+	Entries []knowledgeEntryConfig `yaml:"entries,omitempty"`
+}
+
+type knowledgeEntryConfig struct {
+	Name        string       `yaml:"name,omitempty"`
+	Embedder    *rawYAMLNode `yaml:"embedder,omitempty"`
+	VectorStore *rawYAMLNode `yaml:"vector_store,omitempty"`
 }
 
 type pluginSpec struct {
@@ -1013,12 +1148,14 @@ type redisConfig struct {
 }
 
 type summaryConfig struct {
-	Enabled        *bool   `yaml:"enabled,omitempty"`
-	Policy         *string `yaml:"policy,omitempty"`
-	EventThreshold *int    `yaml:"event_threshold,omitempty"`
-	TokenThreshold *int    `yaml:"token_threshold,omitempty"`
-	IdleThreshold  *string `yaml:"idle_threshold,omitempty"`
-	MaxWords       *int    `yaml:"max_words,omitempty"`
+	Enabled             *bool    `yaml:"enabled,omitempty"`
+	Mode                *string  `yaml:"mode,omitempty"`
+	Policy              *string  `yaml:"policy,omitempty"`
+	EventThreshold      *int     `yaml:"event_threshold,omitempty"`
+	TokenThreshold      *int     `yaml:"token_threshold,omitempty"`
+	IdleThreshold       *string  `yaml:"idle_threshold,omitempty"`
+	MaxWords            *int     `yaml:"max_words,omitempty"`
+	ApproxRunesPerToken *float64 `yaml:"approx_runes_per_token,omitempty"`
 }
 
 type memoryAuto struct {
@@ -1166,6 +1303,13 @@ func (cfg *fileConfig) apply(
 			opts.AdminAutoPort = *cfg.Admin.AutoPort
 		}
 	}
+	if cfg.Observability != nil &&
+		cfg.Observability.Langfuse != nil {
+		applyLangfuseConfig(
+			cfg.Observability.Langfuse,
+			opts,
+		)
+	}
 	if cfg.A2A != nil {
 		if cfg.A2A.Enabled != nil &&
 			!flagWasSet(set, flagA2AEnabled) {
@@ -1205,6 +1349,14 @@ func (cfg *fileConfig) apply(
 		if cfg.Agent.AddSessionSummary != nil &&
 			!flagWasSet(set, flagAddSessionSummary) {
 			opts.AddSessionSummary = *cfg.Agent.AddSessionSummary
+		}
+		if cfg.Agent.EnableContextCompaction != nil &&
+			!flagWasSet(set, flagEnableContextCompaction) {
+			opts.EnableContextCompaction = *cfg.Agent.EnableContextCompaction
+		}
+		if cfg.Agent.ContextCompactionOversizedToolResultMaxTokens != nil &&
+			!flagWasSet(set, flagContextCompactionOversizedToolResultMaxTokens) {
+			opts.ContextCompactionOversizedToolResultMaxTokens = *cfg.Agent.ContextCompactionOversizedToolResultMaxTokens
 		}
 		if cfg.Agent.MaxHistoryRuns != nil &&
 			!flagWasSet(set, flagMaxHistoryRuns) {
@@ -1313,6 +1465,18 @@ func (cfg *fileConfig) apply(
 		if cfg.Model.Config != nil {
 			opts.ModelConfig = cfg.Model.Config.Node
 		}
+		if cfg.Model.GenerationConfig != nil {
+			opts.GenerationConfig = resolveGenerationConfigYAML(
+				cfg.Model.GenerationConfig,
+			)
+		}
+	}
+	if cfg.Knowledges != nil {
+		knowledges, err := convertKnowledgeConfigs(cfg.Knowledges.Entries)
+		if err != nil {
+			return err
+		}
+		opts.KnowledgesConfig = knowledges
 	}
 
 	if cfg.Gateway != nil {
@@ -1365,10 +1529,40 @@ func (cfg *fileConfig) apply(
 				csvDelimiter,
 			)
 		}
+		if cfg.Skills.Watch != nil &&
+			!flagWasSet(set, flagSkillsWatch) {
+			opts.SkillsWatch = *cfg.Skills.Watch
+		}
+		watchBundled := firstBoolPtr(
+			cfg.Skills.WatchBundled,
+			cfg.Skills.WatchBundledCamel,
+		)
+		if watchBundled != nil &&
+			!flagWasSet(set, flagSkillsWatchBundled) {
+			opts.SkillsWatchBundled = *watchBundled
+		}
+		watchDebounceMS := firstIntPtr(
+			cfg.Skills.WatchDebounceMS,
+			cfg.Skills.WatchDebounceCamel,
+		)
+		if watchDebounceMS != nil &&
+			!flagWasSet(set, flagSkillsWatchDebounce) {
+			opts.SkillsWatchDebounce = time.Duration(
+				*watchDebounceMS,
+			) * time.Millisecond
+		}
 		if len(cfg.Skills.Entries) > 0 {
 			opts.SkillConfigs = convertSkillConfigs(
 				cfg.Skills.Entries,
 			)
+		}
+		toolProfile := firstStringPtr(
+			cfg.Skills.ToolProfile,
+			cfg.Skills.ToolProfileCamel,
+		)
+		if toolProfile != nil &&
+			!flagWasSet(set, flagSkillsToolProfile) {
+			opts.SkillsToolProfile = strings.TrimSpace(*toolProfile)
 		}
 		loadMode := firstStringPtr(
 			cfg.Skills.LoadMode,
@@ -1417,6 +1611,10 @@ func (cfg *fileConfig) apply(
 					*cfg.Tools.EnableOpenClawTools
 			}
 		}
+		opts.OpenClawToolingGuide = firstStringPtr(
+			cfg.Tools.OpenClawToolingGuide,
+			cfg.Tools.OpenClawToolingGuideCamel,
+		)
 		if cfg.Tools.EnableParallelTools != nil &&
 			!flagWasSet(set, flagEnableParallelTools) {
 			opts.EnableParallelTools = *cfg.Tools.EnableParallelTools
@@ -1517,6 +1715,34 @@ func (cfg *fileConfig) apply(
 	}
 
 	return nil
+}
+
+func applyLangfuseConfig(
+	cfg *langfuseConfig,
+	opts *runOptions,
+) {
+	if cfg == nil || opts == nil {
+		return
+	}
+
+	if cfg.Enabled != nil {
+		opts.LangfuseEnabled = *cfg.Enabled
+	}
+	if cfg.Required != nil {
+		opts.LangfuseRequired = *cfg.Required
+	}
+	if cfg.UIBaseURL != nil {
+		opts.LangfuseUIBaseURL = strings.TrimSpace(*cfg.UIBaseURL)
+	}
+	if cfg.TraceURLTemplate != nil {
+		opts.LangfuseTraceURLTemplate = strings.TrimSpace(
+			*cfg.TraceURLTemplate,
+		)
+	}
+	if cfg.ObservationLeafValueMaxBytes != nil {
+		value := *cfg.ObservationLeafValueMaxBytes
+		opts.LangfuseObservationLeafValueMaxBytes = &value
+	}
 }
 
 func applyRalphLoopConfig(
@@ -1640,6 +1866,75 @@ func convertSkillConfigs(
 	return out
 }
 
+func convertKnowledgeConfigs(
+	entries []knowledgeEntryConfig,
+) (map[string]*yaml.Node, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
+	out := make(map[string]*yaml.Node, len(entries))
+	for i := range entries {
+		entry := entries[i]
+		name := strings.TrimSpace(entry.Name)
+		if name == "" {
+			return nil, fmt.Errorf("knowledges.entries[%d].name is empty", i)
+		}
+		if _, exists := out[name]; exists {
+			return nil, fmt.Errorf("duplicate knowledge name: %s", name)
+		}
+
+		node := &yaml.Node{
+			Kind: yaml.MappingNode,
+			Tag:  "!!map",
+		}
+		if entry.Embedder != nil && entry.Embedder.Node != nil {
+			node.Content = append(
+				node.Content,
+				&yaml.Node{
+					Kind:  yaml.ScalarNode,
+					Tag:   "!!str",
+					Value: "embedder",
+				},
+				cloneYAMLNode(entry.Embedder.Node),
+			)
+		}
+		if entry.VectorStore != nil && entry.VectorStore.Node != nil {
+			node.Content = append(
+				node.Content,
+				&yaml.Node{
+					Kind:  yaml.ScalarNode,
+					Tag:   "!!str",
+					Value: "vector_store",
+				},
+				cloneYAMLNode(entry.VectorStore.Node),
+			)
+		}
+		if len(node.Content) == 0 {
+			continue
+		}
+		out[name] = node
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+func cloneYAMLNode(node *yaml.Node) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	cloned := *node
+	if len(node.Content) > 0 {
+		cloned.Content = make([]*yaml.Node, 0, len(node.Content))
+		for _, child := range node.Content {
+			cloned.Content = append(cloned.Content, cloneYAMLNode(child))
+		}
+	}
+	return &cloned
+}
+
 func applySessionSummary(
 	cfg *summaryConfig,
 	opts *runOptions,
@@ -1651,6 +1946,9 @@ func applySessionSummary(
 
 	if cfg.Enabled != nil && !flagWasSet(set, "session-summary") {
 		opts.SessionSummaryEnabled = *cfg.Enabled
+	}
+	if cfg.Mode != nil && !flagWasSet(set, "session-summary-mode") {
+		opts.SessionSummaryMode = strings.TrimSpace(*cfg.Mode)
 	}
 	if cfg.Policy != nil && !flagWasSet(set, "session-summary-policy") {
 		opts.SessionSummaryPolicy = strings.TrimSpace(*cfg.Policy)
@@ -1672,6 +1970,10 @@ func applySessionSummary(
 	}
 	if cfg.MaxWords != nil && !flagWasSet(set, "session-summary-max-words") {
 		opts.SessionSummaryMaxWords = *cfg.MaxWords
+	}
+	if cfg.ApproxRunesPerToken != nil &&
+		!flagWasSet(set, "session-summary-approx-runes-per-token") {
+		opts.SessionSummaryApproxRunesPerToken = *cfg.ApproxRunesPerToken
 	}
 	return nil
 }
@@ -1719,8 +2021,9 @@ func flagWasSet(set map[string]struct{}, name string) bool {
 	return ok
 }
 
-func loadModeExitCode(set map[string]struct{}) int {
-	if flagWasSet(set, flagSkillsLoadMode) {
+func skillsOptionExitCode(set map[string]struct{}) int {
+	if flagWasSet(set, flagSkillsToolProfile) ||
+		flagWasSet(set, flagSkillsLoadMode) {
 		return 2
 	}
 	return 1
@@ -1730,14 +2033,39 @@ func finalizeRunOptions(opts *runOptions) error {
 	if opts == nil {
 		return nil
 	}
+	profile, err := normalizeSkillsToolProfile(opts.SkillsToolProfile)
+	if err != nil {
+		return err
+	}
+	opts.SkillsToolProfile = profile
 	mode, err := normalizeSkillsLoadMode(opts.SkillsLoadMode)
 	if err != nil {
 		return err
 	}
 	opts.SkillsLoadMode = mode
+	if opts.SkillsWatchDebounce < 0 {
+		return fmt.Errorf(
+			"invalid skills watch debounce: %v",
+			opts.SkillsWatchDebounce,
+		)
+	}
+	opts.MemoryBackend = resolveMemoryBackendType(opts.MemoryBackend)
 	opts.AdminAddr = strings.TrimSpace(opts.AdminAddr)
 	if opts.AdminEnabled && opts.AdminAddr == "" {
 		opts.AdminAddr = defaultAdminAddr
+	}
+	opts.LangfuseUIBaseURL = strings.TrimRight(
+		strings.TrimSpace(opts.LangfuseUIBaseURL),
+		"/",
+	)
+	opts.LangfuseTraceURLTemplate = strings.TrimSpace(
+		opts.LangfuseTraceURLTemplate,
+	)
+	if v := opts.SessionSummaryApproxRunesPerToken; math.IsNaN(v) ||
+		math.IsInf(v, 0) || v < 0 {
+		return fmt.Errorf(
+			"invalid session-summary-approx-runes-per-token: %v", v,
+		)
 	}
 	normalizeA2AOptions(opts)
 	return nil
@@ -1759,6 +2087,23 @@ func normalizeA2AHost(raw string) string {
 		return ""
 	}
 	return ia2a.NormalizeURL(host)
+}
+
+func normalizeSkillsToolProfile(raw string) (string, error) {
+	profile := strings.ToLower(strings.TrimSpace(raw))
+	if profile == "" {
+		return defaultSkillsToolProfile, nil
+	}
+	switch profile {
+	case skillprofile.Full, skillprofile.KnowledgeOnly:
+		return profile, nil
+	default:
+		return "", fmt.Errorf(
+			"invalid skills tool profile %q: "+
+				"want full|knowledge_only",
+			raw,
+		)
+	}
 }
 
 func normalizeSkillsLoadMode(raw string) (string, error) {
@@ -1796,4 +2141,36 @@ func firstStringPtr(primary, fallback *string) *string {
 		return primary
 	}
 	return fallback
+}
+
+func resolveGenerationConfigYAML(
+	cfg *generationConfigYAML,
+) *model.GenerationConfig {
+	if cfg == nil {
+		return nil
+	}
+	out := &model.GenerationConfig{Stream: true}
+	out.MaxTokens = cfg.MaxTokens
+	out.Temperature = cfg.Temperature
+	out.TopP = cfg.TopP
+	if cfg.Stream != nil {
+		out.Stream = *cfg.Stream
+	}
+	if cfg.Stop != nil {
+		out.Stop = append([]string(nil), cfg.Stop...)
+	}
+	out.PresencePenalty = cfg.PresencePenalty
+	out.FrequencyPenalty = cfg.FrequencyPenalty
+	out.ReasoningEffort = trimStringPtr(cfg.ReasoningEffort)
+	out.ThinkingEnabled = cfg.ThinkingEnabled
+	out.ThinkingTokens = cfg.ThinkingTokens
+	return out
+}
+
+func trimStringPtr(v *string) *string {
+	if v == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*v)
+	return &trimmed
 }

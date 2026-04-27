@@ -24,7 +24,7 @@ A simple example that demonstrates manual memory tool integration where LLM agen
   delete, clear)
 - Custom tool implementations
 - Streaming and non-streaming response modes
-- Multiple storage backends (in-memory, SQLite, Redis, MySQL, PostgreSQL, pgvector)
+- Multiple storage backends (in-memory, SQLite, Redis, MySQL, MySQL Vector, PostgreSQL, pgvector)
 
 **Use Cases:**
 
@@ -72,6 +72,31 @@ go run main.go
 
 [Read full documentation →](./auto/README.md)
 
+### 📁 mem0/
+
+**Mem0 Integration - External Long-Term Memory Platform**
+
+Demonstrates ingest-first integration with [mem0.ai](https://mem0.ai). The
+runner sends session transcripts to mem0 after each turn; the agent accesses
+stored memories through read-only tools.
+
+**Key Features:**
+
+- Session ingestion via `runner.WithSessionIngestor(...)`
+- Read-only `memory_search` and optional `memory_load` tools
+- No local LLM extractor needed — mem0 handles extraction natively
+
+**Getting Started:**
+
+```bash
+cd examples/memory/mem0
+export MEM0_API_KEY="your-mem0-api-key"
+export OPENAI_API_KEY="your-api-key"
+go run .
+```
+
+[Read full documentation →](./mem0/README.md)
+
 ### 📁 compare/
 
 **Retrieval Comparison - SQLite vs SQLiteVec**
@@ -104,6 +129,7 @@ All examples support multiple storage backends:
 | `sqlitevec` | SQLite + sqlite-vec vector search (embeddings) | `-memory=sqlitevec` |
 | `redis`    | Redis-based storage                         | `-memory=redis`    |
 | `mysql`    | MySQL-based storage                         | `-memory=mysql`    |
+| `mysqlvec` | MySQL + vector search (embeddings)          | `-memory=mysqlvec` |
 | `postgres` | PostgreSQL-based storage                    | `-memory=postgres` |
 | `pgvector` | pgvector PostgreSQL storage with embeddings | `-memory=pgvector` |
 
@@ -131,7 +157,7 @@ All examples support multiple storage backends:
 | ----------------- | ----------------------------------- | ------------------------------- |
 | Tool Registration | Manual (`WithTools`)                | Automatic (`WithExtractor`)     |
 | Memory Extraction | Agent calls tools directly          | Background extraction           |
-| Tools Available   | 6 tools (4 default, 2 configurable) | Limited (search, optional load) |
+| Tools Available   | 6 tools (4 default, 2 configurable) | `memory_search` by default; configurable `memory_load`; enabled write tools exposable |
 | Control Level     | High (explicit)                     | Medium (background)             |
 | Setup Complexity  | Simple                              | Complex                         |
 | Best For          | Fine-grained control needs          | Transparent memory needs        |
@@ -142,12 +168,12 @@ Memory provides 6 tools with different availability in each mode:
 
 | Tool            | Function       | Agentic Mode (Simple) | Auto Extraction Mode (Auto) | Description             |
 | --------------- | -------------- | --------------------- | --------------------------- | ----------------------- |
-| `memory_add`    | Add new memory | ✅ Default            | ❌ Unavailable              | Create new memory entry |
-| `memory_update` | Update memory  | ✅ Default            | ❌ Unavailable              | Modify existing memory  |
+| `memory_add`    | Add new memory | ✅ Default            | ⚙️ Hidden by default        | Create new memory entry |
+| `memory_update` | Update memory  | ✅ Default            | ⚙️ Hidden by default        | Modify existing memory  |
 | `memory_search` | Search memory  | ✅ Default            | ✅ Default                  | Search relevant memories |
 | `memory_load`   | Load memories  | ✅ Default            | ⚙️ Configurable             | Load recent memories    |
-| `memory_delete` | Delete memory  | ⚙️ Configurable       | ❌ Unavailable              | Delete single memory    |
-| `memory_clear`  | Clear memories | ⚙️ Configurable       | ❌ Unavailable              | Delete all memories     |
+| `memory_delete` | Delete memory  | ⚙️ Configurable       | ⚙️ Hidden by default        | Delete single memory    |
+| `memory_clear`  | Clear memories | ⚙️ Configurable       | ⚙️ Disabled by default      | Delete all memories     |
 
 **Notes:**
 
@@ -155,11 +181,11 @@ Memory provides 6 tools with different availability in each mode:
   - Default enabled: `memory_add`, `memory_update`, `memory_search`, `memory_load`
   - Default disabled: `memory_delete`, `memory_clear`
   - Can be enabled/disabled via `WithToolEnabled()`
-- **Auto Mode**: LLM extractor handles write operations in background, only read tools are available
-  - Default enabled: `memory_search`
-  - Default disabled: `memory_load`
-  - Not exposed: `memory_add`, `memory_update`, `memory_delete`, `memory_clear` (extractor handles writes)
-  - `WithToolEnabled()` only affects `memory_search` and `memory_load` availability
+- **Auto Mode**: LLM extractor handles write operations in background; `memory_search` is exposed by default, `memory_load` is configurable, and enabled write tools can be exposed with `WithAutoMemoryExposedTools()`
+  - Default enabled: `memory_add`, `memory_update`, `memory_delete`, `memory_search`
+  - Default disabled: `memory_load`, `memory_clear`
+  - Hidden by default: `memory_add`, `memory_update`, `memory_delete`
+  - Use `WithAutoMemoryExposedTools()` to selectively expose enabled write tools such as `memory_add`
 
 ## Prerequisites
 
@@ -202,6 +228,12 @@ Memory provides 6 tools with different availability in each mode:
 | `MYSQL_USER`              | MySQL user                   | `root`                      |
 | `MYSQL_PASSWORD`          | MySQL password               | (empty)                     |
 | `MYSQL_DATABASE`          | MySQL database               | `trpc_agent_go`             |
+| `MYSQLVEC_HOST`           | MySQL Vector host            | `localhost`                 |
+| `MYSQLVEC_PORT`           | MySQL Vector port            | `3306`                      |
+| `MYSQLVEC_USER`           | MySQL Vector user            | `root`                      |
+| `MYSQLVEC_PASSWORD`       | MySQL Vector password        | (empty)                     |
+| `MYSQLVEC_DATABASE`       | MySQL Vector database        | `trpc_agent_go`             |
+| `MYSQLVEC_EMBEDDER_MODEL` | MySQL Vector embedder model  | `text-embedding-3-small`    |
 
 ## Quick Start
 
@@ -254,6 +286,15 @@ export MYSQL_USER=root
 export MYSQL_PASSWORD=password
 export MYSQL_DATABASE=trpc_agent_go
 go run main.go -memory mysql
+
+# MySQL Vector memory service (with embeddings)
+export MYSQLVEC_HOST=localhost
+export MYSQLVEC_PORT=3306
+export MYSQLVEC_USER=root
+export MYSQLVEC_PASSWORD=password
+export MYSQLVEC_DATABASE=trpc_agent_go
+export MYSQLVEC_EMBEDDER_MODEL=text-embedding-3-small
+go run main.go -memory mysqlvec
 
 # PostgreSQL memory service (using environment variables)
 export PG_HOST=localhost

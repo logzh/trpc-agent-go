@@ -18,7 +18,9 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
+	agenttrace "trpc.group/trpc-go/trpc-agent-go/agent/trace"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/evalresult"
 	evalresultinmemory "trpc.group/trpc-go/trpc-agent-go/evaluation/evalresult/inmemory"
 	evalresultlocal "trpc.group/trpc-go/trpc-agent-go/evaluation/evalresult/local"
@@ -356,6 +358,7 @@ func defaultTestOptions(ae *agentEvaluator) *options {
 		judgeRunner:            ae.judgeRunner,
 		numRuns:                ae.numRuns,
 		numRunsParallelEnabled: ae.numRunsParallelEnabled,
+		runDetailsEnabled:      ae.runDetailsEnabled,
 		runOptions:             append([]agent.RunOption(nil), ae.runOptions...),
 	}
 }
@@ -434,6 +437,7 @@ func TestNewAgentEvaluatorWithParallelOptionsBuildsLocalService(t *testing.T) {
 type optionProbeService struct {
 	lastInferenceOptions *service.Options
 	lastEvaluateOptions  *service.Options
+	lastInferenceRequest *service.InferenceRequest
 }
 
 func (s *optionProbeService) Inference(ctx context.Context, req *service.InferenceRequest, opt ...service.Option) ([]*service.InferenceResult, error) {
@@ -446,7 +450,23 @@ func (s *optionProbeService) Inference(ctx context.Context, req *service.Inferen
 		o(options)
 	}
 	s.lastInferenceOptions = options
-	return []*service.InferenceResult{}, nil
+	if req != nil {
+		cloned := *req
+		cloned.EvalCaseIDs = append([]string(nil), req.EvalCaseIDs...)
+		s.lastInferenceRequest = &cloned
+	}
+	if req == nil {
+		return []*service.InferenceResult{}, nil
+	}
+	results := make([]*service.InferenceResult, 0, len(req.EvalCaseIDs))
+	for _, evalCaseID := range req.EvalCaseIDs {
+		results = append(results, &service.InferenceResult{
+			AppName:    req.AppName,
+			EvalSetID:  req.EvalSetID,
+			EvalCaseID: evalCaseID,
+		})
+	}
+	return results, nil
 }
 
 func (s *optionProbeService) Evaluate(ctx context.Context, req *service.EvaluateRequest, opt ...service.Option) (*service.EvalSetRunResult, error) {
@@ -459,10 +479,23 @@ func (s *optionProbeService) Evaluate(ctx context.Context, req *service.Evaluate
 		o(options)
 	}
 	s.lastEvaluateOptions = options
+	caseResults := make([]*evalresult.EvalCaseResult, 0, len(req.InferenceResults))
+	for _, inferenceResult := range req.InferenceResults {
+		if inferenceResult == nil {
+			continue
+		}
+		caseResults = append(caseResults, &evalresult.EvalCaseResult{
+			EvalSetID:       req.EvalSetID,
+			EvalID:          inferenceResult.EvalCaseID,
+			FinalEvalStatus: status.EvalStatusPassed,
+			SessionID:       inferenceResult.SessionID,
+			UserID:          inferenceResult.UserID,
+		})
+	}
 	return &service.EvalSetRunResult{
 		AppName:         req.AppName,
 		EvalSetID:       req.EvalSetID,
-		EvalCaseResults: []*evalresult.EvalCaseResult{},
+		EvalCaseResults: caseResults,
 	}, nil
 }
 
@@ -513,6 +546,124 @@ func TestAgentEvaluatorEvaluateDoesNotOverrideServiceCallOptionsByDefault(t *tes
 	assert.Equal(t, -456, probeSvc.lastEvaluateOptions.EvalCaseParallelism)
 	assert.True(t, probeSvc.lastEvaluateOptions.EvalCaseParallelInferenceEnabled)
 	assert.True(t, probeSvc.lastEvaluateOptions.EvalCaseParallelEvaluationEnabled)
+}
+
+func TestAgentEvaluatorEvaluatePassesEvalCaseIDsToInference(t *testing.T) {
+	ctx := context.Background()
+	appName := "app"
+	evalSetID := "set"
+	evalSetMgr := evalsetinmemory.New()
+	_, err := evalSetMgr.Create(ctx, appName, evalSetID)
+	assert.NoError(t, err)
+	assert.NoError(t, evalSetMgr.AddCase(ctx, appName, evalSetID, &evalset.EvalCase{EvalID: "case-1"}))
+	assert.NoError(t, evalSetMgr.AddCase(ctx, appName, evalSetID, &evalset.EvalCase{EvalID: "case-2"}))
+	probeSvc := &optionProbeService{}
+	ae, err := New(
+		appName,
+		stubRunner{},
+		WithEvalSetManager(evalSetMgr),
+		WithEvalResultManager(evalresultinmemory.New()),
+		WithMetricManager(metricinmemory.New()),
+		WithRegistry(registry.New()),
+		WithEvaluationService(probeSvc),
+	)
+	assert.NoError(t, err)
+	if err != nil {
+		return
+	}
+	defer func() {
+		assert.NoError(t, ae.Close())
+	}()
+	result, err := ae.Evaluate(ctx, evalSetID, WithEvalCaseIDs("case-2"))
+	assert.NoError(t, err)
+	assert.NotNil(t, probeSvc.lastInferenceRequest)
+	if probeSvc.lastInferenceRequest == nil {
+		return
+	}
+	assert.Equal(t, []string{"case-2"}, probeSvc.lastInferenceRequest.EvalCaseIDs)
+	require.NotNil(t, result)
+	require.Len(t, result.EvalCases, 1)
+	assert.Equal(t, "case-2", result.EvalCases[0].EvalCaseID)
+}
+
+func TestAgentEvaluatorEvaluateUsesConstructorEvalCaseIDs(t *testing.T) {
+	ctx := context.Background()
+	appName := "app"
+	evalSetID := "set"
+	evalSetMgr := evalsetinmemory.New()
+	_, err := evalSetMgr.Create(ctx, appName, evalSetID)
+	assert.NoError(t, err)
+	assert.NoError(t, evalSetMgr.AddCase(ctx, appName, evalSetID, &evalset.EvalCase{EvalID: "case-1"}))
+	assert.NoError(t, evalSetMgr.AddCase(ctx, appName, evalSetID, &evalset.EvalCase{EvalID: "case-2"}))
+	probeSvc := &optionProbeService{}
+	ae, err := New(
+		appName,
+		stubRunner{},
+		WithEvalSetManager(evalSetMgr),
+		WithEvalResultManager(evalresultinmemory.New()),
+		WithMetricManager(metricinmemory.New()),
+		WithRegistry(registry.New()),
+		WithEvaluationService(probeSvc),
+		WithEvalCaseIDs("case-2"),
+	)
+	assert.NoError(t, err)
+	if err != nil {
+		return
+	}
+	defer func() {
+		assert.NoError(t, ae.Close())
+	}()
+	result, err := ae.Evaluate(ctx, evalSetID)
+	assert.NoError(t, err)
+	assert.NotNil(t, probeSvc.lastInferenceRequest)
+	if probeSvc.lastInferenceRequest == nil {
+		return
+	}
+	assert.Equal(t, []string{"case-2"}, probeSvc.lastInferenceRequest.EvalCaseIDs)
+	require.NotNil(t, result)
+	require.Len(t, result.EvalCases, 1)
+	assert.Equal(t, "case-2", result.EvalCases[0].EvalCaseID)
+}
+
+func TestAgentEvaluatorEvaluatePassesExpectedRunnerToInferenceAndEvaluate(t *testing.T) {
+	ctx := context.Background()
+	appName := "app"
+	evalSetID := "set"
+
+	evalSetMgr := evalsetinmemory.New()
+	_, err := evalSetMgr.Create(ctx, appName, evalSetID)
+	assert.NoError(t, err)
+
+	probeSvc := &optionProbeService{}
+	ae, err := New(
+		appName,
+		stubRunner{},
+		WithEvalSetManager(evalSetMgr),
+		WithEvalResultManager(evalresultinmemory.New()),
+		WithMetricManager(metricinmemory.New()),
+		WithRegistry(registry.New()),
+		WithEvaluationService(probeSvc),
+	)
+	assert.NoError(t, err)
+	if err != nil {
+		return
+	}
+	defer func() {
+		assert.NoError(t, ae.Close())
+	}()
+
+	expected := stubRunner{}
+	_, err = ae.Evaluate(ctx, evalSetID, WithExpectedRunner(expected))
+	assert.NoError(t, err)
+
+	assert.NotNil(t, probeSvc.lastInferenceOptions)
+	if assert.NotNil(t, probeSvc.lastInferenceOptions) {
+		assert.Equal(t, expected, probeSvc.lastInferenceOptions.ExpectedRunner)
+	}
+	assert.NotNil(t, probeSvc.lastEvaluateOptions)
+	if assert.NotNil(t, probeSvc.lastEvaluateOptions) {
+		assert.Equal(t, expected, probeSvc.lastEvaluateOptions.ExpectedRunner)
+	}
 }
 
 func TestAgentEvaluatorClose_CollectsErrors(t *testing.T) {
@@ -1083,6 +1234,7 @@ func TestAgentEvaluatorEvaluateSuccess(t *testing.T) {
 	assert.Len(t, caseResult.MetricResults, 1)
 	assert.InDelta(t, 1.0, caseResult.MetricResults[0].Score, 0.001)
 	assert.Len(t, caseResult.EvalCaseResults, 2)
+	assert.Nil(t, caseResult.RunDetails)
 
 	assert.Len(t, svc.inferenceRequests, 2)
 	assert.Len(t, svc.evaluateRequests, 2)
@@ -1094,6 +1246,114 @@ func TestAgentEvaluatorEvaluateSuccess(t *testing.T) {
 		if req.EvaluateConfig != nil {
 			assert.Len(t, req.EvaluateConfig.EvalMetrics, 1)
 			assert.Equal(t, metricName, req.EvaluateConfig.EvalMetrics[0].MetricName)
+		}
+	}
+}
+
+func TestAgentEvaluatorEvaluateIncludesRunDetailsWhenEnabled(t *testing.T) {
+	ctx := context.Background()
+	appName := "app"
+	evalSetID := "set"
+	caseID := "case-1"
+	metricName := "metric"
+	metricMgr := metricinmemory.New()
+	err := metricMgr.Add(ctx, appName, evalSetID, &metric.EvalMetric{MetricName: metricName, Threshold: 1})
+	assert.NoError(t, err)
+	evalSetMgr := evalsetinmemory.New()
+	_, err = evalSetMgr.Create(ctx, appName, evalSetID)
+	assert.NoError(t, err)
+	runOneTrace := &agenttrace.Trace{RootInvocationID: "root-1", SessionID: "session-1", Status: agenttrace.TraceStatusCompleted}
+	runTwoTrace := &agenttrace.Trace{RootInvocationID: "root-2", SessionID: "session-2", Status: agenttrace.TraceStatusCompleted}
+	svc := &fakeService{
+		inferenceResults: [][]*service.InferenceResult{
+			{{
+				AppName:         appName,
+				EvalSetID:       evalSetID,
+				EvalCaseID:      caseID,
+				Inferences:      []*evalset.Invocation{{InvocationID: "inv-1"}},
+				SessionID:       "session-1",
+				UserID:          "user-1",
+				Status:          status.EvalStatusPassed,
+				ExecutionTraces: []*agenttrace.Trace{runOneTrace},
+			}},
+			{{
+				AppName:         appName,
+				EvalSetID:       evalSetID,
+				EvalCaseID:      caseID,
+				Inferences:      []*evalset.Invocation{{InvocationID: "inv-2"}},
+				SessionID:       "session-2",
+				UserID:          "user-2",
+				Status:          status.EvalStatusPassed,
+				ExecutionTraces: []*agenttrace.Trace{runTwoTrace},
+			}},
+		},
+		evaluateResults: []*service.EvalSetRunResult{
+			{
+				AppName:   appName,
+				EvalSetID: evalSetID,
+				EvalCaseResults: []*evalresult.EvalCaseResult{
+					makeEvalCaseResult(evalSetID, caseID, metricName, 0.5, 1, status.EvalStatusFailed),
+				},
+			},
+			{
+				AppName:   appName,
+				EvalSetID: evalSetID,
+				EvalCaseResults: []*evalresult.EvalCaseResult{
+					makeEvalCaseResult(evalSetID, caseID, metricName, 1.5, 1, status.EvalStatusPassed),
+				},
+			},
+		},
+	}
+	ae, err := New(
+		appName,
+		stubRunner{},
+		WithMetricManager(metricMgr),
+		WithEvalSetManager(evalSetMgr),
+		WithRegistry(registry.New()),
+		WithEvaluationService(svc),
+		WithNumRuns(2),
+	)
+	assert.NoError(t, err)
+	if err != nil {
+		return
+	}
+	defer func() {
+		assert.NoError(t, ae.Close())
+	}()
+	evaluationResult, err := ae.Evaluate(ctx, evalSetID, WithRunDetailsEnabled(true))
+	assert.NoError(t, err)
+	if !assert.Len(t, evaluationResult.EvalCases, 1) {
+		return
+	}
+	caseResult := evaluationResult.EvalCases[0]
+	if !assert.Len(t, caseResult.RunDetails, 2) {
+		return
+	}
+	assert.Equal(t, 1, caseResult.RunDetails[0].RunID)
+	assert.Equal(t, 1, caseResult.EvalCaseResults[0].RunID)
+	if assert.NotNil(t, caseResult.RunDetails[0].Inference) {
+		assert.Equal(t, "session-1", caseResult.RunDetails[0].Inference.SessionID)
+		assert.Equal(t, "user-1", caseResult.RunDetails[0].Inference.UserID)
+		assert.Equal(t, status.EvalStatusPassed, caseResult.RunDetails[0].Inference.Status)
+		if assert.Len(t, caseResult.RunDetails[0].Inference.Inferences, 1) {
+			assert.Equal(t, "inv-1", caseResult.RunDetails[0].Inference.Inferences[0].InvocationID)
+		}
+		if assert.Len(t, caseResult.RunDetails[0].Inference.ExecutionTraces, 1) {
+			assert.Equal(t, "root-1", caseResult.RunDetails[0].Inference.ExecutionTraces[0].RootInvocationID)
+			assert.Equal(t, "session-1", caseResult.RunDetails[0].Inference.ExecutionTraces[0].SessionID)
+		}
+	}
+	assert.Equal(t, 2, caseResult.RunDetails[1].RunID)
+	assert.Equal(t, 2, caseResult.EvalCaseResults[1].RunID)
+	if assert.NotNil(t, caseResult.RunDetails[1].Inference) {
+		assert.Equal(t, "session-2", caseResult.RunDetails[1].Inference.SessionID)
+		assert.Equal(t, "user-2", caseResult.RunDetails[1].Inference.UserID)
+		if assert.Len(t, caseResult.RunDetails[1].Inference.Inferences, 1) {
+			assert.Equal(t, "inv-2", caseResult.RunDetails[1].Inference.Inferences[0].InvocationID)
+		}
+		if assert.Len(t, caseResult.RunDetails[1].Inference.ExecutionTraces, 1) {
+			assert.Equal(t, "root-2", caseResult.RunDetails[1].Inference.ExecutionTraces[0].RootInvocationID)
+			assert.Equal(t, "session-2", caseResult.RunDetails[1].Inference.ExecutionTraces[0].SessionID)
 		}
 	}
 }

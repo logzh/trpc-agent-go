@@ -27,6 +27,98 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
+func TestModel_CallbackPanicsAreRecovered(t *testing.T) {
+	t.Run("request callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatRequestCallback: func(ctx context.Context, chatRequest []*genai.Content) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatRequestCallback(context.Background(), nil)
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("response callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatResponseCallback: func(
+				ctx context.Context,
+				chatRequest []*genai.Content,
+				generateConfig *genai.GenerateContentConfig,
+				chatResponse *genai.GenerateContentResponse,
+			) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatResponseCallback(
+				context.Background(),
+				nil,
+				&genai.GenerateContentConfig{},
+				&genai.GenerateContentResponse{},
+			)
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("chunk callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatChunkCallback: func(
+				ctx context.Context,
+				chatRequest []*genai.Content,
+				generateConfig *genai.GenerateContentConfig,
+				chatResponse *genai.GenerateContentResponse,
+			) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatChunkCallback(
+				context.Background(),
+				nil,
+				&genai.GenerateContentConfig{},
+				&genai.GenerateContentResponse{},
+			)
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("stream complete callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatStreamCompleteCallback: func(
+				ctx context.Context,
+				chatRequest []*genai.Content,
+				generateConfig *genai.GenerateContentConfig,
+				chatResponse *model.Response,
+			) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatStreamCompleteCallback(
+				context.Background(),
+				nil,
+				&genai.GenerateContentConfig{},
+				&model.Response{},
+			)
+		})
+		assert.True(t, callbackCalled)
+	})
+}
+
 func TestModel_convertMessages(t *testing.T) {
 	var (
 		text      = "Text"
@@ -1274,7 +1366,8 @@ func TestModel_GenerateContentStreamingError(t *testing.T) {
 	})
 
 	t.Run("error_with_callbacks", func(t *testing.T) {
-		// Test that chunk callback is not called when error occurs immediately
+		// Test that an immediate streaming error skips chunk callbacks but still
+		// invokes the stream-complete callback before the error becomes visible.
 		streamErr := errors.New("callback test error")
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
@@ -1287,7 +1380,8 @@ func TestModel_GenerateContentStreamingError(t *testing.T) {
 			Return(seqWithImmediateError[*genai.GenerateContentResponse](streamErr)).AnyTimes()
 
 		chunkCallbackCalled := false
-		completeCallbackCalled := false
+		completeCallbackCalled := make(chan struct{})
+		var completeCallbackResp *model.Response
 
 		m := &Model{
 			client: mockClient,
@@ -1297,7 +1391,8 @@ func TestModel_GenerateContentStreamingError(t *testing.T) {
 			},
 			chatStreamCompleteCallback: func(ctx context.Context, chatRequest []*genai.Content,
 				generateConfig *genai.GenerateContentConfig, chatResponse *model.Response) {
-				completeCallbackCalled = true
+				completeCallbackResp = chatResponse
+				close(completeCallbackCalled)
 			},
 		}
 		respChan, err := m.GenerateContent(context.Background(), req)
@@ -1306,14 +1401,21 @@ func TestModel_GenerateContentStreamingError(t *testing.T) {
 		// Read response (error)
 		resp := <-respChan
 		assert.NotNil(t, resp.Error)
+		select {
+		case <-completeCallbackCalled:
+		default:
+			t.Fatal("stream-complete callback must run before error response is emitted")
+		}
 
 		// Wait for channel to close
 		for range respChan {
 		}
 
-		// Callbacks should not be called when error occurs immediately
+		// Chunk callbacks should still not run on immediate errors.
 		assert.False(t, chunkCallbackCalled, "chunk callback should not be called on immediate error")
-		assert.False(t, completeCallbackCalled, "complete callback should not be called on error")
+		require.NotNil(t, completeCallbackResp)
+		require.NotNil(t, completeCallbackResp.Error)
+		assert.Equal(t, "callback test error", completeCallbackResp.Error.Message)
 	})
 
 	t.Run("mid_stream_error_with_chunk_callback", func(t *testing.T) {
@@ -1338,30 +1440,45 @@ func TestModel_GenerateContentStreamingError(t *testing.T) {
 			Return(seqFromSliceWithError([]*genai.GenerateContentResponse{successChunk}, streamErr))
 
 		var chunkCallbackRaw []*genai.GenerateContentResponse
+		completeCallbackCalled := make(chan struct{})
+		var completeCallbackResp *model.Response
 		m := &Model{
 			client: mockClient,
 			chatChunkCallback: func(_ context.Context, _ []*genai.Content,
 				_ *genai.GenerateContentConfig, r *genai.GenerateContentResponse) {
 				chunkCallbackRaw = append(chunkCallbackRaw, r)
 			},
+			chatStreamCompleteCallback: func(_ context.Context, _ []*genai.Content,
+				_ *genai.GenerateContentConfig, r *model.Response) {
+				completeCallbackResp = r
+				close(completeCallbackCalled)
+			},
 		}
 		respChan, err := m.GenerateContent(context.Background(), req)
 		require.NoError(t, err)
 
-		var responses []*model.Response
-		for r := range respChan {
-			responses = append(responses, r)
-		}
+		partialResp := <-respChan
+		require.NotNil(t, partialResp)
+		require.Nil(t, partialResp.Error)
+		require.Equal(t, "partial", partialResp.Choices[0].Delta.Content)
 
-		// One partial chunk then one error response.
-		require.Len(t, responses, 2)
-		require.Nil(t, responses[0].Error)
-		require.Equal(t, "partial", responses[0].Choices[0].Delta.Content)
-		require.NotNil(t, responses[1].Error)
-		require.Equal(t, "mid-stream interruption", responses[1].Error.Message)
+		errorResp := <-respChan
+		require.NotNil(t, errorResp)
+		require.NotNil(t, errorResp.Error)
+		require.Equal(t, "mid-stream interruption", errorResp.Error.Message)
+		select {
+		case <-completeCallbackCalled:
+		default:
+			t.Fatal("stream-complete callback must run before error response is emitted")
+		}
+		for range respChan {
+		}
 		// chatChunkCallback must have been called once (for the flushed chunk).
 		require.Len(t, chunkCallbackRaw, 1)
 		require.Equal(t, successChunk, chunkCallbackRaw[0])
+		require.NotNil(t, completeCallbackResp)
+		require.NotNil(t, completeCallbackResp.Error)
+		require.Equal(t, "mid-stream interruption", completeCallbackResp.Error.Message)
 	})
 }
 
@@ -2202,4 +2319,105 @@ func TestModel_ContextCancellation_Streaming(t *testing.T) {
 		require.NoError(t, err)
 		drainWithTimeout(t, respChan)
 	})
+}
+
+// TestChatRequestCallbackSynchronous verifies that
+// chatRequestCallback is invoked synchronously inside
+// GenerateContent, before the response goroutine starts.
+func TestChatRequestCallbackSynchronous(t *testing.T) {
+	subText := "text"
+	now := time.Now()
+	resp := &genai.GenerateContentResponse{
+		ResponseID:   "1",
+		CreateTime:   now,
+		ModelVersion: "v1",
+		Candidates: []*genai.Candidate{{
+			Content: &genai.Content{
+				Parts: []*genai.Part{{Text: "hi"}},
+			},
+			FinishReason: genai.FinishReason("stop"),
+		}},
+		UsageMetadata: &genai.GenerateContentResponseUsageMetadata{
+			TotalTokenCount: 1,
+		},
+	}
+
+	tests := []struct {
+		name   string
+		stream bool
+	}{
+		{name: "non_streaming", stream: false},
+		{name: "streaming", stream: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			mockClient := NewMockClient(ctrl)
+			mockModels := NewMockModels(ctrl)
+			mockClient.EXPECT().Models().
+				Return(mockModels).AnyTimes()
+
+			if tt.stream {
+				mockModels.EXPECT().
+					GenerateContentStream(
+						gomock.Any(), gomock.Any(),
+						gomock.Any(), gomock.Any()).
+					Return(seqFromSlice(
+						[]*genai.GenerateContentResponse{
+							resp,
+						})).AnyTimes()
+			} else {
+				mockModels.EXPECT().
+					GenerateContent(
+						gomock.Any(), gomock.Any(),
+						gomock.Any(), gomock.Any()).
+					Return(resp, nil).AnyTimes()
+			}
+
+			var callCount int64
+			m := &Model{
+				client: mockClient,
+				chatRequestCallback: func(
+					_ context.Context,
+					_ []*genai.Content,
+				) {
+					callCount++
+				},
+			}
+
+			req := &model.Request{
+				Messages: []model.Message{{
+					Role:    model.RoleUser,
+					Content: "hi",
+					ContentParts: []model.ContentPart{{
+						Type: model.ContentTypeText,
+						Text: &subText,
+					}},
+				}},
+				GenerationConfig: model.GenerationConfig{
+					Stream: tt.stream,
+				},
+			}
+
+			ch, err := m.GenerateContent(
+				context.Background(), req)
+			require.NoError(t, err)
+
+			// Callback must have fired synchronously
+			// before GenerateContent returned.
+			assert.Equal(t, int64(1), callCount,
+				"callback must execute exactly once "+
+					"before GenerateContent returns")
+
+			// Drain the channel to avoid goroutine leak.
+			for range ch {
+			}
+
+			// Confirm no extra invocations after drain.
+			assert.Equal(t, int64(1), callCount,
+				"callback must not be called more than once")
+		})
+	}
 }

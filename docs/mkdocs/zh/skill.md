@@ -15,17 +15,15 @@ Agent Skills 把可复用的任务封装为“技能目录”，用 `SKILL.md`
 
 ### 🎯 能力一览
 
-- 🧭 内置两种工具档位：`full`（默认）与 `knowledge_only`
 - 🔎 自动注入技能“概览”（名称与描述），引导模型选择
 - 📥 `skill_load` 按需注入 `SKILL.md` 正文与选定文档
 - 📚 `skill_select_docs` 增/改/清除文档选择
 - 🧾 `skill_list_docs` 列出可用文档
-- 🏃 `skill_run` 在 `full` 档位下于工作区执行命令，返回 stdout/stderr 与输出文件
-- ⌨️ `skill_exec` 与 session 工具在 `full` 档位下处理交互式 stdin/TTY 流程
+- 🧪 执行路径：`skill_load` 会在 `/skills/<name>/` 下物化出可写的
+  技能工作副本，脚本通过 `workspace_exec` 执行（只要配置了 code
+  executor 即可）
 - 🗂️ 按通配符收集输出文件并回传内容与 MIME 类型
 - 🧩 可选择本地或容器工作区执行器（默认本地）
-- 🧱 支持声明式 `inputs`/`outputs`：映射输入、
-  以清单方式收集/内联/保存输出
 
 ### 核心概念：三层信息模型
 
@@ -50,7 +48,7 @@ Agent Skills 把可复用的任务封装为“技能目录”，用 `SKILL.md`
 直接超过模型上下文窗口。
 
 想要**可复现、基于真实运行**的 token 对比（渐进披露 vs 全量注入），
-可参考 `benchmark/anthropic_skills/README.md`，并按其中说明运行
+可参考 [trpc-agent-go-benchmark/anthropic_skills/README.md](https://github.com/trpc-group/trpc-agent-go-benchmark/blob/main/anthropic_skills/README.md)，并按其中说明运行
 `token-report` 套件。
 
 ### Prompt Cache
@@ -85,7 +83,7 @@ Session summary 提醒：如果你启用了会话摘要注入
 如果你希望在 summary 场景恢复旧的回退行为：
 `llmagent.WithSkipSkillsFallbackOnSessionSummary(false)`。
 
-要在真实工具链路中测量提升，参见 `benchmark/anthropic_skills` 的
+要在真实工具链路中测量提升，参见 [trpc-agent-go-benchmark/anthropic_skills](https://github.com/trpc-group/trpc-agent-go-benchmark/tree/main/anthropic_skills) 的
 `prompt-cache` 套件。
 
 与 `SkillLoadMode` 的关系（容易踩坑）：
@@ -228,14 +226,55 @@ agent := llmagent.New(
 )
 ```
 
-仅知识注入模式：
+`NewFSRepository` 也可以同时扫描多个根目录，常见做法是把通用
+skills 目录和用户私有 skills 目录一起传入：
+
+```go
+repo, _ := skill.NewFSRepository(
+    "./skills/common",
+    "./skills/users/alice",
+)
+```
+
+如果是一个常驻 Agent 服务复用同一个 skills 仓库来处理多种请求，
+可以再加一层按请求生效的可见性过滤。过滤函数可以从 `ctx` /
+运行时状态里读取任意业务信号（例如 `user_id`、`tenant_id`、角色、
+实验开关等），并把不匹配的 skill 从概览、工具声明和运行时校验里
+一起隐藏。下面用 `user_id` 只是举例：
+
+```go
+agt := llmagent.New(
+    "skills-assistant",
+    llmagent.WithSkills(repo),
+    llmagent.WithSkillFilter(func(ctx context.Context, s skill.Summary) bool {
+        userID, _ := agent.GetRuntimeStateValueFromContext[string](ctx, "user_id")
+        return allow(userID, s.Name)
+    }),
+)
+
+r := runner.NewRunner("skills-app", agt)
+
+ch, _ := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    model.NewUserMessage("..."),
+    agent.WithRuntimeState(map[string]any{"user_id": userID}),
+)
+```
+
+如果你的进程在启动后还会安装、删除或重命名 skill，请在文件系统
+变更完成后调用一次 `repo.Refresh()`，让下一轮请求看到最新技能
+集合。`Refresh()` 适用于仓库结构变化，不建议每次请求前都调用。
+
+细粒度白名单（只暴露知识注入类工具，适合只读型代理）：
 
 ```go
 agent := llmagent.New(
     "skills-assistant",
     llmagent.WithSkills(repo),
-    llmagent.WithSkillToolProfile(
-        llmagent.SkillToolProfileKnowledgeOnly,
+    llmagent.WithAllowedSkillTools(
+        llmagent.SkillToolLoad,
     ),
 )
 ```
@@ -244,59 +283,67 @@ agent := llmagent.New(
 - 请求处理器注入概览与按需内容：
   [internal/flow/processor/skills.go]
   (https://github.com/trpc-group/trpc-agent-go/blob/main/internal/flow/processor/skills.go)
-- `WithSkills` 会自动注册内置 skill 工具，无需手动添加。
-  - 默认 `full` 档位：`skill_load`、`skill_select_docs`、
-    `skill_list_docs`、`skill_run`，以及——当执行器支持交互式
-    会话时——`skill_exec`、`skill_write_stdin`、`skill_poll_session`、
-    `skill_kill_session`。若执行器未实现 `InteractiveProgramRunner`
-    （且无本地回退），这些会话工具将被省略，相应的提示文案也会被跳过。
-  - `knowledge_only` 档位：只注册 `skill_load`、
-    `skill_select_docs` 与 `skill_list_docs`。
-  - 执行器是否需要，也取决于档位：
-    `full` 通常还需要 `WithCodeExecutor(...)`；
-    `knowledge_only` 则不需要。
-- 注意：当你同时设置了 `WithCodeExecutor` 时，LLMAgent 默认会尝试执行
-  模型回复里的 Markdown 围栏代码块。如果你只是为了给 `skill_run` 提供运行时，
-  不希望自动执行代码块，可以加上
-  `llmagent.WithEnableCodeExecutionResponseProcessor(false)`。
-- 默认提示指引：框架会在系统消息里，在 `Available skills:` 列表后追加一段
-  `Tooling and workspace guidance:` 指引文本。
-  - 关闭该指引（减少提示词占用）：`llmagent.WithSkillsToolingGuidance("")`。
+- `WithSkills` 会自动注册内置 skill 工具（`skill_load`、
+  `skill_select_docs`、`skill_list_docs`），无需手动添加。它们都属于
+  “知识注入”类工具，不直接执行脚本。
+- `WithAllowedSkillTools(...)` 可以用显式白名单进一步收窄这套工具集，
+  例如只保留 `SkillToolLoad`。
+- **执行器自动 fallback**：当 `WithSkills(repo)` 开启但没有显式传
+  `WithCodeExecutor(...)` 时，框架会自动挂一个本地 code executor，
+  让 `workspace_exec` 开箱可用。模型随后通过 `workspace_exec` 在
+  `/skills/<name>/` 的可写工作副本里按 `SKILL.md` 描述的步骤执行脚本
+  并收集输出文件。以下三种情况会**跳过 fallback**：
+  （1）你已经传了 `WithCodeExecutor(...)`（用你自己的 executor）；
+  （2）你用了 `WithAllowedSkillTools(...)` 做精细控制（不做魔法）；
+  （3）你显式传了 `WithSkillToolProfile(SkillToolProfileKnowledgeOnly)`
+  （"我不要框架帮我起执行器"的 opt-out 信号）。生产环境建议显式
+  配置容器 executor，而不是依赖本地 fallback —— 本地 fallback 只是
+  开发期便利，不是上线目标形态。
+- **`CodeExecutor` 与围栏代码自动执行是两个独立开关**：
+  配置 `CodeExecutor` 只是让执行类**工具**（例如 `workspace_exec`）
+  可用，本身并不会让框架扫描模型回复里的 Markdown 围栏代码块并直接
+  运行。后者由独立的 `EnableCodeExecutionResponseProcessor` 控制
+  （默认：`true`）。两条推论：
+  - 当你**显式** `WithCodeExecutor(...)` 时，围栏代码自动执行保持框架
+    默认值，不会被 skills 逻辑偷偷改动。如果你只想让 executor 服务
+    `workspace_exec`，请显式传
+    `llmagent.WithEnableCodeExecutionResponseProcessor(false)`。
+  - 当 skills fallback 代你注入本地 executor 时（即上面的
+    `WithSkills(repo)` 场景），该隐式 executor 的用途被严格收敛为
+    "给 `workspace_exec` 供电"：如果你没有显式调用过
+    `WithEnableCodeExecutionResponseProcessor(...)`，fallback 路径
+    会自动把 `EnableCodeExecutionResponseProcessor` 置为 `false`，
+    避免 `WithSkills(repo)` 的升级路径偷偷打开你原本没配过的围栏
+    代码自动执行能力。
+- 默认提示指引：框架会在系统消息里，在 `Available skills:` 列表后
+  追加一段 `Tooling and workspace guidance:` 指引文本。
+  - 关闭该指引（减少提示词占用）：
+    `llmagent.WithSkillsToolingGuidance("")`。
   - 或用自定义文本替换：`llmagent.WithSkillsToolingGuidance("...")`。
-  - 如果你关闭它，请在自己的指令里明确当前档位下哪些 skill 工具可用。
+  - 指引会跟随最终注册的 skill 工具集，包括
+    `WithAllowedSkillTools(...)`。
+  - 如果你关闭它，请在自己的指令里明确当前白名单下哪些 skill 工具
+    可用。
   - 加载器： [tool/skill/load.go](https://github.com/trpc-group/trpc-agent-go/blob/main/tool/skill/load.go)
-  - 运行器： [tool/skill/run.go](https://github.com/trpc-group/trpc-agent-go/blob/main/tool/skill/run.go)
 
 ### 3) 运行示例
 
-交互式技能对话示例：
-[examples/skillrun/main.go](https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skillrun/main.go)
-
-这个 demo 以及其他以 skill 为中心的示例
-（`skill`、`skilldynamicschema`、`structuredoutputskills`）
-都显式设置了 `llmagent.WithEnableCodeExecutionResponseProcessor(false)`，
-避免在启用 `skill_run` 时自动执行 assistant 文本里的围栏代码块。
-
-```bash
-cd examples/skillrun
-export OPENAI_API_KEY="your-api-key"
-# 本地执行器
-go run . -executor local
-# 或容器执行器（需 Docker）
-go run . -executor container
-```
-
-GAIA 基准示例（技能 + 文件工具）：
+GAIA 基准示例（技能 + 文件工具 + `workspace_exec`）：
 [examples/skill/README.md](https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skill/README.md)
 
 该示例包含数据集下载脚本，以及 `whisper`（音频）/`ocr`（图片）等
 技能的 Python 依赖准备说明。
 
+真实技能发现/安装示例（真实模型 + 真实公网/GitHub）：
+[examples/skillfind/README.md](https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skillfind/README.md)
+
+这个示例从内置的 `skill-find` skill 出发，先到公网搜索候选
+skills，再把 GitHub 上的公开 skill 安装到用户私有目录中，调用
+`repo.Refresh()` 让仓库立即重新发现，然后在同一个会话里继续使用
+新 skill。
+
 SkillLoadMode 演示（无需 API key）：
 [examples/skillloadmode/README.md](https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skillloadmode/README.md)
-
-SkillToolProfile 演示（无需 API key）：
-[examples/skilltoolprofile/README.md](https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skilltoolprofile/README.md)
 
 子代理 skill 隔离演示（AgentTool + Skills）：
 [examples/skillisolation/README.md](https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skillisolation/README.md)
@@ -314,16 +361,11 @@ python3 examples/skill/scripts/download_gaia_2023_level1_validation.py
 python3 examples/skill/scripts/download_gaia_2023_level1_validation.py --with-files
 ```
 
-示例技能（节选）：
-[examples/skillrun/skills/python_math/SKILL.md]
-(https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skillrun/skills/python_math/SKILL.md)
-
 自然语言交互建议：
 - 直接说明你要做什么；模型会根据概览判断是否需要某个技能。
-- 当需要时，模型会先调用 `skill_load` 注入正文/文档，再调用
-  `skill_run` 执行命令并回传输出文件。
-- 在 `knowledge_only` 档位下，模型仍可加载 skill 正文/文档，但只能将其
-  作为知识与操作指引，不能执行 skill 脚本。
+- 当需要时，模型会先调用 `skill_load` 注入正文/文档，然后按
+  `SKILL.md` 里描述的步骤通过 `workspace_exec` 在 `/skills/<name>/`
+  下执行脚本并收集输出文件。
 
 ## `SKILL.md` 结构与示例
 
@@ -374,6 +416,8 @@ https://github.com/anthropics/skills
 - 写入会话临时键（按 agent 隔离，生命周期由 `SkillLoadMode` 控制）：
   - `temp:skill:loaded_by_agent:<agent>/<name>` = "1"
   - `temp:skill:docs_by_agent:<agent>/<name>` = "*" 或 JSON 字符串数组
+  - `temp:skill:loaded_order_by_agent:<agent>` = JSON 字符串数组，
+    按“最早触达 -> 最新触达”的顺序保存 skill 名
   - 旧版 key（`temp:skill:loaded:<name>`、`temp:skill:docs:<name>`）仍被支持，
     并在读到时自动迁移。
 - 多代理提示：transfer 调用子代理时通常共享同一个 Session。key 按 agent
@@ -474,7 +518,8 @@ _ = agt
 
 - 默认 `SkillLoadModeTurn` 会在**下一轮** `Runner.Run` 开始前清空这些
   该 agent 的 `temp:skill:loaded_by_agent:*` /
-  `temp:skill:docs_by_agent:*` state key，所以“已加载列表”通常只在当前这轮
+  `temp:skill:docs_by_agent:*` /
+  `temp:skill:loaded_order_by_agent:*` state key，所以“已加载列表”通常只在当前这轮
   tool loop 里非空。
 - `SkillLoadModeSession` 会跨轮保留这些 key，所以“已加载列表”会一直
   非空，直到你手动清空（或会话过期）。
@@ -486,9 +531,10 @@ option：
 
 - `llmagent.WithMaxLoadedSkills(N)`
 
-它会在**每次模型请求前**检查当前 loaded skills，并根据 session 中最近
-的 `skill_load` / `skill_select_docs` tool result，清空更老的
-`temp:skill:*` state key，从而把 loaded skills 数量控制在 N 以内。
+它会在**每次模型请求前**检查当前 loaded skills，并清空更老的
+`temp:skill:*` state key。最近 skill 的触达顺序会写入 session state，
+并由 `skill_load` / `skill_select_docs` 自动更新，因此不会依赖字母序兜底
+或 tool result history 是否还完整保留。
 
 示例：
 
@@ -717,7 +763,7 @@ svc := inmemory.NewSessionService(
 _ = svc
 ```
 
-`AppendEventHook` 的接口说明见 `docs/mkdocs/zh/session.md`，也可以参考
+`AppendEventHook` 的接口说明见 [Session 文档](session/index.md)，也可以参考
 可运行示例 `examples/session/hook`。
 
 说明：
@@ -861,6 +907,8 @@ agent := llmagent.New(
 行为：
 - 更新当前 agent 的 doc 选择 state key：
   - `temp:skill:docs_by_agent:<agent>/<name>`：`*` 表示全选；数组表示显式列表
+  - 同时刷新 `temp:skill:loaded_order_by_agent:<agent>`，因此
+    `WithMaxLoadedSkills(N)` 会把文档选择也视作一次“最近触达”
   - 旧版 key `temp:skill:docs:<name>` 仍被支持，并在读到时自动迁移
 
 ### `skill_list_docs`
@@ -876,267 +924,24 @@ agent := llmagent.New(
 提示：这些会话键由框架自动管理；用户通常无需直接操作，仅需用
 自然语言驱动对话即可。
 
-### `skill_run`
+### 技能工作区与运行时环境
 
-声明： [tool/skill/run.go](https://github.com/trpc-group/trpc-agent-go/blob/main/tool/skill/run.go)
+当模型通过 `workspace_exec` 执行 skill 脚本时，框架会为每个会话在
+工作区里物化一份可写的技能副本，并注入一组便于脚本使用的环境变量
+与符号链接：
 
-输入：
-- `skill`（必填）：技能名
-- `command`（必填）：Shell 命令（默认通过 `bash -c` 执行）
-- `cwd`（可选）：相对技能根目录的工作路径
-- `env`（可选）：环境变量映射
-- `stdin`（可选）：一次性写入命令的标准输入文本
-- `editor_text`（可选）：用于会拉起 `$EDITOR` 的 CLI 的文本内容
-- `output_files`（可选，传统收集方式）：通配符列表
-  （如 `out/*.txt`）。通配符以工作区根目录为准，也支持
-  `$OUTPUT_DIR/*.txt` 这类写法，会自动归一化为 `out/*.txt`。
-- `inputs`（可选，声明式输入）：把外部资源映射进工作区，
-  结构为对象数组，每项支持：
-  
-  - `from`：来源，支持四类方案（scheme）：
-    - `artifact://name[@version]` 从制品服务拉取文件
-    - `host:///abs/path` 从宿主机绝对路径复制/链接
-    - `workspace://rel/path` 从当前工作区相对路径复制/链接
-    - `skill://<name>/rel/path` 从已缓存的技能目录复制/链接
-  - `to`：目的路径（相对工作区）。未指定时默认写到
-    `WORK_DIR/inputs/<basename>`。为了方便，`skill_run` 也支持
-    `to` 以 `inputs/` 开头的写法，会被视为 `work/inputs/`
-    （因为技能根目录下 `inputs/` 是指向 `work/inputs/` 的软链）。
-  - `mode`：`copy`（默认）或 `link`（在可行时建立符号链接）。
-  - `pin`：当 `from=artifact://name` 未指定 `@version` 时，
-    尝试复用同一 `to` 路径第一次解析到的版本（best effort）。
-
-- 会话文件输入（自动 stage）：
-  - 如果当前会话的用户消息中包含文件输入（`content_parts` 中
-    `type=file` 的条目），`skill_run` 会在执行命令前自动把它们
-    写入 `work/inputs/`（也会出现在 `inputs/`）。
-  - 文件名会清洗为安全的 basename，并在重名时追加数字后缀。
-  - 若文件输入未提供文件名且 `file_id` 为 `artifact://...` 引用，
-    框架会从制品名推断 basename；否则回退为 `upload_N`。
-  - 若文件输入包含原始字节（`data`），会直接写入工作区。
-  - 若文件输入仅包含 `file_id`：
-    - 当 `file_id` 以 `artifact://` 开头时，`skill_run` 会通过制品
-      服务拉取对应内容并写入工作区（适用于用户上传文件已先保存
-      为制品，仅在消息中写入引用的场景）。
-    - 否则，框架会在模型支持下载时拉取内容并写入工作区。
-
-- `outputs`（可选，声明式输出）：使用清单（manifest）收集输出。
-  字段：
-  - `globs`：通配符数组（相对工作区，支持 `**`，也支持
-    `$OUTPUT_DIR/**` 这类写法并归一化为 `out/**`）。
-  - `inline`：是否把文件内容内联返回。
-  - `save`：是否保存为制品（与制品服务协作）。
-  - `name_template`：保存为制品时的文件名前缀（如 `pref/`）。
-  - `max_files`（默认 100）、`max_file_bytes`（默认 4 MiB/文件）、
-    `max_total_bytes`（默认 64 MiB）：上限控制。
-  - 说明：`outputs` 同时兼容 snake_case（推荐）与旧版 Go 风格字段名
-    （例如 `MaxFiles`）
-
-- `timeout`（可选）：超时秒数（执行器有默认值）
-- `save_as_artifacts`（可选，传统收集路径）：把通过
-  `output_files` 收集到的文件保存为制品，并在结果中返回
-  `artifact_files`。
-- `omit_inline_content`（可选）：为 true 时不返回
-  `output_files[*].content` 与 `primary_output.content`（只返回元信息）。
-  非文本输出的 `content` 也会始终为空。需要文本内容时，可用
-  `output_files[*].ref` 配合 `read_file` 按需读取。
-- `artifact_prefix`（可选）：与 `save_as_artifacts` 配合的前缀。
-  - 若未配置制品服务（Artifact service），`skill_run` 会继续
-    返回 `output_files`，并在 `warnings` 中给出提示。
-
-建议：
-- 建议 `skill_run` 尽量只用于执行 Skill 文档里描述的流程
-  （例如 `SKILL.md` 明确要求的命令）。
-- 不建议用 `skill_run` 做通用的 Shell 探索。
-- 优先使用 `skill_list_docs` / `skill_select_docs` 读取 Skill 文档，
-  再用文件工具按需查看选中的内容。
-
-可选的安全限制（白名单）：
-- 环境变量 `TRPC_AGENT_SKILL_RUN_ALLOWED_COMMANDS`：
-  - 逗号/空格分隔的命令名列表（如 `python3,ffmpeg`）
-  - 启用后 `skill_run` 会拒绝管道/重定向/分号等 Shell 语法，
-    并仅允许执行白名单中的“单条命令”
-  - 因为不再经过 Shell 解析，诸如 `> out/x.txt`、heredoc、
-    `$OUTPUT_DIR` 变量展开等写法将不可用；建议改为调用脚本，
-    或使用 `outputs` 收集输出文件
-- 代码侧也可通过 `llmagent.WithSkillRunAllowedCommands(...)` 配置。
-
-可选的安全限制（黑名单）：
-- 环境变量 `TRPC_AGENT_SKILL_RUN_DENIED_COMMANDS`：
-  - 逗号/空格分隔的命令名列表
-  - 启用后同样会拒绝 Shell 语法（仅允许“单条命令”），并拒绝
-    执行黑名单中的命令名
-- 代码侧也可通过 `llmagent.WithSkillRunDeniedCommands(...)` 配置。
-
-可选行为（强制保存到制品）：
-- 代码侧可配置强制让 `skill_run` 尽量把收集到的输出保存到制品服务，
-  即便模型未显式设置 `save_as_artifacts` / `outputs.save`：
-  - `llmagent.WithSkillRunForceSaveArtifacts(true)`
-
-输出：
-- `stdout`、`stderr`、`exit_code`、`timed_out`、`duration_ms`
-- `staged_inputs`（可选）：本次执行前从对话自动 stage 进
-  `work/inputs/` 的文件列表
-- `primary_output`（可选）：包含 `name`、`ref`、`content`、`mime_type`、
-  `size_bytes`、`truncated`
-  - 便捷字段：指向“最合适的”小型文本输出文件（若存在）。当只有一个主要输出时
-    优先使用它。
-- `output_files`：文件列表（`name`、`ref`、`content`、`mime_type`、
-  `size_bytes`、`truncated`）
-  - `ref` 是稳定的 `workspace://<name>` 引用，可传给其它工具使用
-  - 非文本文件的 `content` 会被省略。
-  - 当 `omit_inline_content=true` 时，所有文件的 `content` 会被省略。可用
-    `ref` 配合 `read_file` 按需读取文本内容。
-  - `size_bytes` 表示磁盘上的文件大小；`truncated=true` 表示收集内容触发了
-    内部上限（例如 4 MiB/文件）。
-  - 当命令失败或超时时，会省略 0 字节的收集结果，避免 shell 重定向先创建
-    空文件而造成误导。
-- `warnings`（可选）：非致命提示（例如制品保存被跳过）
-- `artifact_files`：制品引用（`name`、`version`）。两种途径：
-  - 传统路径：设置了 `save_as_artifacts` 时由工具保存并返回
-  - 清单路径：`outputs.save=true` 时由执行器保存并附加到结果
-
-典型流程：
-1) 模型先调用 `skill_load` 注入正文/文档
-   - 当使用 `llmagent.LLMAgent` 时，这一步默认是必需的：
-     `skill_run` 会拒绝执行尚未通过 `skill_load` 加载过的技能。
-     如需关闭，可用：
-     `llmagent.WithSkillRunRequireSkillLoaded(false)`。
-2) 随后调用 `skill_run` 执行命令并收集输出文件：
-   - 传统：用 `output_files` 指定通配符
-   - 声明式：用 `outputs` 统一控制收集/内联/保存
-   - 如需把上游文件带入，可用 `inputs` 先行映射
-
-### 交互式 Skill 会话
-
-声明：
-- [tool/skill/exec.go](https://github.com/trpc-group/trpc-agent-go/blob/main/tool/skill/exec.go)
-
-工具：
-- `skill_exec`：在 Skill 工作区里启动一个可持续交互的命令
-- `skill_write_stdin`：向运行中的会话追加 stdin
-- `skill_poll_session`：继续拉取终端输出或最终结果
-- `skill_kill_session`：终止并移除会话
-
-建议：
-- 一次性命令优先用 `skill_run`
-- 如果命令会等待输入、展示编号选择，或需要跨多次工具调用继续交互，
-  优先用 `skill_exec`
-- 对 `$EDITOR` 型流程，优先在 `skill_run` / `skill_exec` 上传
-  `editor_text`，不要试图通过 stdin 驱动全屏编辑器
-
-`skill_exec` 复用 `skill_run` 的同一套工作区、`inputs`、`outputs`、
-`save_as_artifacts`、`omit_inline_content`、`artifact_prefix`、
-`stdin` 与 `editor_text` 语义，但会额外返回会话状态：
-- `status`：`running` 或 `exited`
-- `session_id`：后续继续交互使用的稳定 id
-- `output`：本次调用观察到的最新终端输出
-- `interaction`：best effort 的输入提示（例如 prompt / selection）
-- `result`：当会话退出后，返回与 `skill_run` 风格一致的最终结果
-
-典型交互流程：
-1) 先调用 `skill_exec`
-2) 查看 `output` / `interaction`
-3) 持续调用 `skill_write_stdin` 或 `skill_poll_session`，直到
-   `status=exited`
-4) 读取 `result` 与收集到的输出；若需要中止，则调用
-   `skill_kill_session`
-
-示例：
-
-映射外部输入文件，并收集一个小型文本输出：
-
-```json
-{
-  "skill": "demo",
-  "inputs": [
-    {
-      "from": "host:///tmp/notes.txt",
-      "to": "work/inputs/notes.txt",
-      "mode": "copy"
-    }
-  ],
-  "command": "mkdir -p out; wc -l work/inputs/notes.txt > out/lines.txt",
-  "outputs": {
-    "globs": ["$OUTPUT_DIR/lines.txt"],
-    "inline": true,
-    "save": false,
-    "max_files": 1
-  }
-}
-```
-
-元信息输出（避免把上下文塞满）：
-
-```json
-{
-  "skill": "demo",
-  "command": "mkdir -p out; echo hi > out/a.txt",
-  "output_files": ["out/*.txt"],
-  "omit_inline_content": true
-}
-```
-
-该调用会返回 `output_files[*].ref`（如 `workspace://out/a.txt`），
-并省略 `content`，同时包含 `size_bytes` 与 `truncated`。
-
-需要内容时再读取：
-
-```json
-{
-  "file_name": "workspace://out/a.txt",
-  "start_line": 1,
-  "num_lines": 20
-}
-```
-
-大文件建议保存为制品（不内联内容）：
-
-```json
-{
-  "skill": "demo",
-  "command": "mkdir -p out; echo report > out/report.txt",
-  "outputs": {
-    "globs": ["$OUTPUT_DIR/report.txt"],
-    "inline": false,
-    "save": true,
-    "max_files": 5
-  }
-}
-```
-
-保存成功后，`skill_run` 会返回 `artifact_files`（`name`、`version`），
-并可用 `artifact://<name>[@<version>]` 作为文件引用传给 `read_file` 等工具。
-
-传统保存路径（当你使用 `output_files` 时）：
-
-```json
-{
-  "skill": "demo",
-  "command": "mkdir -p out; echo report > out/report.txt",
-  "output_files": ["out/report.txt"],
-  "omit_inline_content": true,
-  "save_as_artifacts": true,
-  "artifact_prefix": "pref/"
-}
-```
-
-运行环境与工作目录：
-- 未提供 `cwd` 时，默认在技能根目录运行：`/skills/<name>`
-- 相对 `cwd` 会被解析为技能根目录下的子路径
-- `cwd` 也可以以 `$WORK_DIR`、`$OUTPUT_DIR`、`$SKILLS_DIR`、
-  `$WORKSPACE_DIR`、`$RUN_DIR`（或 `${...}`）开头，
-  工具会将其规范化为工作区内的相对目录
-- 运行时注入环境变量：
-  - `WORKSPACE_DIR`、`SKILLS_DIR`、`WORK_DIR`、`OUTPUT_DIR`、
-    `RUN_DIR`（由执行器注入）
-  - `SKILL_NAME`（由工具注入）
-- 便捷符号链接：在技能根目录下自动创建 `out/`、`work/`、
-  `inputs/` 链接到工作区对应目录，方便按文档中的相对路径使用。
+- 技能根目录 `/skills/<name>` 默认是**会话级的可写工作副本**：脚本
+  可以在源码旁创建缓存、`__pycache__`、`.venv/` 等文件。上游
+  技能仓库仍是事实来源；当源摘要发生变化时，下次 reconcile 会
+  替换工作区中的副本。
+- 便捷符号链接：在技能根目录下自动创建 `out/`、`work/`、`inputs/`
+  链接到工作区对应目录，方便按文档中的相对路径使用。
+- 注入环境变量：`WORKSPACE_DIR`、`SKILLS_DIR`、`WORK_DIR`、
+  `OUTPUT_DIR`、`RUN_DIR`（由执行器注入）。
 - `.venv/`：技能根目录下的可写目录，用于安装技能依赖
   （例如 `python -m venv .venv` + `pip install ...`）。
-- 文件工具在 base directory 下不存在真实 `inputs/` 目录时，会将
-  `inputs/<path>` 视为 `<path>` 的别名
+- 文件工具在 base directory 下不存在真实 `inputs/` 目录时，会把
+  `inputs/<path>` 视为 `<path>` 的别名。
 
 ## 执行器
 
@@ -1155,7 +960,8 @@ agent := llmagent.New(
 
 安全与资源：
 - 本地/容器均限制读取与写入在工作区内
-- 可通过超时、脚本权限（如只读挂载技能树）降低风险
+- `/skills/<name>` 工作副本默认可写；canonical 技能仓库仍是
+  唯一事实来源
 - `stdout`/`stderr` 可能会被截断（见 `warnings`）
 - 输出文件读取大小有限制，避免过大文件影响
 
@@ -1182,15 +988,58 @@ agent := llmagent.New(
 - 执行隔离：脚本以工作区为边界，输出文件由通配符精确收集，避免
   将脚本源码或非必要文件带入模型上下文。
 
+## 执行器环境变量注入
+
+当执行器运行在远端（容器、云函数等）时，宿主进程的环境变量不会
+自动传递。`codeexecutor.NewEnvInjectingCodeExecutor` 可以包装
+任意 `CodeExecutor`，在每次 `RunProgram` / `StartProgram`
+调用前，从 `context` 动态读取环境变量并合并到
+`RunProgramSpec.Env`。
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/codeexecutor"
+
+wrapped := codeexecutor.NewEnvInjectingCodeExecutor(exec,
+    func(ctx context.Context) map[string]string {
+        // 从 ctx 中读取调用方提供的环境变量。
+        // 来源由业务自行决定：RuntimeState、请求头、DB 查询等。
+        return map[string]string{"GITHUB_TOKEN": "..."}
+    },
+)
+
+agent := llmagent.New(
+    "skills-assistant",
+    llmagent.WithSkills(repo),
+    llmagent.WithCodeExecutor(wrapped),  // 用 wrapped 代替原始 exec
+)
+```
+
+行为：
+
+- 覆盖所有走 `Engine.Runner()` 的执行路径（例如 `workspace_exec`）。
+- provider 返回的 key **不覆盖** tool 显式传入的 `env`。
+- 每次 `RunProgram` 调用时求值，不在调用间共享状态。
+- provider 返回 `nil` 时零开销跳过。
+- 也可以只包装 Engine 层：
+  `codeexecutor.NewEnvInjectingEngine(eng, provider)`。
+
+典型场景：多用户 Agent 服务中，每个用户通过 AG-UI `state` 或
+HTTP header 传入自己的 token，provider 从请求上下文中读取后注入
+执行器，LLM 无需感知。
+
 ## 故障排查
 
 - “unknown skill”：确认技能名与仓库路径；调用 `skill_load` 前
   先检查“概览注入”是否包含该技能
-- “executor is not configured”：为 `LLMAgent` 配置
-  `WithCodeExecutor`，或使用默认本地执行器
-- 超时/非零退出码：检查命令、依赖与 `timeout` 参数；容器模式下
-  网络默认关闭，避免依赖网络的脚本
-- 输出文件未返回：检查 `output_files` 通配符是否指向正确位置
+- 没配 executor：默认情况下，`WithSkills(repo)` 会自动 fallback 到
+  一个本地 executor。如果你显式 opt out 了
+  （`WithSkillToolProfile(SkillToolProfileKnowledgeOnly)` 或
+  `WithAllowedSkillTools(...)`），又想要 `workspace_exec`，就显式传
+  `llmagent.WithCodeExecutor(...)`（本地或容器）。
+- 超时/非零退出码：检查命令、依赖与超时参数；容器模式下网络默认关闭，
+  避免依赖网络的脚本
+- 输出文件未收集到：确认 `workspace_exec` 使用的通配符是否指向工作区
+  内的实际路径
 
 ## 参考与示例
 
@@ -1204,7 +1053,9 @@ agent := llmagent.New(
   - OpenAI Codex：在项目文档里列出 skills，并要求按需打开 `SKILL.md`：
     https://github.com/openai/codex/blob/383b45279efda1ef611a4aa286621815fe656b8a/codex-rs/core/src/project_doc.rs
 - 本仓库：
-  - 交互示例： [examples/skillrun/main.go]
-    (https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skillrun/main.go)
-  - 示例技能： [examples/skillrun/skills/python_math/SKILL.md]
-    (https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skillrun/skills/python_math/SKILL.md)
+  - GAIA 基准示例： [examples/skill/README.md]
+    (https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skill/README.md)
+  - 真实技能发现/安装示例： [examples/skillfind/README.md]
+    (https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skillfind/README.md)
+  - 子代理 skill 隔离示例： [examples/skillisolation/README.md]
+    (https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skillisolation/README.md)

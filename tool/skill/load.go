@@ -31,12 +31,56 @@ type stateDeltaProvider interface {
 // LoadTool enables loading a skill into session state.
 // It produces deltas under prefixes defined by skill package.
 type LoadTool struct {
-	repo skill.Repository
+	repo        skill.Repository
+	description string
+}
+
+const defaultLoadToolDescription = "Load a skill body and optional docs. " +
+	"Prefer progressive disclosure: load SKILL.md first, " +
+	"then load only needed docs. " +
+	"Safe to call multiple times to add or replace docs. " +
+	"Do not call this to list skills; names and descriptions " +
+	"are already in context. Use when a task needs a skill's " +
+	"SKILL.md body and selected docs in context."
+
+type loadToolOptions struct {
+	description string
+}
+
+// LoadToolOption configures LoadTool.
+type LoadToolOption func(*loadToolOptions)
+
+// WithLoadToolDescription overrides the skill_load tool description.
+func WithLoadToolDescription(
+	description string,
+) LoadToolOption {
+	return func(o *loadToolOptions) {
+		o.description = description
+	}
 }
 
 // NewLoadTool creates a new LoadTool.
 func NewLoadTool(repo skill.Repository) *LoadTool {
-	return &LoadTool{repo: repo}
+	return NewLoadToolWithOptions(repo)
+}
+
+// NewLoadToolWithOptions creates a new LoadTool with optional overrides.
+func NewLoadToolWithOptions(
+	repo skill.Repository,
+	opts ...LoadToolOption,
+) *LoadTool {
+	options := loadToolOptions{
+		description: defaultLoadToolDescription,
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&options)
+		}
+	}
+	return &LoadTool{
+		repo:        repo,
+		description: options.description,
+	}
 }
 
 // loadInput is the schema for skill_load.
@@ -49,14 +93,8 @@ type loadInput struct {
 // Declaration implements tool.Tool.
 func (t *LoadTool) Declaration() *tool.Declaration {
 	return &tool.Declaration{
-		Name: "skill_load",
-		Description: "Load a skill body and optional docs. " +
-			"Prefer progressive disclosure: load SKILL.md first, " +
-			"then load only needed docs. " +
-			"Safe to call multiple times to add or replace docs. " +
-			"Do not call this to list skills; names and descriptions " +
-			"are already in context. Use when a task needs a skill's " +
-			"SKILL.md body and selected docs in context.",
+		Name:        "skill_load",
+		Description: t.description,
 		InputSchema: &tool.Schema{
 			Type:        "object",
 			Description: "Load skill input",
@@ -96,7 +134,7 @@ func (t *LoadTool) Call(ctx context.Context, args []byte) (any, error) {
 	}
 	if t.repo != nil {
 		// validate existence
-		if _, err := t.repo.Get(in.Skill); err != nil {
+		if _, err := skill.GetForContext(ctx, t.repo, in.Skill); err != nil {
 			return nil, fmt.Errorf("unknown skill: %s", in.Skill)
 		}
 	}
@@ -105,7 +143,8 @@ func (t *LoadTool) Call(ctx context.Context, args []byte) (any, error) {
 
 // StateDelta builds delta keys to mark loaded skill and doc selection.
 func (t *LoadTool) StateDelta(_ string, args []byte, _ []byte) map[string][]byte {
-	return t.stateDelta("", args)
+	delta, _ := t.stateDelta("", args)
+	return delta
 }
 
 // StateDeltaForInvocation writes agent-scoped state for the invocation.
@@ -122,20 +161,26 @@ func (t *LoadTool) StateDeltaForInvocation(
 	if inv != nil {
 		agentName = inv.AgentName
 	}
-	return t.stateDelta(agentName, args)
+	delta, skillName := t.stateDelta(agentName, args)
+	return appendLoadedOrderStateDelta(
+		inv,
+		agentName,
+		delta,
+		skillName,
+	)
 }
 
 func (t *LoadTool) stateDelta(
 	agentName string,
 	args []byte,
-) map[string][]byte {
+) (map[string][]byte, string) {
 	var in loadInput
 	if err := json.Unmarshal(args, &in); err != nil {
 		log.Warnf("skill_load state parse failed: %v", err)
-		return nil
+		return nil, ""
 	}
 	if in.Skill == "" {
-		return nil
+		return nil, ""
 	}
 	delta := make(map[string][]byte)
 	// Mark as loaded.
@@ -152,7 +197,7 @@ func (t *LoadTool) stateDelta(
 			delta[dk] = b
 		}
 	}
-	return delta
+	return delta, in.Skill
 }
 
 var _ tool.Tool = (*LoadTool)(nil)

@@ -10,11 +10,13 @@
 package agui
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"trpc.group/trpc-go/trpc-agent-go/server/agui/adapter"
 	aguirunner "trpc.group/trpc-go/trpc-agent-go/server/agui/runner"
 	"trpc.group/trpc-go/trpc-agent-go/server/agui/service"
 )
@@ -116,10 +118,22 @@ func TestWithReasoningContentEnabled(t *testing.T) {
 	assert.True(t, ro.ReasoningContentEnabled)
 }
 
+func TestWithEventSourceMetadataEnabled(t *testing.T) {
+	opts := newOptions(WithEventSourceMetadataEnabled(true))
+	ro := aguirunner.NewOptions(opts.aguiRunnerOptions...)
+	assert.True(t, ro.EventSourceMetadataEnabled)
+}
+
 func TestWithToolResultInputTranslationEnabled(t *testing.T) {
 	opts := newOptions(WithToolResultInputTranslationEnabled(true))
 	ro := aguirunner.NewOptions(opts.aguiRunnerOptions...)
 	assert.True(t, ro.ToolResultInputTranslationEnabled)
+}
+
+func TestWithStreamingToolResultActivityEnabled(t *testing.T) {
+	opts := newOptions(WithStreamingToolResultActivityEnabled(true))
+	ro := aguirunner.NewOptions(opts.aguiRunnerOptions...)
+	assert.True(t, ro.StreamingToolResultActivityEnabled)
 }
 
 func TestWithMessagesSnapshotFollowEnabled(t *testing.T) {
@@ -143,4 +157,19 @@ func TestWithCancelOnContextDoneEnabled(t *testing.T) {
 	opts := newOptions(WithCancelOnContextDoneEnabled(true))
 	ro := aguirunner.NewOptions(opts.aguiRunnerOptions...)
 	assert.True(t, ro.CancelOnContextDoneEnabled)
+}
+
+func TestWithAppNameResolver(t *testing.T) {
+	called := false
+	resolver := func(ctx context.Context, input *adapter.RunAgentInput) (string, error) {
+		called = true
+		return "custom-app", nil
+	}
+	opts := newOptions(WithAppNameResolver(resolver))
+	ro := aguirunner.NewOptions(opts.aguiRunnerOptions...)
+	assert.NotNil(t, ro.AppNameResolver)
+	appName, err := ro.AppNameResolver(context.Background(), nil)
+	assert.NoError(t, err)
+	assert.Equal(t, "custom-app", appName)
+	assert.True(t, called)
 }

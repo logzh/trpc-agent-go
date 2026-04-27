@@ -29,7 +29,9 @@ const (
 	defaultGraphNodeInterruptActivityEnabled      = false
 	defaultGraphNodeInterruptActivityTopLevelOnly = false
 	defaultReasoningContentEnabled                = false
+	defaultEventSourceMetadataEnabled             = false
 	defaultToolResultInputTranslationEnabled      = false
+	defaultStreamingToolResultActivityEnabled     = false
 )
 
 // Options holds the options for the runner.
@@ -39,6 +41,7 @@ type Options struct {
 	TranslateCallbacks                     *translator.Callbacks // TranslateCallbacks translates the run events to AG-UI events.
 	RunAgentInputHook                      RunAgentInputHook     // RunAgentInputHook allows modifying the run input before processing.
 	AppName                                string                // AppName is the name of the application.
+	AppNameResolver                        AppNameResolver       // AppNameResolver derives the app name for an AG-UI run.
 	SessionService                         session.Service       // SessionService is the session service.
 	StateResolver                          StateResolver         // StateResolver resolves runtime state for an AG-UI run.
 	RunOptionResolver                      RunOptionResolver     // RunOptionResolver resolves the runner options for an AG-UI run.
@@ -55,7 +58,9 @@ type Options struct {
 	GraphNodeInterruptActivityEnabled      bool                  // GraphNodeInterruptActivityEnabled enables graph interrupt activity events.
 	GraphNodeInterruptActivityTopLevelOnly bool                  // GraphNodeInterruptActivityTopLevelOnly drops nested graph interrupt activity events.
 	ReasoningContentEnabled                bool                  // ReasoningContentEnabled controls whether reasoning content events are emitted.
+	EventSourceMetadataEnabled             bool                  // EventSourceMetadataEnabled attaches original trpc-agent-go source metadata to translated AG-UI events.
 	ToolResultInputTranslationEnabled      bool                  // ToolResultInputTranslationEnabled controls whether tool-result inputs are translated before emission.
+	StreamingToolResultActivityEnabled     bool                  // StreamingToolResultActivityEnabled rewrites partial tool results as activity events.
 }
 
 // NewOptions creates a new options instance.
@@ -64,6 +69,7 @@ func NewOptions(opt ...Option) *Options {
 		UserIDResolver:                         defaultUserIDResolver,
 		TranslatorFactory:                      defaultTranslatorFactory,
 		RunAgentInputHook:                      defaultRunAgentInputHook,
+		AppNameResolver:                        defaultAppNameResolver,
 		StateResolver:                          defaultStateResolver,
 		RunOptionResolver:                      defaultRunOptionResolver,
 		AggregatorFactory:                      aggregator.New,
@@ -75,7 +81,9 @@ func NewOptions(opt ...Option) *Options {
 		GraphNodeInterruptActivityEnabled:      defaultGraphNodeInterruptActivityEnabled,
 		GraphNodeInterruptActivityTopLevelOnly: defaultGraphNodeInterruptActivityTopLevelOnly,
 		ReasoningContentEnabled:                defaultReasoningContentEnabled,
+		EventSourceMetadataEnabled:             defaultEventSourceMetadataEnabled,
 		ToolResultInputTranslationEnabled:      defaultToolResultInputTranslationEnabled,
+		StreamingToolResultActivityEnabled:     defaultStreamingToolResultActivityEnabled,
 	}
 	for _, o := range opt {
 		o(opts)
@@ -96,9 +104,7 @@ func WithUserIDResolver(u UserIDResolver) Option {
 	}
 }
 
-// TranslatorFactory is a function that creates a translator for an AG-UI run.
-type TranslatorFactory func(ctx context.Context, input *adapter.RunAgentInput,
-	opts ...translator.Option) (translator.Translator, error)
+type TranslatorFactory = translator.Factory
 
 // WithTranslatorFactory sets the translator factory.
 func WithTranslatorFactory(factory TranslatorFactory) Option {
@@ -128,6 +134,16 @@ func WithRunAgentInputHook(hook RunAgentInputHook) Option {
 func WithAppName(n string) Option {
 	return func(o *Options) {
 		o.AppName = n
+	}
+}
+
+// AppNameResolver is a function that derives the app name for an AG-UI run.
+type AppNameResolver func(ctx context.Context, input *adapter.RunAgentInput) (string, error)
+
+// WithAppNameResolver sets the app name resolver.
+func WithAppNameResolver(r AppNameResolver) Option {
+	return func(o *Options) {
+		o.AppNameResolver = r
 	}
 }
 
@@ -252,10 +268,27 @@ func WithReasoningContentEnabled(enabled bool) Option {
 	}
 }
 
+// WithEventSourceMetadataEnabled controls whether translated AG-UI events
+// carry source metadata from the original trpc-agent-go event in rawEvent.
+func WithEventSourceMetadataEnabled(enabled bool) Option {
+	return func(o *Options) {
+		o.EventSourceMetadataEnabled = enabled
+	}
+}
+
 // WithToolResultInputTranslationEnabled controls whether tool-result inputs are translated before emission.
 func WithToolResultInputTranslationEnabled(enabled bool) Option {
 	return func(o *Options) {
 		o.ToolResultInputTranslationEnabled = enabled
+	}
+}
+
+// WithStreamingToolResultActivityEnabled controls whether partial tool-result
+// chunks are emitted as activity events while only the final tool result
+// remains on the tool-result path.
+func WithStreamingToolResultActivityEnabled(enabled bool) Option {
+	return func(o *Options) {
+		o.StreamingToolResultActivityEnabled = enabled
 	}
 }
 
@@ -266,12 +299,18 @@ func defaultUserIDResolver(ctx context.Context, input *adapter.RunAgentInput) (s
 
 func defaultTranslatorFactory(ctx context.Context, input *adapter.RunAgentInput,
 	opts ...translator.Option) (translator.Translator, error) {
-	return translator.New(ctx, input.ThreadID, input.RunID, opts...)
+	factory := translator.NewFactory()
+	return factory(ctx, input, opts...)
 }
 
 // defaultRunAgentInputHook returns the input unchanged.
 func defaultRunAgentInputHook(ctx context.Context, input *adapter.RunAgentInput) (*adapter.RunAgentInput, error) {
 	return input, nil
+}
+
+// defaultAppNameResolver returns no dynamic app name.
+func defaultAppNameResolver(ctx context.Context, input *adapter.RunAgentInput) (string, error) {
+	return "", nil
 }
 
 // defaultRunOptionResolver is the default run option resolver.

@@ -116,6 +116,67 @@ CLI flags always override config file values.
 The config file supports environment variable placeholders in the form `${NAME}`.
 Missing environment variables cause OpenClaw to fail fast with a config error.
 
+### Native Browser Use
+
+OpenClaw now supports a native `browser` tool provider for real browser
+automation.
+
+Use it when the task needs:
+
+- JS-heavy pages
+- tabs and page navigation
+- screenshots or page snapshots
+- clicking, typing, selecting, or dialog handling
+
+The provider exposes one `browser` tool and uses Playwright MCP under
+the hood. That keeps the model-facing interface stable while preserving
+image forwarding for screenshots.
+
+By default, browser navigation blocks:
+
+- loopback hosts such as `localhost`
+- private-network IPs
+- `file://` URLs
+
+You can relax or refine that policy with:
+`allowed_domains`, `blocked_domains`, `allow_loopback`,
+`allow_private_networks`, and `allow_file_urls`.
+
+Example config:
+
+```yaml
+tools:
+  providers:
+    - type: "browser"
+      config:
+        default_profile: "openclaw"
+        evaluate_enabled: false
+        allowed_domains: ["example.com"]
+        profiles:
+          - name: "openclaw"
+            transport: "stdio"
+            command: "npx"
+            args:
+              - "--yes"
+              - "@playwright/mcp@latest"
+              - "--headless"
+              - "--isolated"
+              - "--caps"
+              - "vision,pdf"
+            timeout: "5m"
+```
+
+Runnable example:
+[examples/browser_use/README.md](./examples/browser_use/README.md)
+
+Browser-server example:
+[examples/browser_server_use/README.md](./examples/browser_server_use/README.md)
+
+The full browser plane scaffolding also lives in:
+
+- [`./browser-server/`](./browser-server/)
+- [`./browser-extension/`](./browser-extension/)
+
 ### Debug recorder (optional)
 
 When debugging multi-step flows (especially Telegram "Processing..." messages),
@@ -178,7 +239,10 @@ admin:
 
 agent:
   # Short instruction text (optional).
-  instruction: "You are a helpful assistant. Reply in a friendly tone."
+  instruction: |
+    You are a helpful assistant. Reply in a friendly tone.
+    Use browser for JS-heavy sites, page interactions, snapshots,
+    screenshots, downloads, uploads, and current-tab relay workflows.
   # Optional: load and merge multiple markdown files into the system prompt.
   # Files are read in alphabetical order.
   # system_prompt_dir: "./prompts/system"
@@ -196,11 +260,41 @@ model:
   name: "gpt-5"
   openai_variant: "auto"
 
+# Optional: knowledge backends used by knowledge search tools.
+# This only configures the embedder and vector store. Content loading
+# can be triggered separately at runtime.
+knowledges:
+  entries:
+    - name: "docs"
+      embedder:
+        type: "openai"
+        model: "text-embedding-3-small"
+        dimensions: 1536
+      vector_store:
+        type: "inmemory"
+        max_results: 5
+
 tools:
   # Optional; default is serial execution.
   # When enabled and the model returns multiple tool calls in one step,
   # OpenClaw executes them concurrently.
   enable_parallel_tools: true
+  # Optional: override the built-in OpenClaw tooling guidance prompt.
+  # Leave unset to use the built-in default, or set to "" to disable it.
+  openclaw_tooling_guidance: ""
+  providers:
+    - type: "browser"
+      name: "browser-runtime"
+      config:
+        default_profile: "openclaw"
+        evaluate_enabled: false
+        server_url: "http://127.0.0.1:19790"
+        sandbox_server_url: "http://127.0.0.1:20790"
+        profiles:
+          - name: "openclaw"
+            description: "Managed Playwright profile from browser-server."
+          - name: "chrome"
+            description: "Current Chromium tab attached through relay."
 
 channels:
   - type: "telegram"
@@ -232,6 +326,41 @@ Notes:
 - Duration fields use Go-style strings like `60s`, `10m`, `1h`.
 - For secrets (model keys, Telegram tokens), keep them out of version control.
   Prefer environment variables when available.
+- `knowledges` currently configures only embedder / vector store wiring.
+  Loading documents into a knowledge base is a separate runtime action.
+- Example `pgvector` knowledge config:
+
+  ```yaml
+  knowledges:
+    entries:
+      - name: "trpc_agent_go"
+        embedder:
+          type: "openai"
+          model: "text-embedding-3-small"
+          base_url: "${OPENAI_BASE_URL}"
+          api_key: "${OPENAI_API_KEY}"
+          dimensions: 1536
+        vector_store:
+          type: "pgvector"
+          url: "postgres://postgres:${PGPASSWORD}@localhost:5432/vectordb?sslmode=disable"
+          table: "trpc_agent_go"
+          index_dimension: 1536
+          enable_tsvector: true
+          max_results: 5
+  ```
+
+  Use identifier-safe table names such as `trpc_agent_go`; do not use raw
+  names like `trpc-agent-go`.
+- The sample Telegram config enables the native `browser` tool against the
+  local browser-server defaults. When `server_url` points at
+  `http://127.0.0.1:19790`, `go run ./cmd/openclaw` now probes that address
+  and auto-starts `openclaw/browser-server` if it is not already running.
+  The checkout must already have `openclaw/browser-server` dependencies
+  installed (`npm install` and `npx playwright install chromium`), and the
+  managed process logs are written under `<state_dir>/debug/services/` and
+  surfaced in the admin Browser card. If auto-start cannot find the local
+  browser-server checkout, set `OPENCLAW_BROWSER_SERVER_DIR` or start the
+  server manually. See `openclaw/examples/browser_server_use/`.
 - The sample config in `./openclaw.yaml` is ready to use with
   `go run ./cmd/openclaw -config ./openclaw.yaml`.
 - The sample config in `./openclaw.stdin.yaml` is ready to use with
@@ -515,10 +644,12 @@ You can override the OpenAI-compatible base URL with:
 
 ### DeepSeek (OpenAI-compatible)
 
-If you use DeepSeek, set `DEEPSEEK_API_KEY`:
+If you use DeepSeek directly, set `DEEPSEEK_API_KEY` together with the official
+DeepSeek base URL:
 
 ```bash
 export DEEPSEEK_API_KEY="your-api-key"
+export OPENAI_BASE_URL="https://api.deepseek.com/v1"
 
 cd openclaw
 go run ./cmd/openclaw \
@@ -540,7 +671,10 @@ go run ./cmd/openclaw \
   -http-addr :8080
 ```
 
-By default, `-openai-variant` is `auto` and is inferred from `-model`.
+By default, `-openai-variant` is `auto` and is inferred from the configured
+base URL host (`OPENAI_BASE_URL`, `-openai-base-url`, or `model.base_url`). For
+custom proxies or other compatible endpoints, set `-openai-variant`
+explicitly.
 You can override it explicitly:
 
 ```bash
@@ -691,6 +825,14 @@ print a suggested `bootstrap deps` command when optional file tools are
 missing, but installation is always explicit. The managed Python environment
 is created with access to the current system site-packages, so existing
 packages such as `pandas` remain visible after bootstrap.
+
+Official OpenClaw skill metadata can currently describe package-manager,
+Go, npm, managed-Python, and asset download install actions. Explicit
+`-skill ...` runs only plan the selected skills and no longer pull in the
+default dependency profiles automatically. `bootstrap deps --apply` is
+best-effort: user-space installs and downloads run first, while root-only
+steps are reported as deferred instead of aborting the entire run. Download
+actions store assets under `<state_dir>/tools/<skill>/...`.
 
 ### 5) Send a message
 
@@ -1020,6 +1162,11 @@ skills:
   # Optional: restrict which bundled skills are enabled by default.
   # Applies only to bundled skills under ./openclaw/skills.
   allowBundled: ["gh-issues", "notion"]
+  # Watch mutable local skill roots and refresh automatically.
+  watch: true
+  watch_bundled: false
+  watch_debounce_ms: 250
+  tool_profile: "knowledge_only" # knowledge_only|full
   load_mode: "turn" # once|turn|session
   loaded_content_in_tool_results: true
   max_loaded_skills: 0
@@ -1041,6 +1188,20 @@ OpenClaw defaults to materializing loaded skill bodies/docs into tool
 result messages. This keeps the system prompt more stable while still
 letting `SkillLoadMode` control how long loaded skill state survives.
 
+`tool_profile: "knowledge_only"` is the default. It keeps `skill_load`,
+`skill_list_docs`, and `skill_select_docs`, while hiding execution
+tools such as `skill_run`. This is useful when you want skills to
+provide guidance and supporting docs but keep actual execution on the
+normal runtime tool surface.
+
+Use `tool_profile: "full"` only when you explicitly want the built-in
+skill execution tools to be visible to the model.
+
+When `skills.watch` is enabled, changes under local filesystem skill
+roots are picked up automatically after the watch debounce fires.
+Official install flows should still prefer staged publish plus explicit
+refresh after the final rename.
+
 The built-in skills guidance is also more runtime-oriented by default:
 the agent prefers skill-owned scripts when present and may use minimal
 read-only probes such as `--help` or `--version` to verify external CLI
@@ -1060,7 +1221,7 @@ If you already have an OpenClaw skills directory, you can reuse it:
 cd openclaw
 go run ./cmd/openclaw \
   -mode openai \
-  -model deepseek-chat \
+  -model gpt-5 \
   -skills-extra-dirs "/path/to/openclaw/skills"
 ```
 
@@ -1295,7 +1456,7 @@ To disable these tools explicitly:
 ```bash
 go run ./cmd/openclaw \
   -mode openai \
-  -model deepseek-chat \
+  -model gpt-5 \
   -config ./openclaw.yaml \
   -enable-openclaw-tools=false
 ```

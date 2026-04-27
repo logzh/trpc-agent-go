@@ -15,14 +15,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
+	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/google/uuid"
 	agentevent "trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/graph"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/server/agui/adapter"
+	"trpc.group/trpc-go/trpc-agent-go/server/agui/internal/source"
+	aguitool "trpc.group/trpc-go/trpc-agent-go/server/agui/internal/tool"
 	"trpc.group/trpc-go/trpc-agent-go/skill"
 )
 
@@ -30,6 +35,21 @@ import (
 type Translator interface {
 	// Translate translates a trpc-agent-go event to AG-UI events.
 	Translate(ctx context.Context, event *agentevent.Event) ([]aguievents.Event, error)
+}
+
+// TranslatorFactory is a function that creates a translator for an AG-UI run.
+type Factory func(ctx context.Context, input *adapter.RunAgentInput, opts ...Option) (Translator, error)
+
+// NewFactory creates a default translator factory for AG-UI.
+// The returned factory constructs the default translator with the provided input and options.
+func NewFactory(baseOpts ...Option) Factory {
+	return func(ctx context.Context, input *adapter.RunAgentInput, opts ...Option) (Translator, error) {
+		if input == nil {
+			return nil, errors.New("run agent input is nil")
+		}
+		allOpts := append(slices.Clone(baseOpts), opts...)
+		return New(ctx, input.ThreadID, input.RunID, allOpts...)
+	}
 }
 
 // PostRunFinalizingTranslator extends Translator with post-run finalization events.
@@ -53,6 +73,9 @@ func New(ctx context.Context, threadID, runID string, opts ...Option) (Translato
 		graphNodeInterruptActivityEnabled:      options.graphNodeInterruptActivityEnabled,
 		graphNodeInterruptActivityTopLevelOnly: options.graphNodeInterruptActivityTopLevelOnly,
 		reasoningContentEnabled:                options.reasoningContentEnabled,
+		eventSourceMetadataEnabled:             options.eventSourceMetadataEnabled,
+		streamingToolResultActivityEnabled:     options.streamingToolResultActivityEnabled,
+		streamingToolResultContent:             make(map[string]string),
 	}, nil
 }
 
@@ -70,6 +93,9 @@ type translator struct {
 	graphNodeInterruptActivityEnabled      bool
 	graphNodeInterruptActivityTopLevelOnly bool
 	reasoningContentEnabled                bool
+	eventSourceMetadataEnabled             bool
+	streamingToolResultActivityEnabled     bool
+	streamingToolResultContent             map[string]string
 }
 
 const skillRunArtifactsStateKey = skill.StateKeyArtifacts
@@ -104,14 +130,14 @@ func (t *translator) Translate(ctx context.Context, event *agentevent.Event) ([]
 	rsp := event.Response
 	if rsp == nil {
 		if len(events) > 0 || hasGraphDelta {
-			return events, nil
+			return t.finalizeEvents(event, events), nil
 		}
 		return nil, errors.New("event response is nil")
 	}
 	if rsp.Error != nil {
 		log.Errorf("agui: threadID: %s, runID: %s, error in response: %v", t.threadID, t.runID, rsp.Error)
 		events = append(events, aguievents.NewRunErrorEvent(rsp.Error.Message, aguievents.WithRunID(t.runID)))
-		return events, nil
+		return t.finalizeEvents(event, events), nil
 	}
 	if rsp.Object == model.ObjectTypeChatCompletionChunk || rsp.Object == model.ObjectTypeChatCompletion {
 		if t.reasoningContentEnabled {
@@ -135,11 +161,22 @@ func (t *translator) Translate(ctx context.Context, event *agentevent.Event) ([]
 		events = append(events, toolCallEvents...)
 	}
 	if rsp.IsToolResultResponse() {
-		toolResultEvents, err := t.toolResultEvent(rsp, event.ID)
-		if err != nil {
-			return nil, err
+		if t.streamingToolResultActivityEnabled && rsp.IsPartial {
+			toolResultActivityEvents, err := t.toolResultActivityEvents(rsp)
+			if err != nil {
+				return nil, err
+			}
+			events = append(events, toolResultActivityEvents...)
+		} else {
+			toolResultEvents, err := t.toolResultEvent(rsp, event.ID)
+			if err != nil {
+				return nil, err
+			}
+			events = append(events, toolResultEvents...)
+			if t.streamingToolResultActivityEnabled {
+				t.clearToolResultActivityState(rsp)
+			}
 		}
-		events = append(events, toolResultEvents...)
 	}
 	if event.IsRunnerCompletion() {
 		finalizationEvents, err := t.PostRunFinalizationEvents(ctx)
@@ -149,7 +186,7 @@ func (t *translator) Translate(ctx context.Context, event *agentevent.Event) ([]
 		events = append(events, finalizationEvents...)
 		events = append(events, aguievents.NewRunFinishedEvent(t.threadID, t.runID))
 	}
-	return events, nil
+	return t.finalizeEvents(event, events), nil
 }
 
 // PostRunFinalizationEvents closes any active reasoning or text streams after a run ends.
@@ -172,6 +209,33 @@ func (t *translator) PostRunFinalizationEvents(context.Context) ([]aguievents.Ev
 		t.receivingMessage = false
 	}
 	return events, nil
+}
+
+func (t *translator) finalizeEvents(
+	src *agentevent.Event,
+	events []aguievents.Event,
+) []aguievents.Event {
+	if t == nil ||
+		!t.eventSourceMetadataEnabled ||
+		len(events) == 0 {
+		return events
+	}
+	// A zero-value override intentionally suppresses rawEvent export.
+	metadata, ok := source.FromEvent(src)
+	if !ok {
+		return events
+	}
+	for _, evt := range events {
+		if evt == nil {
+			continue
+		}
+		base := evt.GetBaseEvent()
+		if base == nil || base.RawEvent != nil {
+			continue
+		}
+		base.RawEvent = metadata
+	}
+	return events
 }
 
 type artifactRef struct {
@@ -258,9 +322,18 @@ func (t *translator) graphNodeActivityEvents(evt *agentevent.Event) []aguievents
 	if meta.NodeID == "" {
 		return nil
 	}
-	// Agent nodes emit an additional start event without attempt metadata; ignore it to avoid duplicates.
-	if meta.NodeType == graph.NodeTypeAgent && meta.Attempt == 0 {
-		return nil
+	if meta.NodeType == graph.NodeTypeAgent {
+		switch graph.NodeEventEmitterFromStateDelta(evt.StateDelta) {
+		case graph.NodeEventEmitterExecutor:
+		case graph.NodeEventEmitterAgentHelper:
+			return nil
+		default:
+			// Backward-compatible fallback for older cores that do not emit explicit
+			// lifecycle source metadata.
+			if meta.Attempt == 0 {
+				return nil
+			}
+		}
 	}
 
 	value := graphNodePatchValue{NodeID: meta.NodeID, Phase: string(meta.Phase)}
@@ -355,7 +428,7 @@ func (t *translator) reasoningEvents(rsp *model.Response) ([]aguievents.Event, e
 			t.receivingReasoning = true
 			events = append(events,
 				aguievents.NewReasoningStartEvent(reasoningID),
-				aguievents.NewReasoningMessageStartEvent(reasoningID, model.RoleAssistant.String()),
+				aguievents.NewReasoningMessageStartEvent(reasoningID, string(aguitypes.RoleReasoning)),
 			)
 		case model.ObjectTypeChatCompletion:
 			if rsp.Choices[0].Message.ReasoningContent == "" {
@@ -371,7 +444,7 @@ func (t *translator) reasoningEvents(rsp *model.Response) ([]aguievents.Event, e
 			t.lastReasoningMessageID = reasoningID
 			events = append(events,
 				aguievents.NewReasoningStartEvent(reasoningID),
-				aguievents.NewReasoningMessageStartEvent(reasoningID, model.RoleAssistant.String()),
+				aguievents.NewReasoningMessageStartEvent(reasoningID, string(aguitypes.RoleReasoning)),
 				aguievents.NewReasoningMessageContentEvent(reasoningID, rsp.Choices[0].Message.ReasoningContent),
 				aguievents.NewReasoningMessageEndEvent(reasoningID),
 				aguievents.NewReasoningEndEvent(reasoningID),
@@ -542,6 +615,62 @@ func (t *translator) toolResultEvent(rsp *model.Response, messageID string) ([]a
 	}
 	t.lastMessageID = messageID
 	return events, nil
+}
+
+func (t *translator) toolResultActivityEvents(rsp *model.Response) ([]aguievents.Event, error) {
+	if rsp == nil || len(rsp.Choices) == 0 {
+		return nil, nil
+	}
+	events := make([]aguievents.Event, 0, len(rsp.Choices))
+	for _, choice := range rsp.Choices {
+		if event, ok := t.toolResultActivityEvent(choice.Message.ToolID, choice.Message.Content); ok {
+			events = append(events, event)
+		}
+		if event, ok := t.toolResultActivityEvent(choice.Delta.ToolID, choice.Delta.Content); ok {
+			events = append(events, event)
+		}
+	}
+	return events, nil
+}
+
+func (t *translator) toolResultActivityEvent(toolCallID, chunk string) (aguievents.Event, bool) {
+	if toolCallID == "" || chunk == "" {
+		return nil, false
+	}
+	content := t.streamingToolResultContent[toolCallID] + chunk
+	t.streamingToolResultContent[toolCallID] = content
+	messageID := aguitool.StreamingToolResultActivityMessageID(toolCallID)
+	if len(content) == len(chunk) {
+		return aguievents.NewActivitySnapshotEvent(
+			messageID,
+			aguitool.StreamingToolResultActivityType,
+			map[string]any{
+				"toolCallId": toolCallID,
+				"content":    content,
+			},
+		), true
+	}
+	return aguievents.NewActivityDeltaEvent(
+		messageID,
+		aguitool.StreamingToolResultActivityType,
+		[]aguievents.JSONPatchOperation{
+			{Op: "add", Path: "/content", Value: content},
+		},
+	), true
+}
+
+func (t *translator) clearToolResultActivityState(rsp *model.Response) {
+	if t == nil || rsp == nil {
+		return
+	}
+	for _, choice := range rsp.Choices {
+		if choice.Message.ToolID != "" {
+			delete(t.streamingToolResultContent, choice.Message.ToolID)
+		}
+		if choice.Delta.ToolID != "" {
+			delete(t.streamingToolResultContent, choice.Delta.ToolID)
+		}
+	}
 }
 
 // formatToolCallArguments formats a tool call arguments event to a string.

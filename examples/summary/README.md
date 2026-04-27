@@ -13,6 +13,7 @@ This example demonstrates LLM-driven session summarization integrated with the f
 - Simple trigger configuration using event-count threshold.
 - Prompt construction that injects the latest summary and recent events.
 - Context-aware routing can be found in `examples/summary/contextaware`.
+- Summary injection mode comparison can be found in `examples/summary/injection`.
 - Backend-specific persistence:
   - Summary text is stored in `sess.Summaries[filterKey]` for both backends.
 
@@ -170,7 +171,7 @@ You can customize the summary prompt to control how conversations are summarized
 ### Available Placeholders
 
 - **`{conversation_text}`**: The conversation content to be summarized
-- **`{max_summary_words}`**: The maximum word count for the summary (only included when `WithMaxSummaryWords` is set). In the default prompt, this placeholder is replaced with a natural instruction like "Please keep the summary within 100 words." In custom prompts, it's replaced with just the number, allowing you to control the wording in your preferred language.
+- **`{max_summary_words}`**: The maximum word count for the summary (only included when `WithMaxSummaryWords` is set). In the default prompt, this placeholder is replaced with a natural instruction like "Please keep the summary within 100 words." In custom prompts, it's replaced with just the number, allowing you to control the wording in your preferred language. When `WithMaxSummaryWords(...)` is set, include this placeholder in either `WithPrompt(...)` or `WithSystemPrompt(...)`.
 
 ### Example Usage
 
@@ -192,6 +193,10 @@ summary.WithPrompt("请将以下对话总结为不超过{max_summary_words}个�
 
 // Custom prompt with length limit (mixed language)
 summary.WithPrompt("请总结以下对话，控制在{max_summary_words}字以内：{conversation_text}")
+
+// Put stable instructions in a dedicated system message
+summary.WithSystemPrompt("Focus on decisions and keep it within {max_summary_words} words.")
+summary.WithPrompt("<conversation>\n{conversation_text}\n</conversation>\n\nSummary:")
 ```
 
 ## Summary Options
@@ -204,15 +209,19 @@ The `SessionSummarizer` supports various configuration options to customize summ
 
 - **`WithPrompt(prompt string)`**: Customizes the prompt template used for summary generation. The prompt must include the `{conversation_text}` placeholder. See the [Prompt Customization](#prompt-customization) section for details and examples.
 
+- **`WithSystemPrompt(prompt string)`**: Adds a dedicated system message for summarization instructions. It must not include `{conversation_text}`; keep the conversation content in the user prompt so the system message remains instruction-only.
+
 - **`WithSkipRecent(skipFunc SkipRecentFunc)`**: Sets a custom function that returns how many recent events to skip during summarization. Return 0 to skip none. Useful for avoiding summarizing very recent/incomplete turns, or applying time/content-based skipping strategies.
 
 ### Trigger Options
+
+- **`WithContextThreshold(opts ...ContextThresholdOption)`**: Zero-configuration trigger that dynamically resolves the model's context window at runtime. Calculates a token threshold as a fraction of the context window (default 50%), automatically adapting when the user switches models. Recommended for coding agents and long-running sessions. Options: `WithContextThresholdRatio(ratio)`, `WithContextThresholdFallbackWindow(tokens)`, `WithContextThresholdMinTokens(tokens)`.
 
 - **`WithEventThreshold(eventCount int)`**: Triggers summarization when the number of events exceeds the threshold.
 
 - **`WithTokenThreshold(tokenCount int)`**: Triggers summarization when the estimated token count exceeds the threshold (0=disabled).
 
-- **`WithTimeThreshold(interval time.Duration)`**: Triggers summarization when the time elapsed since the last event exceeds the interval (useful for periodic summarization in long-running sessions).
+- **`WithTimeThreshold(interval time.Duration)`**: Triggers summarization when the checked session's last event is older than the interval. In the normal delta-summary flow, that effectively means the latest unsummarized event (useful for periodic summarization in long-running sessions).
 
 ### Composite Trigger Options
 
@@ -221,6 +230,14 @@ The `SessionSummarizer` supports various configuration options to customize summ
 - **`WithChecksAll(checks ...Checker)`**: Triggers summarization when ALL of the provided checks pass (AND logic).
 
 ### Example Usage
+
+```go
+// Zero-configuration: auto-detect context window and compact when needed
+sum := summary.NewSummarizer(model,
+    summary.WithContextThreshold(), // Recommended for coding agents
+    summary.WithMaxSummaryWords(200),
+)
+```
 
 ```go
 // Basic configuration

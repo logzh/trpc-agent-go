@@ -205,7 +205,11 @@ type GenerationConfig struct {
     // 存在惩罚
     PresencePenalty *float64 `json:"presence_penalty,omitempty"`
 
-    // 推理努力程度 ("low", "medium", "high")
+    // 推理努力程度。可选值取决于服务方：
+    //   - OpenAI o-series："low"、"medium"、"high"
+    //   - DeepSeek v4（deepseek-v4-pro / deepseek-v4-flash）："high"、"max"
+    //     （服务端为兼容旧配置，会把 "low"/"medium" 映射为 "high"，
+    //     "xhigh" 映射为 "max"）
     ReasoningEffort *string `json:"reasoning_effort,omitempty"`
 
     // 是否启用思考模式
@@ -215,6 +219,11 @@ type GenerationConfig struct {
     ThinkingTokens *int `json:"-"`
 }
 ```
+
+`GenerationConfig` 本身只是一个普通结构体，它的零值等价于
+`Stream=false`。对 `LLMAgent` 来说，如果没有显式传入
+`llmagent.WithGenerationConfig(...)`，框架会直接使用这个零值，
+因此默认是非流式。更上层的封装如果需要不同语义，也可以显式设置自己的默认值。
 
 ### Response 结构
 
@@ -1476,6 +1485,10 @@ model := openai.New("deepseek-chat",
 
 框架会根据模型的上下文窗口自动计算 "maxInputTokens"：
 
+> **Context Window 注册**
+>
+> Token 裁剪和会话摘要的 `WithContextThreshold` 都依赖框架内置的模型 context window 注册表。注册表已覆盖大量常见模型，但不一定包含所有模型——特别是私有部署或较新发布的模型。如果你的模型未被识别，请在启动时调用 `model.RegisterModelContextWindow("my-model", 32768)` 或 `model.RegisterModelContextWindows(map[string]int{...})` 手动注册。完整示例参见[会话摘要文档](session/summary.md)。
+
 ```
 safetyMargin = contextWindow × 10%
 calculatedMax = contextWindow - 2048（输出预留）- 512（协议开销）- safetyMargin
@@ -1592,6 +1605,7 @@ Variant 机制是 Model 模块的重要优化，用于处理不同 OpenAI 兼容
 - DeepSeek 平台适配
 - 默认 BaseURL：`https://api.deepseek.com`
 - API Key 环境变量名：`DEEPSEEK_API_KEY`
+- 显式设置 `WithVariant(openai.VariantDeepSeek)`，或使用官方 DeepSeek API BaseURL 时，才会启用 DeepSeek 特有行为
 - 其他行为与标准 OpenAI 一致
 
 **4. VariantQwen（千问）**
@@ -2354,3 +2368,128 @@ provider.Register("custom-provider", func(opts *provider.Options) (model.Model, 
 
 customModel, err := provider.Model("custom-provider", "custom-model")
 ```
+
+## 模型容灾（Failover）
+
+`model/failover` 提供了一个按优先级顺序兜底的模型包装器。它可将多个 `model.Model` 组成主备链路，在主模型不可用时自动切到下一个候选模型，适用于主备域名、主备网关或不同模型提供方之间的切换场景。
+
+**快速开始：**
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/model/failover"
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+)
+
+primary := openai.New(
+    "gpt-4o-mini",
+    openai.WithBaseURL("https://api.openai.com/v1"),
+)
+backup := openai.New(
+    "deepseek-chat",
+    openai.WithBaseURL("https://api.deepseek.com/v1"),
+)
+
+llm, err := failover.New(
+    failover.WithCandidates(primary, backup),
+)
+if err != nil {
+    return err
+}
+```
+
+`failover.New(...)` 返回普通的 `model.Model`，可以直接传给 `llmagent.WithModel(...)` 等接受 `model.Model` 的位置使用。完整示例见 [examples/model/failover](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/failover)。
+
+**切换规则：**
+
+- 按 `WithCandidates(...)` 传入的顺序依次尝试候选模型。
+- 只有在收到首个非错误 chunk 之前，才允许从当前候选模型切换到下一个候选模型。
+- 如果当前候选模型在此之前直接返回 `error`，或返回带 `Response.Error` 的错误响应，就会继续尝试下一个候选模型。
+- 一旦已经向调用方返回过任意非错误 chunk，后续即使流式过程中再出错，也不会重放到备模型，而是直接将错误返回给调用方。
+
+## 模型对冲（Hedge）
+
+`model/hedge` 提供了一个用于对冲首 token 尾延迟的模型包装器。它会先启动主候选，再按配置的 hedge delay 逐步补发后续候选；如果当前已启动候选都已经失败，则会提前拉起下一个候选。谁先返回首个有意义响应，谁就成为本次请求的胜者，其余候选会被取消。
+
+**快速开始：**
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/model/hedge"
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+)
+
+primary := openai.New(
+    "gpt-4o-mini",
+    openai.WithBaseURL("https://api.openai.com/v1"),
+)
+backup := openai.New(
+    "deepseek-chat",
+    openai.WithBaseURL("https://api.deepseek.com/v1"),
+)
+
+llm, err := hedge.New(
+    hedge.WithName("chat-hedge"),
+    hedge.WithCandidates(primary, backup),
+)
+if err != nil {
+    return err
+}
+```
+
+`hedge.New(...)` 同样返回普通的 `model.Model`，可以直接传给 `llmagent.WithModel(...)` 等接受 `model.Model` 的位置使用。上面这段代码使用包默认 delay；如果要显式控制补发时序，可继续使用 `WithDelay(...)` 或 `WithDelays(...)`。完整示例见 [examples/model/hedge](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/hedge)。
+
+**调度与提交规则：**
+
+- 第一个候选总是在请求开始时立即启动。
+- `WithDelay(...)` 表示相邻 hedge 候选的固定补发间隔；`WithDelays(...)` 可显式指定候选 `1..n` 的启动偏移。
+- 如果当前所有已启动候选都已经失败，且仍有未启动候选，包装器会立即拉起下一个候选，而不是继续等待定时器。
+- 只有真正开始产出有效内容的候选才会成为胜者；只返回空内容或元数据的响应不会抢占胜者。
+- 一旦已经提交胜者，其他候选会被取消，后续只继续向调用方转发胜者的流。
+
+**配置示例：**
+
+下面的片段只展示调度配置差异。
+
+```go
+llm, err := hedge.New(
+    hedge.WithCandidates(primary, backupA, backupB),
+    hedge.WithDelay(100*time.Millisecond),
+)
+```
+
+上面这段配置表示：
+
+- `candidate[0]` 在 `0ms` 启动。
+- `candidate[1]` 在 `100ms` 启动。
+- `candidate[2]` 在 `200ms` 启动。
+
+```go
+llm, err := hedge.New(
+    hedge.WithCandidates(primary, backupA, backupB),
+    hedge.WithDelays(80*time.Millisecond, 250*time.Millisecond),
+)
+```
+
+上面这段配置表示：
+
+- `candidate[0]` 在 `0ms` 启动。
+- `candidate[1]` 在 `80ms` 启动。
+- `candidate[2]` 在 `250ms` 启动。
+
+这里 `WithDelays(...)` 传入的是相对请求开始时刻的绝对启动偏移，不是相对上一个候选的增量间隔。
+
+```go
+llm, err := hedge.New(
+    hedge.WithCandidates(primary, backupA, backupB),
+    hedge.WithDelays(0, 0),
+)
+```
+
+上面这段配置表示：
+
+- `candidate[0]` 在 `0ms` 启动。
+- `candidate[1]` 在 `0ms` 启动。
+- `candidate[2]` 在 `0ms` 启动。
+
+这相当于所有候选在请求开始时立即并发发起；如果是固定间隔模式，也可以写成 `WithDelay(0)`。

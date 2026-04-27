@@ -41,6 +41,13 @@ The framework automatically extracts Agent metadata (name, description, tools, e
 - Capability declarations (streaming support)
 - Skill lists (automatically generated based on Agent tools)
 
+It is important to distinguish these two layers:
+
+- The `streaming` flag in `WithAgent(agent, streaming)` is primarily used to declare `AgentCard.Capabilities.Streaming`.
+- It is not the global execution switch for the `runner`, and it does not directly control the internal message processing pipeline.
+- If you use `WithRunner(...) + WithAgentCard(...)`, the streaming capability should be declared directly on the `AgentCard`, for example via `NewAgentCard(..., streaming)`.
+- In `WithRunner(...) + WithAgentCard(...)` mode, `skills` are owned by the caller. `NewAgentCard(...)` only gives you a default structure and default skill; it does not infer the full tool list from a custom `runner`.
+
 ### Message Protocol Conversion
 
 The framework includes a built-in `messageProcessor` that implements bidirectional conversion between A2A protocol messages and Agent message formats, so users don't need to worry about message format conversion details.
@@ -106,7 +113,11 @@ server, _ := a2aserver.New(
 ```
 
 Task state updates (`submitted`, `completed`) are still emitted as
-`TaskStatusUpdateEvent`.
+`TaskStatusUpdateEvent`. If `WithStructuredTaskErrors(true)` is enabled,
+terminal failures are also emitted as failed task status updates, with
+machine-readable fields preferred on the outer metadata, mirrored into
+`status.message.metadata` for `0.1` compatibility, and display text in
+`status.message.parts`.
 
 #### Direct A2A Protocol Client Call
 
@@ -130,6 +141,195 @@ func main() {
 	response, _ := client.SendMessage(context.Background(),
 		protocol.SendMessageParams{Message: message})
 }
+```
+
+### Advanced Configuration
+
+#### Custom Runner (WithRunner)
+
+By default, A2A Server automatically creates a Runner for you. If you need finer control, such as injecting a MemoryService or customizing SessionService, use `WithRunner`.
+
+Note: `WithRunner` is mutually exclusive with `WithAgent`. When you provide `WithRunner`, you must also provide the public agent identity explicitly via `WithAgentCard`:
+
+```go
+import (
+	"trpc.group/trpc-go/trpc-agent-go/memory/inmemory"
+	"trpc.group/trpc-go/trpc-agent-go/runner"
+	sessionmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
+	"trpc.group/trpc-go/trpc-agent-go/server/a2a"
+)
+
+memoryService := inmemory.NewMemoryService()
+sessionService := sessionmemory.NewSessionService()
+streaming := true
+
+r := runner.NewRunner(
+	agent.Info().Name,
+	agent,
+	runner.WithSessionService(sessionService),
+	runner.WithMemoryService(memoryService),
+)
+
+card, _ := a2a.NewAgentCard(agent.Info().Name, agent.Info().Description, "localhost:8080", streaming)
+
+server, _ := a2a.New(
+	a2a.WithRunner(r),
+	a2a.WithAgentCard(card),
+)
+```
+
+In this `runner-only` mode, streaming capability is no longer passed through `WithAgent(...)`; it is declared directly by the `AgentCard.Capabilities.Streaming` field provided via `WithAgentCard(...)`.
+
+`examples/a2aagent` also includes an explicit example. Use `-server-mode runner-card` to switch the server construction path to `WithRunner(...) + WithAgentCard(...)`:
+
+```bash
+cd examples/a2aagent
+go run . -server-mode runner-card
+```
+
+If you only need a default-compliant card quickly, prefer `NewAgentCard(...)` instead of manually filling in `Name`, `Description`, `Capabilities`, and the default skill. If your `runner` needs a more accurate `skills` list, populate and maintain it in your own code.
+
+#### Dynamically Updating AgentCard
+
+If you need to update the exposed `AgentCard` at runtime, wire the underlying `a2aprotocolserver.WithAgentCardHandler(...)` through `WithExtraA2AOptions(...)`, and use `NewAgentCardHandler(...)` to serve the current snapshot:
+
+```go
+import (
+	"sync"
+
+	a2aprotocolserver "trpc.group/trpc-go/trpc-a2a-go/server"
+	"trpc.group/trpc-go/trpc-agent-go/runner"
+	"trpc.group/trpc-go/trpc-agent-go/server/a2a"
+)
+
+card, _ := a2a.NewAgentCard(agent.Info().Name, agent.Info().Description, "localhost:8080", true)
+var (
+	cardMu      sync.RWMutex
+	currentCard = card
+)
+
+server, _ := a2a.New(
+	a2a.WithRunner(runner.NewRunner(agent.Info().Name, agent)),
+	a2a.WithAgentCard(currentCard),
+	a2a.WithExtraA2AOptions(
+		a2aprotocolserver.WithAgentCardHandler(
+			a2a.NewAgentCardHandler(func() a2aprotocolserver.AgentCard {
+				cardMu.RLock()
+				defer cardMu.RUnlock()
+				return currentCard
+			}),
+		),
+	),
+)
+
+cardMu.Lock()
+updated := currentCard
+updated.Description = "new description"
+currentCard = updated
+cardMu.Unlock()
+```
+
+This only updates the exposed metadata. It does not modify the underlying `runner`, `taskManager`, or message processing pipeline. The caller remains responsible for where `currentCard` is stored and how it is updated.
+
+Treat fields such as `Name` and `URL` as startup-time invariants, because they also participate in identity, routing, or discovery semantics. If those fields must change, rebuilding the server is safer than only updating the card endpoint.
+
+#### Server-Side Message Processing Hook (WithProcessMessageHook)
+
+`WithProcessMessageHook` allows you to insert custom logic before/after the A2A Server processes messages. It uses a middleware pattern, wrapping the underlying `MessageProcessor`:
+
+```go
+import "trpc.group/trpc-go/trpc-a2a-go/taskmanager"
+
+// Custom hook processor
+type hookProcessor struct {
+	next taskmanager.MessageProcessor
+}
+
+func (h *hookProcessor) ProcessMessage(
+	ctx context.Context,
+	message protocol.Message,
+	options taskmanager.ProcessOptions,
+	handler taskmanager.TaskHandler,
+) (*taskmanager.MessageProcessingResult, error) {
+	// Before processing: read custom metadata injected by the client
+	if traceID, ok := message.Metadata["trace_id"]; ok {
+		fmt.Printf("received trace_id: %v\n", traceID)
+	}
+	// Delegate to the next processor
+	return h.next.ProcessMessage(ctx, message, options, handler)
+}
+
+server, _ := a2a.New(
+	a2a.WithHost("localhost:8080"),
+	a2a.WithAgent(agent, true),
+	a2a.WithProcessMessageHook(
+		func(next taskmanager.MessageProcessor) taskmanager.MessageProcessor {
+			return &hookProcessor{next: next}
+		},
+	),
+)
+```
+
+**Typical use cases**:
+- Read custom metadata injected by the client via `BuildMessageHook`
+- Add logging, monitoring, or auditing before/after message processing
+- Modify or validate inbound messages
+
+#### Client-Side Message Build Hook (WithBuildMessageHook)
+
+`WithBuildMessageHook` is a Hook on the A2AAgent (client) side that allows injecting custom data before sending messages to a remote A2A Server. It also uses a middleware pattern:
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/agent/a2aagent"
+
+a2aAgent, _ := a2aagent.New(
+	a2aagent.WithAgentCardURL("http://remote-agent:8888"),
+	a2aagent.WithBuildMessageHook(
+		func(next a2aagent.ConvertToA2AMessageFunc) a2aagent.ConvertToA2AMessageFunc {
+			return func(isStream bool, agentName string, inv *agent.Invocation) (*protocol.Message, error) {
+				// Call the default converter
+				msg, err := next(isStream, agentName, inv)
+				if err != nil {
+					return nil, err
+				}
+				// Inject custom metadata
+				if msg.Metadata == nil {
+					msg.Metadata = make(map[string]any)
+				}
+				msg.Metadata["trace_id"] = "my-trace-123"
+				msg.Metadata["business_tag"] = "order-service"
+				return msg, nil
+			}
+		},
+	),
+)
+```
+
+**BuildMessageHook + ProcessMessageHook interaction**:
+
+```text
+┌──────────────────┐                    ┌───────────────────┐
+│    A2AAgent      │   A2A protocol     │    A2A Server     │
+│                  │                    │                   │
+│ BuildMessageHook │── metadata ──────→ │ProcessMessageHook │
+│ (inject data)    │                    │ (read data)       │
+└──────────────────┘                    └───────────────────┘
+```
+
+The client injects custom data (such as trace_id, business tags) into the A2A message's `metadata` field via `BuildMessageHook`, and the server reads and processes this data via `ProcessMessageHook`.
+
+#### Append RunOptions (WithRunOptions)
+
+`WithRunOptions` allows appending additional `RunOption` to every Agent invocation in the A2A Server:
+
+```go
+server, _ := a2a.New(
+	a2a.WithHost("localhost:8080"),
+	a2a.WithAgent(agent, true),
+	a2a.WithRunOptions(
+		agent.WithRequestID("custom-req-id"),
+	),
+)
 ```
 
 #### Graph internal event forwarding
@@ -164,6 +364,49 @@ Notes:
 
 Use this in debug/diagnostic scenarios. Keeping it off by default reduces noise
 and transport overhead in production.
+
+#### Rewrite outbound A2A responses
+
+`WithResponseRewriter` lets the server rewrite outbound A2A results immediately
+before they are returned to the caller or sent to the streaming subscriber. It is
+useful when you want to hide internal metadata, redact debug fields, or drop
+server-generated events that are not part of your public A2A contract.
+
+The rewriter sees the final unary result after server-side aggregation. In
+streaming mode, it sees every outbound streaming result, including converted
+agent events, task status updates, final artifact updates, structured task
+errors, and messages returned by the error handler. The request context is
+passed to each rewrite call so you can use request-scoped values in logs.
+
+Returning `nil` from the rewriter drops that outbound result.
+
+```go
+import (
+	"context"
+
+	"trpc.group/trpc-go/trpc-a2a-go/protocol"
+	a2aserver "trpc.group/trpc-go/trpc-agent-go/server/a2a"
+)
+
+server, _ := a2aserver.New(
+	a2aserver.WithHost("localhost:8080"),
+	a2aserver.WithAgent(agent, true),
+	a2aserver.WithResponseRewriter(a2aserver.ResponseRewriterFuncs{
+		Unary: func(ctx context.Context, result protocol.UnaryMessageResult) protocol.UnaryMessageResult {
+			if msg, ok := result.(*protocol.Message); ok {
+				delete(msg.Metadata, "debug_trace")
+			}
+			return result
+		},
+		Streaming: func(ctx context.Context, result protocol.StreamingMessageResult) protocol.StreamingMessageResult {
+			if msg, ok := result.(*protocol.Message); ok {
+				delete(msg.Metadata, "debug_trace")
+			}
+			return result
+		},
+	}),
+)
+```
 
 ### Hosting multiple A2A agents on one HTTP port (base paths)
 
@@ -236,6 +479,9 @@ Corresponding to A2A Server, tRPC-Agent-Go also provides `A2AAgent` for calling 
 - **Streaming Support**: Support both streaming and non-streaming communication modes
 - **State Transfer**: Support transferring local state to remote Agents
 - **Error Handling**: Comprehensive error handling and retry mechanisms
+
+For the recommended structured task-error convention between A2A server and
+`A2AAgent`, see [Error Handling](error-handling.md).
 
 ### Use Cases
 
@@ -319,6 +565,16 @@ a2aAgent, err := a2aagent.New(
 	a2aagent.WithEnableStreaming(true),
 )
 ```
+
+Whether the client sends a streaming request follows this priority:
+
+1. Per-call override via `agent.WithStream(...)`
+2. `a2aagent.WithEnableStreaming(...)`
+3. Remote `AgentCard.Capabilities.Streaming`
+4. Default false
+
+In other words, the server-side streaming declaration mainly tells the client whether the remote A2A service supports streaming requests. The client then decides whether to send streaming or non-streaming requests based on that capability.  
+If the client explicitly sets `agent.WithStream(...)` or `a2aagent.WithEnableStreaming(...)`, that explicit choice overrides the `AgentCard` declaration.
 
 ### Complete Example: A2A Server + A2AAgent Combined Usage
 
@@ -554,7 +810,7 @@ If you need to interoperate with Google ADK (Agent Development Kit) Python clien
 server, _ := a2a.New(
 	a2a.WithHost("localhost:8888"),
 	a2a.WithAgent(agent, true),
-	a2a.WithADKCompatibility(true), // Disabled by default
+	a2a.WithADKCompatibility(true), // Enabled by default
 )
 ```
 
@@ -609,6 +865,45 @@ a2aAgent, _ := a2aagent.New(
 )
 ```
 
+### Graph Interrupt and Resume via A2A
+
+When the remote A2A Server runs a Graph Agent that uses `graph.Interrupt`, extra configuration is needed:
+
+- **Server-side**: Allow at least `graph.execution` and `graph.pregel.step`; the former preserves the graph's terminal completion event, while the latter lets interrupt events carry resume metadata such as `state_delta` and `pregel_metadata` back through A2A. If you do not want to maintain a narrow allowlist, use `WithGraphEventObjectAllowlist("*")` instead.
+- **Client-side**: Forward at least `graph.CfgKeyLineageID`, `graph.CfgKeyCheckpointID`, `graph.CfgKeyCheckpointNS`, and `graph.StateKeyCommand`, so resume requests can send lineage/checkpoint/command data back to the remote graph. If you want to forward the full RuntimeState, use `WithTransferStateKey("*")` instead.
+
+```go
+// Server
+server, _ := a2aserver.New(
+    a2aserver.WithAgent(graphAgent, true),
+    a2aserver.WithGraphEventObjectAllowlist(
+        "graph.execution",
+        "graph.pregel.step",
+    ),
+)
+
+// Client
+subAgent, _ := a2aagent.New(
+    a2aagent.WithAgentCardURL("http://remote:8888"),
+    a2aagent.WithEnableStreaming(true),
+    a2aagent.WithTransferStateKey(
+        graph.CfgKeyLineageID,
+        graph.CfgKeyCheckpointID,
+        graph.CfgKeyCheckpointNS,
+        graph.StateKeyCommand,
+    ),
+)
+```
+
+Notes:
+
+- `graph.execution` preserves the graph's terminal completion event.
+- `graph.pregel.step` is the key graph event object used to carry interrupt/resume metadata.
+- `graph.StateKeyCommand` carries `Resume` / `ResumeMap`, which the remote graph uses to continue from the interrupted node.
+- `"*"` remains a convenient catch-all option for debugging or when full state forwarding is acceptable.
+
+> Full example: [examples/graph/a2a_interrupt](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/graph/a2a_interrupt)
+
 ## Protocol Interaction Specification
 
 For detailed specifications on how tool calls, code execution, reasoning content, and other events are transmitted through the A2A protocol, as well as Metadata field definitions, ADK compatibility mode, and distributed tracing, please refer to the dedicated document:
@@ -638,3 +933,40 @@ This document defines the extension specification of trpc-agent-go on top of the
 ```
 
 Through the combined use of A2A Server and A2AAgent, you can easily build distributed Agent systems.
+
+### A2A Server Configuration Reference
+
+| Option | Description |
+|--------|-------------|
+| `WithAgent(agent, streaming)` | Set the Agent and declare whether the generated AgentCard supports streaming; mutually exclusive with `WithRunner` |
+| `WithHost(host)` | Set the service address, supports URLs with path |
+| `WithAgentCard(card)` | Custom AgentCard (overrides auto-generation) |
+| `WithRunner(runner)` | Custom Runner (inject Memory, Session, etc.); requires `WithAgentCard` |
+| `WithSessionService(service)` | Set the session service used by the default Runner |
+| `WithProcessMessageHook(hook)` | Server-side message processing Hook (middleware pattern) |
+| `WithProcessorBuilder(builder)` | Fully custom message processor |
+| `WithTaskManagerBuilder(builder)` | Custom task manager |
+| `WithGraphEventObjectAllowlist(types...)` | Limit graph object types emitted by Event converters |
+| `WithResponseRewriter(rewriter)` | Rewrite or drop outbound A2A unary/streaming results |
+| `WithRunOptions(opts...)` | Append RunOptions to every invocation |
+| `WithStreamingEventType(type)` | Streaming output event type (Artifact/Message) |
+| `WithUserIDHeader(header)` | Custom UserID HTTP Header |
+| `WithADKCompatibility(enabled)` | ADK compatibility mode (default: enabled) |
+| `WithErrorHandler(handler)` | Custom error handler |
+| `WithA2AToAgentConverter(conv)` | Custom A2A→Agent message converter |
+| `WithEventToA2AConverter(conv)` | Custom Event→A2A message converter |
+| `WithExtraA2AOptions(opts...)` | Pass-through options for underlying A2A Server |
+| `WithDebugLogging(enabled)` | Enable debug logging |
+
+### A2AAgent Configuration Reference
+
+| Option | Description |
+|--------|-------------|
+| `WithAgentCardURL(url)` | Remote A2A service address |
+| `WithBuildMessageHook(hook)` | Client-side message build Hook (middleware pattern) |
+| `WithTransferStateKey(keys...)` | Specify RuntimeState keys to transfer |
+| `WithEnableStreaming(enabled)` | Explicitly control streaming mode |
+| `WithStreamingChannelBufSize(size)` | Streaming buffer size |
+| `WithUserIDHeader(header)` | Custom UserID HTTP Header |
+| `WithCustomA2AConverter(conv)` | Custom Invocation→A2A message converter |
+| `WithCustomEventConverter(conv)` | Custom A2A Response→Event converter |

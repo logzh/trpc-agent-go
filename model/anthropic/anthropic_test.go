@@ -12,6 +12,7 @@ package anthropic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -61,6 +62,79 @@ func Test_Model_Info(t *testing.T) {
 	m := New("claude-3-5-sonnet-latest")
 	info := m.Info()
 	assert.Equal(t, "claude-3-5-sonnet-latest", info.Name)
+}
+
+func TestModel_CallbackPanicsAreRecovered(t *testing.T) {
+	t.Run("request callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatRequestCallback: func(ctx context.Context, req *anthropic.MessageNewParams) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatRequestCallback(context.Background(), &anthropic.MessageNewParams{})
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("response callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatResponseCallback: func(ctx context.Context, req *anthropic.MessageNewParams, resp *anthropic.Message) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatResponseCallback(context.Background(), &anthropic.MessageNewParams{}, &anthropic.Message{})
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("chunk callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatChunkCallback: func(ctx context.Context, req *anthropic.MessageNewParams, chunk *anthropic.MessageStreamEventUnion) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			chunk := anthropic.MessageStreamEventUnion{}
+			m.runChatChunkCallback(context.Background(), &anthropic.MessageNewParams{}, &chunk)
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("stream complete callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatStreamCompleteCallback: func(
+				ctx context.Context,
+				req *anthropic.MessageNewParams,
+				resp *anthropic.Message,
+				err error,
+			) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatStreamCompleteCallback(
+				context.Background(),
+				&anthropic.MessageNewParams{},
+				&anthropic.Message{},
+				nil,
+			)
+		})
+		assert.True(t, callbackCalled)
+	})
 }
 
 func TestWithHeaders_AppendsOptions(t *testing.T) {
@@ -687,10 +761,161 @@ func Test_buildChatRequest_ThinkingIgnoredWhenTokensNil(t *testing.T) {
 	}
 	chatReq, err := m.buildChatRequest(req)
 	assert.NoError(t, err)
-	// When tokens are nil, thinking should not be set.
-	// The SDK union has both enabled/disabled variants omitted by default.
-	// We assert nothing and only ensure no error and a valid request.
-	_ = chatReq
+	assert.Nil(t, chatReq.Thinking.OfAdaptive)
+	assert.Nil(t, chatReq.Thinking.OfEnabled)
+	assert.Nil(t, chatReq.Thinking.OfDisabled)
+}
+
+func Test_buildChatRequest_AdaptiveThinkingModels(t *testing.T) {
+	thinking := true
+	thinkingTokens := 1024
+	effort := "medium"
+	for _, modelName := range []string{
+		claudeMythosPreview,
+		claudeOpus47,
+		claudeOpus46,
+		claudeOpus46Alias,
+		claudeSonnet46,
+		claudeSonnet46Alias,
+		claudeOpus46 + "-20260427",
+	} {
+		t.Run(modelName, func(t *testing.T) {
+			m := New(modelName)
+			req := &model.Request{
+				Messages: []model.Message{model.NewUserMessage("u")},
+				GenerationConfig: model.GenerationConfig{
+					ThinkingEnabled: &thinking,
+					ThinkingTokens:  &thinkingTokens,
+					ReasoningEffort: &effort,
+				},
+			}
+			chatReq, err := m.buildChatRequest(req)
+			require.NoError(t, err)
+			require.NotNil(t, chatReq.Thinking.OfAdaptive)
+			assert.Nil(t, chatReq.Thinking.OfEnabled)
+			assert.Nil(t, chatReq.Thinking.OfDisabled)
+			assert.Equal(t, defaultThinkingDisplay, chatReq.Thinking.OfAdaptive.Display)
+			assert.Equal(t, anthropic.OutputConfigEffort(effort), chatReq.OutputConfig.Effort)
+			payload := marshalChatRequestMap(t, chatReq)
+			thinkingPayload, ok := payload["thinking"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, "adaptive", thinkingPayload["type"])
+			assert.Equal(t, "summarized", thinkingPayload["display"])
+			assert.NotContains(t, thinkingPayload, "budget_tokens")
+			outputConfigPayload, ok := payload["output_config"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, effort, outputConfigPayload["effort"])
+		})
+	}
+}
+
+func Test_buildChatRequest_DisabledThinking(t *testing.T) {
+	thinking := false
+	for _, modelName := range []string{claudeOpus47, claudeOpus46, claudeSonnet46} {
+		t.Run(modelName, func(t *testing.T) {
+			m := New(modelName)
+			req := &model.Request{
+				Messages: []model.Message{model.NewUserMessage("u")},
+				GenerationConfig: model.GenerationConfig{
+					ThinkingEnabled: &thinking,
+				},
+			}
+			chatReq, err := m.buildChatRequest(req)
+			require.NoError(t, err)
+			require.NotNil(t, chatReq.Thinking.OfDisabled)
+			assert.Nil(t, chatReq.Thinking.OfAdaptive)
+			assert.Nil(t, chatReq.Thinking.OfEnabled)
+			payload := marshalChatRequestMap(t, chatReq)
+			thinkingPayload, ok := payload["thinking"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, "disabled", thinkingPayload["type"])
+		})
+	}
+}
+
+func Test_buildChatRequest_LegacyDisabledThinkingLeavesThinkingUnset(t *testing.T) {
+	thinking := false
+	m := New("claude-3-haiku-20240307")
+	req := &model.Request{
+		Messages: []model.Message{model.NewUserMessage("u")},
+		GenerationConfig: model.GenerationConfig{
+			ThinkingEnabled: &thinking,
+		},
+	}
+	chatReq, err := m.buildChatRequest(req)
+	require.NoError(t, err)
+	assert.Nil(t, chatReq.Thinking.OfAdaptive)
+	assert.Nil(t, chatReq.Thinking.OfEnabled)
+	assert.Nil(t, chatReq.Thinking.OfDisabled)
+	payload := marshalChatRequestMap(t, chatReq)
+	assert.NotContains(t, payload, "thinking")
+}
+
+func Test_buildChatRequest_MythosDisabledThinkingReturnsError(t *testing.T) {
+	thinking := false
+	m := New(claudeMythosPreview)
+	req := &model.Request{
+		Messages: []model.Message{model.NewUserMessage("u")},
+		GenerationConfig: model.GenerationConfig{
+			ThinkingEnabled: &thinking,
+		},
+	}
+	chatReq, err := m.buildChatRequest(req)
+	require.Error(t, err)
+	assert.Nil(t, chatReq)
+	assert.Contains(t, err.Error(), "thinking cannot be disabled")
+}
+
+func Test_buildChatRequest_NilThinkingEnabledLeavesThinkingUnset(t *testing.T) {
+	for _, modelName := range []string{claudeMythosPreview, claudeOpus47, "claude-test"} {
+		t.Run(modelName, func(t *testing.T) {
+			m := New(modelName)
+			req := &model.Request{
+				Messages: []model.Message{model.NewUserMessage("u")},
+			}
+			chatReq, err := m.buildChatRequest(req)
+			require.NoError(t, err)
+			assert.Nil(t, chatReq.Thinking.OfAdaptive)
+			assert.Nil(t, chatReq.Thinking.OfEnabled)
+			assert.Nil(t, chatReq.Thinking.OfDisabled)
+			payload := marshalChatRequestMap(t, chatReq)
+			assert.NotContains(t, payload, "thinking")
+		})
+	}
+}
+
+func Test_buildChatRequest_LegacyThinkingUsesBudgetTokens(t *testing.T) {
+	thinking := true
+	thinkingTokens := 1024
+	m := New("claude-test")
+	req := &model.Request{
+		Messages: []model.Message{model.NewUserMessage("u")},
+		GenerationConfig: model.GenerationConfig{
+			ThinkingEnabled: &thinking,
+			ThinkingTokens:  &thinkingTokens,
+		},
+	}
+	chatReq, err := m.buildChatRequest(req)
+	require.NoError(t, err)
+	require.NotNil(t, chatReq.Thinking.OfEnabled)
+	assert.Nil(t, chatReq.Thinking.OfAdaptive)
+	assert.Nil(t, chatReq.Thinking.OfDisabled)
+	assert.Equal(t, int64(thinkingTokens), chatReq.Thinking.OfEnabled.BudgetTokens)
+	payload := marshalChatRequestMap(t, chatReq)
+	thinkingPayload, ok := payload["thinking"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "enabled", thinkingPayload["type"])
+	assert.Equal(t, float64(thinkingTokens), thinkingPayload["budget_tokens"])
+	assert.NotContains(t, thinkingPayload, "display")
+}
+
+func marshalChatRequestMap(t *testing.T, chatReq *anthropic.MessageNewParams) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(chatReq)
+	require.NoError(t, err)
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(raw, &payload))
+	return payload
 }
 
 func Test_convertTools_Multiple(t *testing.T) {
@@ -730,6 +955,12 @@ type rtFunc func(*http.Request) (*http.Response, error)
 
 // RoundTrip implements http.RoundTripper.
 func (f rtFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+type errReader struct{ err error }
+
+func (r *errReader) Read(_ []byte) (int, error) {
+	return 0, r.err
+}
 
 func Test_HandleNonStreamingResponse_EndToEnd_NoNetwork(t *testing.T) {
 	// Mock HTTP client to return a fixed Anthropic message JSON body.
@@ -828,7 +1059,8 @@ func Test_HandleStreamingResponse_EndToEnd_NoNetwork(t *testing.T) {
 		})}
 	}
 
-	var chunkCalled, streamCompleteCalled bool
+	var chunkCalled bool
+	streamCompleteCalled := make(chan struct{})
 	m := New(
 		"claude-test",
 		WithHTTPClientOptions(),
@@ -838,7 +1070,7 @@ func Test_HandleStreamingResponse_EndToEnd_NoNetwork(t *testing.T) {
 		}),
 		WithChatStreamCompleteCallback(func(_ context.Context, _ *anthropic.MessageNewParams,
 			_ *anthropic.Message, _ error) {
-			streamCompleteCalled = true
+			close(streamCompleteCalled)
 		}),
 	)
 	req := &model.Request{
@@ -856,6 +1088,12 @@ func Test_HandleStreamingResponse_EndToEnd_NoNetwork(t *testing.T) {
 	for resp := range ch {
 		if resp.Done {
 			final = resp
+			select {
+			case <-streamCompleteCalled:
+				// Success.
+			default:
+				t.Fatal("stream complete callback must run before final response is emitted")
+			}
 			break
 		}
 		if resp.IsPartial {
@@ -866,7 +1104,494 @@ func Test_HandleStreamingResponse_EndToEnd_NoNetwork(t *testing.T) {
 	assert.NotNil(t, final)
 	assert.True(t, final.Done)
 	assert.True(t, chunkCalled)
-	assert.True(t, streamCompleteCalled)
+	select {
+	case <-streamCompleteCalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stream complete callback")
+	}
+}
+
+func Test_HandleStreamingResponse_StreamErrorUsesNilAccumulator(t *testing.T) {
+	streamErr := errors.New("stream read error")
+
+	orig := model.DefaultNewHTTPClient
+	t.Cleanup(func() { model.DefaultNewHTTPClient = orig })
+	model.DefaultNewHTTPClient = func(_ ...HTTPClientOption) model.HTTPClient {
+		return &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			h := make(http.Header)
+			h.Set("Content-Type", "text/event-stream")
+			return &http.Response{
+				StatusCode: 200,
+				Header:     h,
+				Body:       io.NopCloser(&errReader{err: streamErr}),
+			}, nil
+		})}
+	}
+
+	callbackCalled := make(chan struct{})
+	var callbackAcc *anthropic.Message
+	var callbackErr error
+	m := New(
+		"claude-test",
+		WithHTTPClientOptions(),
+		WithChatStreamCompleteCallback(func(_ context.Context,
+			_ *anthropic.MessageNewParams, acc *anthropic.Message, err error) {
+			callbackAcc = acc
+			callbackErr = err
+			close(callbackCalled)
+		}),
+	)
+	ctx := context.Background()
+	ch, err := m.GenerateContent(ctx, &model.Request{
+		Messages:         []model.Message{model.NewUserMessage("U")},
+		GenerationConfig: model.GenerationConfig{Stream: true},
+	})
+	require.NoError(t, err)
+
+	var responses []*model.Response
+	for resp := range ch {
+		responses = append(responses, resp)
+		if resp.Done && resp.Error != nil {
+			select {
+			case <-callbackCalled:
+				assert.Nil(t, callbackAcc)
+				assert.ErrorIs(t, callbackErr, streamErr)
+			default:
+				t.Fatal("stream complete callback must run before terminal error response is emitted")
+			}
+		}
+	}
+
+	require.Len(t, responses, 1)
+	assert.NotNil(t, responses[0].Error)
+	assert.True(t, responses[0].Done)
+	select {
+	case <-callbackCalled:
+		assert.Nil(t, callbackAcc)
+		assert.ErrorIs(t, callbackErr, streamErr)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stream complete callback")
+	}
+}
+
+func Test_HandleStreamingResponse_ToolInputDeltaOverridesStartInput(t *testing.T) {
+	sse := strings.Join([]string{
+		"event: message_start",
+		`data: {"type":"message_start","message":{"id":"msg_sse_tool_1","type":"message","role":"assistant","model":"claude-3-sonnet","content":[],"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":3,"output_tokens":0,"server_tool_use":{"web_search_requests":0}}}}`,
+		"",
+		"event: content_block_start",
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"lookup","input":{"a":1}}}`,
+		"",
+		"event: content_block_delta",
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"a\":1,"}}`,
+		"",
+		"event: content_block_delta",
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"b\":2}"}}`,
+		"",
+		"event: content_block_stop",
+		`data: {"type":"content_block_stop","index":0}`,
+		"",
+		"event: message_delta",
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":""},"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":3,"output_tokens":5,"server_tool_use":{"web_search_requests":0}}}`,
+		"",
+		"event: message_stop",
+		`data: {"type":"message_stop"}`,
+		"",
+	}, "\n")
+	orig := model.DefaultNewHTTPClient
+	t.Cleanup(func() { model.DefaultNewHTTPClient = orig })
+	model.DefaultNewHTTPClient = func(_ ...HTTPClientOption) model.HTTPClient {
+		return &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			h := make(http.Header)
+			h.Set("Content-Type", "text/event-stream")
+			return &http.Response{StatusCode: 200, Header: h, Body: io.NopCloser(strings.NewReader(sse))}, nil
+		})}
+	}
+	callbackCalled := make(chan struct{})
+	var callbackAcc *anthropic.Message
+	m := New(
+		"claude-test",
+		WithHTTPClientOptions(),
+		WithChatStreamCompleteCallback(func(_ context.Context, _ *anthropic.MessageNewParams, acc *anthropic.Message, err error) {
+			assert.NoError(t, err)
+			callbackAcc = acc
+			close(callbackCalled)
+		}),
+	)
+	ch, err := m.GenerateContent(context.Background(), &model.Request{
+		Messages:         []model.Message{model.NewUserMessage("U")},
+		GenerationConfig: model.GenerationConfig{Stream: true},
+	})
+	require.NoError(t, err)
+	var final *model.Response
+	for resp := range ch {
+		if resp.Done {
+			final = resp
+		}
+	}
+	require.NotNil(t, final)
+	require.Nil(t, final.Error)
+	require.Len(t, final.Choices, 1)
+	require.Len(t, final.Choices[0].Message.ToolCalls, 1)
+	assert.JSONEq(t, `{"a":1,"b":2}`, string(final.Choices[0].Message.ToolCalls[0].Function.Arguments))
+	select {
+	case <-callbackCalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stream complete callback")
+	}
+	require.NotNil(t, callbackAcc)
+	require.Len(t, callbackAcc.Content, 1)
+	toolUse, ok := callbackAcc.Content[0].AsAny().(anthropic.ToolUseBlock)
+	require.True(t, ok)
+	assert.JSONEq(t, `{"a":1,"b":2}`, string(toolUse.Input))
+}
+
+func Test_HandleStreamingResponse_ToolInputPreservesStartInputWithoutDelta(t *testing.T) {
+	sse := strings.Join([]string{
+		"event: message_start",
+		`data: {"type":"message_start","message":{"id":"msg_sse_tool_2","type":"message","role":"assistant","model":"claude-3-sonnet","content":[],"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":3,"output_tokens":0,"server_tool_use":{"web_search_requests":0}}}}`,
+		"",
+		"event: content_block_start",
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_2","name":"lookup","input":{"a":1}}}`,
+		"",
+		"event: content_block_stop",
+		`data: {"type":"content_block_stop","index":0}`,
+		"",
+		"event: message_delta",
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":""},"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":3,"output_tokens":5,"server_tool_use":{"web_search_requests":0}}}`,
+		"",
+		"event: message_stop",
+		`data: {"type":"message_stop"}`,
+		"",
+	}, "\n")
+	orig := model.DefaultNewHTTPClient
+	t.Cleanup(func() { model.DefaultNewHTTPClient = orig })
+	model.DefaultNewHTTPClient = func(_ ...HTTPClientOption) model.HTTPClient {
+		return &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			h := make(http.Header)
+			h.Set("Content-Type", "text/event-stream")
+			return &http.Response{StatusCode: 200, Header: h, Body: io.NopCloser(strings.NewReader(sse))}, nil
+		})}
+	}
+	callbackCalled := make(chan struct{})
+	var callbackAcc *anthropic.Message
+	m := New(
+		"claude-test",
+		WithHTTPClientOptions(),
+		WithChatStreamCompleteCallback(func(_ context.Context, _ *anthropic.MessageNewParams, acc *anthropic.Message, err error) {
+			assert.NoError(t, err)
+			callbackAcc = acc
+			close(callbackCalled)
+		}),
+	)
+	ch, err := m.GenerateContent(context.Background(), &model.Request{
+		Messages:         []model.Message{model.NewUserMessage("U")},
+		GenerationConfig: model.GenerationConfig{Stream: true},
+	})
+	require.NoError(t, err)
+	var final *model.Response
+	for resp := range ch {
+		if resp.Done {
+			final = resp
+		}
+	}
+	require.NotNil(t, final)
+	require.Nil(t, final.Error)
+	require.Len(t, final.Choices, 1)
+	require.Len(t, final.Choices[0].Message.ToolCalls, 1)
+	assert.JSONEq(t, `{"a":1}`, string(final.Choices[0].Message.ToolCalls[0].Function.Arguments))
+	select {
+	case <-callbackCalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stream complete callback")
+	}
+	require.NotNil(t, callbackAcc)
+	require.Len(t, callbackAcc.Content, 1)
+	toolUse, ok := callbackAcc.Content[0].AsAny().(anthropic.ToolUseBlock)
+	require.True(t, ok)
+	assert.JSONEq(t, `{"a":1}`, string(toolUse.Input))
+}
+
+func Test_HandleStreamingResponse_ServerToolInputDeltaOverridesStartInput(t *testing.T) {
+	sse := strings.Join([]string{
+		"event: message_start",
+		`data: {"type":"message_start","message":{"id":"msg_sse_server_tool_1","type":"message","role":"assistant","model":"claude-3-sonnet","content":[],"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":3,"output_tokens":0,"server_tool_use":{"web_search_requests":0}}}}`,
+		"",
+		"event: content_block_start",
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"seed"}}}`,
+		"",
+		"event: content_block_delta",
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"latest weather\"}"}}`,
+		"",
+		"event: content_block_stop",
+		`data: {"type":"content_block_stop","index":0}`,
+		"",
+		"event: message_delta",
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":""},"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":3,"output_tokens":5,"server_tool_use":{"web_search_requests":1}}}`,
+		"",
+		"event: message_stop",
+		`data: {"type":"message_stop"}`,
+		"",
+	}, "\n")
+	orig := model.DefaultNewHTTPClient
+	t.Cleanup(func() { model.DefaultNewHTTPClient = orig })
+	model.DefaultNewHTTPClient = func(_ ...HTTPClientOption) model.HTTPClient {
+		return &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			h := make(http.Header)
+			h.Set("Content-Type", "text/event-stream")
+			return &http.Response{StatusCode: 200, Header: h, Body: io.NopCloser(strings.NewReader(sse))}, nil
+		})}
+	}
+	callbackCalled := make(chan struct{})
+	var callbackAcc *anthropic.Message
+	m := New(
+		"claude-test",
+		WithHTTPClientOptions(),
+		WithChatStreamCompleteCallback(func(_ context.Context, _ *anthropic.MessageNewParams, acc *anthropic.Message, err error) {
+			assert.NoError(t, err)
+			callbackAcc = acc
+			close(callbackCalled)
+		}),
+	)
+	ch, err := m.GenerateContent(context.Background(), &model.Request{
+		Messages:         []model.Message{model.NewUserMessage("U")},
+		GenerationConfig: model.GenerationConfig{Stream: true},
+	})
+	require.NoError(t, err)
+	var final *model.Response
+	for resp := range ch {
+		if resp.Done {
+			final = resp
+		}
+	}
+	require.NotNil(t, final)
+	require.Nil(t, final.Error)
+	select {
+	case <-callbackCalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stream complete callback")
+	}
+	require.NotNil(t, callbackAcc)
+	require.Len(t, callbackAcc.Content, 1)
+	serverToolUse, ok := callbackAcc.Content[0].AsAny().(anthropic.ServerToolUseBlock)
+	require.True(t, ok)
+	rawInput, marshalErr := json.Marshal(serverToolUse.Input)
+	require.NoError(t, marshalErr)
+	assert.JSONEq(t, `{"query":"latest weather"}`, string(rawInput))
+}
+
+func Test_HandleStreamingResponse_InvalidToolInputDeltaReturnsError(t *testing.T) {
+	sse := strings.Join([]string{
+		"event: message_start",
+		`data: {"type":"message_start","message":{"id":"msg_sse_tool_3","type":"message","role":"assistant","model":"claude-3-sonnet","content":[],"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":3,"output_tokens":0,"server_tool_use":{"web_search_requests":0}}}}`,
+		"",
+		"event: content_block_start",
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_3","name":"lookup","input":{}}}`,
+		"",
+		"event: content_block_delta",
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"a\":1"}}`,
+		"",
+		"event: content_block_stop",
+		`data: {"type":"content_block_stop","index":0}`,
+		"",
+	}, "\n")
+	orig := model.DefaultNewHTTPClient
+	t.Cleanup(func() { model.DefaultNewHTTPClient = orig })
+	model.DefaultNewHTTPClient = func(_ ...HTTPClientOption) model.HTTPClient {
+		return &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			h := make(http.Header)
+			h.Set("Content-Type", "text/event-stream")
+			return &http.Response{StatusCode: 200, Header: h, Body: io.NopCloser(strings.NewReader(sse))}, nil
+		})}
+	}
+	callbackCalled := make(chan struct{})
+	var callbackAcc *anthropic.Message
+	var callbackErr error
+	m := New(
+		"claude-test",
+		WithHTTPClientOptions(),
+		WithChatStreamCompleteCallback(func(_ context.Context, _ *anthropic.MessageNewParams, acc *anthropic.Message, err error) {
+			callbackAcc = acc
+			callbackErr = err
+			close(callbackCalled)
+		}),
+	)
+	ch, err := m.GenerateContent(context.Background(), &model.Request{
+		Messages:         []model.Message{model.NewUserMessage("U")},
+		GenerationConfig: model.GenerationConfig{Stream: true},
+	})
+	require.NoError(t, err)
+	var responses []*model.Response
+	for resp := range ch {
+		responses = append(responses, resp)
+	}
+	require.Len(t, responses, 1)
+	require.NotNil(t, responses[0].Error)
+	assert.True(t, responses[0].Done)
+	assert.NotEmpty(t, responses[0].Error.Message)
+	select {
+	case <-callbackCalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stream complete callback")
+	}
+	assert.Nil(t, callbackAcc)
+	require.Error(t, callbackErr)
+	assert.Equal(t, responses[0].Error.Message, callbackErr.Error())
+}
+
+func Test_StreamingMessageAccumulator_HelperGuards(t *testing.T) {
+	var nilAcc *streamingMessageAccumulator
+	assert.Equal(t, anthropic.Message{}, nilAcc.Message())
+	require.EqualError(t, nilAcc.Accumulate(anthropic.MessageStreamEventUnion{}), "accumulate: cannot accumulate into nil accumulator")
+	require.NoError(t, nilAcc.Finalize())
+	acc := newStreamingMessageAccumulator()
+	_, _, err := acc.lastContentBlock()
+	require.EqualError(t, err, "no content block")
+	block := anthropic.ContentBlockUnion{Type: "tool_use", Input: json.RawMessage(`{"seed":1}`)}
+	appendInputJSONDelta(nil, nil, "")
+	appendInputJSONDelta(&block, nil, `{"ignored":true}`)
+	assert.JSONEq(t, `{"seed":1}`, string(block.Input))
+	started := false
+	appendInputJSONDelta(&block, &started, "")
+	assert.False(t, started)
+	assert.JSONEq(t, `{"seed":1}`, string(block.Input))
+	appendInputJSONDelta(&block, &started, `{"fresh":1`)
+	assert.True(t, started)
+	assert.Equal(t, `{"fresh":1`, string(block.Input))
+	appendInputJSONDelta(&block, &started, `,"next":2}`)
+	assert.JSONEq(t, `{"fresh":1,"next":2}`, string(block.Input))
+	require.NoError(t, finalizeStreamingMessage(nil))
+	require.NoError(t, refreshContentBlockRawJSON(nil))
+	acc.message = anthropic.Message{
+		Content: []anthropic.ContentBlockUnion{{Type: "tool_use", Input: json.RawMessage(`{"done":true}`)}},
+	}
+	require.NoError(t, acc.Finalize())
+	assert.True(t, acc.finalized)
+	acc.message.Content[0].Input = json.RawMessage("{")
+	require.NoError(t, acc.Finalize())
+}
+
+func Test_StreamingMessageAccumulator_DeltaVariants(t *testing.T) {
+	acc := newStreamingMessageAccumulator()
+	acc.message = anthropic.Message{Content: []anthropic.ContentBlockUnion{{Type: "text", Text: "Hello"}}}
+	acc.inputDeltaStartedAt = []bool{false}
+	require.NoError(t, acc.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}`)))
+	require.NoError(t, acc.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"citations_delta","citation":{"type":"char_location","cited_text":"Hello","document_index":0,"document_title":"Doc","start_char_index":0,"end_char_index":5}}}`)))
+	require.NoError(t, acc.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_stop","index":0}`)))
+	acc.message.Content = append(acc.message.Content, anthropic.ContentBlockUnion{Type: "thinking", Thinking: "Plan", Signature: "sig"})
+	acc.inputDeltaStartedAt = append(acc.inputDeltaStartedAt, false)
+	require.NoError(t, acc.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":" more"}}`)))
+	require.NoError(t, acc.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"-next"}}`)))
+	require.NoError(t, acc.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_stop","index":1}`)))
+	require.NoError(t, acc.Finalize())
+	require.Len(t, acc.message.Content, 2)
+	textBlock, ok := acc.message.Content[0].AsAny().(anthropic.TextBlock)
+	require.True(t, ok)
+	assert.Equal(t, "Hello world", textBlock.Text)
+	require.Len(t, textBlock.Citations, 1)
+	citation, ok := textBlock.Citations[0].AsAny().(anthropic.CitationCharLocation)
+	require.True(t, ok)
+	assert.Equal(t, int64(0), citation.StartCharIndex)
+	assert.Equal(t, int64(5), citation.EndCharIndex)
+	thinkingBlock, ok := acc.message.Content[1].AsAny().(anthropic.ThinkingBlock)
+	require.True(t, ok)
+	assert.Equal(t, "Plan more", thinkingBlock.Thinking)
+	assert.Equal(t, "sig-next", thinkingBlock.Signature)
+}
+
+func Test_StreamingMessageAccumulator_ErrorPaths(t *testing.T) {
+	acc := newStreamingMessageAccumulator()
+	require.ErrorContains(t, acc.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}}`)), "no content block")
+	require.ErrorContains(t, acc.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_stop","index":0}`)), "no content block")
+	acc.message.Content = []anthropic.ContentBlockUnion{{Type: "tool_use", Input: json.RawMessage("{")}}
+	acc.inputDeltaStartedAt = []bool{false}
+	require.ErrorContains(t, acc.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_stop","index":0}`)), "error converting content block to JSON")
+	require.Error(t, refreshContentBlockRawJSON(&anthropic.ContentBlockUnion{Type: "tool_use", Input: json.RawMessage("{")}))
+	require.Error(t, finalizeStreamingMessage(&anthropic.Message{
+		Content: []anthropic.ContentBlockUnion{{Type: "tool_use", Input: json.RawMessage("{")}},
+	}))
+}
+
+func mustMessageStreamEventUnion(t *testing.T, raw string) anthropic.MessageStreamEventUnion {
+	t.Helper()
+	var event anthropic.MessageStreamEventUnion
+	require.NoError(t, event.UnmarshalJSON([]byte(raw)))
+	return event
+}
+
+func Test_HandleStreamingResponse_ContextCancelStillCallsCallback(t *testing.T) {
+	sse := strings.Join([]string{
+		"event: message_start",
+		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_sse_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-sonnet\",\"content\":[]}}",
+		"",
+		"event: content_block_start",
+		"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+		"",
+		"event: content_block_delta",
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}",
+		"",
+		"",
+	}, "\n")
+
+	orig := model.DefaultNewHTTPClient
+	t.Cleanup(func() { model.DefaultNewHTTPClient = orig })
+	model.DefaultNewHTTPClient = func(_ ...HTTPClientOption) model.HTTPClient {
+		return &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			h := make(http.Header)
+			h.Set("Content-Type", "text/event-stream")
+			return &http.Response{
+				StatusCode: 200,
+				Header:     h,
+				Body:       io.NopCloser(strings.NewReader(sse)),
+			}, nil
+		})}
+	}
+
+	callbackCalled := make(chan struct{})
+	var callbackAcc *anthropic.Message
+	var callbackErr error
+	m := New(
+		"claude-test",
+		WithHTTPClientOptions(),
+		WithChatStreamCompleteCallback(func(_ context.Context,
+			_ *anthropic.MessageNewParams, acc *anthropic.Message, err error) {
+			callbackAcc = acc
+			callbackErr = err
+			close(callbackCalled)
+		}),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	responseChan := make(chan *model.Response)
+	m.handleStreamingResponse(ctx, anthropic.MessageNewParams{}, responseChan)
+
+	select {
+	case <-callbackCalled:
+		assert.Nil(t, callbackAcc)
+		require.ErrorIs(t, callbackErr, context.Canceled)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stream complete callback")
+	}
+	select {
+	case resp := <-responseChan:
+		t.Fatalf("unexpected response: %#v", resp)
+	default:
+	}
 }
 
 func Test_HTTPClientOptions_AndAnthropicClientOptions(t *testing.T) {
@@ -1930,4 +2655,159 @@ func TestIntegration_AutoOptimalCacheStrategy(t *testing.T) {
 		}
 	}
 	assert.True(t, foundCacheControl, "expected cache control to be automatically applied to assistant message")
+}
+
+// TestChatRequestCallbackSynchronous verifies that
+// chatRequestCallback is invoked synchronously inside
+// GenerateContent, before the response goroutine starts.
+func TestChatRequestCallbackSynchronous(t *testing.T) {
+	tests := []struct {
+		name   string
+		stream bool
+	}{
+		{name: "non_streaming", stream: false},
+		{name: "streaming", stream: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			orig := model.DefaultNewHTTPClient
+			t.Cleanup(func() {
+				model.DefaultNewHTTPClient = orig
+			})
+			if tt.stream {
+				sse := strings.Join([]string{
+					"event: message_start",
+					`data: {"type":"message_start",` +
+						`"message":{"id":"m1",` +
+						`"type":"message",` +
+						`"role":"assistant",` +
+						`"model":"claude","content":[]}}`,
+					"",
+					"event: content_block_start",
+					`data: {"type":` +
+						`"content_block_start",` +
+						`"index":0,"content_block":` +
+						`{"type":"text","text":""}}`,
+					"",
+					"event: content_block_delta",
+					`data: {"type":` +
+						`"content_block_delta",` +
+						`"index":0,"delta":` +
+						`{"type":"text_delta",` +
+						`"text":"hi"}}`,
+					"",
+					"event: content_block_stop",
+					`data: {"type":` +
+						`"content_block_stop","index":0}`,
+					"",
+					"event: message_delta",
+					`data: {"type":"message_delta",` +
+						`"delta":{"stop_reason":` +
+						`"end_turn","stop_sequence":""},` +
+						`"usage":{` +
+						`"cache_creation_input_tokens":0,` +
+						`"cache_read_input_tokens":0,` +
+						`"input_tokens":0,` +
+						`"output_tokens":0,` +
+						`"server_tool_use":` +
+						`{"web_search_requests":0}}}`,
+					"",
+					"event: message_stop",
+					`data: {"type":"message_stop"}`,
+					"",
+				}, "\n")
+				model.DefaultNewHTTPClient = func(
+					_ ...HTTPClientOption,
+				) model.HTTPClient {
+					return &http.Client{
+						Transport: rtFunc(
+							func(_ *http.Request,
+							) (*http.Response, error) {
+								h := make(http.Header)
+								h.Set("Content-Type",
+									"text/event-stream")
+								return &http.Response{
+									StatusCode: 200,
+									Header:     h,
+									Body: io.NopCloser(
+										strings.NewReader(sse)),
+								}, nil
+							}),
+					}
+				}
+			} else {
+				body := `{"id":"m1","model":"claude",` +
+					`"role":"assistant",` +
+					`"stop_reason":"end_turn",` +
+					`"stop_sequence":"",` +
+					`"type":"message",` +
+					`"usage":{` +
+					`"cache_creation_input_tokens":0,` +
+					`"cache_read_input_tokens":0,` +
+					`"input_tokens":1,` +
+					`"output_tokens":1,` +
+					`"server_tool_use":` +
+					`{"web_search_requests":0}},` +
+					`"content":[{"type":"text",` +
+					`"text":"hi"}]}`
+				model.DefaultNewHTTPClient = func(
+					_ ...HTTPClientOption,
+				) model.HTTPClient {
+					return &http.Client{
+						Transport: rtFunc(
+							func(_ *http.Request,
+							) (*http.Response, error) {
+								h := make(http.Header)
+								h.Set("Content-Type",
+									"application/json")
+								return &http.Response{
+									StatusCode: 200,
+									Header:     h,
+									Body: io.NopCloser(
+										strings.NewReader(body)),
+								}, nil
+							}),
+					}
+				}
+			}
+
+			var callCount int64
+			m := New("claude-test",
+				WithHTTPClientOptions(),
+				WithChatRequestCallback(
+					func(_ context.Context,
+						_ *anthropic.MessageNewParams,
+					) {
+						callCount++
+					}),
+			)
+
+			req := &model.Request{
+				Messages: []model.Message{
+					model.NewUserMessage("hi"),
+				},
+				GenerationConfig: model.GenerationConfig{
+					Stream: tt.stream,
+				},
+			}
+
+			ch, err := m.GenerateContent(
+				context.Background(), req)
+			require.NoError(t, err)
+
+			// Callback must have fired synchronously
+			// before GenerateContent returned.
+			assert.Equal(t, int64(1), callCount,
+				"callback must execute exactly once "+
+					"before GenerateContent returns")
+
+			// Drain the channel to avoid goroutine leak.
+			for range ch {
+			}
+
+			// Confirm no extra invocations after drain.
+			assert.Equal(t, int64(1), callCount,
+				"callback must not be called more than once")
+		})
+	}
 }

@@ -69,6 +69,10 @@ type EventActions struct {
 }
 ```
 
+`SkipSummarization` 是一个流程控制提示，不表示当前这条
+`tool.response` 已经变成 assistant final response。若你需要整次运行真正的
+终止事件，仍应持续消费直到 `runner.completion`。
+
 #### FilterKey（层级作用域 key）
 
 `FilterKey` 是每条事件上的可选字段。你可以把它理解成“像路径一样的标签”，主要用在：
@@ -280,6 +284,22 @@ if e.IsRunnerCompletion() {
 }
 ```
 
+不要混淆 `event.IsFinalResponse()` 与 `event.IsRunnerCompletion()`：
+
+- `event.IsFinalResponse()` 复用的是嵌入 `Response` 的判断逻辑。它只说明
+  当前这条响应已经结束：不是 partial、不是 tool-call response，且
+  `Response.Done == true`。这可能对应 assistant 文本、`tool.response`，
+  也可能是终止错误响应。
+- `event.IsRunnerCompletion()` 判断的是 Runner 是否发出了终止
+  `runner.completion` 事件。只有它返回 true，才表示整次 `Runner.Run`
+  已真正结束，后续不会再有新的运行事件。
+
+经验上：
+
+- 想判断“当前这条输出是否已经完整”，可使用 `IsFinalResponse()`
+- 想停止消费事件流、读取最终状态或把本次运行视为结束，应使用
+  `IsRunnerCompletion()`
+
 ### Event 创建
 
 在开发自定义 Agent 类型或 Processor 时，需要创建 Event。
@@ -343,6 +363,9 @@ evt := event.NewResponseEvent("invoke-123", "agent", response)
 
 - 子 Agent 转发事件依然是 `event.Event`，其中增量内容同样在 `choice.Delta.Content`
 - 为避免重复打印，子 Agent 最终整段文本不会再次作为转发事件出现，但会被聚合到最终的 `tool.response` 内容中，供下一轮 LLM 使用
+- 如果你只想保留内部进度、不想转发子 Agent 的 assistant 正文，可以把
+  `WithStreamInner(true)` 和
+  `WithInnerTextMode(agenttool.InnerTextModeExclude)` 搭配使用
 
 Runner 会自动针对需要完成信号的事件（`RequiresCompletion=true`）发送完成信号，使用者无需额外处理。
 
@@ -510,8 +533,8 @@ func (c *multiTurnChat) processResponse(eventChan <-chan *event.Event) error {
             return err
         }
 
-        // 检查是否为最终事件
-        if event.IsFinalResponse() {
+        // 检查是否为整次运行完成事件
+        if event.IsRunnerCompletion() {
             fmt.Printf("\n")
             break
         }

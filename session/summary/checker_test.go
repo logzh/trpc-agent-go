@@ -16,9 +16,11 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
+	isummaryscope "trpc.group/trpc-go/trpc-agent-go/session/internal/summaryscope"
 )
 
 func TestCheckEventThreshold(t *testing.T) {
@@ -110,7 +112,7 @@ func TestCheckEventThreshold(t *testing.T) {
 
 	t.Run("sub-agent events excluded from count", func(t *testing.T) {
 		// Full-session scenario: 1 primary + 5 sub-agent events.
-		// Mixed FilterKeys → only primary counted. 1 > 2 = false.
+		// Only primary activity counts toward the full-session threshold.
 		const appName = "my-app"
 		checker := CheckEventThreshold(2)
 		events := []event.Event{
@@ -129,48 +131,99 @@ func TestCheckEventThreshold(t *testing.T) {
 		assert.False(t, checker(sess))
 	})
 
-	t.Run("branch summary counts all events in branch", func(t *testing.T) {
-		// Branch-summary scenario: computeDeltaSince already
-		// pre-filtered to one sub-agent branch. All events share
-		// the same FilterKey, so they are all counted.
+	t.Run("full-session ignores child-only activity", func(t *testing.T) {
 		const appName = "my-app"
+		checker := CheckEventThreshold(0)
+		sess := &session.Session{
+			AppName: appName,
+			Events: []event.Event{
+				{Timestamp: time.Now(), FilterKey: "my-app/sub-agent"},
+			},
+		}
+		assert.False(t, checker(sess))
+	})
+
+	t.Run("branch summary counts scoped branch events", func(t *testing.T) {
+		const (
+			appName = "my-app"
+			branch  = "my-app/sub-agent"
+		)
 		checker := CheckEventThreshold(2)
 		events := make([]event.Event, 5)
 		for i := range events {
 			events[i] = event.Event{
 				Timestamp: time.Now(),
-				FilterKey: "sub-agent-abc",
+				FilterKey: branch,
 			}
 		}
 		sess := &session.Session{
 			AppName: appName,
 			Events:  events,
 		}
-		// Single FilterKey → no filtering → 5 > 2 = true.
+		isummaryscope.SetScopeFilterKey(sess, branch)
 		assert.True(t, checker(sess))
 	})
 
-	t.Run("prepended summary event does not break branch detection", func(t *testing.T) {
+	t.Run("prepended summary event is preserved in scoped branch checks", func(t *testing.T) {
 		// prependPrevSummary inserts a synthetic event with
-		// FilterKey="" at the head of the event list. This empty
-		// FilterKey must not cause filterPrimaryEvents to treat
-		// the set as "mixed" and discard all sub-agent events.
-		const appName = "my-app"
+		// FilterKey="" at the head of the event list. Scoped branch
+		// checks must keep that synthetic context while still counting
+		// only the branch subtree.
+		const (
+			appName = "my-app"
+			branch  = "my-app/sub-agent"
+		)
 		checker := CheckEventThreshold(2)
 		events := []event.Event{
 			// Synthetic summary event (FilterKey="").
 			{Timestamp: time.Now(), FilterKey: ""},
-			{Timestamp: time.Now(), FilterKey: "sub-agent-abc"},
-			{Timestamp: time.Now(), FilterKey: "sub-agent-abc"},
-			{Timestamp: time.Now(), FilterKey: "sub-agent-abc"},
+			{Timestamp: time.Now(), FilterKey: branch},
+			{Timestamp: time.Now(), FilterKey: branch},
+			{Timestamp: time.Now(), FilterKey: branch},
 		}
 		sess := &session.Session{
 			AppName: appName,
 			Events:  events,
 		}
-		// Empty FilterKey is ignored in mixed detection → single
-		// non-empty key "sub-agent-abc" → 4 > 2 = true.
+		isummaryscope.SetScopeFilterKey(sess, branch)
 		assert.True(t, checker(sess))
+	})
+
+	t.Run("branch scope ignores ancestor root events", func(t *testing.T) {
+		const (
+			appName = "my-app"
+			branch  = "my-app/sub-agent"
+		)
+		checker := CheckEventThreshold(2)
+		sess := &session.Session{
+			AppName: appName,
+			Events: []event.Event{
+				{Timestamp: time.Now(), FilterKey: appName},
+				{Timestamp: time.Now(), FilterKey: branch},
+				{Timestamp: time.Now(), FilterKey: branch + "/tool"},
+				{Timestamp: time.Now(), FilterKey: branch},
+			},
+		}
+		isummaryscope.SetScopeFilterKey(sess, branch)
+		assert.True(t, checker(sess))
+	})
+
+	t.Run("branch scope stays below threshold when scoped events are insufficient", func(t *testing.T) {
+		const (
+			appName = "my-app"
+			branch  = "my-app/sub-agent"
+		)
+		checker := CheckEventThreshold(2)
+		sess := &session.Session{
+			AppName: appName,
+			Events: []event.Event{
+				{Timestamp: time.Now(), FilterKey: appName},
+				{Timestamp: time.Now(), FilterKey: appName},
+				{Timestamp: time.Now(), FilterKey: branch},
+			},
+		}
+		isummaryscope.SetScopeFilterKey(sess, branch)
+		assert.False(t, checker(sess))
 	})
 }
 
@@ -216,6 +269,38 @@ func TestCheckTimeThreshold_NoEvents(t *testing.T) {
 	}
 	result := checker(sess)
 	assert.False(t, result)
+}
+
+func TestCheckTimeThreshold_BranchScopeUsesScopedLastEvent(t *testing.T) {
+	const (
+		appName = "my-app"
+		branch  = "my-app/sub-agent"
+	)
+	checker := CheckTimeThreshold(time.Hour)
+	sess := &session.Session{
+		AppName: appName,
+		Events: []event.Event{
+			{Timestamp: time.Now().Add(-10 * time.Minute), FilterKey: appName},
+			{Timestamp: time.Now().Add(-2 * time.Hour), FilterKey: branch},
+			{Timestamp: time.Now().Add(-90 * time.Minute), FilterKey: branch + "/tool"},
+		},
+	}
+
+	isummaryscope.SetScopeFilterKey(sess, branch)
+	assert.True(t, checker(sess))
+}
+
+func TestCheckTimeThreshold_FullSessionUsesLastSessionEvent(t *testing.T) {
+	checker := CheckTimeThreshold(time.Hour)
+	sess := &session.Session{
+		AppName: "my-app",
+		Events: []event.Event{
+			{Timestamp: time.Now().Add(-2 * time.Hour), FilterKey: "my-app"},
+			{Timestamp: time.Now().Add(-10 * time.Minute), FilterKey: "my-app/sub-agent"},
+		},
+	}
+
+	assert.False(t, checker(sess))
 }
 
 func TestCheckTokenThreshold(t *testing.T) {
@@ -361,10 +446,10 @@ func TestCheckTokenThreshold(t *testing.T) {
 		assert.False(t, checker(sess))
 	})
 
-	t.Run("only sub-agent events yields false", func(t *testing.T) {
+	t.Run("mixed root and sub-agent events stay below threshold when root text is small", func(t *testing.T) {
 		// Full-session scenario: primary event below threshold,
-		// sub-agent event above threshold. Mixed FilterKeys trigger
-		// filtering, so only the small primary event is counted.
+		// sub-agent event above threshold. Only the primary activity
+		// should count toward the full-session threshold.
 		const appName = "my-app"
 		checker := CheckTokenThreshold(100)
 		sess := &session.Session{
@@ -393,11 +478,7 @@ func TestCheckTokenThreshold(t *testing.T) {
 		assert.False(t, checker(sess))
 	})
 
-	t.Run("branch summary counts all events in branch", func(t *testing.T) {
-		// Branch-summary scenario: computeDeltaSince already
-		// pre-filtered events to one sub-agent branch. All events
-		// share the same FilterKey, so filterPrimaryEvents should
-		// NOT discard them even though they differ from AppName.
+	t.Run("child-only text does not trigger full-session token threshold", func(t *testing.T) {
 		const appName = "my-app"
 		checker := CheckTokenThreshold(10)
 		sess := &session.Session{
@@ -405,7 +486,7 @@ func TestCheckTokenThreshold(t *testing.T) {
 			Events: []event.Event{
 				{
 					Author:    "assistant",
-					FilterKey: "child-agent-xyz",
+					FilterKey: "my-app/sub-agent",
 					Timestamp: time.Now(),
 					Response: &model.Response{Choices: []model.Choice{{
 						Message: model.Message{
@@ -415,16 +496,42 @@ func TestCheckTokenThreshold(t *testing.T) {
 				},
 			},
 		}
-		// Single FilterKey → no filtering → triggers.
+		assert.False(t, checker(sess))
+	})
+
+	t.Run("branch summary counts scoped branch text", func(t *testing.T) {
+		const (
+			appName = "my-app"
+			branch  = "my-app/sub-agent"
+		)
+		checker := CheckTokenThreshold(10)
+		sess := &session.Session{
+			AppName: appName,
+			Events: []event.Event{
+				{
+					Author:    "assistant",
+					FilterKey: branch,
+					Timestamp: time.Now(),
+					Response: &model.Response{Choices: []model.Choice{{
+						Message: model.Message{
+							Content: strings.Repeat("a", 800),
+						},
+					}}},
+				},
+			},
+		}
+		isummaryscope.SetScopeFilterKey(sess, branch)
 		assert.True(t, checker(sess))
 	})
 
-	t.Run("prepended summary event does not break branch detection", func(t *testing.T) {
+	t.Run("prepended summary event is preserved in scoped branch token checks", func(t *testing.T) {
 		// prependPrevSummary inserts a synthetic event with
-		// FilterKey="" at the head. This must not cause
-		// filterPrimaryEvents to treat the set as "mixed" and
-		// discard all sub-agent events.
-		const appName = "my-app"
+		// FilterKey="" at the head. Scoped branch checks should keep
+		// that synthetic context while still measuring the branch text.
+		const (
+			appName = "my-app"
+			branch  = "my-app/sub-agent"
+		)
 		checker := CheckTokenThreshold(10)
 		sess := &session.Session{
 			AppName: appName,
@@ -439,7 +546,7 @@ func TestCheckTokenThreshold(t *testing.T) {
 				},
 				{
 					Author:    "assistant",
-					FilterKey: "child-agent-xyz",
+					FilterKey: branch,
 					Timestamp: time.Now(),
 					Response: &model.Response{Choices: []model.Choice{{
 						Message: model.Message{
@@ -449,9 +556,103 @@ func TestCheckTokenThreshold(t *testing.T) {
 				},
 			},
 		}
-		// Empty FilterKey ignored in mixed detection → single
-		// non-empty key → triggers.
+		isummaryscope.SetScopeFilterKey(sess, branch)
 		assert.True(t, checker(sess))
+	})
+
+	t.Run("branch scope counts descendant events but excludes ancestor root text", func(t *testing.T) {
+		const (
+			threshold = 100
+			appName   = "my-app"
+			branch    = "my-app/sub-agent"
+		)
+		checker := CheckTokenThreshold(threshold)
+		sess := &session.Session{
+			AppName: appName,
+			Events: []event.Event{
+				{
+					Author:    "user",
+					FilterKey: appName,
+					Timestamp: time.Now(),
+					Response: &model.Response{Choices: []model.Choice{{
+						Message: model.Message{Content: "root context"},
+					}}},
+				},
+				{
+					Author:    "assistant",
+					FilterKey: branch,
+					Timestamp: time.Now(),
+					Response: &model.Response{Choices: []model.Choice{{
+						Message: model.Message{Content: strings.Repeat("a", 800)},
+					}}},
+				},
+				{
+					Author:    "assistant",
+					FilterKey: branch + "/tool",
+					Timestamp: time.Now(),
+					Response: &model.Response{Choices: []model.Choice{{
+						Message: model.Message{Content: strings.Repeat("b", 800)},
+					}}},
+				},
+			},
+		}
+		isummaryscope.SetScopeFilterKey(sess, branch)
+		assert.True(t, checker(sess))
+	})
+
+	t.Run("branch scope stays below token threshold when scoped text is insufficient", func(t *testing.T) {
+		const (
+			threshold = 100
+			appName   = "my-app"
+			branch    = "my-app/sub-agent"
+		)
+		checker := CheckTokenThreshold(threshold)
+		sess := &session.Session{
+			AppName: appName,
+			Events: []event.Event{
+				{
+					Author:    "user",
+					FilterKey: appName,
+					Timestamp: time.Now(),
+					Response: &model.Response{Choices: []model.Choice{{
+						Message: model.Message{Content: strings.Repeat("r", 800)},
+					}}},
+				},
+				{
+					Author:    "assistant",
+					FilterKey: branch,
+					Timestamp: time.Now(),
+					Response: &model.Response{Choices: []model.Choice{{
+						Message: model.Message{Content: "short branch message"},
+					}}},
+				},
+			},
+		}
+		isummaryscope.SetScopeFilterKey(sess, branch)
+		assert.False(t, checker(sess))
+	})
+
+	t.Run("injected conversation text takes precedence", func(t *testing.T) {
+		checker := CheckTokenThreshold(100)
+		sess := &session.Session{
+			Events: []event.Event{
+				{
+					Author:    "tool",
+					Timestamp: time.Now(),
+					Response: &model.Response{Choices: []model.Choice{{
+						Message: model.Message{
+							ToolID:   "call-1",
+							ToolName: "read_file",
+							Content:  strings.Repeat("x", 2000),
+						},
+					}}},
+				},
+			},
+			State: session.StateMap{
+				tokenThresholdConversationTextStateKey: []byte("short"),
+			},
+		}
+		assert.False(t, checker(sess))
 	})
 }
 
@@ -668,4 +869,373 @@ func TestChecksAny(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+// --- CheckContextThreshold tests ---
+
+func TestCheckContextThreshold_NoCtx_UsesFallback(t *testing.T) {
+	defer SetTokenCounter(nil)
+	// Fixed counter: every message = 5000 tokens.
+	SetTokenCounter(testFixedTokenCounter{tokens: 5000})
+
+	// fallback=8192, ratio=0.5 → threshold=4096 → 5000 > 4096 → true
+	checker := CheckContextThreshold()
+	sess := &session.Session{
+		Events: []event.Event{
+			{
+				Author:    "user",
+				Timestamp: time.Now(),
+				Response: &model.Response{Choices: []model.Choice{{
+					Message: model.Message{Content: "hello"},
+				}}},
+			},
+		},
+	}
+	assert.True(t, checker(context.Background(), sess))
+}
+
+func TestCheckContextThreshold_NoCtx_BelowThreshold(t *testing.T) {
+	defer SetTokenCounter(nil)
+	// Fixed counter: every message = 100 tokens.
+	SetTokenCounter(testFixedTokenCounter{tokens: 100})
+
+	// fallback=8192, ratio=0.5 → threshold=4096 → 100 < 4096 → false
+	checker := CheckContextThreshold()
+	sess := &session.Session{
+		Events: []event.Event{
+			{
+				Author:    "user",
+				Timestamp: time.Now(),
+				Response: &model.Response{Choices: []model.Choice{{
+					Message: model.Message{Content: "hello"},
+				}}},
+			},
+		},
+	}
+	assert.False(t, checker(context.Background(), sess))
+}
+
+func TestCheckContextThreshold_WithInvocationModel(t *testing.T) {
+	defer SetTokenCounter(nil)
+	// Fixed counter: every message = 70000 tokens.
+	SetTokenCounter(testFixedTokenCounter{tokens: 70000})
+
+	// Model "deepseek-chat" → contextWindow=131072, ratio=0.5 → threshold=65536.
+	// 70000 > 65536 → true.
+	checker := CheckContextThreshold()
+	sess := &session.Session{
+		Events: []event.Event{
+			{
+				Author:    "user",
+				Timestamp: time.Now(),
+				Response: &model.Response{Choices: []model.Choice{{
+					Message: model.Message{Content: "hello"},
+				}}},
+			},
+		},
+	}
+	inv := &agent.Invocation{
+		Model: &fakeModelWithName{name: "deepseek-chat"},
+	}
+	ctx := agent.NewInvocationContext(context.Background(), inv)
+	assert.True(t, checker(ctx, sess))
+}
+
+func TestCheckContextThreshold_ModelSwitchChangesThreshold(t *testing.T) {
+	defer SetTokenCounter(nil)
+	// Fixed counter: every message = 5000 tokens.
+	SetTokenCounter(testFixedTokenCounter{tokens: 5000})
+
+	checker := CheckContextThreshold()
+	sess := &session.Session{
+		Events: []event.Event{
+			{
+				Author:    "user",
+				Timestamp: time.Now(),
+				Response: &model.Response{Choices: []model.Choice{{
+					Message: model.Message{Content: "hello"},
+				}}},
+			},
+		},
+	}
+
+	// With gpt-4 (contextWindow=8192), ratio=0.5 → threshold=4096.
+	// 5000 > 4096 → true.
+	inv1 := &agent.Invocation{
+		Model: &fakeModelWithName{name: "gpt-4"},
+	}
+	ctx1 := agent.NewInvocationContext(context.Background(), inv1)
+	assert.True(t, checker(ctx1, sess))
+
+	// Switch to deepseek-chat (contextWindow=131072), ratio=0.5 → threshold=65536.
+	// 5000 < 65536 → false. Same checker, different model → different result.
+	inv2 := &agent.Invocation{
+		Model: &fakeModelWithName{name: "deepseek-chat"},
+	}
+	ctx2 := agent.NewInvocationContext(context.Background(), inv2)
+	assert.False(t, checker(ctx2, sess))
+}
+
+func TestCheckContextThreshold_CustomRatio(t *testing.T) {
+	defer SetTokenCounter(nil)
+	// Fixed counter: every message = 100000 tokens.
+	SetTokenCounter(testFixedTokenCounter{tokens: 100000})
+
+	// deepseek-chat=131072, ratio=0.9 → threshold=117964.
+	// 100000 < 117964 → false.
+	checker := CheckContextThreshold(WithContextThresholdRatio(0.9))
+	sess := &session.Session{
+		Events: []event.Event{
+			{
+				Author:    "user",
+				Timestamp: time.Now(),
+				Response: &model.Response{Choices: []model.Choice{{
+					Message: model.Message{Content: "hello"},
+				}}},
+			},
+		},
+	}
+	inv := &agent.Invocation{
+		Model: &fakeModelWithName{name: "deepseek-chat"},
+	}
+	ctx := agent.NewInvocationContext(context.Background(), inv)
+	assert.False(t, checker(ctx, sess))
+}
+
+func TestCheckContextThreshold_MinTokenThreshold(t *testing.T) {
+	defer SetTokenCounter(nil)
+	// Fixed counter: every message = 1500 tokens.
+	SetTokenCounter(testFixedTokenCounter{tokens: 1500})
+
+	// Unknown model → fallback=8192, ratio=0.5 → calculated=4096.
+	// But minTokenThreshold=2000 (default) → threshold=4096 (> 2000, no effect).
+	// 1500 < 4096 → false.
+	checker := CheckContextThreshold()
+	sess := &session.Session{
+		Events: []event.Event{
+			{
+				Author:    "user",
+				Timestamp: time.Now(),
+				Response: &model.Response{Choices: []model.Choice{{
+					Message: model.Message{Content: "hello"},
+				}}},
+			},
+		},
+	}
+	assert.False(t, checker(context.Background(), sess))
+
+	// Set a very small fallback so ratio calculation is below minTokenThreshold.
+	// fallback=100, ratio=0.5 → calculated=50 < minTokenThreshold=2000 → threshold=2000.
+	// 1500 < 2000 → false.
+	checkerSmall := CheckContextThreshold(WithContextThresholdFallbackWindow(100))
+	assert.False(t, checkerSmall(context.Background(), sess))
+}
+
+func TestCheckContextThreshold_CustomFallbackContextWindow(t *testing.T) {
+	defer SetTokenCounter(nil)
+	SetTokenCounter(testFixedTokenCounter{tokens: 5000})
+
+	// Custom fallback=200000, ratio=0.5 → threshold=100000.
+	// 5000 < 100000 → false.
+	checker := CheckContextThreshold(WithContextThresholdFallbackWindow(200000))
+	sess := &session.Session{
+		Events: []event.Event{
+			{
+				Author:    "user",
+				Timestamp: time.Now(),
+				Response: &model.Response{Choices: []model.Choice{{
+					Message: model.Message{Content: "hello"},
+				}}},
+			},
+		},
+	}
+	assert.False(t, checker(context.Background(), sess))
+}
+
+func TestCheckContextThreshold_NilSession(t *testing.T) {
+	checker := CheckContextThreshold()
+	assert.False(t, checker(context.Background(), nil))
+}
+
+func TestCheckContextThreshold_EmptySession(t *testing.T) {
+	checker := CheckContextThreshold()
+	sess := &session.Session{}
+	assert.False(t, checker(context.Background(), sess))
+}
+
+func TestResolveContextWindowFromCtx_NoInvocation(t *testing.T) {
+	assert.Equal(t, 16000, resolveContextWindowFromCtx(context.Background(), 16000))
+}
+
+func TestResolveContextWindowFromCtx_InvocationWithoutModel(t *testing.T) {
+	inv := &agent.Invocation{}
+	ctx := agent.NewInvocationContext(context.Background(), inv)
+	assert.Equal(t, 16000, resolveContextWindowFromCtx(ctx, 16000))
+}
+
+func TestResolveContextWindowFromCtx_UnknownModel(t *testing.T) {
+	inv := &agent.Invocation{
+		Model: &fakeModelWithName{name: "totally-unknown-model-xyz"},
+	}
+	ctx := agent.NewInvocationContext(context.Background(), inv)
+	// Unknown model → falls back to fallback value.
+	assert.Equal(t, 16000, resolveContextWindowFromCtx(ctx, 16000))
+}
+
+func TestResolveContextWindowFromCtx_KnownModel(t *testing.T) {
+	inv := &agent.Invocation{
+		Model: &fakeModelWithName{name: "gpt-4o-mini"},
+	}
+	ctx := agent.NewInvocationContext(context.Background(), inv)
+	// gpt-4o-mini → 200000.
+	assert.Equal(t, 200000, resolveContextWindowFromCtx(ctx, 0))
+}
+
+func TestResolveContextWindowFromCtx_ZeroFallback(t *testing.T) {
+	// No invocation, fallback=0 → uses default constant.
+	assert.Equal(t, defaultContextThresholdFallbackWindow, resolveContextWindowFromCtx(context.Background(), 0))
+}
+
+func TestWithContextThresholdRatio_InvalidValues(t *testing.T) {
+	o := contextThresholdOptions{thresholdRatio: 0.5}
+	WithContextThresholdRatio(0)(&o)
+	assert.Equal(t, 0.5, o.thresholdRatio)
+	WithContextThresholdRatio(-0.1)(&o)
+	assert.Equal(t, 0.5, o.thresholdRatio)
+	WithContextThresholdRatio(1.1)(&o)
+	assert.Equal(t, 0.5, o.thresholdRatio)
+	WithContextThresholdRatio(0.8)(&o)
+	assert.Equal(t, 0.8, o.thresholdRatio)
+	WithContextThresholdRatio(1.0)(&o)
+	assert.Equal(t, 1.0, o.thresholdRatio)
+}
+
+func TestWithContextThresholdFallbackWindow_InvalidValues(t *testing.T) {
+	o := contextThresholdOptions{fallbackContextWindow: 8192}
+	WithContextThresholdFallbackWindow(0)(&o)
+	assert.Equal(t, 8192, o.fallbackContextWindow)
+	WithContextThresholdFallbackWindow(-1)(&o)
+	assert.Equal(t, 8192, o.fallbackContextWindow)
+	WithContextThresholdFallbackWindow(32000)(&o)
+	assert.Equal(t, 32000, o.fallbackContextWindow)
+}
+
+func TestWithContextThresholdMinTokens_InvalidValues(t *testing.T) {
+	o := contextThresholdOptions{minTokenThreshold: 2000}
+	WithContextThresholdMinTokens(-1)(&o)
+	assert.Equal(t, 2000, o.minTokenThreshold)
+	WithContextThresholdMinTokens(0)(&o)
+	assert.Equal(t, 0, o.minTokenThreshold)
+	WithContextThresholdMinTokens(500)(&o)
+	assert.Equal(t, 500, o.minTokenThreshold)
+}
+
+func TestWithContextThreshold_SummarizerModelFallback(t *testing.T) {
+	defer SetTokenCounter(nil)
+	// Fixed counter: every message = 70000 tokens.
+	SetTokenCounter(testFixedTokenCounter{tokens: 70000})
+
+	// Create summarizer with deepseek-chat model (contextWindow=131072).
+	// WithContextThreshold() should pick up the summarizer model's context
+	// window as the fallback, so even without invocation context the
+	// threshold is 131072 × 0.5 = 65536 rather than 8192 × 0.5 = 4096.
+	fakeModel := &fakeModelWithName{name: "deepseek-chat"}
+	sum := NewSummarizer(fakeModel, WithContextThreshold())
+
+	sess := &session.Session{
+		Events: []event.Event{
+			{
+				Author:    "user",
+				Timestamp: time.Now(),
+				Response: &model.Response{Choices: []model.Choice{{
+					Message: model.Message{Content: "hello"},
+				}}},
+			},
+		},
+	}
+
+	// Without invocation context, the old behavior (fallback=8192) would
+	// give threshold=4096, so 70000 > 4096 → true.
+	// With summarizer model fallback (131072), threshold=65536,
+	// so 70000 > 65536 → true (just barely).
+	result := sum.ShouldSummarize(sess)
+	assert.True(t, result)
+
+	// Now test with 5000 tokens — should NOT trigger with summarizer fallback.
+	SetTokenCounter(testFixedTokenCounter{tokens: 5000})
+	// 5000 < 65536 → false (summarizer fallback), whereas old 8192 fallback
+	// would give 5000 > 4096 → true.
+	result = sum.ShouldSummarize(sess)
+	assert.False(t, result)
+}
+
+func TestWithContextThreshold_UnknownSummarizerModel(t *testing.T) {
+	defer SetTokenCounter(nil)
+	SetTokenCounter(testFixedTokenCounter{tokens: 5000})
+
+	// Create summarizer with an unknown model name. WithContextThreshold()
+	// should NOT find it in the registry, so it falls back to the default
+	// 8192 context window. threshold = 8192 × 0.5 = 4096. 5000 > 4096 → true.
+	fakeModel := &fakeModelWithName{name: "totally-unknown-model-xyz"}
+	sum := NewSummarizer(fakeModel, WithContextThreshold())
+
+	sess := &session.Session{
+		Events: []event.Event{
+			{
+				Author:    "user",
+				Timestamp: time.Now(),
+				Response: &model.Response{Choices: []model.Choice{{
+					Message: model.Message{Content: "hello"},
+				}}},
+			},
+		},
+	}
+	result := sum.ShouldSummarize(sess)
+	assert.True(t, result)
+}
+
+func TestWithContextThreshold_NilSummarizerModel(t *testing.T) {
+	defer SetTokenCounter(nil)
+	SetTokenCounter(testFixedTokenCounter{tokens: 5000})
+
+	// Create summarizer with nil model. WithContextThreshold() should
+	// gracefully fall back to the default. Note: NewSummarizer allows
+	// nil model (the model is only used for generating summaries).
+	sum := NewSummarizer(nil, WithContextThreshold())
+
+	sess := &session.Session{
+		Events: []event.Event{
+			{
+				Author:    "user",
+				Timestamp: time.Now(),
+				Response: &model.Response{Choices: []model.Choice{{
+					Message: model.Message{Content: "hello"},
+				}}},
+			},
+		},
+	}
+	// fallback=8192, ratio=0.5 → threshold=4096. 5000 > 4096 → true.
+	result := sum.ShouldSummarize(sess)
+	assert.True(t, result)
+}
+
+// fakeModelWithName implements model.Model with a configurable name.
+type fakeModelWithName struct {
+	name string
+}
+
+func (m *fakeModelWithName) GenerateContent(
+	_ context.Context, _ *model.Request,
+) (<-chan *model.Response, error) {
+	ch := make(chan *model.Response, 1)
+	ch <- &model.Response{
+		Done:    true,
+		Choices: []model.Choice{{Message: model.Message{Content: "ok"}}},
+	}
+	close(ch)
+	return ch, nil
+}
+
+func (m *fakeModelWithName) Info() model.Info {
+	return model.Info{Name: m.name}
 }

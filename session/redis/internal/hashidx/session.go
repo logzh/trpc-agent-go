@@ -29,6 +29,11 @@ type Config struct {
 	SessionEventLimit int
 	// KeyPrefix is the optional prefix for all HashIdx keys.
 	KeyPrefix string
+	// EnableUserSessionIndex enables the per-user session index Hash.
+	// When true, CreateSession writes an index entry and ListSessions uses HSCAN
+	// on the user session index.
+	// When false (default), no index is maintained and ListSessions falls back to SCAN.
+	EnableUserSessionIndex bool
 }
 
 // Client implements HashIdx session storage logic.
@@ -59,6 +64,8 @@ type sessionMeta struct {
 
 // CreateSession creates a new session using HashIdx logic.
 // SessionID must be provided by the caller; empty SessionID returns an error.
+// When EnableUserSessionIndex is true, atomically writes both the session meta key
+// and the session index Hash entry via Lua script.
 func (c *Client) CreateSession(
 	ctx context.Context,
 	key session.Key,
@@ -68,7 +75,6 @@ func (c *Client) CreateSession(
 		return nil, fmt.Errorf("sessionID is required")
 	}
 
-	// Deep copy state to avoid external modifications affecting stored data
 	copiedState := deepCopyState(state)
 
 	now := time.Now()
@@ -86,10 +92,16 @@ func (c *Client) CreateSession(
 		return nil, fmt.Errorf("marshal session meta: %w", err)
 	}
 
-	if ok, err := c.client.SetNX(ctx, c.keys.SessionMetaKey(key), metaJSON, c.cfg.SessionTTL).Result(); err != nil {
-		return nil, fmt.Errorf("create session: %w", err)
-	} else if !ok {
-		return nil, fmt.Errorf("session already exists")
+	if c.cfg.EnableUserSessionIndex {
+		if err := c.addSessionToUserIndex(ctx, key, metaJSON, now); err != nil {
+			return nil, err
+		}
+	} else {
+		if ok, err := c.client.SetNX(ctx, c.keys.SessionMetaKey(key), metaJSON, c.cfg.SessionTTL).Result(); err != nil {
+			return nil, fmt.Errorf("create session: %w", err)
+		} else if !ok {
+			return nil, fmt.Errorf("session already exists")
+		}
 	}
 
 	sess := session.NewSession(key.AppName, key.UserID, key.SessionID)
@@ -97,7 +109,6 @@ func (c *Client) CreateSession(
 	sess.CreatedAt = now
 	sess.UpdatedAt = now
 
-	// Inject HashIdx version tag into ServiceMeta (not persisted, memory only)
 	sess.ServiceMeta = map[string]string{util.ServiceMetaStorageTypeKey: util.StorageTypeHashIdx}
 
 	return sess, nil
@@ -324,8 +335,6 @@ func (c *Client) AppendEvent(ctx context.Context, key session.Key, evt *event.Ev
 		ttlSeconds = int64(c.cfg.SessionTTL.Seconds())
 	}
 
-	// Determine if event should be stored in event list (matches zset behavior)
-	// Only store events with valid response content
 	shouldStoreEvent := shouldStoreEventInList(evt)
 
 	keys := []string{
@@ -370,18 +379,23 @@ func boolToInt(b bool) int {
 
 // DeleteSession deletes a session and all associated data in HashIdx storage,
 // including track keys discovered from session state.
+// When EnableUserSessionIndex is true, also removes the session index entry.
 func (c *Client) DeleteSession(ctx context.Context, key session.Key) error {
 	keys := c.keys.SessionKeys(key)
 
-	// Best-effort: query tracks from session meta and append track keys (data + index).
-	// If this fails (e.g. meta already gone), we still delete the fixed keys.
 	tracks, _ := c.ListTracksForSession(ctx, key)
 	for _, t := range tracks {
 		keys = append(keys, c.keys.TrackKeys(key, t)...)
 	}
 
-	if _, err := luaDeleteSession.Run(ctx, c.client, keys).Result(); err != nil {
-		return fmt.Errorf("delete session: %w", err)
+	if c.cfg.EnableUserSessionIndex {
+		if err := c.removeSessionFromUserIndex(ctx, keys, key); err != nil {
+			return err
+		}
+	} else {
+		if _, err := luaDeleteSessionLegacy.Run(ctx, c.client, keys).Result(); err != nil {
+			return fmt.Errorf("delete session: %w", err)
+		}
 	}
 	return nil
 }
@@ -434,51 +448,35 @@ func (c *Client) RefreshSummaryTTL(ctx context.Context, key session.Key) error {
 	return c.client.Expire(ctx, c.keys.SummaryKey(key), c.cfg.SessionTTL).Err()
 }
 
-// ListSessions scans for sessions (HashIdx) with all post-processing.
+// ListSessions lists sessions (HashIdx) with all post-processing.
+// Uses HSCAN on the user session index when enabled.
+// Falls back to SCAN session meta keys when user session index is disabled.
 // This matches zset behavior:
 // - Events (filtered by limit and afterTime)
 // - App/User state merged (batch loaded, shared across sessions)
 // - Track events loaded
 // - Note: Summaries are NOT loaded in ListSessions (same as zset)
-func (c *Client) ListSessions(ctx context.Context, userKey session.UserKey, limit int, afterTime time.Time) ([]*session.Session, error) {
-	pattern := c.keys.SessionMetaPattern(userKey)
+func (c *Client) ListSessions(ctx context.Context, userKey session.UserKey, limit int, afterTime time.Time, listOnlyMeta bool) ([]*session.Session, error) {
 	var sessions []*session.Session
+	var err error
 
-	iter := c.client.Scan(ctx, 0, pattern, 100).Iterator()
-	for iter.Next(ctx) {
-		mKey := iter.Val()
-		metaJSON, err := c.client.Get(ctx, mKey).Bytes()
-		if err != nil {
-			continue
-		}
-		// Parse meta to get session key for loading events
-		var meta sessionMeta
-		if err := json.Unmarshal(metaJSON, &meta); err != nil {
-			continue
-		}
-		key := session.Key{
-			AppName:   meta.AppName,
-			UserID:    meta.UserID,
-			SessionID: meta.ID,
-		}
-		sess, err := c.loadSessionBasic(ctx, key, metaJSON, limit, afterTime)
-		if err == nil && sess != nil {
-			sessions = append(sessions, sess)
-		}
+	if c.cfg.EnableUserSessionIndex {
+		sessions, err = c.listSessionsFromUserIndex(ctx, userKey, limit, afterTime, listOnlyMeta)
+	} else {
+		sessions, err = c.listSessionsByScan(ctx, userKey, limit, afterTime, listOnlyMeta)
 	}
-	if err := iter.Err(); err != nil {
+	if err != nil {
 		return nil, err
 	}
+	if len(sessions) == 0 {
+		return nil, nil
+	}
 
-	// Post-process: batch load shared app/user state and track events
-	// This is more efficient than loading per-session
 	if len(sessions) > 0 {
-		// Batch load app/user state (shared across all sessions of the same user)
 		appState, _ := c.ListAppStates(ctx, userKey.AppName)
 		userState, _ := c.ListUserStates(ctx, userKey)
 
 		for _, sess := range sessions {
-			// Merge app/user state
 			for k, v := range appState {
 				sess.SetState(session.StateAppPrefix+k, v)
 			}
@@ -486,12 +484,12 @@ func (c *Client) ListSessions(ctx context.Context, userKey session.UserKey, limi
 				sess.SetState(session.StateUserPrefix+k, v)
 			}
 
-			// Load track events for each session
-			key := session.Key{AppName: sess.AppName, UserID: sess.UserID, SessionID: sess.ID}
-			c.loadAndAttachTrackEvents(ctx, key, sess, nil, limit, afterTime)
+			if !listOnlyMeta {
+				key := session.Key{AppName: sess.AppName, UserID: sess.UserID, SessionID: sess.ID}
+				c.loadAndAttachTrackEvents(ctx, key, sess, nil, limit, afterTime)
+			}
 		}
 
-		// Refresh shared state TTLs once
 		_ = c.RefreshAppStateTTL(ctx, userKey.AppName)
 		_ = c.RefreshUserStateTTL(ctx, userKey)
 	}
@@ -499,14 +497,112 @@ func (c *Client) ListSessions(ctx context.Context, userKey session.UserKey, limi
 	return sessions, nil
 }
 
+func (c *Client) listSessionsByScan(
+	ctx context.Context,
+	userKey session.UserKey,
+	limit int,
+	afterTime time.Time,
+	listOnlyMeta bool,
+) ([]*session.Session, error) {
+	pattern := c.keys.SessionMetaPattern(userKey)
+	iter := c.client.Scan(ctx, 0, pattern, 100).Iterator()
+
+	var sessions []*session.Session
+	for iter.Next(ctx) {
+		metaJSON, err := c.client.Get(ctx, iter.Val()).Bytes()
+		if err != nil {
+			continue
+		}
+
+		var meta sessionMeta
+		if err := json.Unmarshal(metaJSON, &meta); err != nil {
+			continue
+		}
+
+		key := session.Key{
+			AppName:   meta.AppName,
+			UserID:    meta.UserID,
+			SessionID: meta.ID,
+		}
+		sess, err := c.loadSessionBasic(ctx, key, metaJSON, limit, afterTime, listOnlyMeta)
+		if err == nil && sess != nil {
+			sessions = append(sessions, sess)
+		}
+	}
+
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("scan session meta keys: %w", err)
+	}
+
+	return sessions, nil
+}
+
+func (c *Client) listSessionsFromUserIndex(
+	ctx context.Context,
+	userKey session.UserKey,
+	limit int,
+	afterTime time.Time,
+	listOnlyMeta bool,
+) ([]*session.Session, error) {
+	sessionIDs, err := c.listSessionIDsFromUserIndex(ctx, userKey)
+	if err != nil {
+		return nil, fmt.Errorf("scan session index: %w", err)
+	}
+	if len(sessionIDs) == 0 {
+		return nil, nil
+	}
+
+	pipe := c.client.Pipeline()
+	metaCmds := make(map[string]*redis.StringCmd, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		key := session.Key{AppName: userKey.AppName, UserID: userKey.UserID, SessionID: sessionID}
+		metaCmds[sessionID] = pipe.Get(ctx, c.keys.SessionMetaKey(key))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+		return nil, fmt.Errorf("batch get session meta: %w", err)
+	}
+
+	var staleIDs []string
+	var sessions []*session.Session
+	for sessionID, cmd := range metaCmds {
+		metaJSON, err := cmd.Bytes()
+		if err != nil {
+			if err == redis.Nil {
+				staleIDs = append(staleIDs, sessionID)
+			}
+			continue
+		}
+
+		var meta sessionMeta
+		if err := json.Unmarshal(metaJSON, &meta); err != nil {
+			continue
+		}
+
+		key := session.Key{
+			AppName:   meta.AppName,
+			UserID:    meta.UserID,
+			SessionID: meta.ID,
+		}
+		sess, err := c.loadSessionBasic(ctx, key, metaJSON, limit, afterTime, listOnlyMeta)
+		if err == nil && sess != nil {
+			sessions = append(sessions, sess)
+		}
+	}
+
+	c.cleanupStaleUserSessionIndexEntries(ctx, userKey, staleIDs)
+	return sessions, nil
+}
+
 // loadSessionBasic loads session with events only (no app/user state, no track, no summary).
 // Used by ListSessions where post-processing is done in batch.
+// When listOnlyMeta is true, events are not loaded from Redis.
 func (c *Client) loadSessionBasic(
 	ctx context.Context,
 	key session.Key,
 	metaJSON []byte,
 	limit int,
 	afterTime time.Time,
+	listOnlyMeta bool,
 ) (*session.Session, error) {
 	var meta sessionMeta
 	if err := json.Unmarshal(metaJSON, &meta); err != nil {
@@ -518,29 +614,29 @@ func (c *Client) loadSessionBasic(
 	sess.CreatedAt = meta.CreatedAt
 	sess.UpdatedAt = meta.UpdatedAt
 
-	result, err := luaLoadEvents.Run(ctx, c.client,
-		[]string{
-			c.keys.EventDataKey(key),
-			c.keys.EventTimeIndexKey(key),
-		},
-		0, int64(-1), 0,
-	).StringSlice()
-	if err != nil && err != redis.Nil {
-		return nil, fmt.Errorf("load events: %w", err)
-	}
-
-	for _, evtJSON := range result {
-		var evt event.Event
-		if err := json.Unmarshal([]byte(evtJSON), &evt); err != nil {
-			continue
+	if !listOnlyMeta {
+		result, err := luaLoadEvents.Run(ctx, c.client,
+			[]string{
+				c.keys.EventDataKey(key),
+				c.keys.EventTimeIndexKey(key),
+			},
+			0, int64(-1), 0,
+		).StringSlice()
+		if err != nil && err != redis.Nil {
+			return nil, fmt.Errorf("load events: %w", err)
 		}
-		sess.Events = append(sess.Events, evt)
+
+		for _, evtJSON := range result {
+			var evt event.Event
+			if err := json.Unmarshal([]byte(evtJSON), &evt); err != nil {
+				continue
+			}
+			sess.Events = append(sess.Events, evt)
+		}
+
+		sess.ApplyEventFiltering(session.WithEventNum(limit), session.WithEventTime(afterTime))
 	}
 
-	// Apply event filtering
-	sess.ApplyEventFiltering(session.WithEventNum(limit), session.WithEventTime(afterTime))
-
-	// Inject HashIdx version tag into ServiceMeta (not persisted, memory only)
 	sess.ServiceMeta = map[string]string{util.ServiceMetaStorageTypeKey: util.StorageTypeHashIdx}
 
 	return sess, nil

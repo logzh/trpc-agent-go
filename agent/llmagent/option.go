@@ -14,16 +14,19 @@ import (
 	"reflect"
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
-	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent/internal/jsonschema"
 	"trpc.group/trpc-go/trpc-agent-go/codeexecutor"
+	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/internal/flow/processor"
+	"trpc.group/trpc-go/trpc-agent-go/internal/jsonschema"
 	"trpc.group/trpc-go/trpc-agent-go/internal/skillprofile"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/searchfilter"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/planner"
+	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/skill"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
+	toolskill "trpc.group/trpc-go/trpc-agent-go/tool/skill"
 )
 
 const (
@@ -75,7 +78,21 @@ const (
 	// SkillLoadModeSession keeps loaded skill content available across
 	// invocations until cleared or the session expires.
 	SkillLoadModeSession = processor.SkillLoadModeSession
+
+	// SessionSummaryInjectionSystem injects the session summary as a system
+	// message (default behavior).
+	SessionSummaryInjectionSystem = processor.SessionSummaryInjectionSystem
+	// SessionSummaryInjectionUser injects the session summary as a user
+	// message that participates in token-budget trimming for sliding-window
+	// behavior. The processor prefers merging it into the first user
+	// history/current message and only falls back to a trailing prefix user
+	// message when needed.
+	SessionSummaryInjectionUser = processor.SessionSummaryInjectionUser
 )
+
+// SessionSummaryInjectionMode controls how the session summary is injected
+// into the model request.
+type SessionSummaryInjectionMode = processor.SessionSummaryInjectionMode
 
 // MessageFilterMode is the mode for filtering messages.
 type MessageFilterMode int
@@ -94,6 +111,14 @@ const (
 	// equivalent to TimelineFilterCurrentInvocation + BranchFilterModeExact.
 	IsolatedInvocation
 )
+
+// EventMessageProjector projects one event-derived message into the
+// model-facing request view.
+type EventMessageProjector func(
+	inv *agent.Invocation,
+	evt event.Event,
+	msg model.Message,
+) model.Message
 
 var (
 	defaultOptions = Options{
@@ -117,10 +142,24 @@ var (
 		//     memories. Consider using a positive budget (e.g., 10-50) for
 		//     production use.
 		PreloadMemory: 0,
+		// Default to disabling query-time session recall preload.
+		PreloadSessionRecall:           0,
+		PreloadSessionRecallSearchMode: session.SearchModeHybrid,
 
 		SkillLoadMode: SkillLoadModeTurn,
 
 		SkipSkillsFallbackOnSessionSummary: true,
+
+		EnableContextCompaction:              false,
+		ContextCompactionThresholdRatio:      0.7,
+		ContextCompactionToolResultMaxTokens: processor.DefaultContextCompactionToolResultMaxTokens,
+		ContextCompactionKeepRecentRequests:  processor.DefaultContextCompactionKeepRecentRequests,
+		// Pass 2 is opt-in. Defaulting to 0 keeps EnableContextCompaction=false
+		// truly equivalent to "framework does not modify tool results". Users
+		// who want the head+tail truncation safety net should explicitly call
+		// WithContextCompactionOversizedToolResultMaxTokens (the recommended
+		// value is processor.DefaultContextCompactionOversizedToolResultMaxTokens).
+		ContextCompactionOversizedToolResultMaxTokens: 0,
 
 		skillRunRequireSkillLoaded: true,
 	}
@@ -139,28 +178,61 @@ type Options struct {
 	Models map[string]model.Model
 	// Description is a description of the agent.
 	Description string
-	// Instruction is the instruction for the agent.
+	// Instruction is the instruction template for the agent.
+	// It is rendered at request time using the same placeholder subset as the
+	// internal prompt state adapter in `internal/prompt/adapter/state`. See
+	// `Render` there for supported placeholder forms and resolution rules.
 	Instruction string
-	// GlobalInstruction is the global instruction for the agent.
-	// It will be used for all agents in the agent tree.
+	// GlobalInstruction is the global instruction template for the agent.
+	// It will be used for all agents in the agent tree and is rendered at
+	// request time using the same placeholder subset as the internal prompt
+	// state adapter in `internal/prompt/adapter/state`. See `Render` there for
+	// supported placeholder forms and resolution rules.
 	GlobalInstruction string
-	// ModelInstructions maps model.Info().Name to a model-specific instruction.
-	// When present, it overrides Instruction for matching models.
+	// ModelInstructions maps model.Info().Name to a model-specific instruction
+	// template. When present, it overrides Instruction for matching models.
+	// Values are rendered at request time using the same placeholder subset as
+	// the internal prompt state adapter in `internal/prompt/adapter/state`. See
+	// `Render` there for supported placeholder forms and resolution rules.
 	ModelInstructions map[string]string
 	// ModelGlobalInstructions maps model.Info().Name to a model-specific system
-	// prompt.
-	// When present, it overrides GlobalInstruction for matching models.
+	// prompt template. When present, it overrides GlobalInstruction for matching
+	// models. Values are rendered at request time using the same placeholder
+	// subset as the internal prompt state adapter in
+	// `internal/prompt/adapter/state`. See `Render` there for supported
+	// placeholder forms and resolution rules.
 	ModelGlobalInstructions map[string]string
 	// GenerationConfig contains the generation configuration.
 	GenerationConfig model.GenerationConfig
 	// ChannelBufferSize is the buffer size for event channels (default: 256).
 	ChannelBufferSize int
 	codeExecutor      codeexecutor.CodeExecutor
+	// workspaceExecSurfaceEnabled controls whether generic workspace
+	// execution tools such as workspace_exec are exposed to the model
+	// when a code executor is available.
+	//
+	// Default: true.
+	workspaceExecSurfaceEnabled *bool
 	// EnableCodeExecutionResponseProcessor controls whether the agent
 	// auto-executes fenced code blocks from model responses.
 	//
+	// This switch is independent of WithCodeExecutor: a CodeExecutor may
+	// be configured purely so that execution tools such as workspace_exec
+	// can be registered, without also opting into auto-executing fenced
+	// code in the assistant's final reply. When the skills auto-fallback
+	// injects a CodeExecutor (see applySkillsExecutorFallback in
+	// llm_agent.go) and the caller has not explicitly set this option,
+	// the fallback path force-disables it so the implicit executor only
+	// powers workspace_exec, never the fenced-code auto-exec chain.
+	//
 	// Default: true (preserves existing behavior).
 	EnableCodeExecutionResponseProcessor bool
+	// codeExecutionResponseProcessorExplicit records whether the caller
+	// explicitly set EnableCodeExecutionResponseProcessor via
+	// WithEnableCodeExecutionResponseProcessor. It is used by the skills
+	// auto-fallback to decide whether it may suppress the fenced-code
+	// auto-exec chain on behalf of the caller.
+	codeExecutionResponseProcessorExplicit bool
 	// Tools is the list of tools available to the agent.
 	Tools []tool.Tool
 	// ToolSets is the list of tool sets available to the agent.
@@ -169,12 +241,18 @@ type Options struct {
 	Planner planner.Planner
 	// SubAgents is the list of sub-agents available to the agent.
 	SubAgents []agent.Agent
+	// EnableAwaitUserReplyTool adds the await_user_reply framework tool.
+	// When enabled, the model can explicitly mark that the next user turn
+	// should resume at this agent.
+	EnableAwaitUserReplyTool bool
 	// AgentCallbacks contains callbacks for agent operations.
 	AgentCallbacks *agent.Callbacks
 	// ModelCallbacks contains callbacks for model operations.
 	ModelCallbacks *model.Callbacks
 	// ToolCallbacks contains callbacks for tool operations.
 	ToolCallbacks *tool.Callbacks
+	// ToolCallRetryPolicy configures retry behavior for callable tool calls.
+	ToolCallRetryPolicy *tool.RetryPolicy
 	// Knowledge is the knowledge base for the agent.
 	// If provided, the knowledge search tool will be automatically added.
 	Knowledge knowledge.Knowledge
@@ -214,6 +292,11 @@ type Options struct {
 	// AddSessionSummary controls whether to prepend the current branch summary
 	// as a system message when available (default: false).
 	AddSessionSummary bool
+	// SessionSummaryInjectionMode controls how the session summary is injected
+	// into the model request. Default is "system" (SessionSummaryInjectionSystem).
+	// Set to "user" (SessionSummaryInjectionUser) to inject as a user message
+	// that participates in token-budget trimming for sliding-window behavior.
+	SessionSummaryInjectionMode processor.SessionSummaryInjectionMode
 	// SyncSummaryIntraRun controls whether to refresh session summary
 	// synchronously between LLM loop iterations inside the same run.
 	// When false (default), summary refresh happens asynchronously and
@@ -223,6 +306,32 @@ type Options struct {
 	// MaxHistoryRuns sets the maximum number of history messages when AddSessionSummary is false.
 	// When 0 (default), no limit is applied.
 	MaxHistoryRuns int
+	// EnableContextCompaction enables prompt-side context compaction.
+	// Historical oversized tool results can be compacted during request
+	// projection even when AddSessionSummary is false. When AddSessionSummary
+	// is also true, the framework may additionally trigger a one-time
+	// synchronous summary refresh before the LLM call.
+	EnableContextCompaction bool
+	// ContextCompactionThresholdRatio controls when the pre-LLM synchronous
+	// summary retry triggers, expressed as a fraction of the model context
+	// window. This retry only applies when AddSessionSummary is enabled.
+	ContextCompactionThresholdRatio float64
+	// ContextCompactionToolResultMaxTokens sets the token threshold above
+	// which
+	// historical tool results are replaced with a placeholder.
+	ContextCompactionToolResultMaxTokens int
+	// ContextCompactionKeepRecentRequests preserves the latest N completed
+	// requests in full when request-side context compaction is enabled.
+	ContextCompactionKeepRecentRequests int
+	// ContextCompactionOversizedToolResultMaxTokens sets the token threshold
+	// above which any tool result (including from the current request) is
+	// truncated using head+tail preservation. Like Pass 1, this also requires
+	// EnableContextCompaction=true to take effect; it will not fire when
+	// context compaction is disabled, even if a positive threshold is
+	// configured. 0 disables it regardless of EnableContextCompaction.
+	// Default is 0; the recommended value to pass when opting in is
+	// processor.DefaultContextCompactionOversizedToolResultMaxTokens (8192).
+	ContextCompactionOversizedToolResultMaxTokens int
 	// summaryFormatter allows custom formatting of session summary content.
 	// When nil (default), uses the default formatSummaryContent function.
 	summaryFormatter func(summary string) string
@@ -249,6 +358,13 @@ type Options struct {
 	// Default is false, so same-branch events are merged into user context
 	// unless explicitly opted into preserving roles.
 	PreserveSameBranch bool
+	// PreserveForeignMessages keeps messages authored by other agents in their
+	// original roles/order instead of rewriting them into user-context messages.
+	// Default is false to preserve current handoff behavior.
+	PreserveForeignMessages bool
+	// EventMessageProjector rewrites one event-derived message before it
+	// is appended to the model request.
+	EventMessageProjector EventMessageProjector
 	// StructuredOutput defines how the model should produce structured output in normal runs.
 	StructuredOutput *model.StructuredOutput
 	// StructuredOutputType is the reflect.Type of the example pointer used to generate the schema.
@@ -307,14 +423,36 @@ type Options struct {
 
 	// skillsRepository enables agent skills when non-nil.
 	skillsRepository skill.Repository
+	// skillFilter narrows the visible skill set per run context.
+	skillFilter skill.VisibilityFilter
 	// skillToolProfile controls which built-in skill tools are registered.
 	skillToolProfile string
+	// allowedSkillTools, when non-nil, overrides skillToolProfile and limits
+	// the final built-in skill tool registration set to this explicit allowlist.
+	allowedSkillTools []string
+	// skillsCapabilityGuidance overrides the built-in skill capability
+	// disclosure block.
+	skillsCapabilityGuidance *string
+	// skillsProtocolGuidance overrides the full built-in skill protocol
+	// text appended after the overview.
+	skillsProtocolGuidance *string
 	// skillsToolingGuidance overrides the built-in skills guidance block.
 	skillsToolingGuidance *string
+	// skillsDirectoryHints exposes skill directory locators in prompt
+	// materialization when enabled.
+	skillsDirectoryHints bool
+	// skillsFilePathHints exposes SKILL.md file locators in prompt
+	// materialization when enabled.
+	skillsFilePathHints bool
+	// skillLoadToolDescription overrides the built-in skill_load tool
+	// description when non-nil.
+	skillLoadToolDescription *string
 	// skillRunAllowedCommands restricts skill_run to allowlisted commands.
 	skillRunAllowedCommands []string
 	// skillRunDeniedCommands rejects denylisted commands for skill_run.
 	skillRunDeniedCommands []string
+	// skillRunOutputLimits customizes inline skill_run output sizes.
+	skillRunOutputLimits toolskill.RunOutputLimits
 
 	// skillRunForceSaveArtifacts forces skill_run to persist collected
 	// outputs via the artifact service when possible.
@@ -322,8 +460,21 @@ type Options struct {
 	// skillRunRequireSkillLoaded rejects skill_run unless the skill was
 	// loaded via skill_load in the current session state.
 	skillRunRequireSkillLoaded bool
-	messageTimelineFilterMode  string
-	messageBranchFilterMode    string
+	// skillRunStager overrides how skill_run materializes a skill in
+	// the workspace.
+	skillRunStager toolskill.SkillStager
+	// workspaceBootstrap declares static files and commands that
+	// must be present/executed in the workspace before user
+	// commands run. When non-empty it is converted into a Provider
+	// and attached to workspace_exec.
+	workspaceBootstrap codeexecutor.WorkspaceBootstrapSpec
+	// disableWorkspacePreparers keeps workspace_exec on the legacy
+	// StageConversationFiles-only path even when a skills repo or
+	// bootstrap spec is configured. Useful for tests and for users
+	// that want to opt out of the new reconciler.
+	disableWorkspacePreparers bool
+	messageTimelineFilterMode string
+	messageBranchFilterMode   string
 
 	// ReasoningContentMode controls how reasoning_content is handled in
 	// multi-turn conversations. This is particularly important for DeepSeek
@@ -342,6 +493,19 @@ type Options struct {
 	// When 0 (default), no memories are preloaded (use tools instead).
 	// When < 0, all memories are loaded.
 	PreloadMemory int
+	// PreloadSessionRecall sets the number of recalled
+	// session events to preload into the system prompt.
+	// When > 0, search runs across other sessions owned by
+	// the current user. When 0 (default), recall preload is
+	// disabled.
+	PreloadSessionRecall int
+	// PreloadSessionRecallMinScore filters low-confidence
+	// recalled session hits before injection.
+	PreloadSessionRecallMinScore float64
+	// PreloadSessionRecallSearchMode controls which
+	// retrieval mode is used for query-time session recall.
+	// Default is session.SearchModeHybrid.
+	PreloadSessionRecallSearchMode session.SearchMode
 
 	// postToolPromptEnabled controls whether the post-tool dynamic prompt
 	// injection is enabled. When nil (default), injection is enabled to
@@ -363,13 +527,40 @@ type Options struct {
 // SkillToolProfile controls which framework-provided skill tools are enabled.
 type SkillToolProfile string
 
+// SkillTool identifies a built-in framework-provided skill tool that can be
+// exposed when skills are enabled.
+type SkillTool string
+
 const (
-	// SkillToolProfileFull keeps the existing behavior and registers the full
-	// built-in skill tool suite, including execution tools.
+	// SkillToolProfileFull registers the full built-in skill tool suite,
+	// including skill_run, skill_exec, and the interactive exec-session
+	// helpers. This profile is opt-in; callers that want skill-driven
+	// execution must request it explicitly. New code should prefer
+	// workspace_exec together with skill_load for script execution.
 	SkillToolProfileFull SkillToolProfile = skillprofile.Full
-	// SkillToolProfileKnowledgeOnly registers only progressive-disclosure skill
-	// tools used for knowledge injection. No execution tools are exposed.
+	// SkillToolProfileKnowledgeOnly registers only progressive-disclosure
+	// skill tools (skill_load / skill_list_docs / skill_select_docs) and
+	// omits every execution tool. This is the default profile: agents
+	// that only configure a skill repository get knowledge injection and
+	// rely on workspace_exec for running scripts.
 	SkillToolProfileKnowledgeOnly SkillToolProfile = skillprofile.KnowledgeOnly
+
+	// SkillToolLoad loads SKILL.md and optional docs into model context.
+	SkillToolLoad SkillTool = skillprofile.ToolLoad
+	// SkillToolListDocs lists the docs exposed by a skill.
+	SkillToolListDocs SkillTool = skillprofile.ToolListDocs
+	// SkillToolSelectDocs updates which docs are selected for a skill.
+	SkillToolSelectDocs SkillTool = skillprofile.ToolSelectDocs
+	// SkillToolRun executes a non-interactive command inside a skill workspace.
+	SkillToolRun SkillTool = skillprofile.ToolRun
+	// SkillToolExec starts an interactive skill execution session.
+	SkillToolExec SkillTool = skillprofile.ToolExec
+	// SkillToolWriteStdin writes stdin to a running skill_exec session.
+	SkillToolWriteStdin SkillTool = skillprofile.ToolWriteStdin
+	// SkillToolPollSession polls a running skill_exec session.
+	SkillToolPollSession SkillTool = skillprofile.ToolPollSession
+	// SkillToolKillSession terminates a running skill_exec session.
+	SkillToolKillSession SkillTool = skillprofile.ToolKillSession
 )
 
 // WithModel sets the model to use.
@@ -397,21 +588,30 @@ func WithDescription(description string) Option {
 	}
 }
 
-// WithInstruction sets the instruction of the agent.
+// WithInstruction sets the instruction template of the agent.
+// The template uses the same placeholder subset as the internal prompt state
+// adapter in `internal/prompt/adapter/state`. See `Render` there for supported
+// placeholder forms and resolution rules.
 func WithInstruction(instruction string) Option {
 	return func(opts *Options) {
 		opts.Instruction = instruction
 	}
 }
 
-// WithGlobalInstruction sets the global instruction of the agent.
+// WithGlobalInstruction sets the global instruction template of the agent.
+// The template uses the same placeholder subset as the internal prompt state
+// adapter in `internal/prompt/adapter/state`. See `Render` there for supported
+// placeholder forms and resolution rules.
 func WithGlobalInstruction(instruction string) Option {
 	return func(opts *Options) {
 		opts.GlobalInstruction = instruction
 	}
 }
 
-// WithModelInstructions sets model-specific instruction overrides.
+// WithModelInstructions sets model-specific instruction template overrides.
+// Values use the same placeholder subset as the internal prompt state adapter
+// in `internal/prompt/adapter/state`. See `Render` there for supported
+// placeholder forms and resolution rules.
 // Key: model.Info().Name, Value: instruction text.
 func WithModelInstructions(instructions map[string]string) Option {
 	return func(opts *Options) {
@@ -419,7 +619,10 @@ func WithModelInstructions(instructions map[string]string) Option {
 	}
 }
 
-// WithModelGlobalInstructions sets model-specific system prompt overrides.
+// WithModelGlobalInstructions sets model-specific system prompt template
+// overrides. Values use the same placeholder subset as the internal prompt
+// state adapter in `internal/prompt/adapter/state`. See `Render` there for
+// supported placeholder forms and resolution rules.
 // Key: model.Info().Name, Value: system prompt text.
 func WithModelGlobalInstructions(prompts map[string]string) Option {
 	return func(opts *Options) {
@@ -471,11 +674,40 @@ func WithCodeExecutor(ce codeexecutor.CodeExecutor) Option {
 	}
 }
 
+// WithWorkspaceExecSurfaceEnabled controls whether generic workspace
+// execution tools are exposed to the model when a code executor is
+// available.
+//
+// This does not disable the configured code executor itself; it only
+// suppresses model-visible workspace tools such as workspace_exec and
+// its session helpers.
+//
+// Default: true.
+func WithWorkspaceExecSurfaceEnabled(enable bool) Option {
+	return func(opts *Options) {
+		value := enable
+		opts.workspaceExecSurfaceEnabled = &value
+	}
+}
+
 // WithEnableCodeExecutionResponseProcessor controls whether the agent
-// auto-executes fenced code blocks found in model responses.
+// auto-executes assistant replies that are exactly one runnable fenced
+// code block.
+//
+// This option is independent of WithCodeExecutor: configuring a
+// CodeExecutor only enables execution tools (for example, workspace_exec)
+// and does not by itself cause the agent to execute fenced code from
+// assistant replies. Use this option explicitly when you want to opt
+// into — or out of — the fenced-code auto-execution response processor.
+//
+// Calling this option (with either value) marks the setting as
+// explicit, which prevents the skills auto-fallback from quietly
+// disabling the processor when it injects a local CodeExecutor on
+// behalf of WithSkills.
 func WithEnableCodeExecutionResponseProcessor(enable bool) Option {
 	return func(opts *Options) {
 		opts.EnableCodeExecutionResponseProcessor = enable
+		opts.codeExecutionResponseProcessorExplicit = true
 	}
 }
 
@@ -508,9 +740,33 @@ func WithRefreshToolSetsOnRun(refresh bool) Option {
 // WithSkills enables model-agnostic Agent Skills support using the
 // provided repository. The processor will inject a small overview
 // and on-demand content according to session state.
+//
+// Code executor auto-fallback: when WithSkills is configured without an
+// explicit WithCodeExecutor, the agent will auto-wire a local
+// codeexecutor so that workspace_exec is available and the zero-config
+// upgrade path keeps working. The fallback is skipped when any of the
+// following hold:
+//
+//   - an explicit executor was provided via WithCodeExecutor,
+//   - WithAllowedSkillTools was used to drive fine-grained selection, or
+//   - WithSkillToolProfile(SkillToolProfileKnowledgeOnly) was explicitly
+//     set (the documented opt-out for "no convenience execution").
+//
+// For production, prefer configuring an explicit code executor (for
+// example, a container-backed executor) rather than relying on the
+// local fallback.
 func WithSkills(repo skill.Repository) Option {
 	return func(opts *Options) {
 		opts.skillsRepository = repo
+	}
+}
+
+// WithSkillFilter narrows visible skills per run context without changing the
+// mounted repository roots. The filter is evaluated against skill summaries
+// and can read runtime state from ctx.
+func WithSkillFilter(filter skill.VisibilityFilter) Option {
+	return func(opts *Options) {
+		opts.skillFilter = filter
 	}
 }
 
@@ -518,11 +774,48 @@ func WithSkills(repo skill.Repository) Option {
 // skills are enabled via WithSkills.
 //
 // Supported profiles:
-//   - SkillToolProfileFull (default)
-//   - SkillToolProfileKnowledgeOnly
+//   - SkillToolProfileKnowledgeOnly (default): progressive-disclosure tools
+//     only (skill_load / skill_list_docs / skill_select_docs). Execution is
+//     expected to happen through workspace_exec against the writable skill
+//     working copy materialized under /skills/<name>.
+//   - SkillToolProfileFull: additionally registers skill_run, skill_exec,
+//     and the interactive exec-session helpers. This path predates
+//     workspace_exec-based execution and is kept for backward compatibility;
+//     new code should prefer the default profile.
+//
+// Explicit vs default: not calling WithSkillToolProfile(...) and calling
+// WithSkillToolProfile(SkillToolProfileKnowledgeOnly) register the same
+// built-in skill tool set, but carry different intent around the
+// convenience executor fallback documented on WithSkills:
+//
+//   - Unconfigured (default): if no WithCodeExecutor is supplied,
+//     the framework auto-falls back to a local executor so
+//     workspace_exec is still available out of the box.
+//   - Explicit SkillToolProfileKnowledgeOnly: the framework treats
+//     this as an opt-out and will NOT auto-fall back to a local
+//     executor. Pass this when you intentionally want a
+//     knowledge-only agent, or when you are wiring execution through
+//     your own user-registered tools.
 func WithSkillToolProfile(profile SkillToolProfile) Option {
 	return func(opts *Options) {
 		opts.skillToolProfile = string(profile)
+	}
+}
+
+// WithAllowedSkillTools overrides the profile-derived built-in skill tool set
+// with an explicit allowlist.
+//
+// When not configured, built-in skill tools continue to follow
+// WithSkillToolProfile (default: knowledge_only).
+//
+// When configured with no tools, no built-in skill tools are registered.
+func WithAllowedSkillTools(tools ...SkillTool) Option {
+	return func(opts *Options) {
+		names := make([]string, 0, len(tools))
+		for _, tl := range tools {
+			names = append(names, string(tl))
+		}
+		opts.allowedSkillTools = names
 	}
 }
 
@@ -542,7 +835,8 @@ func WithSkillLoadMode(mode string) Option {
 // WithMaxLoadedSkills caps how many skills remain "loaded" in session
 // state at the same time.
 //
-// When max <= 0, no cap is applied (default behavior).
+// When max <= 0, no cap is applied (default behavior). Recent skill
+// touches are tracked by skill_load / skill_select_docs state updates.
 func WithMaxLoadedSkills(max int) Option {
 	return func(opts *Options) {
 		opts.MaxLoadedSkills = max
@@ -577,7 +871,8 @@ func WithSkipSkillsFallbackOnSessionSummary(
 //
 // Behavior:
 //   - Not configured: use the built-in default guidance.
-//   - Configured with empty string: omit the guidance block.
+//   - Configured with empty string: omit both the tooling/workspace
+//     guidance block and the capability disclosure block.
 //   - Configured with non-empty string: append the provided text.
 func WithSkillsToolingGuidance(
 	guidance string,
@@ -585,6 +880,75 @@ func WithSkillsToolingGuidance(
 	return func(opts *Options) {
 		text := guidance
 		opts.skillsToolingGuidance = &text
+	}
+}
+
+// WithSkillsCapabilityGuidance overrides the capability disclosure block
+// appended to the skills overview.
+//
+// Behavior:
+//   - Not configured: use the built-in default disclosure.
+//   - Configured with empty string: omit the capability block.
+//   - Configured with non-empty string: append the provided text.
+func WithSkillsCapabilityGuidance(
+	guidance string,
+) Option {
+	return func(opts *Options) {
+		text := guidance
+		opts.skillsCapabilityGuidance = &text
+	}
+}
+
+// WithSkillsProtocolGuidance overrides the full skill protocol text
+// appended after the skills overview.
+//
+// Behavior:
+//   - Not configured: use the built-in capability/tooling guidance flow.
+//   - Configured with empty string: omit all built-in skill guidance.
+//   - Configured with non-empty string: append the provided text and skip
+//     the built-in capability/tooling guidance blocks.
+func WithSkillsProtocolGuidance(
+	guidance string,
+) Option {
+	return func(opts *Options) {
+		text := guidance
+		opts.skillsProtocolGuidance = &text
+	}
+}
+
+// WithSkillsDirectoryHints exposes skill directory locators in the skills
+// overview and in loaded skill materialization.
+//
+// Default: false.
+func WithSkillsDirectoryHints(enable bool) Option {
+	return func(opts *Options) {
+		opts.skillsDirectoryHints = enable
+	}
+}
+
+// WithSkillsFilePathHints exposes SKILL.md file locators in the skills
+// overview and in loaded skill materialization.
+//
+// Default: false.
+func WithSkillsFilePathHints(enable bool) Option {
+	return func(opts *Options) {
+		opts.skillsFilePathHints = enable
+	}
+}
+
+// WithSkillLoadToolDescription overrides the skill_load tool
+// description.
+//
+// Behavior:
+//   - Not configured: use the built-in default description.
+//   - Configured with empty string: set an empty description.
+//   - Configured with non-empty string: use the provided text.
+func WithSkillLoadToolDescription(
+	description string,
+) Option {
+	return func(opts *Options) {
+		text := description
+		opts.skillLoadToolDescription = &text
 	}
 }
 
@@ -608,6 +972,16 @@ func WithSkillRunDeniedCommands(cmds ...string) Option {
 	}
 }
 
+// WithSkillRunOutputLimits customizes inline stdout/stderr and
+// primary_output limits for skill_run.
+func WithSkillRunOutputLimits(
+	limits toolskill.RunOutputLimits,
+) Option {
+	return func(opts *Options) {
+		opts.skillRunOutputLimits = limits
+	}
+}
+
 // WithSkillRunForceSaveArtifacts forces skill_run to persist collected
 // outputs via the artifact service when possible.
 func WithSkillRunForceSaveArtifacts(enable bool) Option {
@@ -624,6 +998,44 @@ func WithSkillRunForceSaveArtifacts(enable bool) Option {
 func WithSkillRunRequireSkillLoaded(enable bool) Option {
 	return func(opts *Options) {
 		opts.skillRunRequireSkillLoaded = enable
+	}
+}
+
+// WithSkillRunStager overrides how skill_run materializes skills into
+// the execution workspace.
+func WithSkillRunStager(stager toolskill.SkillStager) Option {
+	return func(opts *Options) {
+		opts.skillRunStager = stager
+	}
+}
+
+// WithWorkspaceBootstrap declares the static files and one-shot
+// commands that must be materialized in every workspace before
+// workspace_exec runs user commands. Files are applied first, then
+// commands execute in declaration order. The spec is converted into
+// reconcile work behind the scenes; idempotency and
+// skip-on-fingerprint-match are handled by the framework.
+//
+// This is currently the only public hook into workspace preparation.
+// The underlying Requirement / Provider / Reconciler abstractions
+// live in an internal package while their semantics are still being
+// refined; if a custom-provider extension point becomes necessary it
+// will be added here.
+func WithWorkspaceBootstrap(
+	spec codeexecutor.WorkspaceBootstrapSpec,
+) Option {
+	return func(opts *Options) {
+		opts.workspaceBootstrap = spec
+	}
+}
+
+// WithWorkspacePreparersDisabled keeps workspace_exec on its legacy
+// "stage conversation files only" path even when a skills repository
+// or a bootstrap spec is configured. Primarily useful for regression
+// tests that assert pre-reconciler behavior.
+func WithWorkspacePreparersDisabled(disabled bool) Option {
+	return func(opts *Options) {
+		opts.disableWorkspacePreparers = disabled
 	}
 }
 
@@ -659,6 +1071,13 @@ func WithModelCallbacks(callbacks *model.Callbacks) Option {
 func WithToolCallbacks(callbacks *tool.Callbacks) Option {
 	return func(opts *Options) {
 		opts.ToolCallbacks = callbacks
+	}
+}
+
+// WithToolCallRetryPolicy sets the retry policy for callable tool calls.
+func WithToolCallRetryPolicy(policy *tool.RetryPolicy) Option {
+	return func(opts *Options) {
+		opts.ToolCallRetryPolicy = policy
 	}
 }
 
@@ -761,7 +1180,11 @@ func WithStructuredOutputJSON(examplePtr any, strict bool, description string) O
 			t = reflect.PointerTo(rt)
 		}
 		// Generate a robust JSON schema via the generator.
-		gen := jsonschema.New()
+		genOpts := make([]jsonschema.Option, 0, 1)
+		if strict {
+			genOpts = append(genOpts, jsonschema.WithStrict())
+		}
+		gen := jsonschema.New(genOpts...)
 		schema := gen.Generate(t.Elem())
 		name := t.Elem().Name()
 		if name == "" {
@@ -820,6 +1243,20 @@ func WithAddSessionSummary(addSummary bool) Option {
 	}
 }
 
+// WithSessionSummaryInjectionMode sets the injection mode for session summaries.
+//
+// Available modes:
+//   - processor.SessionSummaryInjectionSystem (default): injects as system message.
+//   - processor.SessionSummaryInjectionUser: injects as a user message that
+//     participates in token-budget trimming for sliding-window behavior.
+//     If the first history message is also a user message, the summary is
+//     merged into it to avoid consecutive user messages.
+func WithSessionSummaryInjectionMode(mode processor.SessionSummaryInjectionMode) Option {
+	return func(opts *Options) {
+		opts.SessionSummaryInjectionMode = mode
+	}
+}
+
 // WithSyncSummaryIntraRun enables synchronous summary refresh between LLM loop
 // iterations in the same run. When enabled, the summary is updated before each
 // LLM call within a run, ensuring the model sees the most recent summary.
@@ -838,6 +1275,66 @@ func WithMaxHistoryRuns(maxRuns int) Option {
 	}
 }
 
+// WithEnableContextCompaction enables prompt-side context compaction.
+// Historical oversized tool results can be compacted during request
+// projection even when AddSessionSummary is false. When AddSessionSummary is
+// also true, the framework may additionally trigger a one-time synchronous
+// summary refresh before the LLM call.
+func WithEnableContextCompaction(enable bool) Option {
+	return func(opts *Options) {
+		opts.EnableContextCompaction = enable
+	}
+}
+
+// WithContextCompactionThresholdRatio sets the fraction of the model context
+// window at which pre-LLM synchronous summary retry triggers. This retry is
+// only available when AddSessionSummary is enabled.
+func WithContextCompactionThresholdRatio(ratio float64) Option {
+	return func(opts *Options) {
+		if ratio > 0 && ratio <= 1 {
+			opts.ContextCompactionThresholdRatio = ratio
+		}
+	}
+}
+
+// WithContextCompactionToolResultMaxTokens sets the token threshold above
+// which
+// historical tool results are replaced with a placeholder.
+func WithContextCompactionToolResultMaxTokens(tokens int) Option {
+	return func(opts *Options) {
+		if tokens >= 0 {
+			opts.ContextCompactionToolResultMaxTokens = tokens
+		}
+	}
+}
+
+// WithContextCompactionKeepRecentRequests preserves the latest N completed
+// requests in full when request-side context compaction is enabled.
+func WithContextCompactionKeepRecentRequests(n int) Option {
+	return func(opts *Options) {
+		if n >= 0 {
+			opts.ContextCompactionKeepRecentRequests = n
+		}
+	}
+}
+
+// WithContextCompactionOversizedToolResultMaxTokens sets the token threshold
+// above which any tool result (including from the current request) is truncated
+// using head+tail preservation. Like Pass 1, this requires
+// WithEnableContextCompaction(true) to take effect; the framework will not
+// modify tool results when context compaction is disabled, even if a positive
+// threshold is configured here. 0 disables it regardless of
+// EnableContextCompaction. The default is 0; the recommended value to pass
+// when opting in is processor.DefaultContextCompactionOversizedToolResultMaxTokens
+// (8192).
+func WithContextCompactionOversizedToolResultMaxTokens(tokens int) Option {
+	return func(opts *Options) {
+		if tokens >= 0 {
+			opts.ContextCompactionOversizedToolResultMaxTokens = tokens
+		}
+	}
+}
+
 // WithPreserveSameBranch controls whether messages from the same invocation
 // branch lineage (ancestor/descendant) should preserve their original roles
 // instead of being rewritten into user context when used as history.
@@ -845,6 +1342,33 @@ func WithMaxHistoryRuns(maxRuns int) Option {
 func WithPreserveSameBranch(preserve bool) Option {
 	return func(opts *Options) {
 		opts.PreserveSameBranch = preserve
+	}
+}
+
+// WithPreserveForeignMessages controls whether messages authored by other
+// agents should preserve their original assistant/tool roles and order instead
+// of being rewritten into user context when used as history. Default is false.
+func WithPreserveForeignMessages(preserve bool) Option {
+	return func(opts *Options) {
+		opts.PreserveForeignMessages = preserve
+	}
+}
+
+// WithEventMessageProjector rewrites one event-derived message before
+// it is appended to the model request.
+func WithEventMessageProjector(
+	projector EventMessageProjector,
+) Option {
+	return func(opts *Options) {
+		opts.EventMessageProjector = projector
+	}
+}
+
+// WithAwaitUserReplyTool controls whether the await_user_reply framework tool
+// is exposed to the model.
+func WithAwaitUserReplyTool(enabled bool) Option {
+	return func(opts *Options) {
+		opts.EnableAwaitUserReplyTool = enabled
 	}
 }
 
@@ -967,6 +1491,40 @@ func WithMessageFilterMode(mode MessageFilterMode) Option {
 func WithPreloadMemory(limit int) Option {
 	return func(opts *Options) {
 		opts.PreloadMemory = limit
+	}
+}
+
+// WithPreloadSessionRecall sets the number of recalled
+// session events to preload into the system prompt.
+func WithPreloadSessionRecall(limit int) Option {
+	return func(opts *Options) {
+		opts.PreloadSessionRecall = limit
+	}
+}
+
+// WithPreloadSessionRecallMinScore sets the minimum
+// search score required for preloaded session recall.
+func WithPreloadSessionRecallMinScore(minScore float64) Option {
+	return func(opts *Options) {
+		opts.PreloadSessionRecallMinScore = minScore
+	}
+}
+
+// WithPreloadSessionRecallSearchMode sets the retrieval
+// mode used for query-time session recall preload.
+// Default is session.SearchModeHybrid.
+func WithPreloadSessionRecallSearchMode(
+	mode session.SearchMode,
+) Option {
+	return func(opts *Options) {
+		switch mode {
+		case "", session.SearchModeHybrid:
+			opts.PreloadSessionRecallSearchMode = session.SearchModeHybrid
+		case session.SearchModeDense:
+			opts.PreloadSessionRecallSearchMode = session.SearchModeDense
+		default:
+			opts.PreloadSessionRecallSearchMode = session.SearchModeHybrid
+		}
 	}
 }
 

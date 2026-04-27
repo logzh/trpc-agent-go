@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -265,6 +266,39 @@ func TestBuildRequestProcessors_AddSessionSummaryWiring(t *testing.T) {
 	require.False(t, crp.AddSessionSummary)
 }
 
+// Test that buildRequestProcessors wires SessionSummaryInjectionMode into
+// ContentRequestProcessor correctly.
+func TestBuildRequestProcessors_SessionSummaryInjectionModeWiring(t *testing.T) {
+	// user mode
+	optsUser := &Options{}
+	WithAddSessionSummary(true)(optsUser)
+	WithSessionSummaryInjectionMode(SessionSummaryInjectionUser)(optsUser)
+	procs := buildRequestProcessors("test-agent", optsUser)
+	var crp *processor.ContentRequestProcessor
+	for _, p := range procs {
+		if v, ok := p.(*processor.ContentRequestProcessor); ok {
+			crp = v
+		}
+	}
+	require.NotNil(t, crp)
+	require.True(t, crp.AddSessionSummary)
+	require.Equal(t, processor.SessionSummaryInjectionUser, crp.SessionSummaryInjectionMode)
+
+	// default (system) mode
+	optsSystem := &Options{}
+	WithAddSessionSummary(true)(optsSystem)
+	procs = buildRequestProcessors("test-agent", optsSystem)
+	crp = nil
+	for _, p := range procs {
+		if v, ok := p.(*processor.ContentRequestProcessor); ok {
+			crp = v
+		}
+	}
+	require.NotNil(t, crp)
+	require.True(t, crp.AddSessionSummary)
+	require.Equal(t, processor.SessionSummaryInjectionSystem, crp.SessionSummaryInjectionMode)
+}
+
 // Test that buildRequestProcessors wires MaxHistoryRuns into
 // ContentRequestProcessor correctly.
 func TestBuildRequestProcessors_MaxHistoryRunsWiring(t *testing.T) {
@@ -295,6 +329,25 @@ func TestBuildRequestProcessors_MaxHistoryRunsWiring(t *testing.T) {
 	require.Equal(t, 0, crp.MaxHistoryRuns)
 }
 
+func TestBuildRequestProcessors_ContextCompactionWiring(t *testing.T) {
+	opts := &Options{}
+	WithEnableContextCompaction(true)(opts)
+	WithContextCompactionKeepRecentRequests(2)(opts)
+	WithContextCompactionToolResultMaxTokens(2048)(opts)
+
+	procs := buildRequestProcessors("test-agent", opts)
+	var crp *processor.ContentRequestProcessor
+	for _, p := range procs {
+		if v, ok := p.(*processor.ContentRequestProcessor); ok {
+			crp = v
+		}
+	}
+	require.NotNil(t, crp)
+	require.True(t, crp.ContextCompactionConfig.Enabled)
+	require.Equal(t, 2, crp.ContextCompactionConfig.KeepRecentRequests)
+	require.Equal(t, 2048, crp.ContextCompactionConfig.ToolResultMaxTokens)
+}
+
 // Test that buildRequestProcessors wires PreserveSameBranch into
 // ContentRequestProcessor correctly.
 func TestBuildRequestProcessors_PreserveSameBranchWiring(t *testing.T) {
@@ -323,6 +376,88 @@ func TestBuildRequestProcessors_PreserveSameBranchWiring(t *testing.T) {
 	}
 	require.NotNil(t, crp)
 	require.False(t, crp.PreserveSameBranch)
+}
+
+func TestBuildRequestProcessors_PreserveForeignMessagesWiring(t *testing.T) {
+	optsTrue := &Options{}
+	WithPreserveForeignMessages(true)(optsTrue)
+	procs := buildRequestProcessors("tester", optsTrue)
+	var crp *processor.ContentRequestProcessor
+	for _, p := range procs {
+		if v, ok := p.(*processor.ContentRequestProcessor); ok {
+			crp = v
+		}
+	}
+	require.NotNil(t, crp)
+	require.True(t, crp.PreserveForeignMessages)
+
+	optsFalse := &Options{}
+	WithPreserveForeignMessages(false)(optsFalse)
+	procs = buildRequestProcessors("tester", optsFalse)
+	crp = nil
+	for _, p := range procs {
+		if v, ok := p.(*processor.ContentRequestProcessor); ok {
+			crp = v
+		}
+	}
+	require.NotNil(t, crp)
+	require.False(t, crp.PreserveForeignMessages)
+}
+
+func TestBuildRequestProcessors_PreloadSessionRecallWiring(t *testing.T) {
+	opts := &Options{}
+	WithPreloadSessionRecall(4)(opts)
+	WithPreloadSessionRecallMinScore(0.6)(opts)
+	WithPreloadSessionRecallSearchMode(session.SearchModeDense)(opts)
+
+	procs := buildRequestProcessors("tester", opts)
+	var crp *processor.ContentRequestProcessor
+	for _, p := range procs {
+		if v, ok := p.(*processor.ContentRequestProcessor); ok {
+			crp = v
+		}
+	}
+	require.NotNil(t, crp)
+	require.Equal(t, 4, crp.PreloadSessionRecall)
+	require.Equal(t, 0.6, crp.PreloadSessionRecallMinScore)
+	require.Equal(
+		t,
+		session.SearchModeDense,
+		crp.PreloadSessionRecallSearchMode,
+	)
+}
+
+func TestBuildRequestProcessors_EventMessageProjectorWiring(
+	t *testing.T,
+) {
+	projector := func(
+		_ *agent.Invocation,
+		_ event.Event,
+		msg model.Message,
+	) model.Message {
+		msg.Content = "projected"
+		return msg
+	}
+
+	opts := &Options{}
+	WithEventMessageProjector(projector)(opts)
+	procs := buildRequestProcessors("tester", opts)
+	var crp *processor.ContentRequestProcessor
+	for _, p := range procs {
+		if v, ok := p.(*processor.ContentRequestProcessor); ok {
+			crp = v
+		}
+	}
+
+	require.NotNil(t, crp)
+	require.NotNil(t, crp.EventMessageProjector)
+
+	got := crp.EventMessageProjector(
+		nil,
+		event.Event{},
+		model.NewUserMessage("hello"),
+	)
+	require.Equal(t, "projected", got.Content)
 }
 
 func TestBuildRequestProcessors_PostToolPromptInjection(t *testing.T) {
@@ -844,6 +979,18 @@ func TestLLMAgent_New_WithOutputSchema_InvalidCombos(t *testing.T) {
 			},
 		)
 	})
+
+	t.Run("with await_user_reply", func(t *testing.T) {
+		require.PanicsWithValue(t,
+			invalidOutputSchemaAwaitUserReply,
+			func() {
+				_ = New("test",
+					WithOutputSchema(schema),
+					WithAwaitUserReplyTool(true),
+				)
+			},
+		)
+	})
 }
 
 func TestLLMAgent_New_WithStructuredOutputJSONSchema_AllowsTools(t *testing.T) {
@@ -861,6 +1008,43 @@ func TestLLMAgent_New_WithStructuredOutputJSONSchema_AllowsTools(t *testing.T) {
 			WithToolSets([]tool.ToolSet{toolset}),
 		)
 	})
+}
+
+func TestLLMAgent_OutputSchemaOnly_InjectsJSONInstructions(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"status": map[string]any{"type": "string"},
+		},
+	}
+	agt := New(
+		"test-agent",
+		WithOutputSchema(schema),
+	)
+
+	reqProcs := buildRequestProcessorsWithAgent(agt, &agt.option)
+	var instrProc *processor.InstructionRequestProcessor
+	for _, rp := range reqProcs {
+		if p, ok := rp.(*processor.InstructionRequestProcessor); ok {
+			instrProc = p
+			break
+		}
+	}
+	require.NotNil(t, instrProc)
+
+	inv := &agent.Invocation{InvocationID: testModelPromptInvocationID}
+	agt.setupInvocation(inv)
+
+	req := &model.Request{
+		Messages: []model.Message{model.NewUserMessage("hi")},
+	}
+	eventCh := make(chan *event.Event, 10)
+	instrProc.ProcessRequest(context.Background(), inv, req, eventCh)
+
+	require.NotEmpty(t, req.Messages)
+	require.Equal(t, model.RoleSystem, req.Messages[0].Role)
+	require.Contains(t, req.Messages[0].Content, "IMPORTANT: Return ONLY a JSON object")
+	require.Contains(t, req.Messages[0].Content, `"status"`)
 }
 
 // TestLLMAgent_InvocationContextAccess verifies that LLMAgent can access invocation
@@ -1021,11 +1205,12 @@ func TestLLMAgent_EnableCodeExecutionResponseProcessor(t *testing.T) {
 		}
 	}
 
-	newInvocation := func() *agent.Invocation {
+	newInvocation := func(opts ...agent.RunOption) *agent.Invocation {
 		return &agent.Invocation{
 			Message:      model.NewUserMessage("hi"),
 			InvocationID: "test-invocation",
 			Session:      &session.Session{ID: "test-session"},
+			RunOptions:   agent.NewRunOptions(opts...),
 		}
 	}
 
@@ -1069,6 +1254,63 @@ func TestLLMAgent_EnableCodeExecutionResponseProcessor(t *testing.T) {
 
 		require.Equal(t, 0, exec.CallCount())
 		require.Equal(t, codeBlock, gotContent)
+	})
+
+	t.Run("run_override_takes_precedence", func(t *testing.T) {
+		staticExec := &countingCodeExecutor{}
+		overrideExec := &countingCodeExecutor{}
+		agt := New(
+			"test",
+			WithModel(newMockModel()),
+			WithCodeExecutor(staticExec),
+		)
+
+		events, err := agt.Run(
+			context.Background(),
+			newInvocation(agent.WithCodeExecutor(overrideExec)),
+		)
+		require.NoError(t, err)
+		for range events {
+		}
+
+		require.Equal(t, 0, staticExec.CallCount())
+		require.Equal(t, 1, overrideExec.CallCount())
+	})
+
+	t.Run("non_executable_markdown_block", func(t *testing.T) {
+		exec := &countingCodeExecutor{}
+		agt := New(
+			"test",
+			WithModel(&mockModelWithResponse{
+				response: &model.Response{
+					Choices: []model.Choice{{
+						Message: model.Message{
+							Role: model.RoleAssistant,
+							Content: "```markdown\n" +
+								"# hello\n```",
+						},
+					}},
+					Done: true,
+				},
+			}),
+			WithCodeExecutor(exec),
+		)
+
+		events, err := agt.Run(context.Background(), newInvocation())
+		require.NoError(t, err)
+
+		gotContent := ""
+		for ev := range events {
+			if ev == nil || ev.Response == nil {
+				continue
+			}
+			if ev.IsFinalResponse() && len(ev.Choices) > 0 {
+				gotContent = ev.Choices[0].Message.Content
+			}
+		}
+
+		require.Equal(t, 0, exec.CallCount())
+		require.Equal(t, "```markdown\n# hello\n```", gotContent)
 	})
 }
 
@@ -1117,6 +1359,33 @@ func TestLLMAgent_OptionsWithStructuredOutputJSON(t *testing.T) {
 	require.Equal(t, "test description", opts.StructuredOutput.JSONSchema.Description)
 }
 
+func TestLLMAgent_OptionsWithStructuredOutputJSON_StrictFlagControlsGeneratedSchema(t *testing.T) {
+	type MyStruct struct {
+		Field    string   `json:"field"`
+		Optional []string `json:"optional"`
+	}
+
+	strictOpts := &Options{}
+	WithStructuredOutputJSON(new(MyStruct), true, "strict")(strictOpts)
+	require.NotNil(t, strictOpts.StructuredOutput)
+	strictSchema := strictOpts.StructuredOutput.JSONSchema.Schema
+	strictRequired := strictSchema["required"].([]string)
+	require.Len(t, strictRequired, 2)
+	strictProps := strictSchema["properties"].(map[string]any)
+	_, hasAnyOf := strictProps["optional"].(map[string]any)["anyOf"]
+	require.True(t, hasAnyOf)
+
+	nonStrictOpts := &Options{}
+	WithStructuredOutputJSON(new(MyStruct), false, "non-strict")(nonStrictOpts)
+	require.NotNil(t, nonStrictOpts.StructuredOutput)
+	nonStrictSchema := nonStrictOpts.StructuredOutput.JSONSchema.Schema
+	nonStrictRequired := nonStrictSchema["required"].([]string)
+	require.Equal(t, []string{"field"}, nonStrictRequired)
+	nonStrictProps := nonStrictSchema["properties"].(map[string]any)
+	_, hasAnyOf = nonStrictProps["optional"].(map[string]any)["anyOf"]
+	require.False(t, hasAnyOf)
+}
+
 func TestLLMAgent_OptionsWithStructuredOutputJSONSchema(t *testing.T) {
 	schema := map[string]any{"type": "object"}
 	opts := &Options{}
@@ -1127,6 +1396,73 @@ func TestLLMAgent_OptionsWithStructuredOutputJSONSchema(t *testing.T) {
 	require.Equal(t, "output", opts.StructuredOutput.JSONSchema.Name)
 	require.True(t, opts.StructuredOutput.JSONSchema.Strict)
 	require.Equal(t, "test description", opts.StructuredOutput.JSONSchema.Description)
+}
+
+func TestLLMAgent_SetupInvocation_UsesRunStructuredOutputOverride(t *testing.T) {
+	type agentOutput struct {
+		AgentField string `json:"agent_field"`
+	}
+	type runOutput struct {
+		RunField string `json:"run_field"`
+	}
+
+	agt := New(
+		"test-agent",
+		WithStructuredOutputJSON(new(agentOutput), true, "agent description"),
+	)
+	inv := &agent.Invocation{}
+	agent.WithStructuredOutputJSON(new(runOutput), true, "run description")(&inv.RunOptions)
+
+	agt.setupInvocation(inv)
+
+	require.NotNil(t, inv.StructuredOutput)
+	require.NotNil(t, inv.StructuredOutput.JSONSchema)
+	require.Equal(t, "runOutput", inv.StructuredOutput.JSONSchema.Name)
+	require.Equal(t, "run description", inv.StructuredOutput.JSONSchema.Description)
+	require.Equal(t, reflect.TypeOf((*runOutput)(nil)), inv.StructuredOutputType)
+	require.NotNil(t, inv.RunOptions.StructuredOutput)
+	require.NotNil(t, inv.RunOptions.StructuredOutput.JSONSchema)
+	require.Equal(t, "runOutput", inv.RunOptions.StructuredOutput.JSONSchema.Name)
+	require.Equal(t, reflect.TypeOf((*runOutput)(nil)), inv.RunOptions.StructuredOutputType)
+}
+
+func TestLLMAgent_Run_UsesRunStructuredOutputWithoutStaticOutputProcessor(t *testing.T) {
+	type runOutput struct {
+		RunField string `json:"run_field"`
+	}
+
+	agt := New(
+		"test-agent",
+		WithModel(&mockModelWithResponse{
+			response: &model.Response{
+				Choices: []model.Choice{{
+					Message: model.NewAssistantMessage(`{"run_field":"ok"}`),
+				}},
+				Done: true,
+			},
+		}),
+	)
+	inv := &agent.Invocation{
+		Message:      model.NewUserMessage("hi"),
+		InvocationID: "test-invocation",
+		Session:      &session.Session{ID: "test-session"},
+	}
+	agent.WithStructuredOutputJSON(new(runOutput), true, "run description")(&inv.RunOptions)
+
+	eventCh, err := agt.Run(context.Background(), inv)
+	require.NoError(t, err)
+
+	var structured any
+	for evt := range eventCh {
+		if evt != nil && evt.StructuredOutput != nil {
+			structured = evt.StructuredOutput
+		}
+	}
+
+	require.NotNil(t, structured)
+	result, ok := structured.(*runOutput)
+	require.True(t, ok)
+	require.Equal(t, "ok", result.RunField)
 }
 
 // TestLLMAgent_OptionsWithAddCurrentTime tests WithAddCurrentTime option.
@@ -1202,6 +1538,20 @@ func TestLLMAgent_SetGlobalInstruction(t *testing.T) {
 	require.Equal(t, "initial global", agt.getSystemPrompt())
 
 	agt.SetGlobalInstruction("updated global")
+	require.Equal(t, "updated global", agt.getSystemPrompt())
+}
+
+func TestLLMAgent_SetPrompts(t *testing.T) {
+	agt := New(
+		"test",
+		WithInstruction("initial instruction"),
+		WithGlobalInstruction("initial global"),
+	)
+	require.Equal(t, "initial instruction", agt.getInstruction())
+	require.Equal(t, "initial global", agt.getSystemPrompt())
+
+	agt.SetPrompts("updated instruction", "updated global")
+	require.Equal(t, "updated instruction", agt.getInstruction())
 	require.Equal(t, "updated global", agt.getSystemPrompt())
 }
 

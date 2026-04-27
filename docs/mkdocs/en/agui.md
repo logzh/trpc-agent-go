@@ -205,11 +205,12 @@ To enable message snapshots, configure the following options:
 
 - `agui.WithMessagesSnapshotEnabled(true)` enables message snapshots;
 - `agui.WithMessagesSnapshotPath` sets the custom message snapshot route, defaulting to `/history`;
-- `agui.WithAppName(name)` specifies the application name;
+- `agui.WithAppName(name)` specifies the application name as the default `AppName`;
+- `agui.WithAppNameResolver(resolver)` is optional and overrides `AppName` per request;
 - `agui.WithSessionService(service)` injects the `session.Service` used to look up historical events;
 - `aguirunner.WithUserIDResolver(resolver)` customises how `userID` is resolved, defaulting to `"user"`.
 
-When handling a message snapshot request, the framework extracts `threadId` as the `SessionID` from the AG-UI request body `RunAgentInput`, resolves `userID` using the custom `UserIDResolver`, builds `session.Key` with `appName`, reads the persisted events from session storage, reconstructs the message list required by `MessagesSnapshot`, wraps it into a `MESSAGES_SNAPSHOT` event, and sends matching `RUN_STARTED` and `RUN_FINISHED` events.
+When handling a message snapshot request, the framework extracts `threadId` as the `SessionID` from the AG-UI request body `RunAgentInput`, resolves `userID` using the custom `UserIDResolver`, prefers the `appName` returned by `AppNameResolver`, and falls back to `agui.WithAppName(name)` when the resolver returns an empty value. These values are used to build `session.Key`, read the persisted events from session storage, reconstruct the message list required by `MessagesSnapshot`, wrap it into a `MESSAGES_SNAPSHOT` event, and send matching `RUN_STARTED` and `RUN_FINISHED` events.
 
 Example:
 
@@ -387,6 +388,94 @@ For example, when using React Planner, if you want to apply different custom eve
 
 You can find the complete code example in [examples/agui/server/react](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/agui/server/react).
 
+### Expose source metadata for frontend grouping
+
+When you enable inner Agent streaming, the frontend often needs to know
+which translated AG-UI event came from which sub-agent so it can group tool
+calls, tool results, and text output together.
+
+Use `agui.WithEventSourceMetadataEnabled(true)` to attach compact source
+metadata from the original `trpc-agent-go` event into the translated AG-UI
+event's `rawEvent` field:
+
+```go
+server, err := agui.New(
+    runner,
+    agui.WithEventSourceMetadataEnabled(true),
+)
+```
+
+The same switch is also available at lower layers if you build the stack
+manually:
+
+- `aguirunner.WithEventSourceMetadataEnabled(true)`
+- `translator.WithEventSourceMetadataEnabled(true)`
+
+After enabling it, translated AG-UI events such as `TOOL_CALL_START`,
+`TOOL_CALL_ARGS`, `TOOL_CALL_END`, `TOOL_CALL_RESULT`, text events, and
+activity events will carry a `rawEvent` object similar to:
+
+```json
+{
+  "rawEvent": {
+    "eventId": "evt-tool-call",
+    "author": "member-a",
+    "invocationId": "inv-1",
+    "parentInvocationId": "parent-1",
+    "branch": "root.member-a"
+  }
+}
+```
+
+`rawEvent` is optional. It only appears on AG-UI events produced by the
+AG-UI translator or the AG-UI messages snapshot builder, and it is omitted
+when the framework has no non-empty source metadata to expose.
+
+On the `/history` route, the `MESSAGES_SNAPSHOT` event uses `rawEvent` as a
+source index instead of a single-event payload:
+
+```json
+{
+  "rawEvent": {
+    "messages": {
+      "assistant-1": {
+        "eventId": "evt-assistant",
+        "author": "member-a",
+        "invocationId": "inv-1",
+        "branch": "root.member-a"
+      }
+    },
+    "toolCalls": {
+      "tool-call-1": {
+        "eventId": "evt-tool-call",
+        "author": "member-a",
+        "invocationId": "inv-1",
+        "branch": "root.member-a"
+      }
+    }
+  }
+}
+```
+
+Recommended frontend usage:
+
+- Group by `rawEvent.author` when you want a stable "which agent emitted
+  this" label.
+- Group by `rawEvent.branch` when you want one concrete sub-agent execution
+  block per run, even if the same agent name appears multiple times.
+- Keep `rawEvent.invocationId` if you need a unique execution key but do not
+  want to expose the full branch string in UI state.
+- When restoring history from `MESSAGES_SNAPSHOT`, read
+  `rawEvent.toolCalls[toolCallId]` or `rawEvent.messages[messageId]` to
+  rebuild the same grouping state before the live stream resumes.
+
+Compatibility notes:
+
+- The option is disabled by default.
+- Enabling it is additive only: it does not change event ordering, message
+  IDs, tool call IDs, or existing payload fields.
+- Existing clients that ignore `rawEvent` continue to work unchanged.
+
 ### Thinking content
 
 AG-UI uses `REASONING_*` events to carry model thinking content, making it easier for the frontend to display the thinking process before the final answer. For more details, see the official AG-UI docs: [Reasoning](https://docs.ag-ui.com/concepts/reasoning). A typical event sequence is as follows:
@@ -433,6 +522,43 @@ resolver := func(ctx context.Context, input *adapter.RunAgentInput) (string, err
 
 runner := runner.NewRunner(agent.Info().Name, agent)
 server, _ := agui.New(runner, agui.WithAGUIRunnerOptions(aguirunner.WithUserIDResolver(resolver)))
+```
+
+### Custom `AppNameResolver`
+
+By default, AG-UI uses `agui.WithAppName(name)` as the static `AppName` and combines it with `userID` and `threadId` to form the `SessionKey`.
+
+If you need to switch `AppName` per request, implement `AppNameResolver` and inject it with `agui.WithAppNameResolver`. When `AppNameResolver` returns a non-empty string, it overrides `AppName` for that request. When it returns an empty string, the framework falls back to `agui.WithAppName(name)`.
+
+The real-time conversation route, cancel route, and message snapshot route all share the same `AppName` resolution logic. Requests to `/agui`, `/cancel`, and `/history` for the same session should therefore carry the same business identifier.
+
+When message snapshots are enabled, you still need to configure `agui.WithAppName(name)` at startup as the default value. `AppNameResolver` only provides request-level overrides.
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/runner"
+    "trpc.group/trpc-go/trpc-agent-go/server/agui"
+    "trpc.group/trpc-go/trpc-agent-go/server/agui/adapter"
+)
+
+resolver := func(ctx context.Context, input *adapter.RunAgentInput) (string, error) {
+    forwardedProps, ok := input.ForwardedProps.(map[string]any)
+    if !ok || forwardedProps == nil {
+        return "", nil
+    }
+    appName, ok := forwardedProps["appName"].(string)
+    if !ok || appName == "" {
+        return "", nil
+    }
+    return appName, nil
+}
+
+runner := runner.NewRunner(agent.Info().Name, agent)
+server, _ := agui.New(
+    runner,
+    agui.WithAppName("default-app"),
+    agui.WithAppNameResolver(resolver),
+)
 ```
 
 ### Custom `RunOptionResolver`
@@ -1055,3 +1181,105 @@ The effect is shown below. For a full example, refer to
 [examples/agui/server/report](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/agui/server/report). The corresponding client implementation lives in [examples/agui/client/tdesign-chat](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/agui/client/tdesign-chat).
 
 ![report](../assets/gif/agui/report.gif)
+
+### Streaming Tool Execution Results
+
+In the underlying runner event stream, a `StreamableTool` usually emits several partial `tool.response` events and then a final non-partial `tool.response` when the tool finishes. If the tool stream explicitly returns `tool.FinalResultChunk` or `tool.FinalResultStateChunk`, the runner uses it as the final result directly. Otherwise, the runner keeps merging the previous chunks using the existing merge rules. When the following option is enabled, the frontend receives activity events during tool execution and one final `TOOL_CALL_RESULT` when the tool finishes:
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/server/agui"
+
+server, err := agui.New(
+    runner,
+    agui.WithStreamingToolResultActivityEnabled(true),
+)
+```
+
+This option is disabled by default. When it is not enabled, the realtime event stream for a single tool call usually looks like this:
+
+```text
+RUN_STARTED
+→ TOOL_CALL_START
+→ TOOL_CALL_ARGS
+→ TOOL_CALL_END
+→ TOOL_CALL_RESULT
+→ TOOL_CALL_RESULT
+→ TOOL_CALL_RESULT
+→ ...
+→ TEXT_MESSAGE_*
+→ RUN_FINISHED
+```
+
+In other words, partial `tool.response` events emitted during execution and the final `tool.response` emitted at the end are all still translated into `TOOL_CALL_RESULT` events.
+
+When enabled, the realtime event stream for a single tool call usually looks like this:
+
+```text
+RUN_STARTED
+→ TOOL_CALL_START
+→ TOOL_CALL_ARGS
+→ TOOL_CALL_END
+→ ACTIVITY_SNAPSHOT
+→ ACTIVITY_DELTA
+→ ACTIVITY_DELTA
+→ ...
+→ TOOL_CALL_RESULT
+→ TEXT_MESSAGE_*
+→ RUN_FINISHED
+```
+
+- The first non-empty partial tool result chunk is translated into `ACTIVITY_SNAPSHOT`.
+- Later non-empty partial chunks are translated into `ACTIVITY_DELTA`.
+- These activity events always use the `activityType` `tool.result.stream`.
+- Activity events from the same tool call reuse one synthetic `messageId`, so the frontend can treat them as one activity stream and keep updating the same card.
+- When the tool actually finishes, AG-UI still sends exactly one final `TOOL_CALL_RESULT`.
+
+The built-in `tool.result.stream` activity always uses this state shape:
+
+```json
+{
+  "toolCallId": "call_xxx",
+  "content": "Counted 1 of 3.\n"
+}
+```
+
+The corresponding events usually look like this:
+
+```json
+{
+  "type": "ACTIVITY_SNAPSHOT",
+  "messageId": "tool-result-activity-call_xxx",
+  "activityType": "tool.result.stream",
+  "content": {
+    "toolCallId": "call_xxx",
+    "content": "Counted 1 of 3.\n"
+  }
+}
+```
+
+```json
+{
+  "type": "ACTIVITY_DELTA",
+  "messageId": "tool-result-activity-call_xxx",
+  "activityType": "tool.result.stream",
+  "patch": [
+    {
+      "op": "add",
+      "path": "/content",
+      "value": "Counted 1 of 3.\nCounted 2 of 3.\n"
+    }
+  ]
+}
+```
+
+For the built-in `tool.result.stream` activity, the `patch.path` in `ACTIVITY_DELTA` is fixed to `/content`, which means the patch updates the `content` field inside that activity state.
+
+The `content` carried by each activity event is not the raw single chunk. It is the full accumulated process content built by appending non-empty partial `Content` values in the order they arrive on the server. The frontend can therefore render the latest activity state directly without concatenating strings on its own. The content of the final `TOOL_CALL_RESULT` still follows the runner's original behavior:
+- If the tool stream does not contain an explicit final-result chunk, the final `TOOL_CALL_RESULT` uses the merged result produced from the previous chunks.
+- If the tool stream explicitly returns `tool.FinalResultChunk` or `tool.FinalResultStateChunk`, the final `TOOL_CALL_RESULT` uses that explicit final result directly.
+- In the explicit final-result case, earlier process chunks are not automatically merged into the final `TOOL_CALL_RESULT`.
+
+On the message snapshot route, activity events rewritten from partial tool results are not written into the `SessionService` track. As a result:
+- The `MESSAGES_SNAPSHOT` returned by the message snapshot route does not contain these process activity events.
+- Each tool call keeps only one final `tool` message in the snapshot message list.
+- The content of that final `tool` message is the same as the final `TOOL_CALL_RESULT` seen on the realtime route.

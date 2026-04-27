@@ -28,6 +28,7 @@ import (
 	"trpc.group/trpc-go/trpc-a2a-go/taskmanager"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/graph"
 	ia2a "trpc.group/trpc-go/trpc-agent-go/internal/a2a"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
@@ -41,6 +42,7 @@ type mockAgent struct {
 	description string
 	tools       []tool.Tool
 	subAgents   []agent.Agent
+	runFunc     func(ctx context.Context, invocation *agent.Invocation) (<-chan *event.Event, error)
 }
 
 func (m *mockAgent) Info() agent.Info {
@@ -55,6 +57,9 @@ func (m *mockAgent) Tools() []tool.Tool {
 }
 
 func (m *mockAgent) Run(ctx context.Context, invocation *agent.Invocation) (<-chan *event.Event, error) {
+	if m.runFunc != nil {
+		return m.runFunc(ctx, invocation)
+	}
 	ch := make(chan *event.Event, 1)
 	ch <- &event.Event{
 		Response: &model.Response{
@@ -755,6 +760,173 @@ func TestMessageProcessor_HandleError(t *testing.T) {
 	}
 }
 
+func TestMessageProcessor_HandleError_ResponseRewriter(t *testing.T) {
+	proc := &messageProcessor{
+		responseRewriter: ResponseRewriterFuncs{
+			Unary: func(ctx context.Context, result protocol.UnaryMessageResult) protocol.UnaryMessageResult {
+				msg, ok := result.(*protocol.Message)
+				if !ok {
+					return result
+				}
+				delete(msg.Metadata, "debug_trace")
+				return msg
+			},
+		},
+		errorHandler: func(ctx context.Context, msg *protocol.Message, err error) (*protocol.Message, error) {
+			result := protocol.NewMessage(protocol.MessageRoleAgent, []protocol.Part{protocol.NewTextPart("err")})
+			result.Metadata = map[string]any{
+				"debug_trace":   "drop-me",
+				"business_code": "keep-me",
+			}
+			return &result, nil
+		},
+	}
+
+	result, err := proc.handleError(context.Background(), &protocol.Message{MessageID: "err"}, false, errors.New("boom"))
+	assert.NoError(t, err)
+	msg, ok := result.Result.(*protocol.Message)
+	if !assert.True(t, ok, "expected *protocol.Message, got %T", result.Result) {
+		return
+	}
+	assert.Equal(t, "keep-me", msg.Metadata["business_code"])
+	assert.NotContains(t, msg.Metadata, "debug_trace")
+}
+
+func TestMessageProcessor_HandleError_ResponseRewriter_DropUnaryResult(t *testing.T) {
+	proc := &messageProcessor{
+		responseRewriter: ResponseRewriterFuncs{
+			Unary: func(ctx context.Context, result protocol.UnaryMessageResult) protocol.UnaryMessageResult {
+				return nil
+			},
+		},
+		errorHandler: func(ctx context.Context, msg *protocol.Message, err error) (*protocol.Message, error) {
+			result := protocol.NewMessage(protocol.MessageRoleAgent, []protocol.Part{protocol.NewTextPart("err")})
+			return &result, nil
+		},
+	}
+
+	result, err := proc.handleError(context.Background(), &protocol.Message{MessageID: "err"}, false, errors.New("boom"))
+	assert.NoError(t, err)
+	if assert.NotNil(t, result) {
+		assert.Nil(t, result.Result)
+		assert.Nil(t, result.StreamingEvents)
+	}
+}
+
+func TestMessageProcessor_HandleStreamingProcessingError_ResponseRewriter(t *testing.T) {
+	proc := &messageProcessor{
+		responseRewriter: ResponseRewriterFuncs{
+			Streaming: func(ctx context.Context, result protocol.StreamingMessageResult) protocol.StreamingMessageResult {
+				msg, ok := result.(*protocol.Message)
+				if !ok {
+					return result
+				}
+				delete(msg.Metadata, "debug_trace")
+				return msg
+			},
+		},
+		errorHandler: func(ctx context.Context, msg *protocol.Message, err error) (*protocol.Message, error) {
+			result := protocol.NewMessage(protocol.MessageRoleAgent, []protocol.Part{protocol.NewTextPart("err")})
+			result.Metadata = map[string]any{
+				"debug_trace":   "drop-me",
+				"business_code": "keep-me",
+			}
+			return &result, nil
+		},
+	}
+	subscriber := &mockTaskSubscriber{channel: make(chan protocol.StreamingMessageEvent, 1)}
+
+	err := proc.handleStreamingProcessingError(context.Background(), &protocol.Message{MessageID: "err-stream"}, subscriber, errors.New("boom"))
+	assert.NoError(t, err)
+
+	select {
+	case event := <-subscriber.channel:
+		msg, ok := event.Result.(*protocol.Message)
+		if !assert.True(t, ok, "expected *protocol.Message, got %T", event.Result) {
+			return
+		}
+		assert.Equal(t, "keep-me", msg.Metadata["business_code"])
+		assert.NotContains(t, msg.Metadata, "debug_trace")
+	default:
+		t.Fatal("expected streaming error message event")
+	}
+}
+
+func TestMessageProcessor_HandleStreamingProcessingError_ResponseRewriter_DropResult(
+	t *testing.T,
+) {
+	proc := &messageProcessor{
+		responseRewriter: ResponseRewriterFuncs{
+			Streaming: func(
+				ctx context.Context,
+				result protocol.StreamingMessageResult,
+			) protocol.StreamingMessageResult {
+				return nil
+			},
+		},
+		errorHandler: func(
+			ctx context.Context,
+			msg *protocol.Message,
+			err error,
+		) (*protocol.Message, error) {
+			result := protocol.NewMessage(
+				protocol.MessageRoleAgent,
+				[]protocol.Part{protocol.NewTextPart("err")},
+			)
+			return &result, nil
+		},
+	}
+	subscriber := &mockTaskSubscriber{
+		channel: make(chan protocol.StreamingMessageEvent, 1),
+	}
+
+	err := proc.handleStreamingProcessingError(
+		context.Background(),
+		&protocol.Message{MessageID: "err-stream-drop"},
+		subscriber,
+		errors.New("boom"),
+	)
+	assert.NoError(t, err)
+
+	select {
+	case event := <-subscriber.channel:
+		t.Fatalf("unexpected streaming error event: %#v", event)
+	default:
+	}
+}
+
+func TestMessageProcessor_HandleError_ResponseRewriter_DropStreamingResult(t *testing.T) {
+	proc := &messageProcessor{
+		responseRewriter: ResponseRewriterFuncs{
+			Streaming: func(ctx context.Context, result protocol.StreamingMessageResult) protocol.StreamingMessageResult {
+				return nil
+			},
+		},
+		errorHandler: func(ctx context.Context, msg *protocol.Message, err error) (*protocol.Message, error) {
+			result := protocol.NewMessage(protocol.MessageRoleAgent, []protocol.Part{protocol.NewTextPart("err")})
+			return &result, nil
+		},
+	}
+
+	result, err := proc.handleError(context.Background(), &protocol.Message{MessageID: "err"}, true, errors.New("boom"))
+	assert.NoError(t, err)
+	if !assert.NotNil(t, result) {
+		return
+	}
+	if !assert.NotNil(t, result.StreamingEvents) {
+		return
+	}
+	select {
+	case event, ok := <-result.StreamingEvents.Channel():
+		if ok {
+			assert.Nil(t, event.Result)
+			t.Fatal("expected dropped streaming result to emit no events")
+		}
+	default:
+		t.Fatal("expected dropped streaming result subscriber to close immediately")
+	}
+}
+
 func TestMessageProcessor_HandleError_HandlerFailure(t *testing.T) {
 	proc := &messageProcessor{
 		errorHandler: func(ctx context.Context, msg *protocol.Message, err error) (*protocol.Message, error) {
@@ -989,6 +1161,7 @@ func TestMessageProcessor_ProcessStreamingMessage_Errors(t *testing.T) {
 
 	t.Run("runner_error", func(t *testing.T) {
 		var closed bool
+		var cleanedTaskID string
 		sub := &mockTaskSubscriber{
 			closeFunc: func() { closed = true },
 		}
@@ -998,6 +1171,10 @@ func TestMessageProcessor_ProcessStreamingMessage_Errors(t *testing.T) {
 			},
 			subscribeTaskFunc: func(taskID *string) (taskmanager.TaskSubscriber, error) {
 				return sub, nil
+			},
+			cleanTaskFunc: func(taskID *string) error {
+				cleanedTaskID = *taskID
+				return nil
 			},
 		}
 		processor := createTestMessageProcessor()
@@ -1013,6 +1190,7 @@ func TestMessageProcessor_ProcessStreamingMessage_Errors(t *testing.T) {
 		assert.NotNil(t, result)
 		assert.NotNil(t, result.StreamingEvents)
 		assert.True(t, closed)
+		assert.Equal(t, "task-id", cleanedTaskID)
 	})
 
 	t.Run("build_task_error", func(t *testing.T) {
@@ -1030,6 +1208,7 @@ func TestMessageProcessor_ProcessStreamingMessage_Errors(t *testing.T) {
 
 	t.Run("subscribe_error", func(t *testing.T) {
 		processor := createTestMessageProcessor()
+		var cleanedTaskID string
 		handler := &mockTaskHandler{
 			buildTaskFunc: func(specificTaskID *string, contextID *string) (string, error) {
 				return "task", nil
@@ -1037,11 +1216,16 @@ func TestMessageProcessor_ProcessStreamingMessage_Errors(t *testing.T) {
 			subscribeTaskFunc: func(taskID *string) (taskmanager.TaskSubscriber, error) {
 				return nil, fmt.Errorf("subscribe failed")
 			},
+			cleanTaskFunc: func(taskID *string) error {
+				cleanedTaskID = *taskID
+				return nil
+			},
 		}
 		result, err := processor.processStreamingMessage(ctx, "user", "session", msg, &model.Message{}, handler, nil)
 		assert.NoError(t, err)
 		assert.NotNil(t, result)
 		assert.NotNil(t, result.StreamingEvents)
+		assert.Equal(t, "task", cleanedTaskID)
 	})
 
 	t.Run("success_path", func(t *testing.T) {
@@ -1086,7 +1270,15 @@ func TestMessageProcessor_ProcessBatchStreamingEvents(t *testing.T) {
 	t.Run("empty_batch", func(t *testing.T) {
 		proc := createTestMessageProcessor()
 		sub := &mockTaskSubscriber{}
-		cont, err := proc.processBatchStreamingEvents(ctx, taskID, msg, []*event.Event{}, sub)
+		cont, err := proc.processBatchStreamingEvents(
+			ctx,
+			taskID,
+			msg,
+			[]*event.Event{},
+			sub,
+			nil,
+			nil,
+		)
 		assert.NoError(t, err)
 		assert.True(t, cont)
 	})
@@ -1095,7 +1287,15 @@ func TestMessageProcessor_ProcessBatchStreamingEvents(t *testing.T) {
 		proc := createTestMessageProcessor()
 		sub := &mockTaskSubscriber{}
 		batch := []*event.Event{{}, nil}
-		cont, err := proc.processBatchStreamingEvents(ctx, taskID, msg, batch, sub)
+		cont, err := proc.processBatchStreamingEvents(
+			ctx,
+			taskID,
+			msg,
+			batch,
+			sub,
+			nil,
+			nil,
+		)
 		assert.NoError(t, err)
 		assert.True(t, cont)
 	})
@@ -1105,7 +1305,15 @@ func TestMessageProcessor_ProcessBatchStreamingEvents(t *testing.T) {
 		proc.eventToA2AConverter = streamingErrorConverter{}
 		sub := &mockTaskSubscriber{}
 		evt := &event.Event{Response: &model.Response{}}
-		_, err := proc.processBatchStreamingEvents(ctx, taskID, msg, []*event.Event{evt}, sub)
+		_, err := proc.processBatchStreamingEvents(
+			ctx,
+			taskID,
+			msg,
+			[]*event.Event{evt},
+			sub,
+			nil,
+			nil,
+		)
 		assert.Error(t, err)
 	})
 
@@ -1121,7 +1329,15 @@ func TestMessageProcessor_ProcessBatchStreamingEvents(t *testing.T) {
 				{Delta: model.Message{Content: "chunk"}},
 			},
 		}}
-		_, err := proc.processBatchStreamingEvents(ctx, taskID, msg, []*event.Event{evt}, sendErrSub)
+		_, err := proc.processBatchStreamingEvents(
+			ctx,
+			taskID,
+			msg,
+			[]*event.Event{evt},
+			sendErrSub,
+			nil,
+			nil,
+		)
 		assert.Error(t, err)
 	})
 
@@ -1134,10 +1350,29 @@ func TestMessageProcessor_ProcessBatchStreamingEvents(t *testing.T) {
 				Object: model.ObjectTypeRunnerCompletion,
 				Done:   true,
 			},
+			StateDelta: map[string][]byte{
+				"last_response":              []byte(`"final"`),
+				graph.StateKeyLastResponseID: []byte(`"resp-final"`),
+			},
 		}
-		cont, err := proc.processBatchStreamingEvents(ctx, taskID, msg, []*event.Event{final}, sub)
+		var finalMetadata map[string]any
+		cont, err := proc.processBatchStreamingEvents(
+			ctx,
+			taskID,
+			msg,
+			[]*event.Event{final},
+			sub,
+			nil,
+			&finalMetadata,
+		)
 		assert.NoError(t, err)
 		assert.False(t, cont)
+		assert.Equal(t, "resp-final", finalMetadata[ia2a.MessageMetadataResponseIDKey])
+		rawStateDelta, ok := finalMetadata[ia2a.MessageMetadataStateDeltaKey]
+		if assert.True(t, ok, "expected state_delta metadata") {
+			decoded := ia2a.DecodeStateDeltaMetadata(rawStateDelta)
+			assert.Equal(t, []byte(`"final"`), decoded["last_response"])
+		}
 	})
 }
 
@@ -1495,8 +1730,49 @@ func TestProcessAgentStreamingEvents_ConverterError(t *testing.T) {
 		return &res, nil
 	}
 
-	proc.processAgentStreamingEvents(ctx, "task", "user1", "session1", msg, events, &mockTaskSubscriber{}, &mockTaskHandler{})
+	var results []protocol.StreamingMessageResult
+	sub := &mockTaskSubscriber{
+		sendFunc: func(evt protocol.StreamingMessageEvent) error {
+			if evt.Result != nil {
+				results = append(results, evt.Result)
+			}
+			return nil
+		},
+	}
+	proc.processAgentStreamingEvents(ctx, "task", "user1", "session1", msg, events, sub, &mockTaskHandler{})
 	assert.True(t, handlerCalled)
+	assert.Len(t, results, 2)
+	_, isSubmitted := results[0].(*protocol.TaskStatusUpdateEvent)
+	assert.True(t, isSubmitted)
+	_, isMessage := results[1].(*protocol.Message)
+	assert.True(t, isMessage)
+}
+
+func TestProcessAgentStreamingEvents_ContextCanceledSkipsCompletion(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ctxID := "ctx"
+	msg := &protocol.Message{ContextID: &ctxID}
+	events := make(chan *event.Event)
+	close(events)
+
+	proc := createTestMessageProcessor()
+
+	var results []protocol.StreamingMessageResult
+	sub := &mockTaskSubscriber{
+		sendFunc: func(evt protocol.StreamingMessageEvent) error {
+			if evt.Result != nil {
+				results = append(results, evt.Result)
+			}
+			return nil
+		},
+	}
+
+	proc.processAgentStreamingEvents(ctx, "task", "user1", "session1", msg, events, sub, &mockTaskHandler{})
+	assert.Len(t, results, 1)
+	status, ok := results[0].(*protocol.TaskStatusUpdateEvent)
+	assert.True(t, ok)
+	assert.Equal(t, protocol.TaskStateSubmitted, status.Status.State)
 }
 
 func TestProcessAgentStreamingEvents_Success(t *testing.T) {
@@ -1816,7 +2092,7 @@ func TestNew(t *testing.T) {
 				WithHost("localhost:9090"),
 			},
 			wantErr: true,
-			errMsg:  "agent is required",
+			errMsg:  "either agent (WithAgent) or runner (WithRunner) is required",
 		},
 		{
 			name: "missing host without agent card",
@@ -1826,6 +2102,20 @@ func TestNew(t *testing.T) {
 			},
 			wantErr: true,
 			errMsg:  "host is required when agent card is not provided",
+		},
+		{
+			name: "agent and runner cannot be used together",
+			opts: []Option{
+				WithAgent(&mockAgent{name: "test-agent", description: "test description"}, true),
+				WithRunner(&mockRunner{}),
+				WithAgentCard(a2a.AgentCard{
+					Name:        "custom-agent",
+					Description: "custom description",
+					URL:         "http://custom.example.com",
+				}),
+			},
+			wantErr: true,
+			errMsg:  "WithAgent and WithRunner cannot be used together; use WithAgentCard with WithRunner",
 		},
 		{
 			name: "with agent card but no host - should succeed",
@@ -1840,10 +2130,51 @@ func TestNew(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "runner with agent card but no host - should succeed",
+			opts: []Option{
+				WithRunner(&mockRunner{}),
+				WithAgentCard(a2a.AgentCard{
+					Name:        "runner-agent",
+					Description: "runner description",
+					URL:         "http://runner.example.com",
+				}),
+			},
+			wantErr: false,
+		},
+		{
 			name:    "no options",
 			opts:    []Option{},
 			wantErr: true,
-			errMsg:  "agent is required",
+			errMsg:  "either agent (WithAgent) or runner (WithRunner) is required",
+		},
+		{
+			name: "runner without agent card",
+			opts: []Option{
+				WithRunner(&mockRunner{}),
+			},
+			wantErr: true,
+			errMsg:  "agent card (WithAgentCard) is required when using runner without agent",
+		},
+		{
+			name: "buildAgentCard error - empty agent name",
+			opts: []Option{
+				WithAgent(&mockAgent{name: "", description: "test"}, true),
+				WithHost("localhost:8080"),
+			},
+			wantErr: true,
+		},
+		{
+			name: "explicit agent card with empty name",
+			opts: []Option{
+				WithAgent(&mockAgent{name: "test", description: "desc"}, true),
+				WithAgentCard(a2a.AgentCard{
+					Name:        "",
+					Description: "desc",
+					URL:         "http://localhost:8080",
+				}),
+			},
+			wantErr: true,
+			errMsg:  "agent card name is required",
 		},
 	}
 
@@ -1893,7 +2224,8 @@ func TestBuildAgentCard(t *testing.T) {
 				Description: "test description",
 				URL:         "http://localhost:8080",
 				Capabilities: a2a.AgentCapabilities{
-					Streaming: boolPtr(true),
+					Streaming:  boolPtr(true),
+					Extensions: defaultAgentCardExtensions(),
 				},
 				Skills: []a2a.AgentSkill{
 					{
@@ -1924,7 +2256,8 @@ func TestBuildAgentCard(t *testing.T) {
 				Description: "test description",
 				URL:         "http://example.com:8080",
 				Capabilities: a2a.AgentCapabilities{
-					Streaming: boolPtr(true),
+					Streaming:  boolPtr(true),
+					Extensions: defaultAgentCardExtensions(),
 				},
 				Skills: []a2a.AgentSkill{
 					{
@@ -1955,7 +2288,8 @@ func TestBuildAgentCard(t *testing.T) {
 				Description: "test description",
 				URL:         "https://secure.example.com",
 				Capabilities: a2a.AgentCapabilities{
-					Streaming: boolPtr(true),
+					Streaming:  boolPtr(true),
+					Extensions: defaultAgentCardExtensions(),
 				},
 				Skills: []a2a.AgentSkill{
 					{
@@ -1986,7 +2320,8 @@ func TestBuildAgentCard(t *testing.T) {
 				Description: "agent with custom scheme",
 				URL:         "custom://service.namespace",
 				Capabilities: a2a.AgentCapabilities{
-					Streaming: boolPtr(true),
+					Streaming:  boolPtr(true),
+					Extensions: defaultAgentCardExtensions(),
 				},
 				Skills: []a2a.AgentSkill{
 					{
@@ -2020,7 +2355,8 @@ func TestBuildAgentCard(t *testing.T) {
 				Description: "agent with tools",
 				URL:         "http://localhost:9090",
 				Capabilities: a2a.AgentCapabilities{
-					Streaming: boolPtr(false),
+					Streaming:  boolPtr(false),
+					Extensions: defaultAgentCardExtensions(),
 				},
 				Skills: []a2a.AgentSkill{
 					{
@@ -2073,7 +2409,10 @@ func TestBuildAgentCard(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := buildAgentCard(tt.options)
+			result, err := buildAgentCard(tt.options)
+			if err != nil {
+				t.Fatalf("buildAgentCard() returned error: %v", err)
+			}
 			if !compareAgentCards(result, tt.expected) {
 				t.Errorf("buildAgentCard() = %+v, want %+v", result, tt.expected)
 			}
@@ -2083,30 +2422,36 @@ func TestBuildAgentCard(t *testing.T) {
 
 func TestBuildProcessor(t *testing.T) {
 	tests := []struct {
-		name    string
-		agent   agent.Agent
-		session session.Service
-		options *options
+		name           string
+		agent          agent.Agent
+		session        session.Service
+		serverIdentity string
+		options        *options
 	}{
 		{
-			name:    "default converters",
-			agent:   &mockAgent{name: "test-agent", description: "test description"},
-			session: inmemory.NewSessionService(),
-			options: &options{},
+			name:           "default converters",
+			agent:          &mockAgent{name: "test-agent", description: "test description"},
+			session:        inmemory.NewSessionService(),
+			serverIdentity: "test-agent",
+			options: &options{
+				agent: &mockAgent{name: "test-agent", description: "test description"},
+			},
 		},
 		{
-			name:    "custom converters",
-			agent:   &mockAgent{name: "test-agent", description: "test description"},
-			session: inmemory.NewSessionService(),
+			name:           "custom converters",
+			agent:          &mockAgent{name: "test-agent", description: "test description"},
+			session:        inmemory.NewSessionService(),
+			serverIdentity: "test-agent",
 			options: &options{
+				agent:               &mockAgent{name: "test-agent", description: "test description"},
 				a2aToAgentConverter: &mockA2AToAgentConverter{},
 				eventToA2AConverter: &mockEventToA2AConverter{},
 			},
 		},
 		{
-			name:    "custom runner",
-			agent:   &mockAgent{name: "test-agent", description: "test description"},
-			session: inmemory.NewSessionService(),
+			name:           "custom runner",
+			session:        inmemory.NewSessionService(),
+			serverIdentity: "runner-agent",
 			options: &options{
 				runner: &mockRunner{},
 			},
@@ -2115,7 +2460,10 @@ func TestBuildProcessor(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			processor := buildProcessor(tt.agent, tt.session, tt.options)
+			processor, err := buildProcessor(tt.agent, tt.session, tt.serverIdentity, tt.options)
+			if err != nil {
+				t.Fatalf("buildProcessor() returned error: %v", err)
+			}
 			if processor == nil {
 				t.Errorf("buildProcessor() returned nil")
 				return
@@ -2129,6 +2477,9 @@ func TestBuildProcessor(t *testing.T) {
 			if processor.eventToA2AConverter == nil {
 				t.Errorf("buildProcessor() eventToA2AConverter is nil")
 			}
+			if processor.agentName != tt.serverIdentity {
+				t.Errorf("buildProcessor() agentName = %q, want %q", processor.agentName, tt.serverIdentity)
+			}
 			if tt.options.runner != nil &&
 				processor.runner != tt.options.runner {
 				t.Errorf("buildProcessor() should reuse custom runner")
@@ -2137,17 +2488,315 @@ func TestBuildProcessor(t *testing.T) {
 	}
 }
 
-func TestBuildSkillsFromTools(t *testing.T) {
+func TestBuildProcessor_RunnerWithoutAgent(t *testing.T) {
+	card := &a2a.AgentCard{
+		Name:        "runner-only-agent",
+		Description: "agent provided via runner only",
+		URL:         "http://localhost:9090",
+	}
+	processor, err := buildProcessor(nil, inmemory.NewSessionService(), card.Name, &options{
+		runner:    &mockRunner{},
+		agentCard: card,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, processor)
+	assert.Equal(t, "runner-only-agent", processor.agentName)
+}
+
+func TestBuildProcessor_DefaultEventConverterUsesEventPartMappers(t *testing.T) {
+	mapper := func(ctx context.Context, event *event.Event) ([]protocol.Part, error) {
+		return nil, nil
+	}
+
+	processor, err := buildProcessor(&mockAgent{name: "mapper-agent"}, inmemory.NewSessionService(), "mapper-agent", &options{
+		eventPartMappers: []EventToA2APartMapper{mapper},
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, processor)
+
+	converter, ok := processor.eventToA2AConverter.(*defaultEventToA2AMessage)
+	assert.True(t, ok)
+	assert.Len(t, converter.eventPartMappers, 1)
+	assert.NotNil(t, converter.eventPartMappers[0])
+}
+
+func TestBuildProcessor_CustomEventConverterIgnoresEventPartMappers(t *testing.T) {
+	customConverter := &mockEventToA2AConverter{}
+	mapper := func(ctx context.Context, event *event.Event) ([]protocol.Part, error) {
+		return nil, nil
+	}
+
+	processor, err := buildProcessor(&mockAgent{name: "mapper-agent"}, inmemory.NewSessionService(), "mapper-agent", &options{
+		eventToA2AConverter: customConverter,
+		eventPartMappers:    []EventToA2APartMapper{mapper},
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, processor)
+	assert.Same(t, customConverter, processor.eventToA2AConverter)
+}
+
+func TestBuildProcessor_NoAgentNoRunner(t *testing.T) {
+	_, err := buildProcessor(nil, inmemory.NewSessionService(), "card-only", &options{})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "agent is required when runner is not provided")
+}
+
+func TestBuildAgentCard_ErrorWhenNoAgentAndNoCard(t *testing.T) {
+	_, err := buildAgentCard(&options{})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "agent is required when agent card is not provided")
+}
+
+func TestBuildProcessor_RequiresServerIdentity(t *testing.T) {
+	_, err := buildProcessor(
+		&mockAgent{name: "test-agent", description: "test description"},
+		inmemory.NewSessionService(),
+		"",
+		&options{},
+	)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "agent card name is required")
+}
+
+func TestMessageProcessor_ProcessMessage_RuntimeStateIncludesServerContext(t *testing.T) {
+	ctxID := "runtime-session-1"
+	var capturedState map[string]any
+
+	proc := &messageProcessor{
+		runner: &mockRunner{
+			runFunc: func(ctx context.Context, userID string, sessionID string, message model.Message, opts ...agent.RunOption) (<-chan *event.Event, error) {
+				ro := agent.RunOptions{}
+				for _, opt := range opts {
+					opt(&ro)
+				}
+				capturedState = ro.RuntimeState
+
+				ch := make(chan *event.Event, 1)
+				ch <- &event.Event{
+					Response: &model.Response{
+						Choices: []model.Choice{{Message: model.Message{Content: "ok"}}},
+					},
+				}
+				close(ch)
+				return ch, nil
+			},
+		},
+		a2aToAgentConverter: &defaultA2AMessageToAgentMessage{},
+		eventToA2AConverter: &defaultEventToA2AMessage{},
+		errorHandler:        defaultErrorHandler,
+		agentName:           "test-agent",
+	}
+
+	ctx := context.WithValue(context.Background(), auth.AuthUserKey, &auth.User{ID: "actual-user"})
+	msg := protocol.Message{
+		ContextID: &ctxID,
+		MessageID: "runtime-msg",
+		Role:      protocol.MessageRoleUser,
+		Metadata: map[string]any{
+			"client_key": "client-value",
+		},
+		Parts: []protocol.Part{protocol.NewTextPart("hello")},
+	}
+
+	result, err := proc.ProcessMessage(ctx, msg, taskmanager.ProcessOptions{Streaming: false}, &mockTaskHandler{})
+	assert.NoError(t, err)
+	assert.NotNil(t, result)
+	assert.Equal(t, "client-value", capturedState["client_key"])
+}
+
+func TestMessageProcessor_ProcessMessage_AppendsRunOptions(t *testing.T) {
+	ctxID := "runtime-session-2"
+	var (
+		capturedState     map[string]any
+		capturedRequestID string
+	)
+
+	proc := &messageProcessor{
+		runner: &mockRunner{
+			runFunc: func(ctx context.Context, userID string, sessionID string, message model.Message, opts ...agent.RunOption) (<-chan *event.Event, error) {
+				ro := agent.RunOptions{}
+				for _, opt := range opts {
+					opt(&ro)
+				}
+				capturedState = ro.RuntimeState
+				capturedRequestID = ro.RequestID
+
+				ch := make(chan *event.Event, 1)
+				ch <- &event.Event{
+					Response: &model.Response{
+						Choices: []model.Choice{{Message: model.Message{Content: "ok"}}},
+					},
+				}
+				close(ch)
+				return ch, nil
+			},
+		},
+		a2aToAgentConverter: &defaultA2AMessageToAgentMessage{},
+		eventToA2AConverter: &defaultEventToA2AMessage{},
+		errorHandler:        defaultErrorHandler,
+		agentName:           "test-agent",
+		runOptions:          []agent.RunOption{agent.WithRequestID("req-from-options")},
+	}
+
+	ctx := context.WithValue(context.Background(), auth.AuthUserKey, &auth.User{ID: "actual-user"})
+	msg := protocol.Message{
+		ContextID: &ctxID,
+		MessageID: "runtime-msg-builder",
+		Role:      protocol.MessageRoleUser,
+		Metadata:  map[string]any{"client_key": "client-value"},
+		Parts:     []protocol.Part{protocol.NewTextPart("hello")},
+	}
+
+	result, err := proc.ProcessMessage(ctx, msg, taskmanager.ProcessOptions{Streaming: false}, &mockTaskHandler{})
+	assert.NoError(t, err)
+	assert.NotNil(t, result)
+	assert.Equal(t, "req-from-options", capturedRequestID)
+	assert.Equal(t, "client-value", capturedState["client_key"])
+}
+
+func TestMessageProcessor_ProcessMessage_RuntimeStateMergesWithRunOptions(t *testing.T) {
+	ctxID := "merge-session"
+	var capturedState map[string]any
+
+	proc := &messageProcessor{
+		runner: &mockRunner{
+			runFunc: func(ctx context.Context, userID string, sessionID string, message model.Message, opts ...agent.RunOption) (<-chan *event.Event, error) {
+				ro := agent.RunOptions{}
+				for _, opt := range opts {
+					opt(&ro)
+				}
+				capturedState = ro.RuntimeState
+
+				ch := make(chan *event.Event, 1)
+				ch <- &event.Event{
+					Response: &model.Response{
+						Choices: []model.Choice{{Message: model.Message{Content: "ok"}}},
+					},
+				}
+				close(ch)
+				return ch, nil
+			},
+		},
+		a2aToAgentConverter: &defaultA2AMessageToAgentMessage{},
+		eventToA2AConverter: &defaultEventToA2AMessage{},
+		errorHandler:        defaultErrorHandler,
+		agentName:           "test-agent",
+		// User also sets RuntimeState via WithRunOptions — should be merged, not overwritten
+		runOptions: []agent.RunOption{
+			agent.WithRuntimeState(map[string]any{
+				"user_custom_key": "user-value",
+				"client_key":      "will-be-overwritten-by-metadata",
+			}),
+		},
+	}
+
+	ctx := context.WithValue(context.Background(), auth.AuthUserKey, &auth.User{ID: "actual-user"})
+	msg := protocol.Message{
+		ContextID: &ctxID,
+		MessageID: "merge-msg",
+		Role:      protocol.MessageRoleUser,
+		Metadata: map[string]any{
+			"client_key": "from-metadata",
+		},
+		Parts: []protocol.Part{protocol.NewTextPart("hello")},
+	}
+
+	result, err := proc.ProcessMessage(ctx, msg, taskmanager.ProcessOptions{Streaming: false}, &mockTaskHandler{})
+	assert.NoError(t, err)
+	assert.NotNil(t, result)
+	// User's custom key should be preserved
+	assert.Equal(t, "user-value", capturedState["user_custom_key"])
+	// A2A metadata takes precedence on conflicting keys
+	assert.Equal(t, "from-metadata", capturedState["client_key"])
+}
+
+func TestWithRunOptions(t *testing.T) {
+	opts := &options{}
+
+	WithRunOptions(agent.WithRequestID("req"))(opts)
+
+	assert.Len(t, opts.runOptions, 1)
+}
+
+func TestMessageProcessor_ProcessMessage_SharedRuntimeStateNotMutated(t *testing.T) {
+	ctxID := "shared-state-session"
+
+	originalState := map[string]any{
+		"shared_key": "original-value",
+	}
+
+	proc := &messageProcessor{
+		runner: &mockRunner{
+			runFunc: func(ctx context.Context, userID string, sessionID string, message model.Message, opts ...agent.RunOption) (<-chan *event.Event, error) {
+				ro := agent.RunOptions{}
+				for _, opt := range opts {
+					opt(&ro)
+				}
+				ch := make(chan *event.Event, 1)
+				ch <- &event.Event{
+					Response: &model.Response{
+						Choices: []model.Choice{{Message: model.Message{Content: "ok"}}},
+					},
+				}
+				close(ch)
+				return ch, nil
+			},
+		},
+		a2aToAgentConverter: &defaultA2AMessageToAgentMessage{},
+		eventToA2AConverter: &defaultEventToA2AMessage{},
+		errorHandler:        defaultErrorHandler,
+		agentName:           "test-agent",
+		runOptions: []agent.RunOption{
+			agent.WithRuntimeState(originalState),
+		},
+	}
+
+	ctx := context.WithValue(context.Background(), auth.AuthUserKey, &auth.User{ID: "user"})
+	msg := protocol.Message{
+		ContextID: &ctxID,
+		MessageID: "shared-msg",
+		Role:      protocol.MessageRoleUser,
+		Metadata:  map[string]any{"request_key": "request-value"},
+		Parts:     []protocol.Part{protocol.NewTextPart("hello")},
+	}
+
+	_, err := proc.ProcessMessage(ctx, msg, taskmanager.ProcessOptions{Streaming: false}, &mockTaskHandler{})
+	assert.NoError(t, err)
+
+	// The original shared map must not be mutated by the merge logic.
+	assert.Equal(t, map[string]any{"shared_key": "original-value"}, originalState)
+}
+
+func TestMessageProcessor_AddTaskMetadataUsesAppName(t *testing.T) {
+	proc := &messageProcessor{
+		adkCompatibility: true,
+		agentName:        "agent-name",
+	}
+	evt := protocol.NewTaskStatusUpdateEvent(
+		"task-id",
+		"ctx-id",
+		protocol.TaskStatus{State: protocol.TaskStateSubmitted},
+		false,
+	)
+
+	proc.addTaskMetadata(&evt, "user-1", "session-1")
+
+	assert.Equal(t, "agent-name", evt.Metadata[ia2a.GetADKMetadataKey("app_name")])
+	assert.Equal(t, "user-1", evt.Metadata[ia2a.GetADKMetadataKey("user_id")])
+	assert.Equal(t, "session-1", evt.Metadata[ia2a.GetADKMetadataKey("session_id")])
+}
+
+func TestBuildSkillsFromCardTools(t *testing.T) {
 	tests := []struct {
 		name      string
-		agent     agent.Agent
+		tools     []tool.Tool
 		agentName string
 		agentDesc string
 		expected  []a2a.AgentSkill
 	}{
 		{
 			name:      "no tools",
-			agent:     &mockAgent{tools: []tool.Tool{}},
+			tools:     []tool.Tool{},
 			agentName: "test-agent",
 			agentDesc: "test description",
 			expected: []a2a.AgentSkill{
@@ -2162,11 +2811,9 @@ func TestBuildSkillsFromTools(t *testing.T) {
 		},
 		{
 			name: "with tools",
-			agent: &mockAgent{
-				tools: []tool.Tool{
-					&mockTool{name: "calculator", description: "math tool"},
-					&mockTool{name: "weather", description: "weather tool"},
-				},
+			tools: []tool.Tool{
+				&mockTool{name: "calculator", description: "math tool"},
+				&mockTool{name: "weather", description: "weather tool"},
 			},
 			agentName: "tool-agent",
 			agentDesc: "agent with tools",
@@ -2198,9 +2845,9 @@ func TestBuildSkillsFromTools(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := buildSkillsFromTools(tt.agent, tt.agentName, tt.agentDesc)
+			result := buildSkillsFromCardTools(tt.tools, tt.agentName, tt.agentDesc)
 			if !compareSkills(result, tt.expected) {
-				t.Errorf("buildSkillsFromTools() = %+v, want %+v", result, tt.expected)
+				t.Errorf("buildSkillsFromCardTools() = %+v, want %+v", result, tt.expected)
 			}
 		})
 	}
@@ -2343,9 +2990,44 @@ func compareAgentCards(a, b a2a.AgentCard) bool {
 	} else if a.Capabilities.Streaming != b.Capabilities.Streaming {
 		return false
 	}
+	if !compareExtensions(a.Capabilities.Extensions, b.Capabilities.Extensions) {
+		return false
+	}
 	return compareSkills(a.Skills, b.Skills) &&
 		compareStringSlices(a.DefaultInputModes, b.DefaultInputModes) &&
 		compareStringSlices(a.DefaultOutputModes, b.DefaultOutputModes)
+}
+
+func defaultAgentCardExtensions() []a2a.AgentExtension {
+	return []a2a.AgentExtension{
+		{
+			URI: ia2a.ExtensionTRPCA2AVersion,
+			Params: map[string]any{
+				"version": ia2a.InteractionVersion,
+			},
+		},
+	}
+}
+
+func compareExtensions(a, b []a2a.AgentExtension) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i, extA := range a {
+		extB := b[i]
+		if extA.URI != extB.URI {
+			return false
+		}
+		if len(extA.Params) != len(extB.Params) {
+			return false
+		}
+		for k, v := range extA.Params {
+			if extB.Params[k] != v {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func compareSkills(a, b []a2a.AgentSkill) bool {
@@ -2658,6 +3340,315 @@ func TestMessageProcessor_ProcessMessage_NilResponse(t *testing.T) {
 	assert.NotNil(t, result.Result)
 }
 
+func TestGraphResumeStateFromMetadata(t *testing.T) {
+	t.Run("checkpoint only keeps checkpoint state without command", func(t *testing.T) {
+		state := ia2a.GraphResumeStateFromMetadata(map[string]any{
+			graph.CfgKeyCheckpointID: "ck-1",
+		})
+		if assert.NotNil(t, state) {
+			assert.Equal(t, "ck-1", state[graph.CfgKeyCheckpointID])
+			_, exists := state[graph.StateKeyCommand]
+			assert.False(t, exists)
+		}
+	})
+
+	t.Run("state_delta resume builds state and command", func(t *testing.T) {
+		stateDelta := EncodeStateDeltaMetadata(map[string][]byte{
+			graph.CfgKeyLineageID:    []byte(`"ln-sd"`),
+			graph.CfgKeyCheckpointID: []byte(`"ck-sd"`),
+			graph.CfgKeyCheckpointNS: []byte(`"ns-sd"`),
+			"resume":                 []byte(`"approve"`),
+			graph.CfgKeyResumeMap:    []byte(`{"approval":true}`),
+		})
+		state := ia2a.GraphResumeStateFromMetadata(map[string]any{
+			ia2a.MessageMetadataStateDeltaKey: stateDelta,
+		})
+		if assert.NotNil(t, state) {
+			assert.Equal(t, "ln-sd", state[graph.CfgKeyLineageID])
+			assert.Equal(t, "ck-sd", state[graph.CfgKeyCheckpointID])
+			assert.Equal(t, "ns-sd", state[graph.CfgKeyCheckpointNS])
+			cmd, ok := state[graph.StateKeyCommand].(*graph.ResumeCommand)
+			if assert.True(t, ok, "expected ResumeCommand in state") {
+				assert.Equal(t, "approve", cmd.Resume)
+				assert.Equal(t, true, cmd.ResumeMap["approval"])
+			}
+		}
+	})
+
+	t.Run("state_delta pregel_metadata fallback extracts checkpoint info", func(t *testing.T) {
+		pregelJSON := []byte(`{"lineageId":"ln-p","checkpointId":"ck-p","checkpointNs":"ns-p","interruptKey":"approval"}`)
+		stateDelta := EncodeStateDeltaMetadata(map[string][]byte{
+			graph.MetadataKeyPregel: pregelJSON,
+			"resume":                []byte(`"yes"`),
+		})
+		state := ia2a.GraphResumeStateFromMetadata(map[string]any{
+			ia2a.MessageMetadataStateDeltaKey: stateDelta,
+		})
+		if assert.NotNil(t, state) {
+			assert.Equal(t, "ln-p", state[graph.CfgKeyLineageID])
+			assert.Equal(t, "ck-p", state[graph.CfgKeyCheckpointID])
+			assert.Equal(t, "ns-p", state[graph.CfgKeyCheckpointNS])
+			cmd, ok := state[graph.StateKeyCommand].(*graph.ResumeCommand)
+			if assert.True(t, ok, "expected ResumeCommand in state") {
+				assert.Equal(t, "yes", cmd.Resume)
+			}
+		}
+	})
+
+	t.Run("state_delta checkpoint merges serialized Command fallback", func(t *testing.T) {
+		state := ia2a.GraphResumeStateFromMetadata(map[string]any{
+			ia2a.MessageMetadataStateDeltaKey: EncodeStateDeltaMetadata(map[string][]byte{
+				graph.CfgKeyLineageID:    []byte(`"ln-sd"`),
+				graph.CfgKeyCheckpointID: []byte(`"ck-sd"`),
+			}),
+			graph.StateKeyCommand: map[string]any{
+				"Resume":    "approve",
+				"ResumeMap": map[string]any{"approval": true},
+			},
+		})
+		if assert.NotNil(t, state) {
+			assert.Equal(t, "ln-sd", state[graph.CfgKeyLineageID])
+			assert.Equal(t, "ck-sd", state[graph.CfgKeyCheckpointID])
+			cmd, ok := state[graph.StateKeyCommand].(*graph.ResumeCommand)
+			if assert.True(t, ok, "expected ResumeCommand in state") {
+				assert.Equal(t, "approve", cmd.Resume)
+				assert.Equal(t, true, cmd.ResumeMap["approval"])
+			}
+		}
+	})
+
+	t.Run("flattened resume and resume_map remain backward compatible", func(t *testing.T) {
+		state := ia2a.GraphResumeStateFromMetadata(map[string]any{
+			graph.CfgKeyCheckpointID: "ck-1",
+			"resume":                 "approve",
+			graph.CfgKeyResumeMap:    map[string]any{"approval": true},
+		})
+		cmd, ok := state[graph.StateKeyCommand].(*graph.ResumeCommand)
+		if assert.True(t, ok, "expected ResumeCommand in state") {
+			assert.Equal(t, "approve", cmd.Resume)
+			assert.Equal(t, true, cmd.ResumeMap["approval"])
+		}
+	})
+
+	t.Run("serialized Command struct via transferStateKey fallback", func(t *testing.T) {
+		state := ia2a.GraphResumeStateFromMetadata(map[string]any{
+			graph.CfgKeyCheckpointID: "ck-cmd",
+			graph.CfgKeyLineageID:    "ln-cmd",
+			graph.CfgKeyCheckpointNS: "ns-cmd",
+			graph.StateKeyCommand: map[string]any{
+				"Resume":    nil,
+				"ResumeMap": map[string]any{"remote_ask_approval": true},
+			},
+		})
+		if assert.NotNil(t, state) {
+			assert.Equal(t, "ln-cmd", state[graph.CfgKeyLineageID])
+			assert.Equal(t, "ck-cmd", state[graph.CfgKeyCheckpointID])
+			assert.Equal(t, "ns-cmd", state[graph.CfgKeyCheckpointNS])
+			cmd, ok := state[graph.StateKeyCommand].(*graph.ResumeCommand)
+			if assert.True(t, ok, "expected ResumeCommand in state") {
+				assert.Equal(t, true, cmd.ResumeMap["remote_ask_approval"])
+			}
+		}
+	})
+
+	t.Run("serialized Command struct with Resume value", func(t *testing.T) {
+		state := ia2a.GraphResumeStateFromMetadata(map[string]any{
+			graph.CfgKeyCheckpointID: "ck-2",
+			graph.StateKeyCommand: map[string]any{
+				"Resume":    "approved",
+				"ResumeMap": nil,
+			},
+		})
+		if assert.NotNil(t, state) {
+			cmd, ok := state[graph.StateKeyCommand].(*graph.ResumeCommand)
+			if assert.True(t, ok, "expected ResumeCommand in state") {
+				assert.Equal(t, "approved", cmd.Resume)
+			}
+		}
+	})
+}
+
+func TestMessageProcessor_ProcessMessage_GraphResumeMetadataBecomesCommand(t *testing.T) {
+	ctxID := "ctx"
+	ctx := context.WithValue(context.Background(), auth.AuthUserKey, &auth.User{ID: "user-1"})
+	msg := protocol.Message{
+		ContextID: &ctxID,
+		MessageID: "graph-resume-test",
+		Role:      protocol.MessageRoleUser,
+		Parts:     []protocol.Part{protocol.NewTextPart("resume")},
+		Metadata: map[string]any{
+			ia2a.MessageMetadataStateDeltaKey: EncodeStateDeltaMetadata(map[string][]byte{
+				graph.CfgKeyLineageID:    []byte(`"ln-1"`),
+				graph.CfgKeyCheckpointID: []byte(`"ck-1"`),
+				"resume":                 []byte(`"approve"`),
+				graph.CfgKeyResumeMap:    []byte(`{"approval":true}`),
+			}),
+		},
+	}
+
+	processor := &messageProcessor{
+		debugLogging:         false,
+		a2aToAgentConverter:  &defaultA2AMessageToAgentMessage{},
+		eventToA2AConverter:  &mockEventToA2AConverter{},
+		errorHandler:         defaultErrorHandler,
+		structuredTaskErrors: false,
+		runner: &mockRunner{
+			runFunc: func(ctx context.Context, userID string, sessionID string, message model.Message, opts ...agent.RunOption) (<-chan *event.Event, error) {
+				var ro agent.RunOptions
+				for _, opt := range opts {
+					opt(&ro)
+				}
+				if assert.NotNil(t, ro.RuntimeState) {
+					assert.Equal(t, "ln-1", ro.RuntimeState[graph.CfgKeyLineageID])
+					assert.Equal(t, "ck-1", ro.RuntimeState[graph.CfgKeyCheckpointID])
+					cmd, ok := ro.RuntimeState[graph.StateKeyCommand].(*graph.ResumeCommand)
+					if assert.True(t, ok, "expected ResumeCommand in runtime state") {
+						assert.Equal(t, "approve", cmd.Resume)
+						assert.Equal(t, true, cmd.ResumeMap["approval"])
+					}
+				}
+				ch := make(chan *event.Event, 1)
+				ch <- &event.Event{
+					Response: &model.Response{
+						Choices: []model.Choice{{Message: model.Message{Content: "ok"}}},
+					},
+				}
+				close(ch)
+				return ch, nil
+			},
+		},
+	}
+
+	result, err := processor.ProcessMessage(
+		ctx,
+		msg,
+		taskmanager.ProcessOptions{},
+		&mockTaskHandler{},
+	)
+	assert.NoError(t, err)
+	assert.NotNil(t, result)
+}
+
+func TestMessageProcessor_ProcessMessage_StateDeltaResumeBecomesCommand(t *testing.T) {
+	ctxID := "ctx"
+	ctx := context.WithValue(context.Background(), auth.AuthUserKey, &auth.User{ID: "user-1"})
+	msg := protocol.Message{
+		ContextID: &ctxID,
+		MessageID: "state-delta-resume-test",
+		Role:      protocol.MessageRoleUser,
+		Parts:     []protocol.Part{protocol.NewTextPart("resume")},
+		Metadata: map[string]any{
+			ia2a.MessageMetadataStateDeltaKey: EncodeStateDeltaMetadata(map[string][]byte{
+				graph.CfgKeyLineageID:    []byte(`"ln-sd"`),
+				graph.CfgKeyCheckpointID: []byte(`"ck-sd"`),
+				"resume":                 []byte(`"approve"`),
+				graph.CfgKeyResumeMap:    []byte(`{"approval":true}`),
+			}),
+		},
+	}
+
+	processor := &messageProcessor{
+		debugLogging:         false,
+		a2aToAgentConverter:  &defaultA2AMessageToAgentMessage{},
+		eventToA2AConverter:  &mockEventToA2AConverter{},
+		errorHandler:         defaultErrorHandler,
+		structuredTaskErrors: false,
+		runner: &mockRunner{
+			runFunc: func(ctx context.Context, userID string, sessionID string, message model.Message, opts ...agent.RunOption) (<-chan *event.Event, error) {
+				var ro agent.RunOptions
+				for _, opt := range opts {
+					opt(&ro)
+				}
+				if assert.NotNil(t, ro.RuntimeState) {
+					assert.Equal(t, "ln-sd", ro.RuntimeState[graph.CfgKeyLineageID])
+					assert.Equal(t, "ck-sd", ro.RuntimeState[graph.CfgKeyCheckpointID])
+					cmd, ok := ro.RuntimeState[graph.StateKeyCommand].(*graph.ResumeCommand)
+					if assert.True(t, ok, "expected ResumeCommand in runtime state") {
+						assert.Equal(t, "approve", cmd.Resume)
+						assert.Equal(t, true, cmd.ResumeMap["approval"])
+					}
+				}
+				ch := make(chan *event.Event, 1)
+				ch <- &event.Event{
+					Response: &model.Response{
+						Choices: []model.Choice{{Message: model.Message{Content: "ok"}}},
+					},
+				}
+				close(ch)
+				return ch, nil
+			},
+		},
+	}
+
+	result, err := processor.ProcessMessage(
+		ctx,
+		msg,
+		taskmanager.ProcessOptions{},
+		&mockTaskHandler{},
+	)
+	assert.NoError(t, err)
+	assert.NotNil(t, result)
+}
+
+func TestMessageProcessor_ProcessMessage_StateDeltaCheckpointAndSerializedCommandBecomeResumeCommand(t *testing.T) {
+	ctxID := "ctx"
+	ctx := context.WithValue(context.Background(), auth.AuthUserKey, &auth.User{ID: "user-1"})
+	msg := protocol.Message{
+		ContextID: &ctxID,
+		MessageID: "state-delta-command-fallback-test",
+		Role:      protocol.MessageRoleUser,
+		Parts:     []protocol.Part{protocol.NewTextPart("resume")},
+		Metadata: map[string]any{
+			ia2a.MessageMetadataStateDeltaKey: EncodeStateDeltaMetadata(map[string][]byte{
+				graph.CfgKeyLineageID:    []byte(`"ln-sd"`),
+				graph.CfgKeyCheckpointID: []byte(`"ck-sd"`),
+			}),
+			graph.StateKeyCommand: map[string]any{
+				"Resume":    "approve",
+				"ResumeMap": map[string]any{"approval": true},
+			},
+		},
+	}
+
+	processor := &messageProcessor{
+		debugLogging:         false,
+		a2aToAgentConverter:  &defaultA2AMessageToAgentMessage{},
+		eventToA2AConverter:  &mockEventToA2AConverter{},
+		errorHandler:         defaultErrorHandler,
+		structuredTaskErrors: false,
+		runner: &mockRunner{
+			runFunc: func(ctx context.Context, userID string, sessionID string, message model.Message, opts ...agent.RunOption) (<-chan *event.Event, error) {
+				var ro agent.RunOptions
+				for _, opt := range opts {
+					opt(&ro)
+				}
+				if assert.NotNil(t, ro.RuntimeState) {
+					assert.Equal(t, "ln-sd", ro.RuntimeState[graph.CfgKeyLineageID])
+					assert.Equal(t, "ck-sd", ro.RuntimeState[graph.CfgKeyCheckpointID])
+					cmd, ok := ro.RuntimeState[graph.StateKeyCommand].(*graph.ResumeCommand)
+					if assert.True(t, ok, "expected ResumeCommand in runtime state") {
+						assert.Equal(t, "approve", cmd.Resume)
+						assert.Equal(t, true, cmd.ResumeMap["approval"])
+					}
+				}
+				ch := make(chan *event.Event, 1)
+				ch <- &event.Event{Response: &model.Response{Choices: []model.Choice{{Message: model.Message{Content: "ok"}}}}}
+				close(ch)
+				return ch, nil
+			},
+		},
+	}
+
+	result, err := processor.ProcessMessage(
+		ctx,
+		msg,
+		taskmanager.ProcessOptions{},
+		&mockTaskHandler{},
+	)
+	assert.NoError(t, err)
+	assert.NotNil(t, result)
+}
+
 // TestMessageProcessor_ProcessMessage_ConversionFailure tests handling of conversion errors
 func TestMessageProcessor_ProcessMessage_ConversionFailure(t *testing.T) {
 	ctxID := "ctx"
@@ -2800,7 +3791,337 @@ func TestMessageProcessor_ProcessMessage_MultipleEvents(t *testing.T) {
 	assert.Equal(t, 1, len(resultTask.Artifacts))
 }
 
-func TestMessageProcessor_ProcessMessage_MultipleEvents_PreservesArtifactMetadata(t *testing.T) {
+func TestBuildTaskErrorMetadata(t *testing.T) {
+	t.Run("nil event returns nil", func(t *testing.T) {
+		assert.Nil(t, buildTaskErrorMetadata(nil))
+	})
+
+	t.Run("missing response returns nil", func(t *testing.T) {
+		assert.Nil(
+			t,
+			buildTaskErrorMetadata(&event.Event{}),
+		)
+	})
+
+	t.Run("missing error returns nil", func(t *testing.T) {
+		assert.Nil(t, buildTaskErrorMetadata(&event.Event{
+			Response: &model.Response{},
+		}))
+	})
+
+	t.Run("flow error keeps failed metadata", func(t *testing.T) {
+		metadata := buildTaskErrorMetadata(&event.Event{
+			Response: &model.Response{
+				Error: &model.ResponseError{
+					Type:    model.ErrorTypeFlowError,
+					Message: "task failed",
+				},
+			},
+		})
+
+		if assert.NotNil(t, metadata) {
+			assert.Equal(
+				t,
+				model.ObjectTypeError,
+				metadata[ia2a.MessageMetadataObjectTypeKey],
+			)
+			assert.Equal(
+				t,
+				model.ErrorTypeFlowError,
+				metadata[ia2a.MessageMetadataErrorTypeKey],
+			)
+			assert.Equal(
+				t,
+				"task failed",
+				metadata[ia2a.MessageMetadataErrorMessageKey],
+			)
+			assert.Equal(
+				t,
+				string(protocol.TaskStateFailed),
+				metadata[ia2a.MessageMetadataTaskStateKey],
+			)
+			_, ok := metadata[ia2a.MessageMetadataResponseIDKey]
+			assert.False(t, ok)
+		}
+	})
+
+	t.Run("stop agent error keeps canceled state and response id", func(t *testing.T) {
+		const responseID = "resp-1"
+		metadata := buildTaskErrorMetadata(&event.Event{
+			Response: &model.Response{
+				ID: responseID,
+				Error: &model.ResponseError{
+					Type:    agent.ErrorTypeStopAgentError,
+					Message: "task canceled",
+				},
+			},
+		})
+
+		if assert.NotNil(t, metadata) {
+			assert.Equal(
+				t,
+				string(protocol.TaskStateCanceled),
+				metadata[ia2a.MessageMetadataTaskStateKey],
+			)
+			assert.Equal(
+				t,
+				responseID,
+				metadata[ia2a.MessageMetadataResponseIDKey],
+			)
+		}
+	})
+
+}
+
+func TestBuildTaskErrorMessage(t *testing.T) {
+	const (
+		taskID = "task-1"
+		ctxID  = "ctx-1"
+	)
+
+	t.Run("nil event returns nil", func(t *testing.T) {
+		assert.Nil(t, buildTaskErrorMessage(taskID, ctxID, nil, nil))
+	})
+
+	t.Run("missing response returns nil", func(t *testing.T) {
+		assert.Nil(
+			t,
+			buildTaskErrorMessage(
+				taskID,
+				ctxID,
+				&event.Event{},
+				nil,
+			),
+		)
+	})
+
+	t.Run("missing error returns nil", func(t *testing.T) {
+		assert.Nil(t, buildTaskErrorMessage(
+			taskID,
+			ctxID,
+			&event.Event{
+				Response: &model.Response{},
+			},
+			nil,
+		))
+	})
+
+	t.Run("response id and text keep mirrored metadata", func(t *testing.T) {
+		const responseID = "resp-2"
+		agentEvent := &event.Event{
+			Response: &model.Response{
+				ID: responseID,
+				Error: &model.ResponseError{
+					Type:    model.ErrorTypeFlowError,
+					Message: "task failed",
+				},
+			},
+		}
+		metadata := buildTaskErrorMetadata(agentEvent)
+		msg := buildTaskErrorMessage(
+			taskID,
+			ctxID,
+			agentEvent,
+			metadata,
+		)
+
+		if assert.NotNil(t, msg) {
+			assert.Equal(t, responseID, msg.MessageID)
+			if assert.NotNil(t, msg.Metadata) {
+				assert.Equal(
+					t,
+					metadata[ia2a.MessageMetadataErrorTypeKey],
+					msg.Metadata[ia2a.MessageMetadataErrorTypeKey],
+				)
+				assert.Equal(
+					t,
+					metadata[ia2a.MessageMetadataTaskStateKey],
+					msg.Metadata[ia2a.MessageMetadataTaskStateKey],
+				)
+			}
+			if assert.Len(t, msg.Parts, 1) {
+				var text string
+				switch part := msg.Parts[0].(type) {
+				case *protocol.TextPart:
+					text = part.Text
+				case protocol.TextPart:
+					text = part.Text
+				}
+				if assert.NotEmpty(t, text) {
+					assert.Equal(t, "task failed", text)
+				}
+			}
+
+			metadata[ia2a.MessageMetadataErrorCodeKey] = "mutated"
+			_, ok := msg.Metadata[ia2a.MessageMetadataErrorCodeKey]
+			assert.False(t, ok)
+		}
+	})
+
+	t.Run("empty error message keeps empty parts", func(t *testing.T) {
+		agentEvent := &event.Event{
+			Response: &model.Response{
+				Error: &model.ResponseError{
+					Type: model.ErrorTypeFlowError,
+				},
+			},
+		}
+		msg := buildTaskErrorMessage(
+			taskID,
+			ctxID,
+			agentEvent,
+			buildTaskErrorMetadata(agentEvent),
+		)
+
+		if assert.NotNil(t, msg) {
+			assert.NotEmpty(t, msg.MessageID)
+			assert.NotNil(t, msg.Metadata)
+			assert.Len(t, msg.Parts, 0)
+		}
+	})
+}
+
+func TestMessageProcessor_ProcessMessage_StructuredTaskError(
+	t *testing.T,
+) {
+	ctxID := "ctx"
+	code := "A2A_500"
+	msg := protocol.Message{
+		ContextID: &ctxID,
+		MessageID: "structured-error-test",
+		Role:      protocol.MessageRoleUser,
+		Parts:     []protocol.Part{protocol.NewTextPart("hi")},
+	}
+
+	processor := &messageProcessor{
+		structuredTaskErrors: true,
+		runner: &mockRunner{
+			runFunc: func(
+				ctx context.Context,
+				userID string,
+				sessionID string,
+				message model.Message,
+				opts ...agent.RunOption,
+			) (<-chan *event.Event, error) {
+				ch := make(chan *event.Event, 1)
+				ch <- &event.Event{
+					Response: &model.Response{
+						ID:   "resp-1",
+						Done: true,
+						Error: &model.ResponseError{
+							Type:    model.ErrorTypeFlowError,
+							Message: "task failed",
+							Code:    &code,
+						},
+					},
+				}
+				close(ch)
+				return ch, nil
+			},
+		},
+		a2aToAgentConverter: &defaultA2AMessageToAgentMessage{},
+		eventToA2AConverter: &mockEventToA2AConverter{},
+		errorHandler:        defaultErrorHandler,
+	}
+
+	result, err := processor.processMessage(
+		context.Background(),
+		"user",
+		ctxID,
+		&msg,
+		&model.Message{Content: "input"},
+		nil,
+	)
+	assert.NoError(t, err)
+	if !assert.NotNil(t, result) {
+		return
+	}
+
+	task, ok := result.Result.(*protocol.Task)
+	if !assert.True(t, ok) {
+		return
+	}
+	assert.Equal(t, protocol.TaskStateFailed, task.Status.State)
+	assert.NotNil(t, task.Metadata)
+	assert.Equal(t, code, task.Metadata[ia2a.MessageMetadataErrorCodeKey])
+	assert.NotNil(t, task.Status.Message)
+	assert.Equal(
+		t,
+		task.Metadata[ia2a.MessageMetadataErrorCodeKey],
+		task.Status.Message.Metadata[ia2a.MessageMetadataErrorCodeKey],
+	)
+	task.Metadata["new_key"] = "task-only"
+	_, ok = task.Status.Message.Metadata["new_key"]
+	assert.False(t, ok)
+	assert.Len(t, task.Status.Message.Parts, 1)
+}
+
+func TestMessageProcessor_ProcessMessage_StructuredTaskError_ResponseRewriterDrop(
+	t *testing.T,
+) {
+	ctxID := "ctx"
+	msg := protocol.Message{
+		ContextID: &ctxID,
+		MessageID: "structured-error-drop-test",
+		Role:      protocol.MessageRoleUser,
+		Parts:     []protocol.Part{protocol.NewTextPart("hi")},
+	}
+
+	processor := &messageProcessor{
+		structuredTaskErrors: true,
+		responseRewriter: ResponseRewriterFuncs{
+			Unary: func(
+				ctx context.Context,
+				result protocol.UnaryMessageResult,
+			) protocol.UnaryMessageResult {
+				return nil
+			},
+		},
+		runner: &mockRunner{
+			runFunc: func(
+				ctx context.Context,
+				userID string,
+				sessionID string,
+				message model.Message,
+				opts ...agent.RunOption,
+			) (<-chan *event.Event, error) {
+				ch := make(chan *event.Event, 1)
+				ch <- &event.Event{
+					Response: &model.Response{
+						Done: true,
+						Error: &model.ResponseError{
+							Type:    model.ErrorTypeFlowError,
+							Message: "task failed",
+						},
+					},
+				}
+				close(ch)
+				return ch, nil
+			},
+		},
+		a2aToAgentConverter: &defaultA2AMessageToAgentMessage{},
+		eventToA2AConverter: &mockEventToA2AConverter{},
+		errorHandler:        defaultErrorHandler,
+	}
+
+	result, err := processor.processMessage(
+		context.Background(),
+		"user",
+		ctxID,
+		&msg,
+		&model.Message{Content: "input"},
+		nil,
+	)
+	assert.NoError(t, err)
+	if assert.NotNil(t, result) {
+		assert.Nil(t, result.Result)
+		assert.Nil(t, result.StreamingEvents)
+	}
+}
+
+func TestMessageProcessor_ProcessMessage_MultipleEvents_PreservesArtifactMetadata(
+	t *testing.T,
+) {
 	ctxID := "ctx"
 	ctx := context.Background()
 	msg := protocol.Message{
@@ -2813,11 +4134,21 @@ func TestMessageProcessor_ProcessMessage_MultipleEvents_PreservesArtifactMetadat
 	processor := &messageProcessor{
 		debugLogging: false,
 		runner: &mockRunner{
-			runFunc: func(ctx context.Context, userID string, sessionID string, message model.Message, opts ...agent.RunOption) (<-chan *event.Event, error) {
+			runFunc: func(
+				ctx context.Context,
+				userID string,
+				sessionID string,
+				message model.Message,
+				opts ...agent.RunOption,
+			) (<-chan *event.Event, error) {
 				ch := make(chan *event.Event, 2)
 				ch <- &event.Event{
 					Response: &model.Response{
-						Choices: []model.Choice{{Message: model.Message{Content: "response1"}}},
+						Choices: []model.Choice{{
+							Message: model.Message{
+								Content: "response1",
+							},
+						}},
 					},
 				}
 				ch <- &event.Event{
@@ -2829,7 +4160,9 @@ func TestMessageProcessor_ProcessMessage_MultipleEvents_PreservesArtifactMetadat
 						}},
 					},
 					StateDelta: map[string][]byte{
-						"_node_metadata": []byte(`{"nodeId":"planner","phase":"start"}`),
+						"_node_metadata": []byte(
+							`{"nodeId":"planner","phase":"start"}`,
+						),
 					},
 				}
 				close(ch)
@@ -2841,19 +4174,942 @@ func TestMessageProcessor_ProcessMessage_MultipleEvents_PreservesArtifactMetadat
 		errorHandler:        defaultErrorHandler,
 	}
 
-	result, err := processor.processMessage(ctx, "user", "session", &msg, &model.Message{Content: "input"}, nil)
+	result, err := processor.processMessage(
+		ctx,
+		"user",
+		"session",
+		&msg,
+		&model.Message{Content: "input"},
+		nil,
+	)
 	assert.NoError(t, err)
 	resultTask, ok := result.Result.(*protocol.Task)
-	assert.True(t, ok, "Expected *protocol.Task for multiple events, got %T", result.Result)
+	assert.True(
+		t,
+		ok,
+		"Expected *protocol.Task for multiple events, got %T",
+		result.Result,
+	)
 	if !assert.Len(t, resultTask.Artifacts, 1) {
 		return
 	}
-	assert.Equal(t, "graph.execution", resultTask.Artifacts[0].Metadata[ia2a.MessageMetadataObjectTypeKey])
+	assert.Equal(
+		t,
+		"graph.execution",
+		resultTask.Artifacts[0].Metadata[ia2a.MessageMetadataObjectTypeKey],
+	)
 	rawStateDelta, ok := resultTask.Artifacts[0].Metadata[ia2a.MessageMetadataStateDeltaKey]
 	if assert.True(t, ok, "expected state_delta in artifact metadata") {
 		decoded := ia2a.DecodeStateDeltaMetadata(rawStateDelta)
-		assert.Equal(t, []byte(`{"nodeId":"planner","phase":"start"}`), decoded["_node_metadata"])
+		assert.Equal(
+			t,
+			[]byte(`{"nodeId":"planner","phase":"start"}`),
+			decoded["_node_metadata"],
+		)
 	}
+}
+
+func TestMessageProcessor_ProcessBatchStreamingEvents_StructuredTaskError(
+	t *testing.T,
+) {
+	code := "A2A_500"
+	processor := &messageProcessor{
+		structuredTaskErrors: true,
+	}
+	ctxID := "ctx"
+	msg := &protocol.Message{
+		ContextID: &ctxID,
+		MessageID: "streaming-error-test",
+	}
+	subscriber := &mockTaskSubscriber{
+		channel: make(chan protocol.StreamingMessageEvent, 1),
+	}
+	terminalTaskError := false
+
+	cont, err := processor.processBatchStreamingEvents(
+		context.Background(),
+		"task-1",
+		msg,
+		[]*event.Event{{
+			Response: &model.Response{
+				ID:   "resp-1",
+				Done: true,
+				Error: &model.ResponseError{
+					Type:    model.ErrorTypeFlowError,
+					Message: "task failed",
+					Code:    &code,
+				},
+			},
+		}},
+		subscriber,
+		&terminalTaskError,
+		nil,
+	)
+	assert.NoError(t, err)
+	assert.False(t, cont)
+	assert.True(t, terminalTaskError)
+
+	select {
+	case streamEvent := <-subscriber.channel:
+		status, ok := streamEvent.Result.(*protocol.TaskStatusUpdateEvent)
+		if !assert.True(t, ok) {
+			return
+		}
+		assert.Equal(t, protocol.TaskStateFailed, status.Status.State)
+		assert.Equal(
+			t,
+			code,
+			status.Metadata[ia2a.MessageMetadataErrorCodeKey],
+		)
+		if assert.NotNil(t, status.Status.Message) {
+			messageMetadata := status.Status.Message.Metadata
+			messageCode := messageMetadata[ia2a.MessageMetadataErrorCodeKey]
+			assert.Equal(
+				t,
+				status.Metadata[ia2a.MessageMetadataErrorCodeKey],
+				messageCode,
+			)
+			assert.Len(t, status.Status.Message.Parts, 1)
+		}
+	default:
+		t.Fatal("expected task failure status event")
+	}
+}
+
+func TestMessageProcessor_ProcessBatchStreamingEvents_DropStructuredTaskError(
+	t *testing.T,
+) {
+	processor := &messageProcessor{
+		structuredTaskErrors: true,
+		responseRewriter: ResponseRewriterFuncs{
+			Streaming: func(
+				ctx context.Context,
+				result protocol.StreamingMessageResult,
+			) protocol.StreamingMessageResult {
+				return nil
+			},
+		},
+	}
+	ctxID := "ctx"
+	msg := &protocol.Message{
+		ContextID: &ctxID,
+		MessageID: "streaming-error-drop-test",
+	}
+	subscriber := &mockTaskSubscriber{
+		channel: make(chan protocol.StreamingMessageEvent, 1),
+	}
+	terminalTaskError := false
+
+	cont, err := processor.processBatchStreamingEvents(
+		context.Background(),
+		"task-1",
+		msg,
+		[]*event.Event{{
+			Response: &model.Response{
+				Done: true,
+				Error: &model.ResponseError{
+					Type:    model.ErrorTypeFlowError,
+					Message: "task failed",
+				},
+			},
+		}},
+		subscriber,
+		&terminalTaskError,
+		nil,
+	)
+	assert.NoError(t, err)
+	assert.False(t, cont)
+	assert.True(t, terminalTaskError)
+
+	select {
+	case streamEvent := <-subscriber.channel:
+		t.Fatalf("unexpected streaming result: %#v", streamEvent)
+	default:
+	}
+}
+
+func TestProcessAgentStreamingEvents_ResponseRewriterDropsCompletionEvents(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	ctxID := "ctx"
+	msg := &protocol.Message{ContextID: &ctxID}
+	events := make(chan *event.Event)
+	close(events)
+
+	proc := createTestMessageProcessor()
+	proc.responseRewriter = ResponseRewriterFuncs{
+		Streaming: func(
+			ctx context.Context,
+			result protocol.StreamingMessageResult,
+		) protocol.StreamingMessageResult {
+			switch v := result.(type) {
+			case *protocol.TaskArtifactUpdateEvent:
+				return nil
+			case *protocol.TaskStatusUpdateEvent:
+				if v.Status.State == protocol.TaskStateCompleted {
+					return nil
+				}
+			}
+			return result
+		},
+	}
+
+	var results []protocol.StreamingMessageResult
+	sub := &mockTaskSubscriber{
+		sendFunc: func(evt protocol.StreamingMessageEvent) error {
+			if evt.Result != nil {
+				results = append(results, evt.Result)
+			}
+			return nil
+		},
+	}
+
+	proc.processAgentStreamingEvents(
+		ctx,
+		"task",
+		"user1",
+		"session1",
+		msg,
+		events,
+		sub,
+		&mockTaskHandler{},
+	)
+
+	if assert.Len(t, results, 1) {
+		status, ok := results[0].(*protocol.TaskStatusUpdateEvent)
+		if assert.True(t, ok) {
+			assert.Equal(t, protocol.TaskStateSubmitted, status.Status.State)
+		}
+	}
+}
+
+func TestProcessAgentStreamingEvents_StopAgentError(t *testing.T) {
+	ctx := context.Background()
+	ctxID := "ctx"
+	msg := &protocol.Message{ContextID: &ctxID}
+	code := "A2A_499"
+	events := make(chan *event.Event, 1)
+	events <- &event.Event{
+		Response: &model.Response{
+			ID:   "resp-1",
+			Done: true,
+			Error: &model.ResponseError{
+				Type:    agent.ErrorTypeStopAgentError,
+				Message: "task canceled",
+				Code:    &code,
+			},
+		},
+	}
+	close(events)
+
+	subscriber := &mockTaskSubscriber{
+		channel: make(chan protocol.StreamingMessageEvent, 4),
+	}
+	processor := createTestMessageProcessor()
+	processor.structuredTaskErrors = true
+
+	processor.processAgentStreamingEvents(
+		ctx,
+		"task-1",
+		"user",
+		"session",
+		msg,
+		events,
+		subscriber,
+		&mockTaskHandler{},
+	)
+
+	var results []protocol.StreamingMessageResult
+	for {
+		select {
+		case streamEvent, ok := <-subscriber.channel:
+			if !ok {
+				goto done
+			}
+			if streamEvent.Result != nil {
+				results = append(results, streamEvent.Result)
+			}
+		default:
+			goto done
+		}
+	}
+
+done:
+	if !assert.Len(t, results, 2) {
+		return
+	}
+
+	submitted, ok := results[0].(*protocol.TaskStatusUpdateEvent)
+	if !assert.True(t, ok) {
+		return
+	}
+	assert.Equal(t, protocol.TaskStateSubmitted, submitted.Status.State)
+
+	status, ok := results[1].(*protocol.TaskStatusUpdateEvent)
+	if !assert.True(t, ok) {
+		return
+	}
+	assert.Equal(t, protocol.TaskStateCanceled, status.Status.State)
+	assert.Equal(
+		t,
+		code,
+		status.Metadata[ia2a.MessageMetadataErrorCodeKey],
+	)
+	if assert.NotNil(t, status.Status.Message) {
+		messageMetadata := status.Status.Message.Metadata
+		messageCode := messageMetadata[ia2a.MessageMetadataErrorCodeKey]
+		assert.Equal(
+			t,
+			status.Metadata[ia2a.MessageMetadataErrorCodeKey],
+			messageCode,
+		)
+		assert.Len(t, status.Status.Message.Parts, 1)
+	}
+}
+
+func TestMessageProcessor_ProcessBatchStreamingEvents_GraphNodeErrorNotTerminal(
+	t *testing.T,
+) {
+	processor := &messageProcessor{
+		structuredTaskErrors: true,
+		eventToA2AConverter: &mockEventToA2AConverter{
+			convertStreamingToA2AMessageFunc: func(
+				ctx context.Context,
+				event *event.Event,
+				options EventToA2AStreamingOptions,
+			) (protocol.StreamingMessageResult, error) {
+				return nil, nil
+			},
+		},
+	}
+	ctxID := "ctx"
+	msg := &protocol.Message{
+		ContextID: &ctxID,
+		MessageID: "graph-node-error-test",
+	}
+	subscriber := &mockTaskSubscriber{
+		channel: make(chan protocol.StreamingMessageEvent, 1),
+	}
+	terminalTaskError := false
+
+	cont, err := processor.processBatchStreamingEvents(
+		context.Background(),
+		"task-1",
+		msg,
+		[]*event.Event{{
+			Response: &model.Response{
+				Object: graph.ObjectTypeGraphNodeError,
+				Error: &model.ResponseError{
+					Type:    model.ErrorTypeFlowError,
+					Message: "node failed",
+				},
+			},
+		}},
+		subscriber,
+		&terminalTaskError,
+		nil,
+	)
+	assert.NoError(t, err)
+	assert.True(t, cont)
+	assert.False(t, terminalTaskError)
+
+	select {
+	case streamEvent := <-subscriber.channel:
+		t.Fatalf("unexpected streaming result: %#v", streamEvent)
+	default:
+	}
+}
+
+func TestProcessAgentStreamingEvents_HidesRunnerCompletion_TaskArtifact(t *testing.T) {
+	ctx := context.Background()
+	ctxID := "ctx"
+	msg := &protocol.Message{ContextID: &ctxID}
+	events := make(chan *event.Event, 1)
+	events <- &event.Event{
+		Response: &model.Response{
+			ID:     "runner-completion-test",
+			Object: model.ObjectTypeRunnerCompletion,
+			Done:   true,
+		},
+		StateDelta: map[string][]byte{
+			"last_response":              []byte(`"final"`),
+			graph.StateKeyLastResponseID: []byte(`"resp-final"`),
+		},
+	}
+	close(events)
+
+	subscriber := &mockTaskSubscriber{
+		channel: make(chan protocol.StreamingMessageEvent, 4),
+	}
+	processor := createTestMessageProcessor()
+
+	processor.processAgentStreamingEvents(
+		ctx,
+		"task-1",
+		"user",
+		"session",
+		msg,
+		events,
+		subscriber,
+		&mockTaskHandler{},
+	)
+
+	var results []protocol.StreamingMessageResult
+	for {
+		select {
+		case streamEvent, ok := <-subscriber.channel:
+			if !ok {
+				goto doneArtifact
+			}
+			if streamEvent.Result != nil {
+				results = append(results, streamEvent.Result)
+			}
+		default:
+			goto doneArtifact
+		}
+	}
+
+doneArtifact:
+	if !assert.Len(t, results, 3) {
+		return
+	}
+
+	_, ok := results[0].(*protocol.TaskStatusUpdateEvent)
+	if !assert.True(t, ok, "expected submitted status event") {
+		return
+	}
+	finalArtifact, ok := results[1].(*protocol.TaskArtifactUpdateEvent)
+	if !assert.True(t, ok, "expected final artifact event") {
+		return
+	}
+	completed, ok := results[2].(*protocol.TaskStatusUpdateEvent)
+	if !assert.True(t, ok, "expected completed status event") {
+		return
+	}
+
+	if assert.NotNil(t, finalArtifact.LastChunk, "expected final artifact marker") {
+		assert.True(t, *finalArtifact.LastChunk)
+	}
+	assert.Empty(t, finalArtifact.Artifact.Parts)
+	assert.Equal(t, "resp-final", finalArtifact.Metadata[ia2a.MessageMetadataResponseIDKey])
+	assert.NotContains(t, finalArtifact.Metadata, ia2a.MessageMetadataObjectTypeKey)
+	rawStateDelta, ok := finalArtifact.Metadata[ia2a.MessageMetadataStateDeltaKey]
+	if assert.True(t, ok, "expected state_delta on final artifact") {
+		decoded := ia2a.DecodeStateDeltaMetadata(rawStateDelta)
+		assert.Equal(t, []byte(`"final"`), decoded["last_response"])
+	}
+	assert.Nil(t, completed.Metadata)
+}
+
+func TestProcessAgentStreamingEvents_HidesRunnerCompletion_MessageMode(t *testing.T) {
+	ctx := context.Background()
+	ctxID := "ctx"
+	msg := &protocol.Message{ContextID: &ctxID}
+	events := make(chan *event.Event, 1)
+	events <- &event.Event{
+		Response: &model.Response{
+			ID:     "runner-completion-test",
+			Object: model.ObjectTypeRunnerCompletion,
+			Done:   true,
+		},
+		StateDelta: map[string][]byte{
+			"last_response":              []byte(`"final"`),
+			graph.StateKeyLastResponseID: []byte(`"resp-final"`),
+		},
+	}
+	close(events)
+
+	subscriber := &mockTaskSubscriber{
+		channel: make(chan protocol.StreamingMessageEvent, 4),
+	}
+	processor := createTestMessageProcessor()
+	processor.streamingEventType = StreamingEventTypeMessage
+
+	processor.processAgentStreamingEvents(
+		ctx,
+		"task-1",
+		"user",
+		"session",
+		msg,
+		events,
+		subscriber,
+		&mockTaskHandler{},
+	)
+
+	var results []protocol.StreamingMessageResult
+	for {
+		select {
+		case streamEvent, ok := <-subscriber.channel:
+			if !ok {
+				goto doneMessage
+			}
+			if streamEvent.Result != nil {
+				results = append(results, streamEvent.Result)
+			}
+		default:
+			goto doneMessage
+		}
+	}
+
+doneMessage:
+	if !assert.Len(t, results, 2) {
+		return
+	}
+
+	_, ok := results[0].(*protocol.TaskStatusUpdateEvent)
+	if !assert.True(t, ok, "expected submitted status event") {
+		return
+	}
+	completed, ok := results[1].(*protocol.TaskStatusUpdateEvent)
+	if !assert.True(t, ok, "expected completed status event") {
+		return
+	}
+
+	assert.Equal(t, protocol.TaskStateCompleted, completed.Status.State)
+	assert.Equal(t, "resp-final", completed.Metadata[ia2a.MessageMetadataResponseIDKey])
+	assert.NotContains(t, completed.Metadata, ia2a.MessageMetadataObjectTypeKey)
+	rawStateDelta, ok := completed.Metadata[ia2a.MessageMetadataStateDeltaKey]
+	if assert.True(t, ok, "expected state_delta on completed status") {
+		decoded := ia2a.DecodeStateDeltaMetadata(rawStateDelta)
+		assert.Equal(t, []byte(`"final"`), decoded["last_response"])
+	}
+}
+
+func TestProcessAgentStreamingEvents_PropagatesRunnerCompletionError_TaskArtifact(t *testing.T) {
+	ctx := context.Background()
+	ctxID := "ctx"
+	msg := &protocol.Message{ContextID: &ctxID}
+	code := "A2A_500"
+	events := make(chan *event.Event, 1)
+	events <- &event.Event{
+		Response: &model.Response{
+			ID:     "runner-completion-test",
+			Object: model.ObjectTypeRunnerCompletion,
+			Done:   true,
+			Error: &model.ResponseError{
+				Type:    model.ErrorTypeFlowError,
+				Message: "runner failed",
+				Code:    &code,
+			},
+		},
+		StateDelta: map[string][]byte{
+			"last_response":              []byte(`"final"`),
+			graph.StateKeyLastResponseID: []byte(`"resp-final"`),
+		},
+	}
+	close(events)
+
+	subscriber := &mockTaskSubscriber{
+		channel: make(chan protocol.StreamingMessageEvent, 4),
+	}
+	processor := createTestMessageProcessor()
+
+	processor.processAgentStreamingEvents(
+		ctx,
+		"task-1",
+		"user",
+		"session",
+		msg,
+		events,
+		subscriber,
+		&mockTaskHandler{},
+	)
+
+	var results []protocol.StreamingMessageResult
+	for {
+		select {
+		case streamEvent, ok := <-subscriber.channel:
+			if !ok {
+				goto doneArtifactError
+			}
+			if streamEvent.Result != nil {
+				results = append(results, streamEvent.Result)
+			}
+		default:
+			goto doneArtifactError
+		}
+	}
+
+doneArtifactError:
+	if !assert.Len(t, results, 3) {
+		return
+	}
+
+	finalArtifact, ok := results[1].(*protocol.TaskArtifactUpdateEvent)
+	if !assert.True(t, ok, "expected final artifact event") {
+		return
+	}
+	assert.Equal(t, model.ObjectTypeError, finalArtifact.Metadata[ia2a.MessageMetadataObjectTypeKey])
+	assert.Equal(t, model.ErrorTypeFlowError, finalArtifact.Metadata[ia2a.MessageMetadataErrorTypeKey])
+	assert.Equal(t, "runner failed", finalArtifact.Metadata[ia2a.MessageMetadataErrorMessageKey])
+	assert.Equal(t, code, finalArtifact.Metadata[ia2a.MessageMetadataErrorCodeKey])
+	assert.Equal(t, "resp-final", finalArtifact.Metadata[ia2a.MessageMetadataResponseIDKey])
+	rawStateDelta, ok := finalArtifact.Metadata[ia2a.MessageMetadataStateDeltaKey]
+	if assert.True(t, ok, "expected state_delta on final artifact") {
+		decoded := ia2a.DecodeStateDeltaMetadata(rawStateDelta)
+		assert.Equal(t, []byte(`"final"`), decoded["last_response"])
+	}
+}
+
+func TestProcessAgentStreamingEvents_PropagatesRunnerCompletionError_MessageMode(t *testing.T) {
+	ctx := context.Background()
+	ctxID := "ctx"
+	msg := &protocol.Message{ContextID: &ctxID}
+	code := "A2A_500"
+	events := make(chan *event.Event, 1)
+	events <- &event.Event{
+		Response: &model.Response{
+			ID:     "runner-completion-test",
+			Object: model.ObjectTypeRunnerCompletion,
+			Done:   true,
+			Error: &model.ResponseError{
+				Type:    model.ErrorTypeFlowError,
+				Message: "runner failed",
+				Code:    &code,
+			},
+		},
+		StateDelta: map[string][]byte{
+			"last_response":              []byte(`"final"`),
+			graph.StateKeyLastResponseID: []byte(`"resp-final"`),
+		},
+	}
+	close(events)
+
+	subscriber := &mockTaskSubscriber{
+		channel: make(chan protocol.StreamingMessageEvent, 4),
+	}
+	processor := createTestMessageProcessor()
+	processor.streamingEventType = StreamingEventTypeMessage
+
+	processor.processAgentStreamingEvents(
+		ctx,
+		"task-1",
+		"user",
+		"session",
+		msg,
+		events,
+		subscriber,
+		&mockTaskHandler{},
+	)
+
+	var results []protocol.StreamingMessageResult
+	for {
+		select {
+		case streamEvent, ok := <-subscriber.channel:
+			if !ok {
+				goto doneMessageError
+			}
+			if streamEvent.Result != nil {
+				results = append(results, streamEvent.Result)
+			}
+		default:
+			goto doneMessageError
+		}
+	}
+
+doneMessageError:
+	if !assert.Len(t, results, 2) {
+		return
+	}
+
+	completed, ok := results[1].(*protocol.TaskStatusUpdateEvent)
+	if !assert.True(t, ok, "expected completed status event") {
+		return
+	}
+
+	assert.Equal(t, model.ObjectTypeError, completed.Metadata[ia2a.MessageMetadataObjectTypeKey])
+	assert.Equal(t, model.ErrorTypeFlowError, completed.Metadata[ia2a.MessageMetadataErrorTypeKey])
+	assert.Equal(t, "runner failed", completed.Metadata[ia2a.MessageMetadataErrorMessageKey])
+	assert.Equal(t, code, completed.Metadata[ia2a.MessageMetadataErrorCodeKey])
+	assert.Equal(t, "resp-final", completed.Metadata[ia2a.MessageMetadataResponseIDKey])
+	rawStateDelta, ok := completed.Metadata[ia2a.MessageMetadataStateDeltaKey]
+	if assert.True(t, ok, "expected state_delta on completed status") {
+		decoded := ia2a.DecodeStateDeltaMetadata(rawStateDelta)
+		assert.Equal(t, []byte(`"final"`), decoded["last_response"])
+	}
+}
+
+func TestBuildFinalStreamingMetadata(t *testing.T) {
+	t.Run("nil event", func(t *testing.T) {
+		assert.Nil(t, buildFinalStreamingMetadata(nil))
+	})
+
+	t.Run("empty event no metadata", func(t *testing.T) {
+		evt := &event.Event{}
+		assert.Nil(t, buildFinalStreamingMetadata(evt))
+	})
+
+	t.Run("only response id from state delta", func(t *testing.T) {
+		evt := &event.Event{
+			StateDelta: map[string][]byte{
+				graph.StateKeyLastResponseID: []byte(`"chatcmpl-abc"`),
+			},
+		}
+		meta := buildFinalStreamingMetadata(evt)
+		assert.Equal(t, "chatcmpl-abc", meta[ia2a.MessageMetadataResponseIDKey])
+		_, hasStateDelta := meta[ia2a.MessageMetadataStateDeltaKey]
+		assert.True(t, hasStateDelta, "state_delta should be encoded")
+	})
+
+	t.Run("only error no state delta", func(t *testing.T) {
+		evt := &event.Event{
+			Response: &model.Response{
+				Error: &model.ResponseError{
+					Type:    model.ErrorTypeFlowError,
+					Message: "boom",
+				},
+			},
+		}
+		meta := buildFinalStreamingMetadata(evt)
+		assert.Equal(t, model.ObjectTypeError, meta[ia2a.MessageMetadataObjectTypeKey])
+		assert.Equal(t, "boom", meta[ia2a.MessageMetadataErrorMessageKey])
+	})
+
+	t.Run("only state delta no response id key", func(t *testing.T) {
+		evt := &event.Event{
+			StateDelta: map[string][]byte{
+				"custom_key": []byte(`"val"`),
+			},
+		}
+		meta := buildFinalStreamingMetadata(evt)
+		assert.Nil(t, meta[ia2a.MessageMetadataResponseIDKey])
+		rawSD, ok := meta[ia2a.MessageMetadataStateDeltaKey]
+		assert.True(t, ok)
+		decoded := ia2a.DecodeStateDeltaMetadata(rawSD)
+		assert.Equal(t, []byte(`"val"`), decoded["custom_key"])
+	})
+
+}
+
+func TestFinalStreamingResponseID(t *testing.T) {
+	t.Run("nil event", func(t *testing.T) {
+		assert.Empty(t, finalStreamingResponseID(nil))
+	})
+
+	t.Run("empty state delta", func(t *testing.T) {
+		evt := &event.Event{}
+		assert.Empty(t, finalStreamingResponseID(evt))
+	})
+
+	t.Run("missing key", func(t *testing.T) {
+		evt := &event.Event{
+			StateDelta: map[string][]byte{
+				"other": []byte(`"x"`),
+			},
+		}
+		assert.Empty(t, finalStreamingResponseID(evt))
+	})
+
+	t.Run("empty value", func(t *testing.T) {
+		evt := &event.Event{
+			StateDelta: map[string][]byte{
+				graph.StateKeyLastResponseID: nil,
+			},
+		}
+		assert.Empty(t, finalStreamingResponseID(evt))
+	})
+
+	t.Run("invalid json", func(t *testing.T) {
+		evt := &event.Event{
+			StateDelta: map[string][]byte{
+				graph.StateKeyLastResponseID: []byte("{bad"),
+			},
+		}
+		assert.Empty(t, finalStreamingResponseID(evt))
+	})
+
+	t.Run("valid json", func(t *testing.T) {
+		evt := &event.Event{
+			StateDelta: map[string][]byte{
+				graph.StateKeyLastResponseID: []byte(`"chatcmpl-123"`),
+			},
+		}
+		assert.Equal(t, "chatcmpl-123", finalStreamingResponseID(evt))
+	})
+}
+
+func TestMergeRunnerCompletionStateDeltaIntoLastMessage(t *testing.T) {
+	t.Run("empty messages", func(t *testing.T) {
+		assert.False(t, mergeRunnerCompletionStateDeltaIntoLastMessage(
+			nil, map[string][]byte{"k": []byte("v")},
+		))
+	})
+
+	t.Run("empty state delta", func(t *testing.T) {
+		msgs := []protocol.Message{{}}
+		assert.False(t, mergeRunnerCompletionStateDeltaIntoLastMessage(msgs, nil))
+	})
+
+	t.Run("nil metadata on last message", func(t *testing.T) {
+		msgs := []protocol.Message{{}}
+		ok := mergeRunnerCompletionStateDeltaIntoLastMessage(
+			msgs,
+			map[string][]byte{"k": []byte(`"v"`)},
+		)
+		assert.True(t, ok)
+		assert.NotNil(t, msgs[0].Metadata)
+		rawSD := msgs[0].Metadata[ia2a.MessageMetadataStateDeltaKey]
+		decoded := ia2a.DecodeStateDeltaMetadata(rawSD)
+		assert.Equal(t, []byte(`"v"`), decoded["k"])
+	})
+
+	t.Run("merge with existing state delta", func(t *testing.T) {
+		existing := EncodeStateDeltaMetadata(map[string][]byte{
+			"old": []byte(`"old_val"`),
+		})
+		msgs := []protocol.Message{{
+			Metadata: map[string]any{
+				ia2a.MessageMetadataStateDeltaKey: existing,
+			},
+		}}
+		ok := mergeRunnerCompletionStateDeltaIntoLastMessage(
+			msgs,
+			map[string][]byte{"new": []byte(`"new_val"`)},
+		)
+		assert.True(t, ok)
+		rawSD := msgs[0].Metadata[ia2a.MessageMetadataStateDeltaKey]
+		decoded := ia2a.DecodeStateDeltaMetadata(rawSD)
+		assert.Equal(t, []byte(`"old_val"`), decoded["old"])
+		assert.Equal(t, []byte(`"new_val"`), decoded["new"])
+	})
+
+	t.Run("nil value in state delta", func(t *testing.T) {
+		msgs := []protocol.Message{{}}
+		ok := mergeRunnerCompletionStateDeltaIntoLastMessage(
+			msgs,
+			map[string][]byte{"k": nil},
+		)
+		assert.True(t, ok)
+	})
+
+}
+
+func TestCloneStateDeltaBytes(t *testing.T) {
+	assert.Nil(t, cloneStateDeltaBytes(nil))
+
+	original := []byte("hello")
+	cloned := cloneStateDeltaBytes(original)
+	assert.Equal(t, original, cloned)
+	cloned[0] = 'H'
+	assert.NotEqual(t, original, cloned, "clone must not share backing array")
+}
+
+func TestNormalizeResponseResults(t *testing.T) {
+	t.Run("nil inputs", func(t *testing.T) {
+		proc := &messageProcessor{}
+		assert.Nil(t, proc.rewriteUnaryResult(context.Background(), nil))
+		assert.Nil(t, proc.rewriteStreamingResult(context.Background(), nil))
+		assert.Nil(t, normalizeProtocolMessage(nil))
+		assert.Nil(t, normalizeTask(nil))
+		assert.Nil(t, normalizeTaskArtifactUpdateEvent(nil))
+		assert.Nil(t, normalizeTaskStatusUpdateEvent(nil))
+		assert.Nil(t, normalizeArtifact(nil))
+	})
+
+	t.Run("empty message with only response id is dropped", func(t *testing.T) {
+		msg := &protocol.Message{
+			Metadata: map[string]any{
+				ia2a.MessageMetadataResponseIDKey: "resp-1",
+			},
+		}
+		assert.Nil(t, normalizeProtocolMessage(msg))
+	})
+
+	t.Run("task normalizes nested empty messages and artifacts", func(t *testing.T) {
+		task := &protocol.Task{
+			Metadata: map[string]any{},
+			Status: protocol.TaskStatus{
+				Message: &protocol.Message{
+					Metadata: map[string]any{
+						ia2a.MessageMetadataResponseIDKey: "resp-1",
+					},
+				},
+			},
+			History: []protocol.Message{
+				{
+					Metadata: map[string]any{
+						ia2a.MessageMetadataResponseIDKey: "resp-history",
+					},
+				},
+				{
+					Parts: []protocol.Part{protocol.NewTextPart("keep")},
+				},
+			},
+			Artifacts: []protocol.Artifact{
+				{},
+				{
+					Metadata: map[string]any{"business": "keep"},
+				},
+			},
+		}
+
+		normalized := normalizeTask(task)
+		assert.Nil(t, normalized.Metadata)
+		assert.Nil(t, normalized.Status.Message)
+		if assert.Len(t, normalized.History, 1) {
+			assert.Equal(t, "keep", normalized.History[0].Parts[0].(protocol.TextPart).Text)
+		}
+		if assert.Len(t, normalized.Artifacts, 1) {
+			assert.Equal(t, "keep", normalized.Artifacts[0].Metadata["business"])
+		}
+	})
+
+	t.Run("artifact update keeps final or contentful metadata", func(t *testing.T) {
+		lastChunk := true
+		assert.NotNil(t, normalizeTaskArtifactUpdateEvent(
+			&protocol.TaskArtifactUpdateEvent{LastChunk: &lastChunk},
+		))
+		assert.NotNil(t, normalizeTaskArtifactUpdateEvent(
+			&protocol.TaskArtifactUpdateEvent{
+				Metadata: map[string]any{"business": "keep"},
+			},
+		))
+		assert.Nil(t, normalizeTaskArtifactUpdateEvent(
+			&protocol.TaskArtifactUpdateEvent{
+				Metadata: map[string]any{
+					ia2a.MessageMetadataResponseIDKey: "resp-1",
+				},
+			},
+		))
+	})
+
+	t.Run("streaming task falls through unchanged", func(t *testing.T) {
+		task := &protocol.Task{ID: "task-1"}
+		result := normalizeStreamingResult(task)
+		assert.Same(t, task, result)
+	})
+}
+
+func TestMessageProcessor_ResponseRewriterReceivesContext(t *testing.T) {
+	type contextKey struct{}
+	ctx := context.WithValue(context.Background(), contextKey{}, "trace-1")
+	unary := &protocol.Message{
+		Role:  protocol.MessageRoleAgent,
+		Parts: []protocol.Part{protocol.NewTextPart("unary")},
+	}
+	streaming := &protocol.TaskStatusUpdateEvent{
+		TaskID:    "task",
+		ContextID: "ctx",
+		Status: protocol.TaskStatus{
+			State: protocol.TaskStateCompleted,
+		},
+	}
+	proc := &messageProcessor{
+		responseRewriter: ResponseRewriterFuncs{
+			Unary: func(ctx context.Context, result protocol.UnaryMessageResult) protocol.UnaryMessageResult {
+				assert.Equal(t, "trace-1", ctx.Value(contextKey{}))
+				return result
+			},
+			Streaming: func(ctx context.Context, result protocol.StreamingMessageResult) protocol.StreamingMessageResult {
+				assert.Equal(t, "trace-1", ctx.Value(contextKey{}))
+				return result
+			},
+		},
+	}
+
+	assert.Same(t, unary, proc.rewriteUnaryResult(ctx, unary))
+	assert.Same(t, streaming, proc.rewriteStreamingResult(ctx, streaming))
 }
 
 // TestMessageProcessor_ProcessMessage_NoPartsCollected tests handling when no parts are collected
@@ -2897,6 +5153,503 @@ func TestMessageProcessor_ProcessMessage_NoPartsCollected(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, result)
 	assert.NotNil(t, result.Result)
+}
+
+func TestMessageProcessor_ProcessMessage_ResponseRewriterDropFinalResult(
+	t *testing.T,
+) {
+	ctxID := "ctx"
+	msg := protocol.Message{
+		ContextID: &ctxID,
+		MessageID: "drop-final-result-test",
+		Role:      protocol.MessageRoleUser,
+		Parts:     []protocol.Part{protocol.NewTextPart("hi")},
+	}
+	processor := &messageProcessor{
+		responseRewriter: ResponseRewriterFuncs{
+			Unary: func(
+				ctx context.Context,
+				result protocol.UnaryMessageResult,
+			) protocol.UnaryMessageResult {
+				return nil
+			},
+		},
+		runner: &mockRunner{
+			runFunc: func(
+				ctx context.Context,
+				userID string,
+				sessionID string,
+				message model.Message,
+				opts ...agent.RunOption,
+			) (<-chan *event.Event, error) {
+				ch := make(chan *event.Event, 1)
+				ch <- &event.Event{
+					Response: &model.Response{
+						Choices: []model.Choice{{
+							Message: model.Message{Content: "answer"},
+						}},
+					},
+				}
+				close(ch)
+				return ch, nil
+			},
+		},
+		a2aToAgentConverter: &defaultA2AMessageToAgentMessage{},
+		eventToA2AConverter: &mockEventToA2AConverter{},
+		errorHandler:        defaultErrorHandler,
+	}
+
+	result, err := processor.processMessage(
+		context.Background(),
+		"user",
+		"session",
+		&msg,
+		&model.Message{Content: "input"},
+		nil,
+	)
+	assert.NoError(t, err)
+	if assert.NotNil(t, result) {
+		assert.Nil(t, result.Result)
+		assert.Nil(t, result.StreamingEvents)
+	}
+}
+
+// TestMessageProcessor_ProcessMessage_SkipsRunnerCompletion tests that runner.completion events
+// are filtered out in the non-streaming processMessage path, so only real content events are
+// converted to A2A messages.
+func TestMessageProcessor_ProcessMessage_SkipsRunnerCompletion(t *testing.T) {
+	ctxID := "ctx"
+	ctx := context.Background()
+	msg := protocol.Message{
+		ContextID: &ctxID,
+		MessageID: "skip-runner-completion",
+		Role:      protocol.MessageRoleUser,
+		Parts:     []protocol.Part{protocol.NewTextPart("hi")},
+	}
+
+	t.Run("single_content_event_followed_by_runner_completion", func(t *testing.T) {
+		var convertCallCount int
+		processor := &messageProcessor{
+			debugLogging: false,
+			runner: &mockRunner{
+				runFunc: func(ctx context.Context, userID string, sessionID string, message model.Message, opts ...agent.RunOption) (<-chan *event.Event, error) {
+					ch := make(chan *event.Event, 2)
+					ch <- &event.Event{
+						Response: &model.Response{
+							Object:  "chat.completion",
+							Done:    true,
+							Choices: []model.Choice{{Message: model.Message{Content: "real answer"}}},
+						},
+					}
+					ch <- &event.Event{
+						Response: &model.Response{
+							Object: model.ObjectTypeRunnerCompletion,
+							Done:   true,
+						},
+					}
+					close(ch)
+					return ch, nil
+				},
+			},
+			a2aToAgentConverter: &defaultA2AMessageToAgentMessage{},
+			eventToA2AConverter: &mockEventToA2AConverter{
+				convertToA2AMessageFunc: func(ctx context.Context, evt *event.Event, options EventToA2AUnaryOptions) (protocol.UnaryMessageResult, error) {
+					convertCallCount++
+					return &protocol.Message{
+						Role:  protocol.MessageRoleAgent,
+						Parts: []protocol.Part{protocol.NewTextPart(evt.Response.Choices[0].Message.Content)},
+					}, nil
+				},
+			},
+			errorHandler: defaultErrorHandler,
+		}
+
+		result, err := processor.processMessage(ctx, "user", "session", &msg, &model.Message{Content: "input"}, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.NotNil(t, result.Result)
+
+		// runner.completion should be skipped, so converter is called only once
+		assert.Equal(t, 1, convertCallCount, "converter should be called once; runner.completion must be skipped")
+
+		// Result should be a single Message (not a Task), because only one message was collected
+		resultMsg, ok := result.Result.(*protocol.Message)
+		assert.True(t, ok, "Expected *protocol.Message, got %T", result.Result)
+		assert.Equal(t, protocol.MessageRoleAgent, resultMsg.Role)
+	})
+
+	t.Run("multiple_content_events_followed_by_runner_completion", func(t *testing.T) {
+		var convertCallCount int
+		processor := &messageProcessor{
+			debugLogging: false,
+			runner: &mockRunner{
+				runFunc: func(ctx context.Context, userID string, sessionID string, message model.Message, opts ...agent.RunOption) (<-chan *event.Event, error) {
+					ch := make(chan *event.Event, 3)
+					ch <- &event.Event{
+						Response: &model.Response{
+							Object:  "chat.completion",
+							Choices: []model.Choice{{Message: model.Message{Content: "tool call"}}},
+						},
+					}
+					ch <- &event.Event{
+						Response: &model.Response{
+							Object:  "chat.completion",
+							Done:    true,
+							Choices: []model.Choice{{Message: model.Message{Content: "final answer"}}},
+						},
+					}
+					ch <- &event.Event{
+						Response: &model.Response{
+							Object: model.ObjectTypeRunnerCompletion,
+							Done:   true,
+						},
+					}
+					close(ch)
+					return ch, nil
+				},
+			},
+			a2aToAgentConverter: &defaultA2AMessageToAgentMessage{},
+			eventToA2AConverter: &mockEventToA2AConverter{
+				convertToA2AMessageFunc: func(ctx context.Context, evt *event.Event, options EventToA2AUnaryOptions) (protocol.UnaryMessageResult, error) {
+					convertCallCount++
+					return &protocol.Message{
+						Role:  protocol.MessageRoleAgent,
+						Parts: []protocol.Part{protocol.NewTextPart(evt.Response.Choices[0].Message.Content)},
+					}, nil
+				},
+			},
+			errorHandler: defaultErrorHandler,
+		}
+
+		result, err := processor.processMessage(ctx, "user", "session", &msg, &model.Message{Content: "input"}, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.NotNil(t, result.Result)
+
+		// runner.completion should be skipped, so converter is called only twice
+		assert.Equal(t, 2, convertCallCount, "converter should be called twice; runner.completion must be skipped")
+
+		// Multiple messages → result is a Task
+		resultTask, ok := result.Result.(*protocol.Task)
+		assert.True(t, ok, "Expected *protocol.Task for multiple events, got %T", result.Result)
+		assert.Equal(t, 1, len(resultTask.History), "history should contain the first message")
+		assert.Equal(t, 1, len(resultTask.Artifacts), "artifacts should contain the last content message")
+	})
+
+	t.Run("only_runner_completion_returns_no_response_error", func(t *testing.T) {
+		processor := &messageProcessor{
+			debugLogging: false,
+			runner: &mockRunner{
+				runFunc: func(ctx context.Context, userID string, sessionID string, message model.Message, opts ...agent.RunOption) (<-chan *event.Event, error) {
+					ch := make(chan *event.Event, 1)
+					ch <- &event.Event{
+						Response: &model.Response{
+							Object: model.ObjectTypeRunnerCompletion,
+							Done:   true,
+						},
+					}
+					close(ch)
+					return ch, nil
+				},
+			},
+			a2aToAgentConverter: &defaultA2AMessageToAgentMessage{},
+			eventToA2AConverter: &mockEventToA2AConverter{},
+			errorHandler:        defaultErrorHandler,
+		}
+
+		result, err := processor.processMessage(ctx, "user", "session", &msg, &model.Message{Content: "input"}, nil)
+		// When all events are runner.completion, no messages are collected → error path
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.NotNil(t, result.Result)
+	})
+
+	t.Run("runner_completion_with_echoed_choices_is_preserved", func(t *testing.T) {
+		var convertCallCount int
+		processor := &messageProcessor{
+			debugLogging: false,
+			runner: &mockRunner{
+				runFunc: func(ctx context.Context, userID string, sessionID string, message model.Message, opts ...agent.RunOption) (<-chan *event.Event, error) {
+					ch := make(chan *event.Event, 1)
+					ch <- &event.Event{
+						Response: &model.Response{
+							Object:  model.ObjectTypeRunnerCompletion,
+							Done:    true,
+							Choices: []model.Choice{{Message: model.Message{Content: "graph final answer"}}},
+						},
+					}
+					close(ch)
+					return ch, nil
+				},
+			},
+			a2aToAgentConverter: &defaultA2AMessageToAgentMessage{},
+			eventToA2AConverter: &mockEventToA2AConverter{
+				convertToA2AMessageFunc: func(ctx context.Context, evt *event.Event, options EventToA2AUnaryOptions) (protocol.UnaryMessageResult, error) {
+					convertCallCount++
+					return &protocol.Message{
+						Role:  protocol.MessageRoleAgent,
+						Parts: []protocol.Part{protocol.NewTextPart(evt.Response.Choices[0].Message.Content)},
+					}, nil
+				},
+			},
+			errorHandler: defaultErrorHandler,
+		}
+
+		result, err := processor.processMessage(ctx, "user", "session", &msg, &model.Message{Content: "input"}, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.NotNil(t, result.Result)
+
+		assert.Equal(t, 1, convertCallCount, "runner.completion with choices must not be skipped")
+
+		resultMsg, ok := result.Result.(*protocol.Message)
+		if assert.True(t, ok, "Expected *protocol.Message, got %T", result.Result) {
+			assert.NotEmpty(t, resultMsg.Parts)
+			assert.Equal(t, "graph final answer", resultMsg.Parts[0].(protocol.TextPart).Text)
+		}
+	})
+
+	t.Run("runner_completion_with_state_delta_only_is_preserved", func(t *testing.T) {
+		var convertCallCount int
+		processor := &messageProcessor{
+			debugLogging: false,
+			runner: &mockRunner{
+				runFunc: func(ctx context.Context, userID string, sessionID string, message model.Message, opts ...agent.RunOption) (<-chan *event.Event, error) {
+					ch := make(chan *event.Event, 2)
+					ch <- &event.Event{
+						Response: &model.Response{
+							Object:  "chat.completion",
+							Done:    true,
+							Choices: []model.Choice{{Message: model.Message{Content: "answer"}}},
+						},
+					}
+					ch <- &event.Event{
+						Response: &model.Response{
+							Object: model.ObjectTypeRunnerCompletion,
+							Done:   true,
+						},
+						StateDelta: map[string][]byte{
+							"graph_state": []byte(`"completed"`),
+						},
+					}
+					close(ch)
+					return ch, nil
+				},
+			},
+			a2aToAgentConverter: &defaultA2AMessageToAgentMessage{},
+			eventToA2AConverter: &mockEventToA2AConverter{
+				convertToA2AMessageFunc: func(ctx context.Context, evt *event.Event, options EventToA2AUnaryOptions) (protocol.UnaryMessageResult, error) {
+					convertCallCount++
+					return &protocol.Message{
+						Role:  protocol.MessageRoleAgent,
+						Parts: []protocol.Part{protocol.NewTextPart(evt.Response.Choices[0].Message.Content)},
+					}, nil
+				},
+			},
+			errorHandler: defaultErrorHandler,
+		}
+
+		result, err := processor.processMessage(ctx, "user", "session", &msg, &model.Message{Content: "input"}, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.NotNil(t, result.Result)
+
+		// State-delta-only runner completion should not become a separate
+		// converted message. It should be merged into the latest content message.
+		assert.Equal(t, 1, convertCallCount, "runner.completion state_delta should be merged into the latest message")
+
+		resultMsg, ok := result.Result.(*protocol.Message)
+		if assert.True(t, ok, "Expected *protocol.Message, got %T", result.Result) {
+			assert.NotEmpty(t, resultMsg.Parts)
+			assert.Equal(t, "answer", resultMsg.Parts[0].(protocol.TextPart).Text)
+
+			rawStateDelta, exists := resultMsg.Metadata[ia2a.MessageMetadataStateDeltaKey]
+			if assert.True(t, exists, "expected merged state_delta metadata on final message") {
+				decoded := DecodeStateDeltaMetadata(rawStateDelta)
+				assert.Equal(t, []byte(`"completed"`), decoded["graph_state"])
+			}
+		}
+	})
+
+	t.Run("runner_completion_with_blocked_state_delta_stays_hidden", func(t *testing.T) {
+		var convertCallCount int
+		processor := &messageProcessor{
+			debugLogging: false,
+			responseRewriter: ResponseRewriterFuncs{
+				Unary: func(ctx context.Context, result protocol.UnaryMessageResult) protocol.UnaryMessageResult {
+					msg, ok := result.(*protocol.Message)
+					if !ok {
+						return result
+					}
+					delete(msg.Metadata, ia2a.MessageMetadataStateDeltaKey)
+					return msg
+				},
+			},
+			runner: &mockRunner{
+				runFunc: func(ctx context.Context, userID string, sessionID string, message model.Message, opts ...agent.RunOption) (<-chan *event.Event, error) {
+					ch := make(chan *event.Event, 2)
+					ch <- &event.Event{
+						Response: &model.Response{
+							Object:  "chat.completion",
+							Done:    true,
+							Choices: []model.Choice{{Message: model.Message{Content: "answer"}}},
+						},
+					}
+					ch <- &event.Event{
+						Response: &model.Response{
+							Object: model.ObjectTypeRunnerCompletion,
+							Done:   true,
+						},
+						StateDelta: map[string][]byte{
+							"graph_state": []byte(`"completed"`),
+						},
+					}
+					close(ch)
+					return ch, nil
+				},
+			},
+			a2aToAgentConverter: &defaultA2AMessageToAgentMessage{},
+			eventToA2AConverter: &mockEventToA2AConverter{
+				convertToA2AMessageFunc: func(ctx context.Context, evt *event.Event, options EventToA2AUnaryOptions) (protocol.UnaryMessageResult, error) {
+					convertCallCount++
+					return &protocol.Message{
+						Role:  protocol.MessageRoleAgent,
+						Parts: []protocol.Part{protocol.NewTextPart(evt.Response.Choices[0].Message.Content)},
+					}, nil
+				},
+			},
+			errorHandler: defaultErrorHandler,
+		}
+
+		result, err := processor.processMessage(ctx, "user", "session", &msg, &model.Message{Content: "input"}, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.NotNil(t, result.Result)
+
+		assert.Equal(t, 1, convertCallCount, "rewritten state_delta should not re-expose runner.completion")
+
+		resultMsg, ok := result.Result.(*protocol.Message)
+		if assert.True(t, ok, "Expected *protocol.Message, got %T", result.Result) {
+			assert.NotEmpty(t, resultMsg.Parts)
+			assert.Equal(t, "answer", resultMsg.Parts[0].(protocol.TextPart).Text)
+			assert.Nil(t, resultMsg.Metadata)
+		}
+	})
+
+	t.Run("default_converter_response_rewriter_runs_once", func(t *testing.T) {
+		rewriteCallCount := 0
+		processor := &messageProcessor{
+			debugLogging: false,
+			responseRewriter: ResponseRewriterFuncs{
+				Unary: func(ctx context.Context, result protocol.UnaryMessageResult) protocol.UnaryMessageResult {
+					rewriteCallCount++
+					msg, ok := result.(*protocol.Message)
+					if !ok {
+						return result
+					}
+					msg.Metadata["rewrite_call_count"] = rewriteCallCount
+					return msg
+				},
+			},
+			runner: &mockRunner{
+				runFunc: func(ctx context.Context, userID string, sessionID string, message model.Message, opts ...agent.RunOption) (<-chan *event.Event, error) {
+					ch := make(chan *event.Event, 1)
+					ch <- &event.Event{
+						Response: &model.Response{
+							ID:      "resp-filter-once",
+							Object:  "graph.execution",
+							Choices: []model.Choice{{Message: model.Message{}}},
+						},
+						StateDelta: map[string][]byte{
+							"business_result": []byte(`"ok"`),
+						},
+					}
+					close(ch)
+					return ch, nil
+				},
+			},
+			a2aToAgentConverter: &defaultA2AMessageToAgentMessage{},
+			eventToA2AConverter: &defaultEventToA2AMessage{
+				graphEventObjectAllowlist: []string{"graph.*"},
+			},
+			errorHandler: defaultErrorHandler,
+		}
+
+		result, err := processor.processMessage(ctx, "user", "session", &msg, &model.Message{Content: "input"}, nil)
+		assert.NoError(t, err)
+		resultMsg, ok := result.Result.(*protocol.Message)
+		if !assert.True(t, ok, "Expected *protocol.Message, got %T", result.Result) {
+			return
+		}
+		assert.Equal(t, 1, rewriteCallCount)
+		assert.Equal(t, 1, resultMsg.Metadata["rewrite_call_count"])
+	})
+
+	t.Run("custom_converter_output_uses_response_rewriter", func(t *testing.T) {
+		processor := &messageProcessor{
+			debugLogging: false,
+			responseRewriter: ResponseRewriterFuncs{
+				Unary: func(ctx context.Context, result protocol.UnaryMessageResult) protocol.UnaryMessageResult {
+					msg, ok := result.(*protocol.Message)
+					if !ok {
+						return result
+					}
+					raw, ok := msg.Metadata[ia2a.MessageMetadataStateDeltaKey]
+					if !ok {
+						return msg
+					}
+					stateDelta := DecodeStateDeltaMetadata(raw)
+					delete(stateDelta, "debug_trace")
+					msg.Metadata[ia2a.MessageMetadataStateDeltaKey] = EncodeStateDeltaMetadata(stateDelta)
+					return msg
+				},
+			},
+			runner: &mockRunner{
+				runFunc: func(ctx context.Context, userID string, sessionID string, message model.Message, opts ...agent.RunOption) (<-chan *event.Event, error) {
+					ch := make(chan *event.Event, 1)
+					ch <- &event.Event{
+						Response: &model.Response{
+							Object:  "chat.completion",
+							Done:    true,
+							Choices: []model.Choice{{Message: model.Message{Content: "answer"}}},
+						},
+					}
+					close(ch)
+					return ch, nil
+				},
+			},
+			a2aToAgentConverter: &defaultA2AMessageToAgentMessage{},
+			eventToA2AConverter: &mockEventToA2AConverter{
+				convertToA2AMessageFunc: func(ctx context.Context, evt *event.Event, options EventToA2AUnaryOptions) (protocol.UnaryMessageResult, error) {
+					return &protocol.Message{
+						Role:  protocol.MessageRoleAgent,
+						Parts: []protocol.Part{protocol.NewTextPart("answer")},
+						Metadata: map[string]any{
+							ia2a.MessageMetadataStateDeltaKey: EncodeStateDeltaMetadata(map[string][]byte{
+								"business_result": []byte(`"ok"`),
+								"debug_trace":     []byte(`"drop-me"`),
+							}),
+						},
+					}, nil
+				},
+			},
+			errorHandler: defaultErrorHandler,
+		}
+
+		result, err := processor.processMessage(ctx, "user", "session", &msg, &model.Message{Content: "input"}, nil)
+		assert.NoError(t, err)
+		resultMsg, ok := result.Result.(*protocol.Message)
+		if !assert.True(t, ok, "Expected *protocol.Message, got %T", result.Result) {
+			return
+		}
+		rawStateDelta, ok := resultMsg.Metadata[ia2a.MessageMetadataStateDeltaKey]
+		if !assert.True(t, ok, "expected state_delta metadata on result message") {
+			return
+		}
+		decoded := DecodeStateDeltaMetadata(rawStateDelta)
+		assert.Contains(t, decoded, "business_result")
+		assert.NotContains(t, decoded, "debug_trace")
+	})
 }
 
 // TestTraceContextMiddleware_Extract tests that trace context is extracted from HTTP headers
@@ -2971,4 +5724,350 @@ func TestTraceContextMiddleware_NoTraceparent(t *testing.T) {
 	// Verify the context does not contain valid trace info
 	spanContext := trace.SpanContextFromContext(receivedCtx)
 	assert.False(t, spanContext.IsValid(), "Expected invalid span context when no traceparent")
+}
+
+func TestBuildA2AServer_BuildProcessorErrorWrapping(t *testing.T) {
+	opts := &options{
+		sessionService: &mockSessionService{},
+		errorHandler:   defaultErrorHandler,
+		agentCard: &a2a.AgentCard{
+			Name: "valid",
+			URL:  "http://localhost:8080",
+		},
+	}
+	_, err := buildA2AServer(opts)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to build processor:")
+}
+
+func TestProcessStreamingMessage_CleanupTask_OnSubscribeError(t *testing.T) {
+	t.Run("cleanup succeeds", func(t *testing.T) {
+		ctx := context.Background()
+		ctxID := "ctx"
+		msg := &protocol.Message{ContextID: &ctxID}
+
+		var cleanedTaskID string
+		handler := &mockTaskHandler{
+			buildTaskFunc: func(specificTaskID *string, contextID *string) (string, error) {
+				return "task-cleanup", nil
+			},
+			subscribeTaskFunc: func(taskID *string) (taskmanager.TaskSubscriber, error) {
+				return nil, fmt.Errorf("subscribe failed")
+			},
+			cleanTaskFunc: func(taskID *string) error {
+				cleanedTaskID = *taskID
+				return nil
+			},
+		}
+
+		proc := createTestMessageProcessor()
+		result, err := proc.processStreamingMessage(ctx, "user", "session", msg, &model.Message{Content: "hi"}, handler, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.Equal(t, "task-cleanup", cleanedTaskID)
+	})
+
+	t.Run("cleanup itself fails should not panic", func(t *testing.T) {
+		ctx := context.Background()
+		ctxID := "ctx"
+		msg := &protocol.Message{ContextID: &ctxID}
+
+		var cleanCalled bool
+		handler := &mockTaskHandler{
+			buildTaskFunc: func(specificTaskID *string, contextID *string) (string, error) {
+				return "task-clean-fail", nil
+			},
+			subscribeTaskFunc: func(taskID *string) (taskmanager.TaskSubscriber, error) {
+				return nil, fmt.Errorf("subscribe failed")
+			},
+			cleanTaskFunc: func(taskID *string) error {
+				cleanCalled = true
+				return fmt.Errorf("clean error")
+			},
+		}
+
+		proc := createTestMessageProcessor()
+		assert.NotPanics(t, func() {
+			_, _ = proc.processStreamingMessage(ctx, "user", "session", msg, &model.Message{Content: "hi"}, handler, nil)
+		})
+		assert.True(t, cleanCalled)
+	})
+}
+
+func TestProcessStreamingMessage_CleanupTask_OnRunnerError(t *testing.T) {
+	ctx := context.Background()
+	ctxID := "ctx"
+	msg := &protocol.Message{ContextID: &ctxID}
+
+	var cleanedTaskID string
+	var subscriberClosed bool
+	sub := &mockTaskSubscriber{
+		closeFunc: func() { subscriberClosed = true },
+	}
+	handler := &mockTaskHandler{
+		buildTaskFunc: func(specificTaskID *string, contextID *string) (string, error) {
+			return "task-runner-err", nil
+		},
+		subscribeTaskFunc: func(taskID *string) (taskmanager.TaskSubscriber, error) {
+			return sub, nil
+		},
+		cleanTaskFunc: func(taskID *string) error {
+			cleanedTaskID = *taskID
+			return nil
+		},
+	}
+
+	proc := createTestMessageProcessor()
+	proc.runner = &mockRunner{
+		runFunc: func(ctx context.Context, userID string, sessionID string, message model.Message, opts ...agent.RunOption) (<-chan *event.Event, error) {
+			return nil, errors.New("runner boom")
+		},
+	}
+
+	result, err := proc.processStreamingMessage(ctx, "user", "session", msg, &model.Message{Content: "hi"}, handler, nil)
+	assert.NoError(t, err)
+	assert.NotNil(t, result)
+	assert.Equal(t, "task-runner-err", cleanedTaskID)
+	assert.True(t, subscriberClosed)
+}
+
+func TestAbortStreaming_ContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ctxID := "ctx"
+	msg := &protocol.Message{ContextID: &ctxID}
+
+	events := make(chan *event.Event, 1)
+	events <- &event.Event{
+		Response: &model.Response{
+			Choices: []model.Choice{{Delta: model.Message{Content: "chunk"}}},
+		},
+	}
+	close(events)
+
+	sendCount := 0
+	sub := &mockTaskSubscriber{
+		sendFunc: func(evt protocol.StreamingMessageEvent) error {
+			sendCount++
+			if sendCount == 1 {
+				// After sending the submitted event, cancel context so tunnel returns Canceled
+				cancel()
+				return nil
+			}
+			// Subsequent sends fail with context.Canceled
+			return context.Canceled
+		},
+	}
+
+	proc := createTestMessageProcessor()
+	assert.NotPanics(t, func() {
+		proc.processAgentStreamingEvents(ctx, "task", "user1", "session1", msg, events, sub, &mockTaskHandler{})
+	})
+}
+
+func TestAbortStreaming_DeadlineExceeded(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctxID := "ctx"
+	msg := &protocol.Message{ContextID: &ctxID}
+
+	events := make(chan *event.Event)
+	close(events)
+
+	sendCount := 0
+	sub := &mockTaskSubscriber{
+		sendFunc: func(evt protocol.StreamingMessageEvent) error {
+			sendCount++
+			if sendCount == 1 {
+				return nil // submitted event succeeds
+			}
+			return context.DeadlineExceeded
+		},
+	}
+
+	proc := createTestMessageProcessor()
+	assert.NotPanics(t, func() {
+		proc.processAgentStreamingEvents(ctx, "task", "user1", "session1", msg, events, sub, &mockTaskHandler{})
+	})
+}
+
+func TestAbortStreaming_OtherError_HandleStreamingErrorFails(t *testing.T) {
+	ctx := context.Background()
+	ctxID := "ctx"
+	msg := &protocol.Message{ContextID: &ctxID}
+
+	events := make(chan *event.Event)
+	close(events)
+
+	proc := createTestMessageProcessor()
+	proc.errorHandler = func(ctx context.Context, msg *protocol.Message, err error) (*protocol.Message, error) {
+		return nil, fmt.Errorf("handler also failed")
+	}
+
+	sendCount := 0
+	sub := &mockTaskSubscriber{
+		sendFunc: func(evt protocol.StreamingMessageEvent) error {
+			sendCount++
+			if sendCount == 1 {
+				return nil // submitted succeeds
+			}
+			return fmt.Errorf("send error")
+		},
+	}
+
+	assert.NotPanics(t, func() {
+		proc.processAgentStreamingEvents(ctx, "task", "user1", "session1", msg, events, sub, &mockTaskHandler{})
+	}, "handleStreamingProcessingError failure in abortStreaming should not panic")
+}
+
+func TestAbortStreaming_FinalArtifactSendFail_Aborts(t *testing.T) {
+	ctx := context.Background()
+	ctxID := "ctx"
+	msg := &protocol.Message{ContextID: &ctxID}
+
+	events := make(chan *event.Event)
+	close(events) // no agent events
+
+	sendCount := 0
+	sub := &mockTaskSubscriber{
+		sendFunc: func(evt protocol.StreamingMessageEvent) error {
+			sendCount++
+			if sendCount == 1 {
+				return nil // submitted succeeds
+			}
+			if sendCount == 2 {
+				// final artifact send fails
+				return fmt.Errorf("artifact send fail")
+			}
+			return nil
+		},
+	}
+
+	var handlerCalled bool
+	proc := createTestMessageProcessor()
+	proc.errorHandler = func(ctx context.Context, msg *protocol.Message, err error) (*protocol.Message, error) {
+		handlerCalled = true
+		res := protocol.NewMessage(protocol.MessageRoleAgent, []protocol.Part{protocol.NewTextPart("err")})
+		return &res, nil
+	}
+
+	proc.processAgentStreamingEvents(ctx, "task", "user1", "session1", msg, events, sub, &mockTaskHandler{})
+	assert.True(t, handlerCalled, "error handler should fire for final artifact send failure")
+	// Should abort before sending completed
+	assert.Equal(t, 3, sendCount, "should be: submitted + artifact fail + error msg")
+}
+
+func TestAbortStreaming_CompletedSendFail_Aborts(t *testing.T) {
+	ctx := context.Background()
+	ctxID := "ctx"
+	msg := &protocol.Message{ContextID: &ctxID}
+
+	events := make(chan *event.Event)
+	close(events)
+
+	sendCount := 0
+	sub := &mockTaskSubscriber{
+		sendFunc: func(evt protocol.StreamingMessageEvent) error {
+			sendCount++
+			if sendCount == 3 {
+				// completed send fails
+				return fmt.Errorf("completed send fail")
+			}
+			return nil
+		},
+	}
+
+	var handlerCalled bool
+	proc := createTestMessageProcessor()
+	proc.errorHandler = func(ctx context.Context, msg *protocol.Message, err error) (*protocol.Message, error) {
+		handlerCalled = true
+		res := protocol.NewMessage(protocol.MessageRoleAgent, []protocol.Part{protocol.NewTextPart("err")})
+		return &res, nil
+	}
+
+	proc.processAgentStreamingEvents(ctx, "task", "user1", "session1", msg, events, sub, &mockTaskHandler{})
+	assert.True(t, handlerCalled, "error handler should fire for completed send failure")
+}
+
+func TestBuildRuntimeState(t *testing.T) {
+	t.Run("empty metadata", func(t *testing.T) {
+		result := buildRuntimeState(map[string]any{})
+		assert.NotNil(t, result)
+		assert.Empty(t, result)
+	})
+
+	t.Run("copies all entries", func(t *testing.T) {
+		metadata := map[string]any{
+			"key1": "value1",
+			"key2": 42,
+			"key3": true,
+		}
+		result := buildRuntimeState(metadata)
+		assert.Equal(t, metadata, result)
+	})
+
+	t.Run("shallow copy - modifications don't affect original", func(t *testing.T) {
+		metadata := map[string]any{
+			"key1": "value1",
+		}
+		result := buildRuntimeState(metadata)
+		result["key2"] = "new"
+		assert.NotContains(t, metadata, "key2", "original should not be affected")
+	})
+
+	t.Run("nil metadata produces empty map", func(t *testing.T) {
+		result := buildRuntimeState(nil)
+		assert.NotNil(t, result)
+		assert.Empty(t, result)
+	})
+}
+
+func TestProcessAgentStreamingEvents_CleanupTaskInDefer(t *testing.T) {
+	t.Run("cleanup called on normal completion", func(t *testing.T) {
+		ctx := context.Background()
+		ctxID := "ctx"
+		msg := &protocol.Message{ContextID: &ctxID}
+
+		events := make(chan *event.Event)
+		close(events)
+
+		var cleanedTaskID string
+		handler := &mockTaskHandler{
+			cleanTaskFunc: func(taskID *string) error {
+				cleanedTaskID = *taskID
+				return nil
+			},
+		}
+
+		sub := &mockTaskSubscriber{
+			sendFunc: func(evt protocol.StreamingMessageEvent) error { return nil },
+		}
+
+		proc := createTestMessageProcessor()
+		proc.processAgentStreamingEvents(ctx, "my-task", "user1", "session1", msg, events, sub, handler)
+		assert.Equal(t, "my-task", cleanedTaskID)
+	})
+
+	t.Run("cleanup error should not panic", func(t *testing.T) {
+		ctx := context.Background()
+		ctxID := "ctx"
+		msg := &protocol.Message{ContextID: &ctxID}
+
+		events := make(chan *event.Event)
+		close(events)
+
+		handler := &mockTaskHandler{
+			cleanTaskFunc: func(taskID *string) error {
+				return fmt.Errorf("defer clean error")
+			},
+		}
+
+		sub := &mockTaskSubscriber{
+			sendFunc: func(evt protocol.StreamingMessageEvent) error { return nil },
+		}
+
+		proc := createTestMessageProcessor()
+		assert.NotPanics(t, func() {
+			proc.processAgentStreamingEvents(ctx, "task", "user1", "session1", msg, events, sub, handler)
+		})
+	})
 }

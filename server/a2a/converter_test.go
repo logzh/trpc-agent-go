@@ -13,13 +13,23 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"trpc.group/trpc-go/trpc-a2a-go/protocol"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/graph"
 	ia2a "trpc.group/trpc-go/trpc-agent-go/internal/a2a"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+)
+
+const (
+	testCustomDataPartType         = "custom_data"
+	testCustomDataPartExtensionKey = "trpc.a2a.custom_payload"
 )
 
 func TestDefaultA2AMessageToAgentMessage_ConvertToAgentMessage(t *testing.T) {
@@ -398,6 +408,7 @@ func TestDefaultEventToA2AMessage_ConvertToA2AMessage(t *testing.T) {
 			event: &event.Event{
 				ID: "error-event-123",
 				Response: &model.Response{
+					Done: true,
 					Error: &model.ResponseError{
 						Message: "Something went wrong",
 					},
@@ -620,6 +631,7 @@ func TestDefaultEventToA2AMessage_ConvertStreamingToA2AMessage(t *testing.T) {
 			event: &event.Event{
 				ID: "error-event-456",
 				Response: &model.Response{
+					Done: true,
 					Error: &model.ResponseError{
 						Message: "Streaming error",
 					},
@@ -751,6 +763,39 @@ func TestDefaultEventToA2AMessage_ConvertStreamingToA2AMessage(t *testing.T) {
 	}
 }
 
+func TestDefaultEventToA2AMessage_ConvertStreamingNodeError(
+	t *testing.T,
+) {
+	converter := &defaultEventToA2AMessage{
+		graphEventObjectAllowlist: []string{"graph.*"},
+	}
+	evt := graph.NewNodeErrorEvent(
+		graph.WithNodeEventInvocationID("inv"),
+		graph.WithNodeEventNodeID("lookup"),
+		graph.WithNodeEventNodeType(graph.NodeTypeFunction),
+		graph.WithNodeEventError("boom"),
+	)
+
+	result, err := converter.ConvertStreamingToA2AMessage(
+		context.Background(),
+		evt,
+		EventToA2AStreamingOptions{
+			CtxID:  "ctx",
+			TaskID: "task",
+		},
+	)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	update, ok := result.(*protocol.TaskArtifactUpdateEvent)
+	require.True(t, ok)
+	require.Equal(
+		t,
+		graph.ObjectTypeGraphNodeError,
+		update.Metadata[ia2a.MessageMetadataObjectTypeKey],
+	)
+}
+
 func TestDefaultEventToA2AMessage_GraphEventFilter(t *testing.T) {
 	internalEvt := &event.Event{
 		ID: "evt-internal",
@@ -856,6 +901,77 @@ func TestDefaultEventToA2AMessage_GraphEventFilter(t *testing.T) {
 		if streamingInternal == nil {
 			t.Fatal("expected non-nil streaming result for internal graph event when allowlist matches")
 		}
+	})
+
+	t.Run("allowlist forwards interrupt pregel events with interrupt info in state_delta", func(t *testing.T) {
+		converter := &defaultEventToA2AMessage{graphEventObjectAllowlist: []string{"graph.pregel.step"}}
+		intrEvt := graph.NewPregelInterruptEvent(
+			graph.WithPregelEventInvocationID("inv-1"),
+			graph.WithPregelEventStepNumber(3),
+			graph.WithPregelEventNodeID("approval"),
+			graph.WithPregelEventInterruptKey("approval"),
+			graph.WithPregelEventInterruptValue(map[string]any{"prompt": "approve?"}),
+			graph.WithPregelEventLineageID("ln-1"),
+			graph.WithPregelEventCheckpointID("ck-1"),
+			graph.WithPregelEventCheckpointNS("ns-1"),
+		)
+		intrEvt.Response.Choices = []model.Choice{{Message: model.Message{}}}
+
+		unaryResult, err := converter.ConvertToA2AMessage(
+			context.Background(),
+			intrEvt,
+			EventToA2AUnaryOptions{},
+		)
+		if err != nil {
+			t.Fatalf("ConvertToA2AMessage(interrupt) error: %v", err)
+		}
+		msg, ok := unaryResult.(*protocol.Message)
+		if !ok {
+			t.Fatalf("expected *protocol.Message, got %T", unaryResult)
+		}
+		// Interrupt info should be in state_delta._pregel_metadata
+		sdRaw, ok := msg.Metadata[ia2a.MessageMetadataStateDeltaKey]
+		if !assert.True(t, ok, "expected state_delta metadata") {
+			return
+		}
+		sd := ia2a.DecodeStateDeltaMetadata(sdRaw)
+		pregelRaw, ok := sd[graph.MetadataKeyPregel]
+		if !assert.True(t, ok, "expected _pregel_metadata in state_delta") {
+			return
+		}
+		var pregel graph.PregelStepMetadata
+		require.NoError(t, json.Unmarshal(pregelRaw, &pregel))
+		assert.Equal(t, "approval", pregel.InterruptKey)
+		assert.Equal(t, "ln-1", pregel.LineageID)
+		assert.Equal(t, "ck-1", pregel.CheckpointID)
+		assert.Equal(t, "ns-1", pregel.CheckpointNS)
+
+		streamingResult, err := converter.ConvertStreamingToA2AMessage(
+			context.Background(),
+			intrEvt,
+			EventToA2AStreamingOptions{CtxID: "ctx-1", TaskID: "task-1"},
+		)
+		if err != nil {
+			t.Fatalf("ConvertStreamingToA2AMessage(interrupt) error: %v", err)
+		}
+		taskEvent, ok := streamingResult.(*protocol.TaskArtifactUpdateEvent)
+		if !ok {
+			t.Fatalf("expected *protocol.TaskArtifactUpdateEvent, got %T", streamingResult)
+		}
+		sdRaw, ok = taskEvent.Metadata[ia2a.MessageMetadataStateDeltaKey]
+		if !assert.True(t, ok, "expected state_delta metadata in streaming") {
+			return
+		}
+		sd = ia2a.DecodeStateDeltaMetadata(sdRaw)
+		pregelRaw, ok = sd[graph.MetadataKeyPregel]
+		if !assert.True(t, ok, "expected _pregel_metadata in streaming state_delta") {
+			return
+		}
+		require.NoError(t, json.Unmarshal(pregelRaw, &pregel))
+		assert.Equal(t, "approval", pregel.InterruptKey)
+		assert.Equal(t, "ln-1", pregel.LineageID)
+		assert.Equal(t, "ck-1", pregel.CheckpointID)
+		assert.Equal(t, "ns-1", pregel.CheckpointNS)
 	})
 }
 
@@ -3225,6 +3341,88 @@ func TestDefaultEventToA2AMessage_ReasoningContent(t *testing.T) {
 	}
 }
 
+func TestMatchesAllowedGraphObjectType(t *testing.T) {
+	tests := []struct {
+		name     string
+		objType  string
+		allowed  []string
+		expected bool
+	}{
+		{
+			name:     "exact match",
+			objType:  "graph.execution",
+			allowed:  []string{"graph.execution"},
+			expected: true,
+		},
+		{
+			name:     "wildcard all",
+			objType:  "graph.node.start",
+			allowed:  []string{"*"},
+			expected: true,
+		},
+		{
+			name:     "prefix wildcard with dot",
+			objType:  "graph.node.start",
+			allowed:  []string{"graph.*"},
+			expected: true,
+		},
+		{
+			name:     "prefix wildcard without dot",
+			objType:  "graph.node.start",
+			allowed:  []string{"graph*"},
+			expected: true,
+		},
+		{
+			name:     "prefix wildcard no match",
+			objType:  "chat.completion",
+			allowed:  []string{"graph.*"},
+			expected: false,
+		},
+		{
+			name:     "suffix wildcard with dot",
+			objType:  "graph.node.start",
+			allowed:  []string{"*.start"},
+			expected: true,
+		},
+		{
+			name:     "suffix wildcard without dot",
+			objType:  "graph.node.start",
+			allowed:  []string{"*start"},
+			expected: true,
+		},
+		{
+			name:     "suffix wildcard no match",
+			objType:  "graph.node.start",
+			allowed:  []string{"*.end"},
+			expected: false,
+		},
+		{
+			name:     "no match at all",
+			objType:  "custom.type",
+			allowed:  []string{"graph.execution", "graph.node.*"},
+			expected: false,
+		},
+		{
+			name:     "empty allowed list",
+			objType:  "graph.node.start",
+			allowed:  nil,
+			expected: false,
+		},
+		{
+			name:     "multiple patterns with suffix match",
+			objType:  "graph.pregel.step",
+			allowed:  []string{"graph.execution", "*.step"},
+			expected: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := matchesAllowedGraphObjectType(tt.objType, tt.allowed)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
 func TestDefaultEventToA2AMessage_StreamingReasoningContent(t *testing.T) {
 	tests := []struct {
 		name            string
@@ -3340,4 +3538,364 @@ func TestDefaultEventToA2AMessage_StreamingReasoningContent(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDefaultEventToA2AMessage_DoesNotAutoConvertStructuredOutput(t *testing.T) {
+	evt := &event.Event{
+		Tag: "network.rpc.trace",
+		Response: &model.Response{
+			ID:      "resp-custom-1",
+			Object:  graph.ObjectTypeGraphNodeCustom,
+			Choices: []model.Choice{},
+		},
+		StructuredOutput: map[string]any{"trace": true},
+	}
+
+	converter := &defaultEventToA2AMessage{
+		graphEventObjectAllowlist: []string{"graph.node.*"},
+	}
+
+	result, err := converter.ConvertToA2AMessage(context.Background(), evt, EventToA2AUnaryOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	msg, ok := result.(*protocol.Message)
+	require.True(t, ok)
+	assert.Empty(t, msg.Parts)
+	assert.Equal(t, graph.ObjectTypeGraphNodeCustom, msg.Metadata[ia2a.MessageMetadataObjectTypeKey])
+	assert.Equal(t, "network.rpc.trace", msg.Metadata[ia2a.MessageMetadataTagKey])
+}
+
+func TestDefaultEventToA2AMessage_EventPartMapperUnary(t *testing.T) {
+	evt := &event.Event{
+		Tag: "network.rpc.trace",
+		Response: &model.Response{
+			ID:      "resp-custom-2",
+			Object:  graph.ObjectTypeGraphNodeCustom,
+			Choices: []model.Choice{},
+		},
+	}
+	require.NoError(t, event.SetExtension(evt, testCustomDataPartExtensionKey, map[string]any{
+		"layer_details": []any{map[string]any{"layer_name": "engine"}},
+	}))
+
+	mapperCalled := false
+	converter := &defaultEventToA2AMessage{
+		graphEventObjectAllowlist: []string{"graph.node.*"},
+		eventPartMappers: []EventToA2APartMapper{
+			func(ctx context.Context, evt *event.Event) ([]protocol.Part, error) {
+				mapperCalled = true
+				data, ok, err := event.GetExtension[map[string]any](evt, testCustomDataPartExtensionKey)
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					return nil, nil
+				}
+				part := protocol.NewDataPart(data)
+				part.Metadata = map[string]any{
+					ia2a.DataPartMetadataTypeKey: testCustomDataPartType,
+				}
+				return []protocol.Part{&part}, nil
+			},
+		},
+	}
+
+	result, err := converter.ConvertToA2AMessage(context.Background(), evt, EventToA2AUnaryOptions{})
+	require.NoError(t, err)
+	require.True(t, mapperCalled)
+	require.NotNil(t, result)
+
+	msg, ok := result.(*protocol.Message)
+	require.True(t, ok)
+	require.Len(t, msg.Parts, 1)
+
+	part, ok := msg.Parts[0].(*protocol.DataPart)
+	require.True(t, ok)
+	assert.Equal(t, testCustomDataPartType, part.Metadata[ia2a.DataPartMetadataTypeKey])
+	assert.Equal(t, graph.ObjectTypeGraphNodeCustom, msg.Metadata[ia2a.MessageMetadataObjectTypeKey])
+	assert.Equal(t, "network.rpc.trace", msg.Metadata[ia2a.MessageMetadataTagKey])
+	assert.Equal(t, map[string]any{
+		"layer_details": []any{map[string]any{"layer_name": "engine"}},
+	}, part.Data)
+}
+
+func TestDefaultEventToA2AMessage_EventPartMapperStreaming(t *testing.T) {
+	evt := &event.Event{
+		Tag: "network.rpc.trace",
+		Response: &model.Response{
+			ID:      "resp-custom-3",
+			Object:  graph.ObjectTypeGraphNodeCustom,
+			Choices: []model.Choice{},
+		},
+	}
+	require.NoError(t, event.SetExtension(evt, testCustomDataPartExtensionKey, map[string]any{"trace": "ok"}))
+
+	converter := &defaultEventToA2AMessage{
+		graphEventObjectAllowlist: []string{"graph.node.*"},
+		eventPartMappers: []EventToA2APartMapper{
+			func(ctx context.Context, evt *event.Event) ([]protocol.Part, error) {
+				data, ok, err := event.GetExtension[map[string]any](evt, testCustomDataPartExtensionKey)
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					return nil, nil
+				}
+				part := protocol.NewDataPart(data)
+				part.Metadata = map[string]any{
+					ia2a.DataPartMetadataTypeKey: testCustomDataPartType,
+				}
+				return []protocol.Part{&part}, nil
+			},
+		},
+	}
+
+	result, err := converter.ConvertStreamingToA2AMessage(
+		context.Background(),
+		evt,
+		EventToA2AStreamingOptions{TaskID: "task-1", CtxID: "ctx-1"},
+	)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	artifact, ok := result.(*protocol.TaskArtifactUpdateEvent)
+	require.True(t, ok)
+	require.Len(t, artifact.Artifact.Parts, 1)
+
+	part, ok := artifact.Artifact.Parts[0].(*protocol.DataPart)
+	require.True(t, ok)
+	assert.Equal(t, map[string]any{"trace": "ok"}, part.Data)
+	assert.Equal(t, testCustomDataPartType, part.Metadata[ia2a.DataPartMetadataTypeKey])
+	assert.Equal(t, graph.ObjectTypeGraphNodeCustom, artifact.Metadata[ia2a.MessageMetadataObjectTypeKey])
+}
+
+func TestDefaultEventToA2AMessage_EventPartMapperRunsAfterBuiltins(t *testing.T) {
+	mapperCalled := false
+	converter := &defaultEventToA2AMessage{
+		eventPartMappers: []EventToA2APartMapper{
+			func(ctx context.Context, event *event.Event) ([]protocol.Part, error) {
+				mapperCalled = true
+				part := protocol.NewDataPart(map[string]any{"unexpected": true})
+				part.Metadata = map[string]any{
+					ia2a.DataPartMetadataTypeKey: testCustomDataPartType,
+				}
+				return []protocol.Part{&part}, nil
+			},
+		},
+	}
+
+	evt := &event.Event{
+		Response: &model.Response{
+			Choices: []model.Choice{{
+				Message: model.Message{
+					ToolCalls: []model.ToolCall{{
+						ID:   "call-1",
+						Type: "function",
+						Function: model.FunctionDefinitionParam{
+							Name:      "lookup",
+							Arguments: []byte(`{"query":"test"}`),
+						},
+					}},
+				},
+			}},
+		},
+	}
+
+	result, err := converter.ConvertToA2AMessage(context.Background(), evt, EventToA2AUnaryOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.False(t, mapperCalled)
+
+	msg, ok := result.(*protocol.Message)
+	require.True(t, ok)
+	require.Len(t, msg.Parts, 1)
+
+	var part *protocol.DataPart
+	switch p := msg.Parts[0].(type) {
+	case *protocol.DataPart:
+		part = p
+	case protocol.DataPart:
+		part = &p
+	default:
+		t.Fatalf("expected DataPart, got %T", msg.Parts[0])
+	}
+	assert.Equal(t, ia2a.DataPartMetadataTypeFunctionCall, part.Metadata[ia2a.DataPartMetadataTypeKey])
+
+	data, ok := part.Data.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "lookup", data[ia2a.ToolCallFieldName])
+}
+
+func TestDefaultEventToA2AMessage_EventPartMapperAppendsAfterText(t *testing.T) {
+	converter := &defaultEventToA2AMessage{
+		eventPartMappers: []EventToA2APartMapper{
+			func(ctx context.Context, event *event.Event) ([]protocol.Part, error) {
+				part := protocol.NewDataPart(map[string]any{"trace": "ok"})
+				part.Metadata = map[string]any{
+					ia2a.DataPartMetadataTypeKey: testCustomDataPartType,
+				}
+				return []protocol.Part{&part}, nil
+			},
+		},
+	}
+
+	evt := &event.Event{
+		Response: &model.Response{
+			Choices: []model.Choice{{
+				Message: model.Message{
+					ReasoningContent: "thinking",
+					Content:          "answer",
+				},
+			}},
+		},
+	}
+
+	result, err := converter.ConvertToA2AMessage(context.Background(), evt, EventToA2AUnaryOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	msg, ok := result.(*protocol.Message)
+	require.True(t, ok)
+	require.Len(t, msg.Parts, 3)
+
+	assert.Equal(t, protocol.KindText, msg.Parts[0].GetKind())
+	assert.Equal(t, protocol.KindText, msg.Parts[1].GetKind())
+	assert.Equal(t, protocol.KindData, msg.Parts[2].GetKind())
+}
+
+func TestDefaultEventToA2AMessage_EventPartMapperAppendsAfterStreamingText(t *testing.T) {
+	converter := &defaultEventToA2AMessage{
+		eventPartMappers: []EventToA2APartMapper{
+			func(ctx context.Context, event *event.Event) ([]protocol.Part, error) {
+				part := protocol.NewDataPart(map[string]any{"trace": "ok"})
+				part.Metadata = map[string]any{
+					ia2a.DataPartMetadataTypeKey: testCustomDataPartType,
+				}
+				return []protocol.Part{&part}, nil
+			},
+		},
+	}
+
+	evt := &event.Event{
+		Response: &model.Response{
+			ID: "resp-streaming-custom",
+			Choices: []model.Choice{{
+				Delta: model.Message{
+					ReasoningContent: "thinking",
+					Content:          "answer",
+				},
+			}},
+		},
+	}
+
+	result, err := converter.ConvertStreamingToA2AMessage(
+		context.Background(),
+		evt,
+		EventToA2AStreamingOptions{TaskID: "task-1", CtxID: "ctx-1"},
+	)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	artifact, ok := result.(*protocol.TaskArtifactUpdateEvent)
+	require.True(t, ok)
+	require.Len(t, artifact.Artifact.Parts, 3)
+
+	assert.Equal(t, protocol.KindText, artifact.Artifact.Parts[0].GetKind())
+	assert.Equal(t, protocol.KindText, artifact.Artifact.Parts[1].GetKind())
+	assert.Equal(t, protocol.KindData, artifact.Artifact.Parts[2].GetKind())
+}
+
+func TestDefaultEventToA2AMessage_RunEventPartMappersSkipsNilAndEmpty(t *testing.T) {
+	converter := &defaultEventToA2AMessage{
+		eventPartMappers: []EventToA2APartMapper{
+			nil,
+			func(ctx context.Context, evt *event.Event) ([]protocol.Part, error) {
+				return nil, nil
+			},
+			func(ctx context.Context, evt *event.Event) ([]protocol.Part, error) {
+				part := protocol.NewDataPart(map[string]any{"trace": "ok"})
+				part.Metadata = map[string]any{
+					ia2a.DataPartMetadataTypeKey: testCustomDataPartType,
+				}
+				return []protocol.Part{&part}, nil
+			},
+		},
+	}
+
+	parts, err := converter.runEventPartMappers(context.Background(), &event.Event{})
+	require.NoError(t, err)
+	require.Len(t, parts, 1)
+}
+
+func TestDefaultEventToA2AMessage_EventPartMapperUnaryErrorOnEmptyChoices(t *testing.T) {
+	converter := &defaultEventToA2AMessage{
+		eventPartMappers: []EventToA2APartMapper{
+			func(ctx context.Context, evt *event.Event) ([]protocol.Part, error) {
+				return nil, errors.New("mapper failed")
+			},
+		},
+	}
+
+	result, err := converter.ConvertToA2AMessage(context.Background(), &event.Event{
+		Response: &model.Response{Choices: []model.Choice{}},
+	}, EventToA2AUnaryOptions{})
+	require.Error(t, err)
+	require.Nil(t, result)
+}
+
+func TestDefaultEventToA2AMessage_EventPartMapperUnaryErrorOnContentEvent(t *testing.T) {
+	converter := &defaultEventToA2AMessage{
+		eventPartMappers: []EventToA2APartMapper{
+			func(ctx context.Context, evt *event.Event) ([]protocol.Part, error) {
+				return nil, errors.New("mapper failed")
+			},
+		},
+	}
+
+	result, err := converter.ConvertToA2AMessage(context.Background(), &event.Event{
+		Response: &model.Response{
+			Choices: []model.Choice{{
+				Message: model.Message{Content: "answer"},
+			}},
+		},
+	}, EventToA2AUnaryOptions{})
+	require.Error(t, err)
+	require.Nil(t, result)
+}
+
+func TestDefaultEventToA2AMessage_EventPartMapperStreamingErrorOnEmptyChoices(t *testing.T) {
+	converter := &defaultEventToA2AMessage{
+		eventPartMappers: []EventToA2APartMapper{
+			func(ctx context.Context, evt *event.Event) ([]protocol.Part, error) {
+				return nil, errors.New("mapper failed")
+			},
+		},
+	}
+
+	result, err := converter.ConvertStreamingToA2AMessage(context.Background(), &event.Event{
+		Response: &model.Response{Choices: []model.Choice{}},
+	}, EventToA2AStreamingOptions{TaskID: "task-1", CtxID: "ctx-1"})
+	require.Error(t, err)
+	require.Nil(t, result)
+}
+
+func TestDefaultEventToA2AMessage_EventPartMapperStreamingErrorOnDeltaEvent(t *testing.T) {
+	converter := &defaultEventToA2AMessage{
+		eventPartMappers: []EventToA2APartMapper{
+			func(ctx context.Context, evt *event.Event) ([]protocol.Part, error) {
+				return nil, errors.New("mapper failed")
+			},
+		},
+	}
+
+	result, err := converter.ConvertStreamingToA2AMessage(context.Background(), &event.Event{
+		Response: &model.Response{
+			Choices: []model.Choice{{
+				Delta: model.Message{Content: "delta"},
+			}},
+		},
+	}, EventToA2AStreamingOptions{TaskID: "task-1", CtxID: "ctx-1"})
+	require.Error(t, err)
+	require.Nil(t, result)
 }

@@ -750,6 +750,13 @@ Model (LLM) messages, you can enable `agent.WithStreamMode(...)` (see
 "Event Monitoring"). When `agent.StreamModeMessages` is selected, graph LLM
 nodes enable final model responses automatically for that run.
 
+If your graph contains multiple LLM nodes or sub-agent nodes, and the
+caller-visible stream should keep only terminal graph messages, enable
+`agent.WithGraphTerminalMessagesOnly(true)` on the run. This keeps default
+behavior fully backward compatible when disabled, preserves all terminal nodes
+in parallel fan-out graphs, and does not change internal graph state handoff or
+tracing. See `examples/graph/terminal_messages_only`.
+
 Tip: parsing JSON / structured output from streaming
 
 - Streaming chunks (`choice.Delta.Content`) are incremental and are not
@@ -1319,6 +1326,10 @@ Use cases:
   GraphAgent, `SubgraphResult.FinalState` contains the child's final state
   snapshot and can be mapped into parent keys. Runnable example:
   `examples/graph/agent_state_handoff`.
+- **Handle fatal child fallback state separately**: if the child stops before
+  `graph.execution`, read `SubgraphResult.FallbackState` /
+  `SubgraphResult.FallbackStateDelta`, or use
+  `SubgraphResult.EffectiveState()` when you want one code path.
 - **Store the child LLM's final text under your own keys**: `SubgraphResult`
   always includes `LastResponse`, so output mappers work for both GraphAgent and
   non-graph agents.
@@ -1516,6 +1527,31 @@ stateGraph.AddToolsNode(
     graph.WithEnableParallelTools(true), // optional; default is serial
 )
 ```
+
+Configure tool call retry for a ToolsNode:
+
+```go
+policy := &tool.RetryPolicy{
+    MaxAttempts:     2,
+    InitialInterval: 200 * time.Millisecond,
+    BackoffFactor:   2.0,
+    MaxInterval:     time.Second,
+}
+
+stateGraph.AddToolsNode(
+    "tools",
+    tools,
+    graph.WithToolCallRetryPolicy(policy),
+)
+```
+
+Notes:
+
+- The retry applies only to the current tool call. It does not rerun the whole ToolsNode.
+- It is disabled by default, so the ToolsNode keeps its existing behavior unless you opt in.
+- It currently applies only to `CallableTool`; `StreamableTool` is not retried yet.
+- The default retry rule covers common transient raw errors. If you also want to retry result-level failures, customize `tool.RetryPolicy.RetryOn`.
+- Runnable example: [examples/graph/tool_call_retry](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/graph/tool_call_retry).
 
 Tool-call pairing and second entry into LLM:
 
@@ -3612,11 +3648,14 @@ API:
 - `graph.WithCallOptions(...)` attaches call options to this run.
 - `graph.WithCallGenerationConfigPatch(...)` overrides `model.GenerationConfig`
   fields for LLM nodes in the current graph scope.
+- `graph.WithCallResumeStateOverrideKeys(keys...)` configures resume-time
+  `RuntimeState` override keys for the current graph scope. During resume,
+  those keys may override checkpoint-restored values with the caller-provided values.
 - `graph.DesignateNode(nodeID, ...)` targets a specific node in the current
   graph.
   - For LLM nodes: affects that node's model call.
   - For Agent nodes (subgraphs): affects the child invocation, so it becomes the
-    default for the nested graph.
+  default for the nested graph.
 - `graph.DesignateNodeWithPath(graph.NodePath{...}, ...)` targets a node inside
   nested subgraphs (path segments are node IDs).
 
@@ -3658,6 +3697,35 @@ ch, err := r.Run(ctx, userID, sessionID, msg, runOpts)
 ```
 
 See `examples/graph/call_options_generation_config` for a runnable demo.
+
+Resume-state override keys example:
+
+```go
+runOpts := graph.WithCallOptions(
+    graph.WithCallResumeStateOverrideKeys("request_id", "tenant_config"),
+    graph.DesignateNode("child_agent",
+        // child_agent inherits the parent's override keys, then adds its own key.
+        graph.WithCallResumeStateOverrideKeys("child_only_key"),
+    ),
+)
+
+eventCh, err := r.Run(ctx, userID, sessionID,
+    model.NewUserMessage("resume"),
+    agent.WithRuntimeState(map[string]any{
+        graph.CfgKeyLineageID:    lineageID,
+        graph.CfgKeyCheckpointID: checkpointID,
+        "request_id":            requestID,
+        "tenant_config":         tenantConfig,
+        "child_only_key":        childValue,
+    }),
+    runOpts,
+)
+```
+
+`child_agent` sees `request_id`, `tenant_config`, and `child_only_key`. Without
+configured override keys, resume still prefers checkpoint values. The override
+keys are useful for request-scoped values that should be refreshed on every
+resume while leaving the rest of the checkpointed state unchanged.
 
 #### ToolSets in Graphs vs Agents
 
@@ -3965,7 +4033,12 @@ Use a stable business identifier for `namespace` in production (e.g., `svc:prod:
 
 Resuming from a checkpoint gives you "time travel" (rewind to any checkpoint and continue). For HITL and debugging, you often want one extra step: edit the state at a checkpoint and keep running from there.
 
-Important detail: on resume, the executor restores state from the checkpoint first. `runtime_state` does not override existing checkpoint keys; it only fills missing non-internal keys. If you need to change an existing key, you must write a new checkpoint.
+Important detail: on resume, the executor restores state from the checkpoint
+first. By default, `runtime_state` does not override existing checkpoint keys;
+it only fills missing non-internal keys. If you need to override a small set of
+existing keys for one resume, use
+`graph.WithCallOptions(graph.WithCallResumeStateOverrideKeys(...))`. If you need to
+change the checkpointed state itself, write a new checkpoint.
 
 Use `graph.TimeTravel`:
 
@@ -4358,6 +4431,9 @@ Recommendations:
 
 #### Recover from non-fatal node errors
 
+For the recommended standardized pattern that also covers fatal fallback state,
+subgraph propagation, and A2A alignment, see [Error Handling](error-handling.md).
+
 By default, if a node returns a non‑nil `error`, graph execution stops and the
 Executor emits an error event.
 
@@ -4544,6 +4620,18 @@ graphAgent, _ := graphagent.New("workflow", g,
     graphagent.WithAgentCallbacks(cb),
 )
 ```
+
+> **Runner plugins and Graph agent-nodes**
+>
+> Callbacks registered via `graphagent.WithAgentCallbacks` apply **only to
+> the GraphAgent itself**. Runner-level `PluginManager` callbacks
+> (`BeforeAgent` / `AfterAgent`) also fire for the **sub-agents** attached
+> to an agent node via `AddAgentNode(name, ...)` — once per sub-agent
+> invocation. For the full semantics (how BeforeAgent short-circuit
+> affects `SubgraphResult.FinalState`, how AfterAgent `CustomResponse`
+> overrides downstream `StateKeyLastResponse`, etc.) see the
+> "Order and early-exit (short-circuit)" section in the
+> [Plugin guide](./plugin.md) for multi-agent container caveats.
 
 ## Troubleshooting
 

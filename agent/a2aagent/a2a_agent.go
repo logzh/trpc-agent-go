@@ -12,6 +12,7 @@ package a2aagent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -50,11 +51,13 @@ type A2AAgent struct {
 	agentCard            *server.AgentCard      // Agent card and resolution state
 	agentURL             string                 // URL of the remote A2A agent
 	eventConverter       A2AEventConverter      // Custom A2A event converters
+	dataPartMappers      []A2ADataPartMapper    // Lightweight inbound DataPart mappers for default converter
 	a2aMessageConverter  InvocationA2AConverter // Custom A2A message converters for requests
 	extraA2AOptions      []client.Option        // Additional A2A client options
 	streamingBufSize     int                    // Buffer size for streaming responses
 	streamingRespHandler StreamingRespHandler   // Handler for streaming responses
 	transferStateKey     []string               // Keys in session state to transfer to the A2A agent message by metadata
+	buildMessageHook     BuildMessageHook       // Hook called after A2A message is built but before it is sent
 	userIDHeader         string                 // HTTP header name to send UserID to A2A server
 	enableStreaming      *bool                  // Explicitly set streaming mode; nil means use agent card capability
 
@@ -71,6 +74,21 @@ func New(opts ...Option) (*A2AAgent, error) {
 
 	for _, opt := range opts {
 		opt(agent)
+	}
+
+	if len(agent.dataPartMappers) > 0 {
+		if converter, ok := agent.eventConverter.(*defaultA2AEventConverter); ok {
+			for _, mapper := range agent.dataPartMappers {
+				if mapper == nil {
+					continue
+				}
+				converter.dataPartMappers = append(converter.dataPartMappers, mapper)
+			}
+		} else {
+			log.Warn(
+				"WithA2ADataPartMapper is ignored because WithCustomEventConverter provided a custom converter",
+			)
+		}
 	}
 
 	var agentURL string
@@ -129,16 +147,20 @@ func New(opts ...Option) (*A2AAgent, error) {
 	return agent, nil
 }
 
-// sendErrorEvent sends an error event to the event channel
-func (r *A2AAgent) sendErrorEvent(ctx context.Context, eventChan chan<- *event.Event,
-	invocation *agent.Invocation, errorMessage string) {
+// sendErrorEvent sends an error event to the event channel.
+func (r *A2AAgent) sendErrorEvent(
+	ctx context.Context,
+	eventChan chan<- *event.Event,
+	invocation *agent.Invocation,
+	err error,
+) {
+	respErr := model.ResponseErrorFromError(err, model.ErrorTypeRunError)
 	agent.EmitEvent(ctx, invocation, eventChan, event.New(
 		invocation.InvocationID,
 		r.name,
 		event.WithResponse(&model.Response{
-			Error: &model.ResponseError{
-				Message: errorMessage,
-			},
+			Object: model.ObjectTypeError,
+			Error:  respErr,
 		}),
 	))
 }
@@ -247,27 +269,98 @@ func (r *A2AAgent) shouldUseStreaming(invocation *agent.Invocation) bool {
 	return false
 }
 
-// buildA2AMessage constructs A2A message from session events
+// buildA2AMessage constructs A2A message from session events.
+// It assembles a middleware chain around the base converter:
+//
+//	transferStateKey → user hook → base converter
+//
+// transferStateKey is the outermost layer so it always runs even if
+// the user hook short-circuits (skips calling next).
 func (r *A2AAgent) buildA2AMessage(invocation *agent.Invocation, isStream bool) (*protocol.Message, error) {
 	if r.a2aMessageConverter == nil {
 		return nil, fmt.Errorf("a2a message converter not set")
 	}
-	message, err := r.a2aMessageConverter.ConvertToA2AMessage(isStream, r.name, invocation)
-	if err != nil || message == nil {
-		return nil, fmt.Errorf("custom A2A converter failed, msg:%v, err:%w", message, err)
+
+	// Base converter function.
+	convertFn := r.a2aMessageConverter.ConvertToA2AMessage
+
+	// User hook layer wraps the base converter.
+	if r.buildMessageHook != nil {
+		convertFn = r.buildMessageHook(convertFn)
 	}
 
+	// Built-in layer (outermost): transfer state keys into message metadata.
+	// Placed after hook so it always runs regardless of hook behavior.
 	if len(r.transferStateKey) > 0 {
+		convertFn = r.wrapWithTransferState(convertFn)
+	}
+
+	message, err := convertFn(isStream, r.name, invocation)
+	if err != nil {
+		return nil, fmt.Errorf("A2A message conversion failed: %w", err)
+	}
+	if message == nil {
+		return nil, errors.New("A2A message conversion returned nil message")
+	}
+	return message, nil
+}
+
+// wrapWithTransferState returns a middleware that injects transferStateKey values
+// from RuntimeState into the message metadata after calling next.
+//
+// Supported patterns:
+//   - "*"        — transfer all keys
+//   - "prefix*"  — transfer keys with the given prefix (e.g. "user.*" or "user*")
+//   - "*suffix"  — transfer keys with the given suffix (e.g. "*.id" or "*id")
+//   - "exact"    — transfer only the exact key
+func (r *A2AAgent) wrapWithTransferState(next ConvertToA2AMessageFunc) ConvertToA2AMessageFunc {
+	return func(isStream bool, agentName string, invocation *agent.Invocation) (*protocol.Message, error) {
+		message, err := next(isStream, agentName, invocation)
+		if err != nil {
+			return nil, err
+		}
+		if message == nil {
+			return nil, nil
+		}
+		if invocation.RunOptions.RuntimeState == nil {
+			return message, nil
+		}
 		if message.Metadata == nil {
 			message.Metadata = make(map[string]any)
 		}
-		for _, key := range r.transferStateKey {
-			if value, ok := invocation.RunOptions.RuntimeState[key]; ok {
-				message.Metadata[key] = value
+		for _, pattern := range r.transferStateKey {
+			matchStateKeys(pattern, invocation.RunOptions.RuntimeState, message.Metadata)
+		}
+		return message, nil
+	}
+}
+
+// matchStateKeys copies keys from src to dst that match the given pattern.
+func matchStateKeys(pattern string, src map[string]any, dst map[string]any) {
+	switch {
+	case pattern == "*":
+		for k, v := range src {
+			dst[k] = v
+		}
+	case strings.HasPrefix(pattern, "*"):
+		suffix := pattern[1:]
+		for k, v := range src {
+			if strings.HasSuffix(k, suffix) {
+				dst[k] = v
 			}
 		}
+	case strings.HasSuffix(pattern, "*"):
+		prefix := pattern[:len(pattern)-1]
+		for k, v := range src {
+			if strings.HasPrefix(k, prefix) {
+				dst[k] = v
+			}
+		}
+	default:
+		if v, ok := src[pattern]; ok {
+			dst[pattern] = v
+		}
 	}
-	return message, nil
 }
 
 // runStreaming handles streaming A2A communication
@@ -288,19 +381,47 @@ func (r *A2AAgent) runStreaming(ctx context.Context, invocation *agent.Invocatio
 func (r *A2AAgent) executeStreaming(ctx context.Context, invocation *agent.Invocation, eventChan chan<- *event.Event) {
 	a2aMessage, err := r.buildA2AMessage(invocation, true)
 	if err != nil {
-		r.sendErrorEvent(ctx, eventChan, invocation, fmt.Sprintf("failed to construct A2A message: %v", err))
+		r.sendErrorEvent(
+			ctx,
+			eventChan,
+			invocation,
+			fmt.Errorf("failed to construct A2A message: %w", err),
+		)
 		return
 	}
 
 	requestOpts := r.buildRequestOptions(ctx, invocation)
 	streamChan, err := r.a2aClient.StreamMessage(ctx, protocol.SendMessageParams{Message: *a2aMessage}, requestOpts...)
 	if err != nil {
-		r.sendErrorEvent(ctx, eventChan, invocation, fmt.Sprintf("A2A streaming request failed to %s: %v", r.agentCard.URL, err))
+		r.sendErrorEvent(
+			ctx,
+			eventChan,
+			invocation,
+			fmt.Errorf(
+				"A2A streaming request failed to %s: %w",
+				r.agentCard.URL,
+				err,
+			),
+		)
 		return
 	}
 
-	responseID, aggregatedContent := r.processStreamingEvents(ctx, invocation, eventChan, streamChan)
-	r.emitFinalEvent(ctx, invocation, eventChan, responseID, aggregatedContent)
+	streamResult := r.processStreamingEvents(
+		ctx,
+		invocation,
+		eventChan,
+		streamChan,
+	)
+	if streamResult.terminalError != nil {
+		return
+	}
+	r.emitFinalEvent(
+		ctx,
+		invocation,
+		eventChan,
+		streamResult.responseID,
+		streamResult.aggregatedContent,
+	)
 }
 
 // buildRequestOptions constructs A2A request options from invocation.
@@ -327,36 +448,124 @@ func (r *A2AAgent) buildRequestOptions(ctx context.Context, invocation *agent.In
 	return requestOpts
 }
 
+type streamingEventResult struct {
+	responseID        string
+	aggregatedContent string
+	terminalError     *model.ResponseError
+}
+
 // processStreamingEvents processes streaming events and aggregates content.
-// Returns the response ID and aggregated content.
+// Returns the response ID, aggregated content, and terminal error state.
 func (r *A2AAgent) processStreamingEvents(
 	ctx context.Context,
 	invocation *agent.Invocation,
 	eventChan chan<- *event.Event,
 	streamChan <-chan protocol.StreamingMessageEvent,
-) (responseID string, aggregatedContent string) {
+) streamingEventResult {
+	var result streamingEventResult
 	var contentBuilder strings.Builder
 
 	for streamEvent := range streamChan {
 		if err := agent.CheckContextCancelled(ctx); err != nil {
-			return responseID, contentBuilder.String()
+			result.aggregatedContent = contentBuilder.String()
+			return result
 		}
 
 		events, err := r.eventConverter.ConvertStreamingToEvents(streamEvent, r.name, invocation)
 		if err != nil {
-			r.sendErrorEvent(ctx, eventChan, invocation, fmt.Sprintf("custom event converter failed: %v", err))
-			return responseID, contentBuilder.String()
+			r.sendErrorEvent(
+				ctx,
+				eventChan,
+				invocation,
+				fmt.Errorf("custom event converter failed: %w", err),
+			)
+			result.aggregatedContent = contentBuilder.String()
+			return result
 		}
 
 		for _, evt := range events {
 			if evt == nil {
 				continue
 			}
-			responseID, _ = r.aggregateEventContent(ctx, invocation, eventChan, evt, responseID, &contentBuilder)
+			currentResponseID := result.responseID
+			if evt.Response != nil && evt.Response.ID != "" {
+				currentResponseID = evt.Response.ID
+			}
+			if evt.Response != nil && !evt.Response.IsPartial {
+				r.flushBufferedContent(
+					ctx,
+					invocation,
+					eventChan,
+					currentResponseID,
+					evt.Timestamp,
+					&contentBuilder,
+				)
+			}
+			result.responseID, _ = r.aggregateEventContent(
+				ctx,
+				invocation,
+				eventChan,
+				evt,
+				result.responseID,
+				&contentBuilder,
+			)
 			agent.EmitEvent(ctx, invocation, eventChan, evt)
+			if evt.Response != nil &&
+				evt.Response.Error != nil &&
+				evt.Response.Done {
+				result.aggregatedContent = contentBuilder.String()
+				result.terminalError = evt.Response.Error
+				return result
+			}
 		}
 	}
-	return responseID, contentBuilder.String()
+	result.aggregatedContent = contentBuilder.String()
+	return result
+}
+
+// flushBufferedContent emits buffered streaming text as a complete assistant
+// message before forwarding a non-partial event such as a tool call or tool
+// response. This preserves the original turn order in session history.
+func (r *A2AAgent) flushBufferedContent(
+	ctx context.Context,
+	invocation *agent.Invocation,
+	eventChan chan<- *event.Event,
+	responseID string,
+	anchorTimestamp time.Time,
+	contentBuilder *strings.Builder,
+) {
+	if contentBuilder == nil || contentBuilder.Len() == 0 {
+		return
+	}
+
+	content := contentBuilder.String()
+	contentBuilder.Reset()
+
+	flushTime := time.Now()
+	if !anchorTimestamp.IsZero() {
+		flushTime = anchorTimestamp.Add(-1 * time.Nanosecond)
+	}
+
+	evt := event.New(
+		invocation.InvocationID,
+		r.name,
+		event.WithResponse(&model.Response{
+			ID:        responseID,
+			Object:    model.ObjectTypeChatCompletion,
+			Done:      false,
+			IsPartial: false,
+			Timestamp: flushTime,
+			Created:   flushTime.Unix(),
+			Choices: []model.Choice{{
+				Message: model.Message{
+					Role:    model.RoleAssistant,
+					Content: content,
+				},
+			}},
+		}),
+	)
+	evt.Timestamp = flushTime
+	agent.EmitEvent(ctx, invocation, eventChan, evt)
 }
 
 // aggregateEventContent aggregates content from event delta.
@@ -369,7 +578,10 @@ func (r *A2AAgent) aggregateEventContent(
 	responseID string,
 	contentBuilder *strings.Builder,
 ) (string, bool) {
-	if evt.Response == nil || len(evt.Response.Choices) == 0 {
+	if evt.Response == nil || evt.Response.Error != nil {
+		return responseID, false
+	}
+	if len(evt.Response.Choices) == 0 {
 		return responseID, false
 	}
 
@@ -380,7 +592,12 @@ func (r *A2AAgent) aggregateEventContent(
 	if r.streamingRespHandler != nil {
 		content, err := r.streamingRespHandler(evt.Response)
 		if err != nil {
-			r.sendErrorEvent(ctx, eventChan, invocation, fmt.Sprintf("streaming resp handler failed: %v", err))
+			r.sendErrorEvent(
+				ctx,
+				eventChan,
+				invocation,
+				fmt.Errorf("streaming resp handler failed: %w", err),
+			)
 			return responseID, true
 		}
 		if content != "" {
@@ -430,7 +647,12 @@ func (r *A2AAgent) runNonStreaming(ctx context.Context, invocation *agent.Invoca
 		// Construct A2A message from session
 		a2aMessage, err := r.buildA2AMessage(invocation, false)
 		if err != nil {
-			r.sendErrorEvent(ctx, eventChan, invocation, fmt.Sprintf("failed to construct A2A message: %v", err))
+			r.sendErrorEvent(
+				ctx,
+				eventChan,
+				invocation,
+				fmt.Errorf("failed to construct A2A message: %w", err),
+			)
 			return
 		}
 
@@ -440,7 +662,16 @@ func (r *A2AAgent) runNonStreaming(ctx context.Context, invocation *agent.Invoca
 		requestOpts := r.buildRequestOptions(ctx, invocation)
 		result, err := r.a2aClient.SendMessage(ctx, params, requestOpts...)
 		if err != nil {
-			r.sendErrorEvent(ctx, eventChan, invocation, fmt.Sprintf("A2A request failed to %s: %v", r.agentCard.URL, err))
+			r.sendErrorEvent(
+				ctx,
+				eventChan,
+				invocation,
+				fmt.Errorf(
+					"A2A request failed to %s: %w",
+					r.agentCard.URL,
+					err,
+				),
+			)
 			return
 		}
 
@@ -448,7 +679,12 @@ func (r *A2AAgent) runNonStreaming(ctx context.Context, invocation *agent.Invoca
 		msgResult := protocol.MessageResult{Result: result.Result}
 		events, err := r.eventConverter.ConvertToEvents(msgResult, r.name, invocation)
 		if err != nil {
-			r.sendErrorEvent(ctx, eventChan, invocation, fmt.Sprintf("custom event converter failed: %v", err))
+			r.sendErrorEvent(
+				ctx,
+				eventChan,
+				invocation,
+				fmt.Errorf("custom event converter failed: %w", err),
+			)
 			return
 		}
 
@@ -475,9 +711,24 @@ func (r *A2AAgent) wrapEventChannelWithTelemetry(
 		var responseErrorType string
 		tokenUsage := &itelemetry.TokenUsage{}
 		defer func() {
+			if fullRespEvent != nil && fullRespEvent.Response != nil {
+				responseErrorType = ""
+				if fullRespEvent.Response.Error != nil {
+					responseErrorType = itelemetry.FormatResponseErrorLabel(
+						fullRespEvent.Response.Error,
+						model.ErrorTypeRunError,
+					)
+				}
+			}
 			if startedSpan && fullRespEvent != nil {
 				log.DebugContext(ctx, "fullRespEvent is not ni")
-				itelemetry.TraceAfterInvokeAgent(span, fullRespEvent, tokenUsage, tracker.FirstTokenTimeDuration())
+				itelemetry.TraceAfterInvokeAgent(
+					span,
+					fullRespEvent,
+					tokenUsage,
+					tracker.FirstTokenTimeDuration(),
+					model.ErrorTypeRunError,
+				)
 			}
 			tracker.SetResponseErrorType(responseErrorType)
 			tracker.RecordMetrics()()
@@ -499,7 +750,10 @@ func (r *A2AAgent) wrapEventChannelWithTelemetry(
 				}
 			}
 			if evt != nil && evt.Error != nil {
-				responseErrorType = evt.Error.Type
+				responseErrorType = itelemetry.FormatResponseErrorLabel(
+					evt.Error,
+					model.ErrorTypeRunError,
+				)
 			}
 			if err := event.EmitEvent(ctx, wrappedChan, evt); err != nil {
 				return

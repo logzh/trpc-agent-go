@@ -86,17 +86,31 @@ func TestNew(t *testing.T) {
 			},
 		},
 		{
-			name:      "infer deepseek from model name",
+			name:      "does not infer deepseek from official model name",
 			modelName: "deepseek-chat",
-			opts:      nil,
-			expectOpts: []Option{
+			opts: []Option{
 				WithAPIKey(testKey),
-				WithBaseURL(defaultDeepSeekBaseURL),
-				WithVariant(VariantDeepSeek),
 			},
+			expectOpts: nil,
 		},
 		{
-			name:      "infer deepseek from base url",
+			name:      "does not infer deepseek from reasoner model name",
+			modelName: "deepseek-reasoner",
+			opts: []Option{
+				WithAPIKey(testKey),
+			},
+			expectOpts: nil,
+		},
+		{
+			name:      "does not infer deepseek from third party deepseek model name",
+			modelName: "deepseek-v3.2",
+			opts: []Option{
+				WithAPIKey(testKey),
+			},
+			expectOpts: nil,
+		},
+		{
+			name:      "infers deepseek from official deepseek base url",
 			modelName: "custom-model",
 			opts: []Option{
 				WithBaseURL("https://api.deepseek.com/v1"),
@@ -108,12 +122,41 @@ func TestNew(t *testing.T) {
 			},
 		},
 		{
-			name:      "explicit variant beats deepseek inference",
+			name:      "explicit variant sets deepseek on official model name",
 			modelName: "deepseek-chat",
 			opts: []Option{
-				WithVariant(VariantOpenAI),
+				WithVariant(VariantDeepSeek),
 			},
-			expectOpts: nil,
+			expectOpts: []Option{
+				WithAPIKey(testKey),
+				WithBaseURL(defaultDeepSeekBaseURL),
+			},
+		},
+		{
+			name:      "explicit deepseek variant preserves custom proxy base url",
+			modelName: "deepseek-chat",
+			opts: []Option{
+				WithVariant(VariantDeepSeek),
+				WithBaseURL("https://proxy.example.com/v1"),
+			},
+			expectOpts: []Option{
+				WithAPIKey(testKey),
+				WithBaseURL("https://proxy.example.com/v1"),
+				WithVariant(VariantDeepSeek),
+			},
+		},
+		{
+			name:      "custom proxy base url before explicit deepseek variant is preserved",
+			modelName: "deepseek-chat",
+			opts: []Option{
+				WithBaseURL("https://proxy.example.com/v1"),
+				WithVariant(VariantDeepSeek),
+			},
+			expectOpts: []Option{
+				WithAPIKey(testKey),
+				WithBaseURL("https://proxy.example.com/v1"),
+				WithVariant(VariantDeepSeek),
+			},
 		},
 	}
 
@@ -139,42 +182,34 @@ func TestNew(t *testing.T) {
 }
 
 func TestIsDeepSeekBaseURL(t *testing.T) {
-	const (
-		deepSeekURL        = "https://api.deepseek.com/v1"
-		upperDeepSeekURL   = " HTTPS://API.DEEPSEEK.COM/V1 "
-		invalidDeepSeekURL = "https://api.deepseek.com/%zz"
-		openAIURL          = "https://api.openai.com/v1"
-		emptyURL           = "   "
-	)
-
 	tests := []struct {
 		name   string
 		rawURL string
 		want   bool
 	}{
 		{
-			name:   "matches deepseek host",
-			rawURL: deepSeekURL,
+			name:   "matches official api host",
+			rawURL: "https://api.deepseek.com/v1",
 			want:   true,
 		},
 		{
-			name:   "matches deepseek host after trim and lowercase",
-			rawURL: upperDeepSeekURL,
+			name:   "matches official api host after trim and lowercase",
+			rawURL: " HTTPS://API.DEEPSEEK.COM/V1 ",
 			want:   true,
 		},
 		{
-			name:   "falls back to substring match on parse error",
-			rawURL: invalidDeepSeekURL,
-			want:   true,
-		},
-		{
-			name:   "does not match other hosts",
-			rawURL: openAIURL,
+			name:   "does not match non api deepseek host",
+			rawURL: "https://deepseek.com/v1",
 			want:   false,
 		},
 		{
-			name:   "empty url is not deepseek",
-			rawURL: emptyURL,
+			name:   "does not match custom proxy host",
+			rawURL: "https://deepseek-proxy.internal/v1",
+			want:   false,
+		},
+		{
+			name:   "parse error does not fall back to substring match",
+			rawURL: "https://api.deepseek.com/%zz",
 			want:   false,
 		},
 	}
@@ -435,6 +470,76 @@ func TestModel_GenerateContentIter_Streaming(t *testing.T) {
 	require.True(t, sawHello)
 }
 
+func TestModel_GenerateContentIter_StreamingContextCancellationRunsCallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		chunks := []string{
+			`data: {"id":"iter-stream-cancel","object":"chat.completion.chunk","created":1699200000,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}`,
+			`data: {"id":"iter-stream-cancel","object":"chat.completion.chunk","created":1699200000,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}`,
+			`data: [DONE]`,
+		}
+		for _, chunk := range chunks {
+			fmt.Fprintf(w, "%s\n\n", chunk)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	}))
+	defer server.Close()
+
+	callbackCalled := make(chan error, 1)
+	m := New("gpt-3.5-turbo",
+		WithBaseURL(server.URL),
+		WithAPIKey("test-key"),
+		WithChatStreamCompleteCallback(func(
+			ctx context.Context,
+			req *openaigo.ChatCompletionNewParams,
+			acc *openaigo.ChatCompletionAccumulator,
+			streamErr error,
+		) {
+			callbackCalled <- streamErr
+		}),
+	)
+
+	req := &model.Request{
+		Messages: []model.Message{
+			model.NewUserMessage("hi"),
+		},
+		GenerationConfig: model.GenerationConfig{
+			Stream: true,
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	seq, err := m.GenerateContentIter(ctx, req)
+	require.NoError(t, err)
+
+	var responses []*model.Response
+	seq(func(resp *model.Response) bool {
+		responses = append(responses, resp)
+		cancel()
+		return false
+	})
+
+	require.Len(t, responses, 1)
+	require.False(t, responses[0].Done)
+
+	select {
+	case streamErr := <-callbackCalled:
+		require.ErrorIs(t, streamErr, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for stream complete callback")
+	}
+}
+
 func TestOptions_Validation(t *testing.T) {
 	tests := []struct {
 		name string
@@ -615,6 +720,119 @@ func TestModel_convertMessages_ReasoningContent(t *testing.T) {
 		_, ok := parsed[model.ReasoningContentKey]
 		assert.False(t, ok, "reasoning_content should NOT be present when empty")
 	})
+
+	t.Run("assistant tool call backfills empty reasoning_content",
+		func(t *testing.T) {
+			msgs := []model.Message{
+				{
+					Role:    model.RoleAssistant,
+					Content: "Calling a tool.",
+					ToolCalls: []model.ToolCall{
+						{
+							ID:   "call-backfill",
+							Type: "function",
+							Function: model.FunctionDefinitionParam{
+								Name:      "calculator",
+								Arguments: []byte(`{"expression":"2+2"}`),
+							},
+						},
+					},
+				},
+			}
+
+			converted := New(
+				"dummy-model",
+				WithReasoningContentBackfill(true),
+			).convertMessages(msgs)
+			require.Len(t, converted, 1)
+			require.NotNil(t, converted[0].OfAssistant)
+
+			data, err := json.Marshal(converted[0].OfAssistant)
+			require.NoError(t, err)
+
+			var parsed map[string]any
+			err = json.Unmarshal(data, &parsed)
+			require.NoError(t, err)
+
+			reasoningValue, ok := parsed[model.ReasoningContentKey]
+			require.True(
+				t,
+				ok,
+				"reasoning_content should be present when backfill "+
+					"is enabled",
+			)
+			assert.Equal(t, "", reasoningValue)
+		})
+
+	t.Run("assistant tool call is not backfilled by default",
+		func(t *testing.T) {
+			msgs := []model.Message{
+				{
+					Role:    model.RoleAssistant,
+					Content: "Calling a tool.",
+					ToolCalls: []model.ToolCall{
+						{
+							ID:   "call-default-off",
+							Type: "function",
+							Function: model.FunctionDefinitionParam{
+								Name:      "calculator",
+								Arguments: []byte(`{"expression":"2+2"}`),
+							},
+						},
+					},
+				},
+			}
+
+			converted := New("dummy-model").convertMessages(msgs)
+			require.Len(t, converted, 1)
+			require.NotNil(t, converted[0].OfAssistant)
+
+			data, err := json.Marshal(converted[0].OfAssistant)
+			require.NoError(t, err)
+
+			var parsed map[string]any
+			err = json.Unmarshal(data, &parsed)
+			require.NoError(t, err)
+
+			_, ok := parsed[model.ReasoningContentKey]
+			assert.False(
+				t,
+				ok,
+				"reasoning_content should stay absent when backfill "+
+					"is disabled",
+			)
+		})
+
+	t.Run("assistant message without tool calls is not backfilled",
+		func(t *testing.T) {
+			msgs := []model.Message{
+				{
+					Role:    model.RoleAssistant,
+					Content: "Simple response without tool calls.",
+				},
+			}
+
+			converted := New(
+				"dummy-model",
+				WithReasoningContentBackfill(true),
+			).convertMessages(msgs)
+			require.Len(t, converted, 1)
+			require.NotNil(t, converted[0].OfAssistant)
+
+			data, err := json.Marshal(converted[0].OfAssistant)
+			require.NoError(t, err)
+
+			var parsed map[string]any
+			err = json.Unmarshal(data, &parsed)
+			require.NoError(t, err)
+
+			_, ok := parsed[model.ReasoningContentKey]
+			assert.False(
+				t,
+				ok,
+				"reasoning_content should stay absent without tool calls",
+			)
+		})
 
 	t.Run("assistant message with tool calls and reasoning_content", func(t *testing.T) {
 		msgs := []model.Message{
@@ -1105,17 +1323,28 @@ func TestModel_Callbacks(t *testing.T) {
 		responseChan, err := m.GenerateContent(ctx, request)
 		require.NoError(t, err, "failed to generate content: %v", err)
 
-		// Consume all responses
+		// Consume all responses and ensure the callback runs before
+		// the final response becomes visible to the caller.
+		sawDone := false
 		for response := range responseChan {
-			if response.Done {
-				break
+			if !response.Done {
+				continue
 			}
+			sawDone = true
+			select {
+			case <-callbackCalled:
+				// Success.
+			default:
+				require.Fail(t,
+					"stream complete callback must run before final response is emitted")
+			}
+			break
 		}
+		require.True(t, sawDone,
+			"expected terminal Done response to be emitted")
 
-		// Wait for callback with timeout
 		select {
 		case <-callbackCalled:
-			// Success - callback was called
 		case <-time.After(3 * time.Second):
 			require.Fail(t, "timeout waiting for stream complete callback")
 		}
@@ -1395,8 +1624,163 @@ func TestModel_CallbackAssignment(t *testing.T) {
 
 		// Verify that callbacks are nil when not provided.
 		assert.Nil(t, m.chatRequestCallback, "expected chat request callback to be nil")
+		assert.Nil(
+			t,
+			m.chatRequestJSONCallback,
+			"expected chat request json callback to be nil",
+		)
 		assert.Nil(t, m.chatResponseCallback, "expected chat response callback to be nil")
 		assert.Nil(t, m.chatChunkCallback, "expected chat chunk callback to be nil")
+	})
+
+	t.Run("request json callback assignment", func(t *testing.T) {
+		var (
+			callbackRaw []byte
+			callbackErr error
+		)
+		m := New(
+			"test-model",
+			WithAPIKey("test-key"),
+			WithChatRequestJSONCallback(func(
+				ctx context.Context,
+				raw []byte,
+				err error,
+			) {
+				callbackRaw = append([]byte(nil), raw...)
+				callbackErr = err
+			}),
+		)
+
+		assert.NotNil(t, m.chatRequestJSONCallback)
+
+		req := &openaigo.ChatCompletionNewParams{
+			Model: "test-model",
+			Messages: []openaigo.ChatCompletionMessageParamUnion{
+				openaigo.UserMessage("hello"),
+			},
+		}
+		wantRaw, err := req.MarshalJSON()
+		require.NoError(t, err)
+
+		m.runChatRequestJSONCallback(context.Background(), req)
+
+		require.NoError(t, callbackErr)
+		assert.JSONEq(t, string(wantRaw), string(callbackRaw))
+	})
+}
+
+func TestModel_CallbackPanicsAreRecovered(t *testing.T) {
+	t.Run("request callback", func(t *testing.T) {
+		callbackCalled := false
+		m := New("test-model",
+			WithAPIKey("test-key"),
+			WithChatRequestCallback(func(ctx context.Context, req *openaigo.ChatCompletionNewParams) {
+				callbackCalled = true
+				panic("boom")
+			}),
+		)
+
+		require.NotPanics(t, func() {
+			m.runChatRequestCallback(context.Background(), &openaigo.ChatCompletionNewParams{})
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("request json callback", func(t *testing.T) {
+		callbackCalled := false
+		m := New("test-model",
+			WithAPIKey("test-key"),
+			WithChatRequestJSONCallback(func(
+				ctx context.Context,
+				raw []byte,
+				err error,
+			) {
+				callbackCalled = true
+				panic("boom")
+			}),
+		)
+
+		require.NotPanics(t, func() {
+			m.runChatRequestJSONCallback(
+				context.Background(),
+				&openaigo.ChatCompletionNewParams{},
+			)
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("response callback", func(t *testing.T) {
+		callbackCalled := false
+		m := New("test-model",
+			WithAPIKey("test-key"),
+			WithChatResponseCallback(func(
+				ctx context.Context,
+				req *openaigo.ChatCompletionNewParams,
+				resp *openaigo.ChatCompletion,
+			) {
+				callbackCalled = true
+				panic("boom")
+			}),
+		)
+
+		require.NotPanics(t, func() {
+			m.runChatResponseCallback(
+				context.Background(),
+				&openaigo.ChatCompletionNewParams{},
+				&openaigo.ChatCompletion{},
+			)
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("chunk callback", func(t *testing.T) {
+		callbackCalled := false
+		m := New("test-model",
+			WithAPIKey("test-key"),
+			WithChatChunkCallback(func(
+				ctx context.Context,
+				req *openaigo.ChatCompletionNewParams,
+				chunk *openaigo.ChatCompletionChunk,
+			) {
+				callbackCalled = true
+				panic("boom")
+			}),
+		)
+
+		require.NotPanics(t, func() {
+			m.runChatChunkCallback(
+				context.Background(),
+				&openaigo.ChatCompletionNewParams{},
+				&openaigo.ChatCompletionChunk{},
+			)
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("stream complete callback", func(t *testing.T) {
+		callbackCalled := false
+		m := New("test-model",
+			WithAPIKey("test-key"),
+			WithChatStreamCompleteCallback(func(
+				ctx context.Context,
+				req *openaigo.ChatCompletionNewParams,
+				acc *openaigo.ChatCompletionAccumulator,
+				streamErr error,
+			) {
+				callbackCalled = true
+				panic("boom")
+			}),
+		)
+
+		require.NotPanics(t, func() {
+			m.handleStreamCompleteCallback(
+				context.Background(),
+				openaigo.ChatCompletionNewParams{},
+				openaigo.ChatCompletionAccumulator{},
+				nil,
+			)
+		})
+		assert.True(t, callbackCalled)
 	})
 }
 
@@ -2112,11 +2496,12 @@ func stringPtr(s string) *string {
 func TestModel_GenerateContent_StreamingBatchProcessing(t *testing.T) {
 	// Test cases covering different streaming scenarios.
 	tests := []struct {
-		name          string
-		chunks        []string
-		expectedTool  string
-		expectedArgs  string
-		expectedCount int
+		name           string
+		chunks         []string
+		expectedTool   string
+		expectedArgs   string
+		expectedCount  int
+		expectedReason string
 	}{
 		{
 			name: "Normal_Sandwich_Mode", // Normal "sandwich" mode: content does not exist in tool call chunks {0}.
@@ -2139,6 +2524,17 @@ func TestModel_GenerateContent_StreamingBatchProcessing(t *testing.T) {
 			expectedTool:  "calculate",
 			expectedArgs:  `{"expr":"2+2"}`,
 			expectedCount: 1,
+		},
+		{
+			name: "Reasoning_ToolCalls_SameChunk",
+			chunks: []string{
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"tool planning","tool_calls":[{"index":0,"id":"call_reasoning","type":"function","function":{"name":"lookup_weather","arguments":"{\"city\":\"Shenzhen\"}"}}]},"finish_reason":null}]}`,
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{"content":""},"finish_reason":"tool_calls"}]}`,
+			},
+			expectedTool:   "lookup_weather",
+			expectedArgs:   `{"city":"Shenzhen"}`,
+			expectedCount:  1,
+			expectedReason: "tool planning",
 		},
 		{
 			name: "Multiple_ToolCalls_Sandwich", // multiple tool calls in normal mode.
@@ -2266,6 +2662,14 @@ func TestModel_GenerateContent_StreamingBatchProcessing(t *testing.T) {
 				assert.Equalf(t, tt.expectedArgs, string(tc.Function.Arguments), "Expected args '%s', got '%s'", tt.expectedArgs, string(tc.Function.Arguments))
 				// Verify Done=false for tool call responses.
 				assert.Falsef(t, toolCallResponse.Done, "Tool call response should have Done=false")
+			}
+
+			if tt.expectedReason != "" {
+				assert.Equal(
+					t,
+					tt.expectedReason,
+					toolCallResponse.Choices[0].Message.ReasoningContent,
+				)
 			}
 
 			// Special verification for ID_Index_Mapping_Verification test case.
@@ -2877,6 +3281,8 @@ func TestModel_GenerateContent_Streaming_FinalReasoningAggregated(t *testing.T) 
 	got := final.Choices[0].Message.ReasoningContent
 	want := "First second final"
 	assert.Equalf(t, want, got, "final ReasoningContent mismatch: got %q want %q", got, want)
+	require.NotNil(t, final.Choices[0].FinishReason)
+	assert.Equal(t, "stop", *final.Choices[0].FinishReason)
 	assert.Truef(t, final.Done, "expected final.Done == true")
 	assert.Falsef(t, final.IsPartial, "expected final.IsPartial == false")
 }
@@ -4009,7 +4415,7 @@ func TestConvertUserMessageContent_HunyuanVariant(t *testing.T) {
 }
 
 func TestConvertUserMessageContent_DeepSeekVariant(t *testing.T) {
-	m := New("deepseek-chat")
+	m := New("deepseek-chat", WithVariant(VariantDeepSeek))
 
 	t.Run("omits non-text content parts", func(t *testing.T) {
 		message := model.Message{
@@ -4854,6 +5260,39 @@ func TestSanitizeChunkForAccumulator_NoFinishReason(t *testing.T) {
 	assert.Len(t, sanitized.Choices[0].Delta.ToolCalls, 0)
 }
 
+func TestStripReasoningFromChunkForAccumulator(t *testing.T) {
+	chunk := parseChunkWithExtraFields(t, `{
+		"id": "test",
+		"object": "chat.completion.chunk",
+		"created": 1699200000,
+		"model": "gpt-3.5-turbo",
+		"choices": [
+			{
+				"index": 0,
+				"delta": {
+					"content": "hello",
+					"reasoning_content": "plan"
+				}
+			}
+		]
+	}`)
+
+	stripped, ok := stripReasoningFromChunkForAccumulator(chunk)
+
+	require.True(t, ok)
+	require.Len(t, stripped.Choices, 1)
+	assert.Equal(t, "hello", stripped.Choices[0].Delta.Content)
+	assert.Empty(
+		t,
+		extractReasoningContent(stripped.Choices[0].Delta.JSON.ExtraFields),
+	)
+	assert.Equal(
+		t,
+		"plan",
+		extractReasoningContent(chunk.Choices[0].Delta.JSON.ExtraFields),
+	)
+}
+
 // TestStreamingCallbackIntegration tests the integration of streaming callbacks.
 func TestStreamingCallbackIntegration(t *testing.T) {
 	t.Run("streaming with chat stream complete callback", func(t *testing.T) {
@@ -4925,6 +5364,86 @@ func TestStreamingCallbackIntegration(t *testing.T) {
 		assert.NotNil(t, capturedRequest, "expected request to be captured in callback")
 	})
 
+	t.Run("streaming continues when chat stream complete callback panics", func(t *testing.T) {
+		callbackCalled := make(chan struct{})
+		callback := func(
+			ctx context.Context,
+			req *openai.ChatCompletionNewParams,
+			acc *openai.ChatCompletionAccumulator,
+			err error,
+		) {
+			close(callbackCalled)
+			panic("boom")
+		}
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+
+			chunks := []string{
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}`,
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}`,
+				`data: {"id":"test","object":"chat.completion.chunk","created":1699200000,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+				`data: [DONE]`,
+			}
+
+			for _, chunk := range chunks {
+				fmt.Fprintf(w, "%s\n\n", chunk)
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}))
+		defer server.Close()
+
+		m := New("gpt-3.5-turbo",
+			WithBaseURL(server.URL),
+			WithAPIKey("test-key"),
+			WithChatStreamCompleteCallback(callback),
+		)
+
+		req := &model.Request{
+			Messages: []model.Message{
+				model.NewUserMessage("Hello"),
+			},
+			GenerationConfig: model.GenerationConfig{
+				Stream: true,
+			},
+		}
+
+		responseChan, err := m.GenerateContent(context.Background(), req)
+		require.NoError(t, err)
+
+		var responses []*model.Response
+		timeout := time.After(2 * time.Second)
+	loop:
+		for {
+			select {
+			case resp, ok := <-responseChan:
+				if !ok {
+					break loop
+				}
+				responses = append(responses, resp)
+			case <-timeout:
+				t.Fatal("timed out waiting for streaming responses")
+			}
+		}
+
+		select {
+		case <-callbackCalled:
+		default:
+			t.Fatal("expected chat stream complete callback to be called")
+		}
+
+		require.NotEmpty(t, responses)
+		finalResp := responses[len(responses)-1]
+		require.True(t, finalResp.Done)
+		require.Len(t, finalResp.Choices, 1)
+		assert.Equal(t, "Hello world", finalResp.Choices[0].Message.Content)
+	})
+
 	t.Run("streaming with reasoning content handling", func(t *testing.T) {
 		// Create mock server with reasoning content
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4989,6 +5508,15 @@ func TestStreamingCallbackIntegration(t *testing.T) {
 			}
 		}
 		assert.True(t, hasReasoning, "expected at least one response to contain reasoning content")
+		require.NotEmpty(t, responses)
+		finalResp := responses[len(responses)-1]
+		require.True(t, finalResp.Done)
+		require.Len(t, finalResp.Choices, 1)
+		assert.Equal(
+			t,
+			"I think the answer is 42.",
+			finalResp.Choices[0].Message.Content,
+		)
 	})
 
 	t.Run("streaming with malformed reasoning content", func(t *testing.T) {
@@ -5169,7 +5697,7 @@ func TestModel_buildChatRequest(t *testing.T) {
 		},
 		{
 			name:  "deepseek thinking",
-			model: New("deepseek-chat"),
+			model: New("deepseek-chat", WithVariant(VariantDeepSeek)),
 			args: args{
 				request: &model.Request{
 					Messages: []model.Message{},
@@ -5180,7 +5708,7 @@ func TestModel_buildChatRequest(t *testing.T) {
 				},
 			},
 			want1: []openaiopt.RequestOption{
-				openaiopt.WithJSONSet(model.ThinkingEnabledKey, true),
+				openaiopt.WithJSONSet("thinking", map[string]string{"type": "enabled"}),
 			},
 		},
 		{
@@ -6358,11 +6886,11 @@ func TestModel_accumulateChunk(t *testing.T) {
 		assert.Equal(t, "", reasoningBuf.String())
 	})
 
-	t.Run("skip chunk with reasoning content", func(t *testing.T) {
+	t.Run("skip pure reasoning-only chunk", func(t *testing.T) {
 		chunk := parseChunkWithExtraFields(t, `{
-			"id": "test-id",
-			"object": "chat.completion.chunk",
-			"created": 1699200000,
+				"id": "test-id",
+				"object": "chat.completion.chunk",
+				"created": 1699200000,
 			"model": "test-model",
 			"choices": [{
 				"index": 0,
@@ -6378,6 +6906,96 @@ func TestModel_accumulateChunk(t *testing.T) {
 
 		assert.Equal(t, "First reasoning", reasoningBuf.String())
 		assert.Empty(t, acc.Choices)
+	})
+
+	t.Run("accumulate chunk with reasoning and content", func(t *testing.T) {
+		chunk := parseChunkWithExtraFields(t, `{
+				"id": "test-id",
+				"object": "chat.completion.chunk",
+				"created": 1699200000,
+				"model": "test-model",
+				"choices": [{
+					"index": 0,
+					"delta": {
+						"content": "Hello",
+						"reasoning_content": "plan"
+					}
+				}]
+			}`)
+		acc := openai.ChatCompletionAccumulator{}
+		var reasoningBuf bytes.Buffer
+
+		m.accumulateChunk(chunk, &acc, &reasoningBuf)
+
+		require.Len(t, acc.Choices, 1)
+		assert.Equal(t, "Hello", acc.Choices[0].Message.Content)
+		assert.Equal(t, "plan", reasoningBuf.String())
+	})
+
+	t.Run("accumulate chunk with reasoning and tool calls", func(t *testing.T) {
+		chunk := parseChunkWithExtraFields(t, `{
+				"id": "test-id",
+				"object": "chat.completion.chunk",
+				"created": 1699200000,
+				"model": "test-model",
+				"choices": [{
+					"index": 0,
+					"delta": {
+						"reasoning_content": "tool planning",
+						"tool_calls": [{
+							"index": 0,
+							"id": "call_123",
+							"type": "function",
+							"function": {
+								"name": "lookup_weather",
+								"arguments": "{\"city\":\"Shenzhen\"}"
+							}
+						}]
+					}
+				}]
+			}`)
+		acc := openai.ChatCompletionAccumulator{}
+		var reasoningBuf bytes.Buffer
+
+		m.accumulateChunk(chunk, &acc, &reasoningBuf)
+
+		require.Len(t, acc.Choices, 1)
+		require.Len(t, acc.Choices[0].Message.ToolCalls, 1)
+		assert.Equal(
+			t,
+			"lookup_weather",
+			acc.Choices[0].Message.ToolCalls[0].Function.Name,
+		)
+		assert.Equal(
+			t,
+			`{"city":"Shenzhen"}`,
+			acc.Choices[0].Message.ToolCalls[0].Function.Arguments,
+		)
+		assert.Equal(t, "tool planning", reasoningBuf.String())
+	})
+
+	t.Run("accumulate chunk with reasoning and finish reason", func(t *testing.T) {
+		chunk := parseChunkWithExtraFields(t, `{
+				"id": "test-id",
+				"object": "chat.completion.chunk",
+				"created": 1699200000,
+				"model": "test-model",
+				"choices": [{
+					"index": 0,
+					"delta": {
+						"reasoning_content": "final step"
+					},
+					"finish_reason": "stop"
+				}]
+			}`)
+		acc := openai.ChatCompletionAccumulator{}
+		var reasoningBuf bytes.Buffer
+
+		m.accumulateChunk(chunk, &acc, &reasoningBuf)
+
+		require.Len(t, acc.Choices, 1)
+		assert.Equal(t, "stop", acc.Choices[0].FinishReason)
+		assert.Equal(t, "final step", reasoningBuf.String())
 	})
 
 	t.Run("accumulate with custom usage function", func(t *testing.T) {
@@ -6531,6 +7149,71 @@ func TestModel_handleStreamCompleteCallback(t *testing.T) {
 		assert.Nil(t, capturedAcc)
 		assert.Error(t, capturedErr)
 		assert.Equal(t, "stream error", capturedErr.Error())
+	})
+
+	t.Run("callback panic is recovered", func(t *testing.T) {
+		callbackCalled := false
+		callback := func(ctx context.Context, req *openai.ChatCompletionNewParams, acc *openai.ChatCompletionAccumulator, streamErr error) {
+			callbackCalled = true
+			panic("boom")
+		}
+
+		m := New("test-model", WithAPIKey("test-key"), WithChatStreamCompleteCallback(callback))
+		chatRequest := openai.ChatCompletionNewParams{}
+		acc := openai.ChatCompletionAccumulator{}
+
+		require.NotPanics(t, func() {
+			m.handleStreamCompleteCallback(context.Background(), chatRequest, acc, nil)
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("callback mutations do not affect original accumulator", func(t *testing.T) {
+		callbackCalled := false
+		callback := func(ctx context.Context, req *openai.ChatCompletionNewParams, acc *openai.ChatCompletionAccumulator, streamErr error) {
+			callbackCalled = true
+			require.NotNil(t, acc)
+			acc.Choices[0].Message.Content = "mutated"
+			acc.Choices[0].Message.ToolCalls[0].Function.Arguments = `{"city":"shanghai"}`
+			delete(acc.Choices[0].Message.JSON.ExtraFields, "reasoning_content")
+		}
+
+		m := New("test-model", WithAPIKey("test-key"), WithChatStreamCompleteCallback(callback))
+		chatRequest := openai.ChatCompletionNewParams{}
+		acc := openai.ChatCompletionAccumulator{
+			ChatCompletion: openai.ChatCompletion{
+				ID: "acc-id",
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Index:        0,
+						FinishReason: "stop",
+						Message: openai.ChatCompletionMessage{
+							Content: "original",
+							ToolCalls: []openai.ChatCompletionMessageToolCall{
+								{
+									ID: "call-1",
+									Function: openai.ChatCompletionMessageToolCallFunction{
+										Name:      "weather",
+										Arguments: `{"city":"beijing"}`,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		acc.Choices[0].Message.JSON.ExtraFields = map[string]respjson.Field{
+			"reasoning_content": {},
+		}
+
+		m.handleStreamCompleteCallback(context.Background(), chatRequest, acc, nil)
+
+		assert.True(t, callbackCalled)
+		assert.Equal(t, "original", acc.Choices[0].Message.Content)
+		assert.Equal(t, `{"city":"beijing"}`, acc.Choices[0].Message.ToolCalls[0].Function.Arguments)
+		_, exists := acc.Choices[0].Message.JSON.ExtraFields["reasoning_content"]
+		assert.True(t, exists)
 	})
 }
 
@@ -7011,4 +7694,354 @@ func TestAppendUserContentParts_SkipsInternalFiles(t *testing.T) {
 	})
 	require.Nil(t, fields)
 	require.Empty(t, dst)
+}
+
+// TestChatRequestCallbackSynchronous verifies that
+// chatRequestCallback is invoked synchronously inside
+// GenerateContent, before the response goroutine starts.
+func TestChatRequestCallbackSynchronous(t *testing.T) {
+	tests := []struct {
+		name   string
+		stream bool
+	}{
+		{name: "non_streaming", stream: false},
+		{name: "streaming", stream: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					if !strings.HasSuffix(
+						r.URL.Path, "/chat/completions",
+					) {
+						http.Error(w, "not found",
+							http.StatusNotFound)
+						return
+					}
+					if tt.stream {
+						w.Header().Set("Content-Type",
+							"text/event-stream")
+						fmt.Fprint(w, "data: {\"id\":\"s\","+
+							"\"object\":\"chat.completion.chunk\","+
+							"\"created\":1,\"model\":\"m\","+
+							"\"choices\":[{\"index\":0,"+
+							"\"delta\":{\"content\":\"hi\"},"+
+							"\"finish_reason\":\"stop\"}]}\n\n")
+						fmt.Fprint(w, "data: [DONE]\n\n")
+						return
+					}
+					w.Header().Set("Content-Type",
+						"application/json")
+					fmt.Fprint(w, `{"id":"n","object":`+
+						`"chat.completion","created":1,`+
+						`"model":"m","choices":[{"index":0,`+
+						`"message":{"role":"assistant",`+
+						`"content":"hi"},`+
+						`"finish_reason":"stop"}]}`)
+				}))
+			defer server.Close()
+
+			var callCount int64
+			m := New("test-model",
+				WithBaseURL(server.URL),
+				WithAPIKey("key"),
+				WithChatRequestCallback(
+					func(_ context.Context,
+						_ *openai.ChatCompletionNewParams,
+					) {
+						callCount++
+					}),
+			)
+
+			req := &model.Request{
+				Messages: []model.Message{
+					model.NewUserMessage("hi"),
+				},
+				GenerationConfig: model.GenerationConfig{
+					Stream: tt.stream,
+				},
+			}
+
+			ch, err := m.GenerateContent(
+				context.Background(), req)
+			require.NoError(t, err)
+
+			// Callback must have fired synchronously
+			// before GenerateContent returned.
+			assert.Equal(t, int64(1), callCount,
+				"callback must execute exactly once "+
+					"before GenerateContent returns")
+
+			// Drain the channel to avoid goroutine leak.
+			for range ch {
+			}
+
+			// Confirm no extra invocations after drain.
+			assert.Equal(t, int64(1), callCount,
+				"callback must not be called more than once")
+		})
+	}
+}
+
+func TestExtractEmbeddedErrorResponse(t *testing.T) {
+	mustCompletion := func(t *testing.T, raw string) *openaigo.ChatCompletion {
+		t.Helper()
+		var cc openaigo.ChatCompletion
+		require.NoError(t, cc.UnmarshalJSON([]byte(raw)))
+		return &cc
+	}
+
+	tests := []struct {
+		name        string
+		completion  *openaigo.ChatCompletion
+		wantNil     bool
+		wantMessage string
+		wantType    string
+		wantCode    string
+		wantParam   string
+	}{
+		{
+			name:       "nil completion",
+			completion: nil,
+			wantNil:    true,
+		},
+		{
+			name: "normal completion with choices",
+			completion: mustCompletion(t, `{
+				"id": "chatcmpl-123",
+				"object": "chat.completion",
+				"choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop"}],
+				"model": "gpt-4"
+			}`),
+			wantNil: true,
+		},
+		{
+			name: "normal completion with choices and extra error field is not treated as error",
+			completion: mustCompletion(t, `{
+				"id": "chatcmpl-123",
+				"object": "chat.completion",
+				"choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop"}],
+				"model": "gpt-4",
+				"error": {"message": "some warning", "type": "info"}
+			}`),
+			wantNil: true,
+		},
+		{
+			name:       "empty completion without error field",
+			completion: mustCompletion(t, `{}`),
+			wantNil:    true,
+		},
+		{
+			name: "empty completion with embedded error",
+			completion: mustCompletion(t, `{
+				"error": {
+					"message": "When using tool_choice, 'tools' must be set.",
+					"type": "invalid_request_error",
+					"code": "validation_error"
+				}
+			}`),
+			wantNil:     false,
+			wantMessage: "When using tool_choice, 'tools' must be set.",
+			wantType:    model.ErrorTypeAPIError,
+			wantCode:    "validation_error",
+		},
+		{
+			name: "empty completion with embedded error containing ret_code",
+			completion: mustCompletion(t, `{
+				"error": {
+					"message": "API key exceeded rate limit",
+					"type": "requestAuthError",
+					"code": "rate_limited",
+					"ret_code": -2000
+				}
+			}`),
+			wantNil:     false,
+			wantMessage: "API key exceeded rate limit",
+			wantType:    model.ErrorTypeAPIError,
+			wantCode:    "rate_limited",
+		},
+		{
+			name: "empty completion with error message only, type defaults to api_error",
+			completion: mustCompletion(t, `{
+				"error": {"message": "something went wrong"}
+			}`),
+			wantNil:     false,
+			wantMessage: "something went wrong",
+			wantType:    model.ErrorTypeAPIError,
+		},
+		{
+			name: "empty completion with embedded error where code is a number",
+			completion: mustCompletion(t, `{
+				"error": {
+					"message": "rate limit",
+					"type": "requestAuthError",
+					"code": -2000
+				}
+			}`),
+			wantNil:     false,
+			wantMessage: "rate limit",
+			wantType:    model.ErrorTypeAPIError,
+			wantCode:    "-2000",
+		},
+		{
+			name: "empty completion with embedded error containing param",
+			completion: mustCompletion(t, `{
+				"error": {
+					"message": "invalid parameter",
+					"type": "invalid_request_error",
+					"param": "tool_choice"
+				}
+			}`),
+			wantNil:     false,
+			wantMessage: "invalid parameter",
+			wantType:    model.ErrorTypeAPIError,
+			wantParam:   "tool_choice",
+		},
+		{
+			name: "empty completion with error field that is not a valid object",
+			completion: mustCompletion(t, `{
+				"error": "plain string error"
+			}`),
+			wantNil: true,
+		},
+		{
+			name: "empty completion with error field that is null",
+			completion: mustCompletion(t, `{
+				"error": null
+			}`),
+			wantNil: true,
+		},
+		{
+			name: "empty completion with error object but empty message and type",
+			completion: mustCompletion(t, `{
+				"error": {"code": "unknown"}
+			}`),
+			wantNil: true,
+		},
+		{
+			name: "empty completion with type only and no message falls back to generic message",
+			completion: mustCompletion(t, `{
+				"error": {"type": "server_error"}
+			}`),
+			wantNil:     false,
+			wantMessage: "OpenAI-compatible API returned an embedded error in HTTP 200 response",
+			wantType:    model.ErrorTypeAPIError,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := extractEmbeddedErrorResponse(tt.completion)
+			if tt.wantNil {
+				assert.Nil(t, resp, "expected nil response")
+				return
+			}
+			require.NotNil(t, resp, "expected non-nil error response")
+			require.NotNil(t, resp.Error, "expected Error field")
+			assert.Equal(t, tt.wantMessage, resp.Error.Message)
+			assert.Equal(t, tt.wantType, resp.Error.Type)
+			assert.True(t, resp.Done, "error response must be Done")
+			if tt.wantCode != "" {
+				require.NotNil(t, resp.Error.Code, "expected Code field")
+				assert.Equal(t, tt.wantCode, *resp.Error.Code)
+			}
+			if tt.wantParam != "" {
+				require.NotNil(t, resp.Error.Param, "expected Param field")
+				assert.Equal(t, tt.wantParam, *resp.Error.Param)
+			}
+		})
+	}
+}
+
+func TestModel_GenerateContent_EmbeddedErrorHTTP200(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// Simulate a provider returning HTTP 200 with an error body.
+		fmt.Fprint(w, `{
+			"error": {
+				"message": "When using tool_choice, 'tools' must be set.",
+				"type": "invalid_request_error",
+				"ret_code": -1000
+			}
+		}`)
+	}))
+	defer server.Close()
+
+	m := New("test-model",
+		WithBaseURL(server.URL),
+		WithAPIKey("test-key"),
+	)
+
+	req := &model.Request{
+		Messages: []model.Message{
+			model.NewUserMessage("hello"),
+		},
+		GenerationConfig: model.GenerationConfig{Stream: false},
+	}
+
+	ch, err := m.GenerateContent(context.Background(), req)
+	require.NoError(t, err)
+
+	var responses []*model.Response
+	for resp := range ch {
+		responses = append(responses, resp)
+	}
+
+	require.Len(t, responses, 1, "expected exactly one response")
+	resp := responses[0]
+	require.NotNil(t, resp.Error, "response must carry an error")
+	assert.Equal(t, "When using tool_choice, 'tools' must be set.", resp.Error.Message)
+	assert.Equal(t, model.ErrorTypeAPIError, resp.Error.Type)
+	assert.True(t, resp.Done)
+	assert.Empty(t, resp.Choices, "error response should have no choices")
+}
+
+func TestModel_GenerateContentIter_EmbeddedErrorHTTP200(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"error": {
+				"message": "rate limit exceeded",
+				"type": "requestAuthError",
+				"ret_code": -2000
+			}
+		}`)
+	}))
+	defer server.Close()
+
+	m := New("test-model",
+		WithBaseURL(server.URL),
+		WithAPIKey("test-key"),
+	)
+
+	req := &model.Request{
+		Messages: []model.Message{
+			model.NewUserMessage("hello"),
+		},
+		GenerationConfig: model.GenerationConfig{Stream: false},
+	}
+
+	seq, err := m.GenerateContentIter(context.Background(), req)
+	require.NoError(t, err)
+
+	var responses []*model.Response
+	seq(func(resp *model.Response) bool {
+		responses = append(responses, resp)
+		return true
+	})
+
+	require.Len(t, responses, 1)
+	resp := responses[0]
+	require.NotNil(t, resp.Error)
+	assert.Equal(t, "rate limit exceeded", resp.Error.Message)
+	assert.Equal(t, model.ErrorTypeAPIError, resp.Error.Type)
+	assert.True(t, resp.Done)
 }

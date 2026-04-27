@@ -32,6 +32,14 @@ type ChatRequestCallbackFunc func(
 	chatRequest *openai.ChatCompletionNewParams,
 )
 
+// ChatRequestJSONCallbackFunc is the function type for the chat request
+// JSON callback.
+type ChatRequestJSONCallbackFunc func(
+	ctx context.Context,
+	chatRequestJSON []byte,
+	marshalErr error,
+)
+
 // ChatResponseCallbackFunc is the function type for the chat response callback.
 type ChatResponseCallbackFunc func(
 	ctx context.Context,
@@ -67,6 +75,8 @@ type options struct {
 	HTTPClientOptions []HTTPClientOption
 	// Callback for the chat request.
 	ChatRequestCallback ChatRequestCallbackFunc
+	// Callback for the marshaled chat request JSON.
+	ChatRequestJSONCallback ChatRequestJSONCallbackFunc
 	// Callback for the chat response.
 	ChatResponseCallback ChatResponseCallbackFunc
 	// Callback for the chat chunk.
@@ -102,8 +112,13 @@ type options struct {
 	// chunks from the provider will be forwarded via
 	// Response.Choices[].Delta.ToolCalls instead of being
 	// suppressed until the final aggregated response.
-	ShowToolCallDelta    bool
-	accumulateChunkUsage AccumulateChunkUsage
+	ShowToolCallDelta bool
+	// ReasoningContentBackfill controls whether assistant
+	// tool-call messages should replay an empty
+	// reasoning_content field when the message has no
+	// reasoning text.
+	ReasoningContentBackfill bool
+	accumulateChunkUsage     AccumulateChunkUsage
 	// OptimizeForCache controls whether to optimize message structure for prompt caching.
 	// When enabled, system messages will be moved to the front to improve cache hit rates.
 	// OpenAI's prompt caching is automatic and doesn't require explicit cache control,
@@ -163,10 +178,21 @@ func WithChannelBufferSize(size int) Option {
 	}
 }
 
-// WithChatRequestCallback sets the function to be called before sending a chat request.
+// WithChatRequestCallback sets the function to be called before sending a
+// chat request. The callback runs synchronously in GenerateContent before
+// the response goroutine starts. Start your own goroutine in the callback
+// if asynchronous behavior is needed.
 func WithChatRequestCallback(fn ChatRequestCallbackFunc) Option {
 	return func(opts *options) {
 		opts.ChatRequestCallback = fn
+	}
+}
+
+// WithChatRequestJSONCallback sets the function to be called with the
+// marshaled chat request JSON before sending the request.
+func WithChatRequestJSONCallback(fn ChatRequestJSONCallbackFunc) Option {
+	return func(opts *options) {
+		opts.ChatRequestJSONCallback = fn
 	}
 }
 
@@ -186,11 +212,22 @@ func WithChatChunkCallback(fn ChatChunkCallbackFunc) Option {
 	}
 }
 
-// WithChatStreamCompleteCallback sets the function to be called when streaming is completed.
+// WithChatStreamCompleteCallback sets the function to be called when
+// streaming is completed. The callback runs synchronously before the
+// terminal streaming result is surfaced to the caller.
 // Called for both successful and failed streaming completions.
 func WithChatStreamCompleteCallback(fn ChatStreamCompleteCallbackFunc) Option {
 	return func(opts *options) {
 		opts.ChatStreamCompleteCallback = fn
+	}
+}
+
+// WithReasoningContentBackfill enables replay-time
+// reasoning_content backfill for assistant tool-call
+// messages that have no reasoning text.
+func WithReasoningContentBackfill(enabled bool) Option {
+	return func(opts *options) {
+		opts.ReasoningContentBackfill = enabled
 	}
 }
 

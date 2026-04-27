@@ -204,6 +204,142 @@ Notes:
 - The factory is called once per `Runner.Run(...)`.
 - `agent.WithAgent(...)` still overrides everything (useful for tests).
 
+#### Resource Ownership Inside Agent Factories
+
+`AgentFactory` is ideal for request-scoped Agent construction, but it
+**does not transfer ownership of resources** created inside the factory.
+
+- The `Runner` only asks the factory for an `agent.Agent`.
+- `Runner.Close()` only closes resources created or owned by the Runner
+  itself; it does **not** automatically close request-scoped
+  `tool.ToolSet` instances, temporary MCP connections, sandbox sessions,
+  or similar resources created inside the factory.
+- The reason is structural: the `agent.Agent` interface does not expose a
+  `Close()` method, so the Runner has no generic way to reclaim those
+  resources.
+
+Recommended patterns:
+
+- If a `ToolSet` or external connection can be reused across requests,
+  create it once outside the factory, reuse it inside the factory, and
+  close it during application shutdown.
+- If a resource must be created per request, the caller should clean it
+  up explicitly after that run finishes. Common patterns are wrapping the
+  Agent with cleanup logic, or running cleanup from an after-agent
+  callback.
+
+This boundary is especially important when using MCP ToolSets. See the
+ToolSet lifecycle notes in the `tool` documentation for more details.
+
+### Resume the Next User Turn at a Specific Agent
+
+In a multi-Agent conversation, a transferred SubAgent may ask the user for
+missing information. The next request is a brand-new `Runner.Run(...)` call, so
+`Runner` needs an explicit signal if that next user message should resume at
+the same Agent instead of the normal entry Agent.
+
+Enable the one-shot route consumer on Runner:
+
+```go
+r := runner.NewRunner(
+    "crm-app",
+    coordinatorAgent,
+    runner.WithAwaitUserReplyRouting(true),
+)
+```
+
+There are two ways to produce that route:
+
+1. `LLMAgent`: enable `llmagent.WithAwaitUserReplyTool(true)` and instruct the
+   model to call `await_user_reply` immediately before it asks the user for
+   missing information.
+2. Custom Agent implementations: call `agent.MarkAwaitingUserReply(invocation)`
+   before you emit the final clarifying question event.
+
+#### Low-Level Example for a Custom Agent
+
+```go
+type clarifierAgent struct{}
+
+func (a *clarifierAgent) Run(
+    ctx context.Context,
+    inv *agent.Invocation,
+) (<-chan *event.Event, error) {
+    ch := make(chan *event.Event, 1)
+    go func() {
+        defer close(ch)
+
+        if missingPhoneNumber(inv.Message) {
+            _ = agent.MarkAwaitingUserReply(inv)
+            _ = agent.EmitEvent(
+                ctx,
+                inv,
+                ch,
+                event.NewResponseEvent(
+                    inv.InvocationID,
+                    inv.AgentName,
+                    &model.Response{
+                        Done: true,
+                        Choices: []model.Choice{{
+                            Index: 0,
+                            Message: model.Message{
+                                Role:    model.RoleAssistant,
+                                Content: "What phone number should I save?",
+                            },
+                        }},
+                    },
+                ),
+            )
+            return
+        }
+
+        _ = agent.EmitEvent(
+            ctx,
+            inv,
+            ch,
+            event.NewResponseEvent(
+                inv.InvocationID,
+                inv.AgentName,
+                &model.Response{
+                    Done: true,
+                    Choices: []model.Choice{{
+                        Index: 0,
+                        Message: model.Message{
+                            Role:    model.RoleAssistant,
+                            Content: "Profile updated.",
+                        },
+                    }},
+                },
+            ),
+        )
+    }()
+    return ch, nil
+}
+```
+
+Behavior summary:
+
+- The route is stored in session state as a stable agent path, not by
+  mutating message roles.
+- It is consumed once, right before the next user turn starts.
+- `agent.WithAgent(...)` and `agent.WithAgentByName(...)` still take
+  precedence.
+- If the recorded Agent path no longer exists, Runner clears the stale route
+  and falls back to the default entry Agent.
+- Nested SubAgents are resumed by their full invocation path, so the common
+  `coordinator + WithSubAgents(...)` setup works without manually registering
+  every child Agent.
+
+Advanced note:
+
+- The built-in `Runner` records the stable root lookup key automatically,
+  including `AgentFactory` cases where the runtime `Info().Name` differs from
+  the registered factory name.
+- If you build and run invocations manually outside `Runner`, and the stable
+  root lookup key is different from `inv.AgentName`, call
+  `agent.SetAwaitUserReplyRootLookupName(inv, rootLookupName)` before the
+  Agent emits its final clarifying reply.
+
 ### 🔌 Plugins
 
 Runner plugins are global, runner-scoped hooks. Register plugins once and they
@@ -294,6 +430,140 @@ _ = ok
 // Cancel the run by requestID.
 managed.Cancel(requestID)
 ```
+
+#### Queue a New User Message into the Same Run
+
+Sometimes you do not want to start a second run. You want to keep the current
+`requestID`, queue a new `role=user` message, and insert it only after the
+current assistant round is finished.
+
+Use `runner.EnqueueUserMessage(...)`:
+
+```go
+requestID := "req-123"
+
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    model.NewUserMessage("Draft a launch note."),
+    agent.WithRequestID(requestID),
+)
+if err != nil {
+    panic(err)
+}
+
+go func() {
+    time.Sleep(time.Second)
+    err := runner.EnqueueUserMessage(
+        r,
+        requestID,
+        model.NewUserMessage("Also make the tone warmer."),
+    )
+    if err != nil {
+        log.Printf("enqueue steer failed: %v", err)
+    }
+}()
+
+_ = eventChan
+```
+
+Think of one assistant output as one round:
+
+- If the assistant only replies with text, the round ends at that reply
+- If the assistant emits `tool_call`s, the round ends only after that whole
+  tool batch finishes
+
+The queued user message can only be inserted between rounds. It is never
+inserted in the middle of a round.
+
+The simplest valid shape is:
+
+```text
+user(Q1)
+assistant(tool_call A)
+tool(result A)
+user(Q2, queued steer)
+assistant(...)
+```
+
+If one assistant message emits multiple tool calls, the framework still waits
+for the whole round:
+
+```text
+user(Q1)
+assistant(tool_calls A, B)
+tool(result A)
+tool(result B)
+user(Q2, queued steer)
+assistant(...)
+```
+
+It will not insert like this:
+
+```text
+user(Q1)
+assistant(tool_calls A, B)
+tool(result A)
+user(Q2, queued steer)
+tool(result B)
+```
+
+because that would break the `tool_call -> tool_response` structure of the
+same assistant round.
+
+So the behavior is:
+
+- This does **not** start a second run
+- The message is queued first, not written to session immediately
+- It is appended only after the previous assistant round and its tool work are
+  fully finished
+- This keeps the `tool_call -> tool_response` structure intact
+- If the run has already finished, enqueue returns an error
+
+If you want the implementation-level mapping, this happens after one
+`runOneStep()` finishes and before the next `runOneStep()` starts.
+
+Runnable example: `examples/steer/`
+
+#### Per-Request App Name Override (multi-tenant isolation)
+
+By default, Runner uses the `appName` supplied at construction for session keys
+and event filter keys. If a single Runner instance serves multiple projects or
+tenants, you can override the app name on each `Run` call with
+`agent.WithAppName`:
+
+```go
+// One runner, two projects.
+r := runner.NewRunner("default-app", myAgent)
+
+// Project A — sessions are stored under "project-a".
+evA, _ := r.Run(ctx, userID, sessionID, msg,
+    agent.WithAppName("project-a"),
+)
+
+// Project B — sessions are stored under "project-b", fully isolated from A.
+evB, _ := r.Run(ctx, userID, sessionID, msg,
+    agent.WithAppName("project-b"),
+)
+```
+
+When `WithAppName` is **not** provided (or the value is empty), the runner
+falls back to the constructor-supplied default app name. The override affects:
+
+| Dimension | Default (no override) | With `WithAppName("X")` |
+|---|---|---|
+| `session.Key.AppName` | constructor `appName` | `"X"` |
+| Default `EventFilterKey` | constructor `appName` | `"X"` |
+
+Other runner-level registrations (observability `appid`, agent registry) remain
+bound to the original constructor `appName`.
+
+> **Note**
+>
+> `appName` must not be empty. If neither the constructor nor `WithAppName`
+> provides a non-empty value, the session service returns
+> `session.ErrAppNameRequired`.
 
 #### Detached Cancellation (background execution)
 
@@ -395,6 +665,132 @@ single `invocation.Message` if the session has no events). `RunWithMessages`
 still sets `invocation.Message` to the latest user turn so graph/flow agents
 that inspect it continue to work.
 
+### User Message Rewriting
+
+`agent.WithUserMessageRewriter(...)` rewrites the current-turn user message
+before the run starts. The rewritten result is written into the session as the
+effective input for the current turn and continues to participate in subsequent
+turns. This is useful for adding business context, normalizing user wording, or
+splitting one input into multiple messages that are easier for the model to
+process.
+
+The signature of `UserMessageRewriter` is:
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/model"
+)
+
+type UserMessageRewriter func(
+    ctx context.Context,
+    args *UserMessageRewriteArgs,
+) ([]model.Message, error)
+
+type UserMessageRewriteArgs struct {
+    AppName         string
+    UserID          string
+    SessionID       string
+    RequestID       string
+    OriginalMessage model.Message
+}
+```
+
+`OriginalMessage` is the raw user input for the current turn. The other fields
+provide stable identifiers for the current run.
+
+The returned messages are processed in order. The last message becomes
+`invocation.Message`, and any preceding messages are persisted as leading
+messages for the same turn. This allows the interface to support both `1 -> 1`
+rewrites and `1 -> N` expansions. If the same call also passes historical
+messages via `agent.WithMessages(...)`, the rewritten result is written
+together with that history. The rewriter must not return an empty slice; if it
+does, the runner returns an error immediately.
+
+Example:
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+)
+
+func rewriteUserMessage(
+    ctx context.Context,
+    args *agent.UserMessageRewriteArgs,
+) ([]model.Message, error) {
+    raw := strings.TrimSpace(args.OriginalMessage.Content)
+    if raw == "" {
+        return []model.Message{args.OriginalMessage}, nil
+    }
+    if needsContext(raw) {
+        return []model.Message{
+            model.NewUserMessage("Please interpret the following request with the business context below."),
+            model.NewUserMessage(raw),
+        }, nil
+    }
+    return []model.Message{
+        model.NewUserMessage("Please rewrite the following request into a clearer and more complete user message: " + raw),
+    }, nil
+}
+
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    userMessage,
+    agent.WithUserMessageRewriter(rewriteUserMessage),
+)
+```
+
+A complete example is available at [examples/usermessagerewriter](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/usermessagerewriter).
+
+### Override Runtime Surfaces for a Specific Node by `nodeID`
+
+If you need to change one specific node in a `runner.Run(...)` call instead of
+changing the entire agent, pass `agent.WithSurfacePatchForNode(nodeID, patch)`.
+
+```go
+var patch agent.SurfacePatch
+patch.SetInstruction("Answer in one short paragraph.")
+
+events, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    model.NewUserMessage("Summarize this report."),
+    agent.WithSurfacePatchForNode(nodeID, patch),
+)
+```
+
+Prefer obtaining a stable `nodeID` from `structure.Export(...)` and then pass
+it to `WithSurfacePatchForNode(...)`. If you need to patch multiple nodes in
+the same run, pass multiple `WithSurfacePatchForNode(...)` options. For full
+details and more examples, see [Agent: Override Runtime Surfaces by `nodeID`](./agent.md#override-runtime-surfaces-by-nodeid).
+
+### Override `code executor` Per Run
+
+If you need to specify a different execution environment for a particular
+request on an agent that resolves its executor from `RunOptions.CodeExecutor`,
+such as `LLMAgent`, pass `agent.WithCodeExecutor(exec)` to `runner.Run(...)`.
+
+```go
+events, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    model.NewUserMessage("Run the release checklist skill."),
+    agent.WithCodeExecutor(containerExec),
+)
+```
+
+Notes:
+
+- This option applies only to the current `runner.Run(...)` call and does not change the agent's default configuration.
+- This option only applies to agents that read `RunOptions.CodeExecutor`. If you use a custom agent, make sure its implementation handles this run option.
+- If the agent was created with `llmagent.WithCodeExecutor(...)`, the executor passed here temporarily overrides that default for this run.
+- Capabilities that resolve their executor from `RunOptions.CodeExecutor` (for example `workspace_exec`) use the executor passed here for this run.
+- If you do not want Markdown fenced code blocks in model replies to auto-execute, set `llmagent.WithEnableCodeExecutionResponseProcessor(false)` when creating the agent. See [Skill](./skill.md) for more details.
+
 ### ✅ Detecting End-of-Run and Reading Final Output (Graph-friendly)
 
 When driving a GraphAgent workflow, the LLM’s “final response” is not the end of
@@ -434,6 +830,9 @@ preserving detailed graph events for advanced use.
 
 #### Fatal Errors Before a Graph Completion Event
 
+For the full framework-level recommendation, including the standard graph
+collector and A2A conventions, see [Error Handling](error-handling.md).
+
 Sometimes a run stops early because of a fatal error before the graph emits its
 final `graph.execution` event. A common example is:
 
@@ -459,33 +858,107 @@ This lets application code keep the same simple rule: read the last event first
 for business-level fatal details, instead of scanning the whole stream to find
 the callback/error event.
 
+If the graph uses `graph.NewExecutionErrorCollector()`, any collected
+`execution_errors` in that `StateDelta` may come from the default recoverable
+contract as well, for example errors that implement `Recoverable() bool` or
+errors wrapped by `graph.MarkRecoverable(err)`.
+
 Example:
 
 ```go
+package main
+
 import (
+    "context"
     "encoding/json"
     "fmt"
 
     "trpc.group/trpc-go/trpc-agent-go/event"
+    "trpc.group/trpc-go/trpc-agent-go/graph"
+    "trpc.group/trpc-go/trpc-agent-go/model"
 )
 
 const stateKeyNodeFatal = "node_fatal_error"
 
-func readLastEvent(eventChan <-chan *event.Event) error {
-    for e := range eventChan {
-        if !e.IsRunnerCompletion() {
+type RunSummary struct {
+    TransportError  *model.ResponseError
+    FatalDetail     map[string]any
+    ExecutionErrors []graph.ExecutionError
+}
+
+func ConsumeRun(
+    ctx context.Context,
+    eventChan <-chan *event.Event,
+) (*RunSummary, error) {
+    summary := &RunSummary{}
+
+    for {
+        select {
+        case <-ctx.Done():
+            return nil, ctx.Err()
+        case evt, ok := <-eventChan:
+            if !ok {
+                return summary, nil
+            }
+            if evt.Response != nil && evt.Response.Error != nil {
+                summary.TransportError = evt.Response.Error
+            }
+            if !evt.IsRunnerCompletion() {
+                continue
+            }
+
+            if b, ok := evt.StateDelta[stateKeyNodeFatal]; ok {
+                var detail map[string]any
+                if err := json.Unmarshal(b, &detail); err != nil {
+                    return nil, err
+                }
+                summary.FatalDetail = detail
+            }
+
+            executionErrors, err := graph.ExecutionErrorsFromStateDelta(
+                evt.StateDelta,
+                graph.StateKeyExecutionErrors,
+            )
+            if err != nil {
+                return nil, err
+            }
+            summary.ExecutionErrors = executionErrors
+            return summary, nil
+        }
+    }
+}
+
+func PrintSummary(summary *RunSummary) {
+    if summary.TransportError != nil {
+        fmt.Printf(
+            "transport error: type=%s code=%s message=%s\n",
+            summary.TransportError.Type,
+            ptrValue(summary.TransportError.Code),
+            summary.TransportError.Message,
+        )
+    }
+    if summary.FatalDetail != nil {
+        fmt.Printf("fatal detail: %+v\n", summary.FatalDetail)
+    }
+    for _, record := range summary.ExecutionErrors {
+        if record.Error == nil {
             continue
         }
-
-        if b, ok := e.StateDelta[stateKeyNodeFatal]; ok {
-            var detail map[string]any
-            if err := json.Unmarshal(b, &detail); err == nil {
-                fmt.Printf("fatal detail: %+v\n", detail)
-            }
-        }
-        return nil
+        fmt.Printf(
+            "execution error: severity=%s node=%s code=%s message=%s\n",
+            record.Severity,
+            record.NodeName,
+            ptrValue(record.Error.Code),
+            record.Error.Message,
+        )
     }
-    return nil
+}
+
+func ptrValue(value *string) string {
+    if value == nil {
+        return ""
+    }
+    return *value
 }
 ```
 
@@ -559,6 +1032,46 @@ Recommendation: for GraphAgent workflows, always read the final output from the
 Runner completion event’s `StateDelta` (for example,
 `graph.StateKeyLastResponse`). Treat `Response.Choices` on the completion event
 as optional when this option is enabled.
+
+#### Option: Keep Only Terminal Graph Message Events
+
+When a graph contains multiple Large Language Model (LLM) nodes or sub-agent
+nodes, the caller-visible message stream may include intermediate drafts from
+earlier nodes. To preserve full backward compatibility, that behavior remains
+the default.
+
+If you want the caller-visible stream to keep only terminal graph message
+events, enable:
+
+```go
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    message,
+    agent.WithGraphTerminalMessagesOnly(true),
+)
+```
+
+Behavior summary:
+
+- Default (`false`): unchanged. Intermediate graph node message events are
+  still forwarded.
+- Enabled (`true`): caller-visible message events are limited to terminal LLM
+  nodes and terminal sub-agent nodes.
+- Parallel terminal nodes are all preserved. The option does not collapse a
+  fan-out graph into a single winner.
+- Internal graph execution is unchanged. State handoff, history aggregation,
+  tracing, and token accounting still use the full raw graph event stream.
+
+This option is especially useful when your product experience should stream
+only the last user-facing graph step, while keeping intermediate graph
+messages internal.
+
+For graph LLM nodes, pair this option with
+`agent.WithGraphEmitFinalModelResponses(true)` when you also want terminal
+`Done=true` assistant message events to be forwarded. See
+`examples/graph/terminal_messages_only`.
 
 #### 🎛️ Option: StreamMode
 

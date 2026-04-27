@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -112,6 +113,42 @@ func TestClient_SendMessage_Success(t *testing.T) {
 	require.Equal(t, 200, rsp.StatusCode)
 	require.Equal(t, "ok", rsp.Reply)
 	require.Equal(t, "req-1", rsp.RequestID)
+}
+
+func TestClient_SendMessage_IncludesUsage(t *testing.T) {
+	t.Parallel()
+
+	srv, err := gateway.New(&staticRunner{
+		events: []*event.Event{{
+			Response: &model.Response{
+				Object: model.ObjectTypeChatCompletion,
+				Choices: []model.Choice{
+					{Message: model.NewAssistantMessage("ok")},
+				},
+				Usage: &model.Usage{
+					PromptTokens:     12000,
+					CompletionTokens: 345,
+					TotalTokens:      12345,
+				},
+				Done: true,
+			},
+			RequestID: "req-1",
+		}},
+	})
+	require.NoError(t, err)
+
+	cli, err := New(srv.Handler(), srv.MessagesPath(), srv.CancelPath())
+	require.NoError(t, err)
+
+	rsp, err := cli.SendMessage(context.Background(), MessageRequest{
+		From: "u1",
+		Text: "hello",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, rsp.Usage)
+	require.Equal(t, 12000, rsp.Usage.PromptTokens)
+	require.Equal(t, 345, rsp.Usage.CompletionTokens)
+	require.Equal(t, 12345, rsp.Usage.TotalTokens)
 }
 
 func TestClient_SendMessage_MentionGating(t *testing.T) {
@@ -428,6 +465,52 @@ func TestClient_StreamMessage_StatusError(t *testing.T) {
 	})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "unauthorized")
+}
+
+func TestParseSSEStream_ThoughtEvent(t *testing.T) {
+	t.Parallel()
+
+	out := make(chan StreamEvent, 1)
+	err := parseSSEStream(
+		context.Background(),
+		strings.NewReader(
+			"event: thought.delta\n"+
+				"data: {\"delta\":\"plan\"}\n\n",
+		),
+		out,
+	)
+	require.NoError(t, err)
+
+	evt := <-out
+	require.Equal(
+		t,
+		gwproto.StreamEventTypeThoughtDelta,
+		evt.Type,
+	)
+	require.Equal(t, "plan", evt.Delta)
+}
+
+func TestParseSSEStream_PublicEvent(t *testing.T) {
+	t.Parallel()
+
+	out := make(chan StreamEvent, 1)
+	err := parseSSEStream(
+		context.Background(),
+		strings.NewReader(
+			"event: public.completed\n"+
+				"data: {\"reply\":\"let me check\"}\n\n",
+		),
+		out,
+	)
+	require.NoError(t, err)
+
+	evt := <-out
+	require.Equal(
+		t,
+		gwproto.StreamEventTypePublicCompleted,
+		evt.Type,
+	)
+	require.Equal(t, "let me check", evt.Reply)
 }
 
 type streamContentTypeHandler struct {

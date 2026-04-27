@@ -9,9 +9,13 @@ including tasks that require:
 
 The goal is to show how to combine:
 
-- `skill_load` / `skill_run` (run scripts inside an isolated workspace)
+- Skill knowledge loading and script execution inside an isolated
+  workspace
 - File tools (list/search files under `-data-dir`)
 - `workspace://...` references to pass skill outputs across tools
+
+For the recommended execution pattern in new code, see
+[docs/mkdocs/en/skill.md](../../docs/mkdocs/en/skill.md).
 
 ## What You Get
 
@@ -30,7 +34,7 @@ The goal is to show how to combine:
 
 ### Python (Optional, for Audio/Image Tasks)
 
-`skill_run` executes scripts with `python3` from your `PATH`. Install
+Skill scripts execute with `python3` from your `PATH`. Install
 dependencies into the same Python environment that `python3` points to.
 
 1) Create a Python environment (pick one)
@@ -161,15 +165,13 @@ Notes:
 - Results are written to `../results/trpc-agent-go.json` by default.
 - Skill workspaces are created under `./skill_workspaces/` (safe to delete).
 
-## How Skill Outputs Work (Important)
+## How Skill Outputs Work
 
-`skill_run` executes in an isolated workspace. Files written there are not
-automatically visible to normal file tools unless they are exported.
+Skill scripts execute in an isolated workspace. Files written there are
+not automatically visible to normal file tools unless they are exported
+through the executing tool's output collection. When passing an output
+file to other tools, use a `workspace://...` reference rather than a
+host filesystem path.
 
-Recommended patterns:
-
-- When calling `skill_run`, write outputs under `out/` and set
-  `output_files` so the tool returns text file contents inline.
-  Non-text files (like images) are returned as metadata only.
-- When passing an output file to other tools, use `output_files[*].ref`
-  (a `workspace://...` reference), not a host filesystem path.
+For the recommended execution / output pattern in new code, see
+[docs/mkdocs/en/skill.md](../../docs/mkdocs/en/skill.md).

@@ -10,6 +10,7 @@ The Tool system is a core component of the tRPC-Agent-Go framework, enabling Age
 - **🌊 Streaming Responses**: Supports both real-time streaming responses and normal responses.
 - **⚡ Parallel Execution**: Tool invocations support parallel execution to improve performance.
 - **🔄 MCP Protocol**: Full support for STDIO, SSE, and Streamable HTTP transports.
+- **🔁 Tool Call Retry**: Supports retrying callable tool calls in LLMAgent and Graph ToolsNode.
 - **🛠️ Configuration Support**: Provides configuration options and filter support.
 - **🧹 Arguments Repair**: Optionally enable `agent.WithToolCallArgumentsJSONRepairEnabled(true)` to best-effort repair `tool_calls` `arguments`, improving robustness for tool execution and external parsing.
 
@@ -211,7 +212,297 @@ for {
 reader.Close()
 ```
 
+### Access Tool Call ID inside Tool implementations
+
+When the model emits a `tool_call`, the framework injects that call's
+`tool_call_id` into the tool execution `context.Context` before your tool
+starts running.
+
+This means the framework **does support** reading the current tool call ID
+directly inside your own Tool implementation.
+
+This is especially useful when you want to:
+
+- create unique state keys for concurrent calls to the same tool
+- attach a stable identifier to logs, metrics, or traces
+- launch a child Agent inside the tool and tell your UI which
+  `tool_call` that child Agent belongs to
+
+Today this mechanism applies to:
+
+- regular function tools in LLMAgent
+- streamable tools in LLMAgent
+- tool execution in GraphAgent tools nodes
+- Tool callbacks and plugins as well
+
+#### The simplest form
+
+Call `tool.ToolCallIDFromContext(ctx)` inside the tool:
+
+```go
+const defaultToolCallID = "default"
+
+type searchArgs struct {
+    Query string `json:"query"`
+}
+
+func searchDocs(
+    ctx context.Context,
+    args searchArgs,
+) (map[string]any, error) {
+    toolCallID, ok := tool.ToolCallIDFromContext(ctx)
+    if !ok || toolCallID == "" {
+        toolCallID = defaultToolCallID
+    }
+
+    log.Printf(
+        "tool_call_id=%s query=%s",
+        toolCallID,
+        args.Query,
+    )
+
+    return map[string]any{
+        "tool_call_id": toolCallID,
+        "query":        args.Query,
+    }, nil
+}
+```
+
+If all you need is per-call logging, metrics, or Invocation State, this is
+usually enough.
+
+For a runnable end-to-end example, see `examples/toolcallid`.
+
+#### When the Tool also launches a child Agent
+
+There are two different kinds of identifiers here:
+
+- `tool_call_id`: identifies one model-issued tool call
+- `InvocationID` / `ParentInvocationID`: identify parent-child Agent runs
+
+If your goal is "show the child Agent output under the specific tool card in
+the UI", keep both layers:
+
+1. Read the current `tool_call_id` with
+   `tool.ToolCallIDFromContext(ctx)`
+2. Read the parent Invocation with `agent.InvocationFromContext(ctx)`
+3. Create the child Invocation with `parentInv.Clone(...)`
+4. Put the `tool_call_id` into the child Invocation
+   `RunOptions.RuntimeState`
+5. In the renderer, use:
+   - `InvocationID` / `ParentInvocationID` for the execution tree
+   - the propagated `tool_call_id` for the originating tool card
+
+Example (assuming `childAgent` is an existing runnable child Agent):
+
+```go
+const runtimeStateParentToolCallID = "display.parent_tool_call_id"
+const defaultToolCallID = "default"
+
+type delegateArgs struct {
+    Message string `json:"message"`
+}
+
+func runChildAgentInsideTool(
+    ctx context.Context,
+    args delegateArgs,
+) (string, error) {
+    toolCallID, ok := tool.ToolCallIDFromContext(ctx)
+    if !ok || toolCallID == "" {
+        toolCallID = defaultToolCallID
+    }
+
+    parentInv, ok := agent.InvocationFromContext(ctx)
+    if !ok || parentInv == nil {
+        return "", errors.New("missing parent invocation")
+    }
+
+    childRunOptions := parentInv.RunOptions
+    childRunOptions.RuntimeState = make(
+        map[string]any,
+        len(parentInv.RunOptions.RuntimeState)+1,
+    )
+    for key, value := range parentInv.RunOptions.RuntimeState {
+        childRunOptions.RuntimeState[key] = value
+    }
+    childRunOptions.RuntimeState[
+        runtimeStateParentToolCallID
+    ] = toolCallID
+
+    childInv := parentInv.Clone(
+        agent.WithInvocationAgent(childAgent),
+        agent.WithInvocationMessage(
+            model.NewUserMessage(args.Message),
+        ),
+        agent.WithInvocationRunOptions(childRunOptions),
+    )
+
+    childCtx := agent.NewInvocationContext(ctx, childInv)
+    eventCh, err := agent.RunWithPlugins(
+        childCtx,
+        childInv,
+        childAgent,
+    )
+    if err != nil {
+        return "", err
+    }
+
+    var final string
+    for ev := range eventCh {
+        if ev.Response != nil && len(ev.Response.Choices) > 0 {
+            msg := ev.Response.Choices[0].Message
+            if msg.Content != "" {
+                final = msg.Content
+            }
+        }
+        // Child events naturally carry:
+        // - ev.InvocationID       == childInv.InvocationID
+        // - ev.ParentInvocationID == parentInv.InvocationID
+        //
+        // Your renderer can build the invocation tree from these two
+        // fields, and read runtimeStateParentToolCallID from the child
+        // invocation path to attach that subtree back to the original
+        // tool-call card.
+    }
+
+    return final, nil
+}
+```
+
+Copy `RuntimeState` before writing to it. `Invocation.Clone(...)`
+does not deep-copy the `map`, so mutating a reused map would also
+mutate the parent Invocation.
+
+Inside the child Agent, if you need to read the originating tool call ID
+again, read it from runtime state:
+
+```go
+toolCallID, ok := agent.GetRuntimeStateValueFromContext[string](
+    ctx,
+    runtimeStateParentToolCallID,
+)
+```
+
+#### Recommended pattern
+
+- If you only need the identifier for the current tool call, use
+  `tool.ToolCallIDFromContext(ctx)`
+- If you need to represent "which child Agent belongs to which parent
+  execution", rely on `InvocationID` / `ParentInvocationID`
+- If the UI must also attach that child subtree back to a specific tool
+  card, propagate `tool_call_id` explicitly through `RuntimeState` or
+  custom event metadata
+- If you are using `AgentTool`, the framework already maintains parent-child
+  Invocation linkage via `Invocation.Clone(...)`. In many UIs that is
+  already enough. Propagate `tool_call_id` only when you need the extra
+  tool-card association
+
+#### One subtle caveat
+
+The framework injects `tool_call_id` before tool execution.
+However, if a `BeforeTool` callback replaces the context with a brand-new
+bare context, downstream tool code will no longer see that ID.
+
+So if you replace the context inside callbacks, make sure you preserve the
+existing context values you still need.
+
 ## Built-in Tools
+
+### Tool Call Retry
+
+When a tool call may fail because of a transient issue, you can configure retry for it, for example:
+
+- a temporary network issue;
+- a short timeout;
+- an intermittent failure from an external service.
+
+This feature is disabled by default. It currently applies only to `CallableTool`, and `StreamableTool` is not retried yet. When enabled, the framework retries only the current tool call. It does not rerun the whole Agent or the whole Graph workflow.
+
+### Basic Configuration
+
+```go
+policy := &tool.RetryPolicy{
+    MaxAttempts:     3,
+    InitialInterval: 200 * time.Millisecond,
+    BackoffFactor:   2.0,
+    MaxInterval:     2 * time.Second,
+    Jitter:          true,
+}
+```
+
+Common fields:
+
+- `MaxAttempts`: Total attempt count, including the first call.
+- `InitialInterval`: Delay before the second attempt.
+- `BackoffFactor`: Multiplier for backoff growth.
+- `MaxInterval`: Upper bound for the delay.
+- `Jitter`: Whether to enable jitter.
+
+### Default Retry Rules
+
+If you do not provide `RetryOn`, the framework uses `tool.DefaultRetryOn(...)`.
+
+The default rule is conservative and retries only common transient errors, such as:
+
+- `io.EOF`
+- `io.ErrUnexpectedEOF`
+- timeout / temporary errors reported through `net.Error`
+
+It does not retry `context.Canceled`, `context.DeadlineExceeded`, or result-level failures by default.
+
+### Custom Retry Rules
+
+If the default rule is not enough, you can customize the decision with `RetryOn`. A common pattern is to reuse `tool.DefaultRetryOn(...)` first, then add your own conditions:
+
+```go
+policy := &tool.RetryPolicy{
+    MaxAttempts:     2,
+    InitialInterval: 200 * time.Millisecond,
+    BackoffFactor:   2.0,
+    MaxInterval:     time.Second,
+    RetryOn: func(ctx context.Context, info *tool.RetryInfo) (bool, error) {
+        retry, err := tool.DefaultRetryOn(ctx, info)
+        if err != nil || retry {
+            return retry, err
+        }
+        if info.ResultError {
+            return true, nil
+        }
+        return false, nil
+    },
+}
+```
+
+`tool.RetryInfo` carries the current call information, such as tool name, attempt number, raw error, and result-level failure flag, so you can make your retry decision in one place.
+
+### Enable It in LLMAgent
+
+```go
+agent := llmagent.New(
+    "assistant",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithTools([]tool.Tool{myTool}),
+    llmagent.WithToolCallRetryPolicy(policy),
+)
+```
+
+Runnable example:
+
+- [examples/llmagent_tool_call_retry](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/llmagent_tool_call_retry)
+
+### Enable It in Graph
+
+```go
+sg.AddToolsNode(
+    "tools",
+    tools,
+    graph.WithToolCallRetryPolicy(policy),
+)
+```
+
+Runnable example:
+
+- [examples/graph/tool_call_retry](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/graph/tool_call_retry)
 
 ### DuckDuckGo Search Tool
 
@@ -250,6 +541,70 @@ searchTool := duckduckgo.NewTool(
 )
 ```
 
+### Claude Code ToolSet
+
+`tool/claudecode` provides a code-oriented ToolSet that exposes a Claude Code-style tool surface inside the framework. It covers file editing, repository search, command execution, and web retrieval, and can be attached directly to `LLMAgent` or other runtimes. If your goal is to invoke the local Claude Code CLI and consume its execution trace and tool events, see the [Claude Code Agent guide](claudecode.md).
+
+By default, `claudecode` exposes a core set of workflow tools: `Bash`, `TaskStop`, `TaskOutput`, `Read`, `Glob`, `Grep`, `WebFetch`, and `WebSearch`. When read-only mode is disabled, it also exposes `Write`, `Edit`, and `NotebookEdit`.
+
+The following table lists the tools currently exposed by `claudecode`:
+
+| Tool | Description |
+| --- | --- |
+| `Bash` | Executes local shell commands. |
+| `TaskStop` | Stops a background task started by `Bash`. |
+| `TaskOutput` | Reads the current or final output of a background task. |
+| `Read` | Reads file contents. |
+| `Glob` | Finds files by path pattern. |
+| `Grep` | Searches repository content. |
+| `WebFetch` | Fetches the content of a specific URL. |
+| `WebSearch` | Performs an open web search. |
+| `Write` | Creates a file or overwrites a file with complete contents. Only exposed when read-only mode is disabled. |
+| `Edit` | Performs targeted replacement in an existing text file. Only exposed when read-only mode is disabled. |
+| `NotebookEdit` | Edits `.ipynb` files at the cell level. Only exposed when read-only mode is disabled. |
+
+#### Basic Usage
+
+```go
+import (
+	"log"
+
+	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+	"trpc.group/trpc-go/trpc-agent-go/tool"
+	"trpc.group/trpc-go/trpc-agent-go/tool/claudecode"
+)
+
+toolSet, err := claudecode.NewToolSet(
+	claudecode.WithBaseDir("."),
+)
+if err != nil {
+	log.Fatal(err)
+}
+defer toolSet.Close()
+
+agent := llmagent.New(
+	"claude-style-agent",
+	llmagent.WithToolSets([]tool.ToolSet{toolSet}),
+)
+```
+
+`llmagent.WithToolSets(...)` attaches these tools as a ToolSet. Calling `Tools()` returns the flattened list of individual tools.
+
+#### Common Options
+
+The main `tool/claudecode` options focus on working directory, read-only mode, and web behavior:
+
+| Option | Description |
+| --- | --- |
+| `WithName(name)` | Overrides the ToolSet name. The default name is `claudecode`. |
+| `WithBaseDir(dir)` | Sets the base directory used by file, search, and command execution tools. |
+| `WithReadOnly(readOnly)` | Removes `Write`, `Edit`, and `NotebookEdit` when enabled. |
+| `WithMaxFileSize(size)` | Limits the maximum readable file size. |
+| `WithWebFetchOptions(opts)` | Configures domain policy, timeout, and content handling for `WebFetch`. |
+| `WithWebSearchOptions(opts)` | Configures backend, paging, and request options for `WebSearch`. |
+
+`WithBaseDir` defines the working scope for `Read`, `Write`, `Edit`, `Glob`, and `Grep`, and also determines the default working directory for `Bash`. When read-only mode is enabled, the toolset keeps only read, search, command, and web capabilities. When read-only mode is disabled, it also exposes `Write`, `Edit`, and `NotebookEdit`.
+
 ## MCP Tools
 
 MCP (Model Context Protocol) is an open protocol that standardizes how applications provide context to LLMs. MCP tools are based on JSON-RPC 2.0 and provide standardized integration with external services for Agents.
@@ -287,6 +642,37 @@ agent := llmagent.New("mcp-assistant",
     llmagent.WithModel(model),
     llmagent.WithToolSets([]tool.ToolSet{mcpToolSet}))
 ```
+
+### ToolSet Lifecycle and Ownership
+
+The `ToolSet` interface explicitly includes `Close()`. That means the
+party that creates a ToolSet is also responsible for releasing the
+connections, sessions, caches, and other resources it owns.
+
+Important ownership boundaries:
+
+- `llmagent.WithToolSets(...)` only attaches a `ToolSet` to an Agent for
+  use. It does **not** transfer ownership.
+- `LLMAgent.AddToolSet(...)`, `LLMAgent.RemoveToolSet(...)`, and
+  `LLMAgent.SetToolSets(...)` only change which tools the Agent exposes.
+  They do **not** automatically call `Close()` on replaced or removed
+  ToolSets.
+- `runner.NewRunner(...)` and `runner.NewRunnerWithAgentFactory(...)`
+  likewise do not automatically reclaim a ToolSet just because an Agent
+  uses it.
+
+Recommended patterns:
+
+- **Long-lived ToolSet**: create it at startup, optionally call
+  `Init(ctx)`, reuse it across many runs, and close it during
+  application shutdown.
+- **Per-request ToolSet**: create it only for the current run, then
+  clean it up explicitly when that run finishes.
+
+If your goal is only to let a ToolSet fetch the **latest** tool list on
+each run, prefer `llmagent.WithRefreshToolSetsOnRun(true)`. That refreshes
+`ToolSet.Tools(ctx)` per run, but it does **not** recreate or close the
+ToolSet instance itself.
 
 ### Transport Configuration
 
@@ -405,6 +791,300 @@ discovery without refreshing the tool list on every run, keep using the
 pattern shown in the `examples/mcptool/http_headers` example, where you
 manually call `toolSet.Tools(ctx)` and pass the tools via `WithTools`.
 
+Common pitfalls:
+
+- `WithRefreshToolSetsOnRun(true)` refreshes the **tool list**, not the
+  ToolSet instance itself. It does not automatically create, replace, or
+  close ToolSets for you.
+- `tools/call` uses the current run context, but if you call
+  `agent.Tools()` outside a run, the ToolSet will see
+  `context.Background()`.
+- If `initialize/tools/list` must strictly use a custom context
+  (for example, per-request auth headers or tracing values), the safer
+  pattern is usually to call `toolSet.Tools(ctx)` yourself and inject the
+  resulting tools via `WithTools(...)`.
+
+### MCP Broker (On-Demand MCP Discovery)
+
+In addition to expanding remote MCP tools into first-class Tools, the
+framework also provides another integration style:
+`tool/mcpbroker`.
+
+The core idea of `mcpbroker` is:
+
+- do not expose every remote MCP tool up front
+- expose only a very small broker surface first
+- let the model discover and call remote MCP tools only when needed
+
+This is a better fit when the remote MCP surface is large, but a single
+request usually needs only a small subset of that surface.
+
+#### When to Use MCP Broker
+
+Use `mcpbroker` when:
+
+- an MCP server exposes many tools and you do not want to send the full
+  tool surface to the model on every turn
+- some tools are long-tail or backup capabilities rather than hot-path tools
+- a Skill, System Prompt, or User Prompt reveals an MCP endpoint that
+  should be connected dynamically
+- you want a smaller and more stable initial tool surface
+
+Keep using `mcp.NewMCPToolSet()` when:
+
+- the capability is high-frequency, stable, and already known
+- you want remote MCP tools to become first-class Tools directly
+- you care more about shorter execution paths and stronger schema-level
+  constraints
+
+The two patterns can be mixed:
+
+- use `MCP ToolSet` for hot-path capabilities
+- use `mcpbroker` for long-tail or dynamically discovered capabilities
+
+#### How It Differs from MCP ToolSet
+
+The main difference is **when** remote MCP tools become visible:
+
+- `MCP ToolSet`
+  - performs `initialize + tools/list`
+  - expands remote MCP tools into model-visible Tools
+- `mcpbroker`
+  - initially exposes only 4 broker tools
+  - the model discovers servers, then tools, then inspects selected schemas, then calls a concrete tool
+
+You can think of them as:
+
+- `MCP ToolSet`: directly mount remote tools
+- `mcpbroker`: discover remote tools on demand
+
+Typical trade-offs:
+
+- `MCP ToolSet`: faster and more strongly constrained, but larger tool surface
+- `mcpbroker`: lighter on context and better for long-tail / dynamic capabilities, but usually slower because discovery adds extra steps
+
+#### Basic Integration
+
+```go
+import (
+    "time"
+
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/tool/mcp"
+    "trpc.group/trpc-go/trpc-agent-go/tool/mcpbroker"
+)
+
+broker := mcpbroker.New(
+    mcpbroker.WithServers(map[string]mcp.ConnectionConfig{
+        "local_stdio_code": {
+            Transport:   "stdio",
+            Command:     "go",
+            Args:        []string{"run", "./stdio_server/main.go"},
+            Timeout:     10 * time.Second,
+            Description: "Project management, documentation, and calendar tools.",
+        },
+    }),
+    mcpbroker.WithAllowAdHocHTTP(true),
+)
+
+agent := llmagent.New(
+    "assistant",
+    llmagent.WithModel(model),
+    llmagent.WithTools(broker.Tools()),
+)
+```
+
+#### Server Description
+
+The `Description` field on `ConnectionConfig` provides a capability
+summary for the MCP server, helping the model decide which server to
+explore at the `mcp_list_servers` stage. The output includes the
+description:
+
+```json
+{
+  "servers": [
+    {
+      "name": "local_stdio_code",
+      "transport": "stdio",
+      "description": "Project management, documentation, and calendar tools."
+    }
+  ]
+}
+```
+
+This is analogous to the `description` field on an OpenAI tool namespace:
+the model can read it at the `mcp_list_servers` step and decide which
+server to explore next, without needing to `mcp_list_tools` every server
+one by one. The more servers you have, or the less self-explanatory the
+server names are, the more valuable this description becomes.
+
+The field is optional. When omitted, the output simply does not include
+a `description` property, and existing behavior is unchanged.
+
+Today `mcpbroker` is a **tool-layer integration**. Unlike `Skill`, it
+does not automatically inject routing guidance into the system prompt.
+If you want the model to behave more predictably, it is still useful to
+add a small amount of business-level instruction such as:
+
+- when to list named servers first
+- when to use `mcp_list_tools` first
+- when to expand selected tools with `mcp_inspect_tools`
+- when to prefer broker over direct tools
+
+#### The 4 Model-Visible Broker Tools
+
+The model only sees these 4 tools:
+
+- `mcp_list_servers`
+- `mcp_list_tools`
+- `mcp_inspect_tools`
+- `mcp_call`
+
+The recommended flow is usually:
+
+1. `mcp_list_servers()` to inspect named servers already known to the broker
+2. `mcp_list_tools(selector)` to inspect a server or ad-hoc MCP endpoint with lightweight summaries
+3. `mcp_inspect_tools(selector, tools[])` to expand schema for only the selected tools
+4. `mcp_call(selector, arguments)` to call one concrete MCP tool
+
+So instead of seeing the entire remote tool surface immediately, the
+model explores it progressively through the broker.
+
+#### Selector Mental Model
+
+`mcpbroker` intentionally avoids a mixed input model like
+`server_name + tool_name + url`. Instead it uses a unified `selector`:
+
+- In `mcp_list_tools`:
+  - named server: `local_stdio_code`
+  - ad-hoc URL: `https://example.com/mcp`
+- In `mcp_call`:
+  - named tool: `local_stdio_code.add`
+  - ad-hoc URL tool: `https://example.com/mcp.add`
+
+If an ad-hoc HTTP endpoint would make dot-based selectors ambiguous, `mcpbroker`
+also supports:
+
+- `https://example.com/mcp#tool=add`
+
+Remote MCP tool parameters always go into:
+
+- `mcp_call(..., arguments={...})`
+
+and not into top-level wrapper fields.
+
+#### Progressive Discovery Flow
+
+- start with `mcp_list_tools` for lightweight summaries
+- only use `mcp_inspect_tools` when preparing to call a specific tool
+
+Compared with sending every full schema up front, this is usually more
+friendly to tight context budgets.
+
+#### Dynamic URL and Skill Scenarios
+
+`mcpbroker` supports ad-hoc HTTP MCP targets:
+
+```go
+broker := mcpbroker.New(
+    mcpbroker.WithAllowAdHocHTTP(true),
+)
+```
+
+`WithAllowAdHocHTTP(true)` makes `selector` model-controlled input for
+HTTP(S) MCP targets. In production, validate or allowlist the URL, domain, and
+path before treating ad-hoc HTTP as a trusted integration path.
+
+In practice, dynamic connection still requires some **information
+source** to tell the model:
+
+- that this MCP endpoint exists
+- what it roughly does
+- which URL should be used
+
+That source can be:
+
+- a System Prompt
+- a User Prompt
+- a Skill
+- a knowledge source
+
+In other words, `mcpbroker` solves “how to connect / inspect / call”.
+It does not solve “why would the model think of connecting to this MCP
+in the first place”.
+
+This makes `mcpbroker` a natural companion to Skills. Some Skills only
+need a dedicated MCP capability while that Skill is relevant, so those
+MCP tools do not need to stay exposed as global tools for the whole
+conversation. Other Skills may reveal an incremental MCP endpoint that
+is only known after the Skill is loaded. In both cases, the Skill can
+act as the information source, while `mcpbroker` handles the dynamic
+connection and progressive tool/schema disclosure.
+
+See:
+
+- `examples/mcpbroker/basic`
+
+That example includes:
+
+- a named local MCP server
+- a Skill that reveals a remote streamable HTTP MCP endpoint
+- a model flow like `skill_load -> mcp_list_tools -> mcp_inspect_tools -> mcp_call`
+
+#### Auth Hooks (Per-Run Header Injection)
+
+For HTTP MCP targets, `mcpbroker` also provides runtime auth hooks:
+
+- `WithHTTPHeaderInjector(...)`
+- `WithErrorInterceptor(...)`
+
+These hooks are useful when:
+
+- you do not want the model to provide `Authorization` itself
+- you need to inject a user-specific token on every request
+- you want business code to wrap 401/403 responses into clearer errors
+
+Example:
+
+```go
+broker := mcpbroker.New(
+    mcpbroker.WithAllowAdHocHTTP(true),
+    mcpbroker.WithHTTPHeaderInjector(func(ctx context.Context, req *mcpbroker.HeaderInjectRequest) (map[string]string, error) {
+        token, _ := resolveUserTokenFromContext(ctx, req.BaseURL)
+        if token == "" {
+            return nil, nil
+        }
+        return map[string]string{
+            "Authorization": "Bearer " + token,
+        }, nil
+    }),
+    mcpbroker.WithErrorInterceptor(func(ctx context.Context, req *mcpbroker.BrokerErrorRequest) (*mcpbroker.BrokerErrorDecision, error) {
+        if isUnauthorized(req.Err) {
+            return &mcpbroker.BrokerErrorDecision{
+                Handled:   true,
+                WrapError: fmt.Errorf("the current user must authorize this provider in the host application before retrying"),
+            }, nil
+        }
+        return nil, nil
+    }),
+)
+```
+
+The key design point is:
+
+- the model chooses the `selector`
+- business code resolves headers from `ctx`
+- `mcpbroker` does not manage a full OAuth session state machine
+
+When `WithAllowAdHocHTTP(true)` is enabled, URL selectors may come from
+model-visible context. In production, validate `req.IsAdHoc` and `req.BaseURL`
+inside your `HTTPHeaderInjector` before returning sensitive headers.
+
+See:
+
+- `examples/mcpbroker/authhooks`
+
 ## Agent Tool (AgentTool)
 
 AgentTool lets you expose an existing Agent as a tool to be used by a parent Agent. Compared with a plain function tool, AgentTool provides:
@@ -439,6 +1119,8 @@ mathTool := agenttool.NewTool(
     agenttool.WithSkipSummarization(false),
     // forward child Agent streaming events to parent flow.
     agenttool.WithStreamInner(true),
+    // hide child assistant prose while still forwarding inner tool progress.
+    agenttool.WithInnerTextMode(agenttool.InnerTextModeExclude),
 )
 
 // 3) Use in parent Agent
@@ -452,11 +1134,15 @@ parent := llmagent.New(
 
 ### Streaming Inner Forwarding
 
-When `WithStreamInner(true)` is enabled, AgentTool forwards child Agent events to the parent flow as they happen:
+When `WithStreamInner(true)` is enabled, AgentTool forwards child Agent events
+to the parent flow as they happen:
 
 - Forwarded items are actual `event.Event` instances, carrying incremental text in `choice.Delta.Content`
 - To avoid duplication, the child Agent’s final full message is not forwarded again; it is aggregated into the final `tool.response` content for the next LLM turn (to satisfy providers requiring tool messages)
 - UI guidance: show forwarded child deltas; avoid printing the aggregated final `tool.response` content unless debugging
+- `WithInnerTextMode(agenttool.InnerTextModeExclude)` lets you keep inner tool
+  progress visible while suppressing forwarded child assistant text. This is
+  useful when an outer coordinator will produce the final user-facing answer.
 
 Example: Only show tool fragments when needed to avoid duplicates
 
@@ -466,8 +1152,9 @@ if ev.Response != nil && ev.Object == model.ObjectTypeToolResponse {
 }
 
 // Child Agent forwarded deltas (author != parent)
-if ev.Author != parentName && len(ev.Choices) > 0 {
-    if delta := ev.Choices[0].Delta.Content; delta != "" {
+if ev.Author != parentName && ev.Response != nil &&
+    len(ev.Response.Choices) > 0 {
+    if delta := ev.Response.Choices[0].Delta.Content; delta != "" {
         fmt.Print(delta)
     }
 }
@@ -485,6 +1172,14 @@ if ev.Author != parentName && len(ev.Choices) > 0 {
   - true: Forward child Agent events to the parent flow (recommended: enable `GenerationConfig{Stream: true}` for both parent and child Agents)
   - false: Treat as a callable-only tool, without inner event forwarding
 
+- WithInnerTextMode(InnerTextMode):
+
+  - `InnerTextModeInclude`: (effective default) forward child assistant text
+    when inner streaming is enabled
+  - `InnerTextModeExclude`: suppress forwarded child assistant text while
+    keeping inner tool calls, tool completions, and the aggregated final tool
+    response
+
 - WithHistoryScope(HistoryScope):
   - `HistoryScopeIsolated` (default): Keep the child Agent fully isolated; it only sees the current tool arguments (no inherited history).
   - `HistoryScopeParentBranch`: Inherit parent conversation history by using a hierarchical filter key `parent/child-uuid`. This allows the content processor to include parent events via prefix matching while keeping child events isolated under a sub-branch. Typical use cases: “edit/optimize/continue previous output”.
@@ -496,6 +1191,7 @@ child := agenttool.NewTool(
     childAgent,
     agenttool.WithSkipSummarization(false),
     agenttool.WithStreamInner(true),
+    agenttool.WithInnerTextMode(agenttool.InnerTextModeExclude),
     agenttool.WithHistoryScope(agenttool.HistoryScopeParentBranch),
 )
 ```
@@ -504,7 +1200,11 @@ child := agenttool.NewTool(
 
 - Completion signaling: Tool response events are marked `RequiresCompletion=true`; Runner sends completion automatically
 - De-duplication: When inner deltas are forwarded, avoid printing the aggregated final `tool.response` text again by default
+- Progress-only UX: combine `WithStreamInner(true)` with
+  `WithInnerTextMode(agenttool.InnerTextModeExclude)` when users should see
+  inner progress without seeing duplicated child prose
 - Model compatibility: Some providers require a tool message after tool_calls; AgentTool automatically supplies the aggregated content
+- `WithSkipSummarization(true)` only skips the extra outer summarization LLM call. It does not make `tool.response` a final assistant response; keep consuming until `runner.completion` if you need the real terminal signal
 
 ## Tool Integration and Usage
 
@@ -616,7 +1316,7 @@ apply to all agents
 
 - 🎯 **Per-Run Control**: Independent configuration per invocation, no Agent modification needed
 - 💰 **Cost Optimization**: Reduce tool descriptions sent to LLM, lowering token costs
-- 🛡️ **Smart Protection**: Framework tools (`transfer_to_agent`, `knowledge_search`) automatically preserved, never filtered
+- 🛡️ **Smart Protection**: Framework tools (`transfer_to_agent`, `knowledge_search`, optional `await_user_reply`) automatically preserved, never filtered
 - 🔧 **Flexible Customization**: Support for built-in filters and custom FilterFunc
 
 #### Tool Search (Automatic Tool Selection)
@@ -866,7 +1566,7 @@ The framework automatically distinguishes **user tools** from **framework tools*
 | Tool Category       | Includes                                                                                                                      | Filtered?                         |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
 | **User Tools**      | Tools registered via `WithTools`<br>Tools registered via `WithToolSets`                                                       | ✅ Subject to filtering           |
-| **Framework Tools** | `transfer_to_agent` (multi-Agent coordination)<br>`knowledge_search` (knowledge base retrieval)<br>`agentic_knowledge_search` | ❌ Never filtered, auto-preserved |
+| **Framework Tools** | `transfer_to_agent` (multi-Agent coordination)<br>`knowledge_search` (knowledge base retrieval)<br>`agentic_knowledge_search`<br>`await_user_reply` (one-shot follow-up routing, when enabled) | ❌ Never filtered, auto-preserved |
 
 **Example:**
 
@@ -879,6 +1579,7 @@ agent := llmagent.New("assistant",
     }),
     llmagent.WithSubAgents([]agent.Agent{subAgent1, subAgent2}), // Auto-adds transfer_to_agent
     llmagent.WithKnowledge(kb),                                   // Auto-adds knowledge_search
+    llmagent.WithAwaitUserReplyTool(true),                        // Auto-adds await_user_reply
 )
 
 // Runtime filtering: only allow calculator
@@ -892,7 +1593,36 @@ runner.Run(ctx, userID, sessionID, message,
 // ❌ textTool          - User tool, filtered out
 // ✅ transfer_to_agent - Framework tool, auto-preserved
 // ✅ knowledge_search  - Framework tool, auto-preserved
+// ✅ await_user_reply  - Framework tool, auto-preserved
 ```
+
+#### `await_user_reply` for Follow-Up Turns
+
+`await_user_reply` is an optional framework tool. Enable it with
+`llmagent.WithAwaitUserReplyTool(true)` when an Agent may ask the user for
+missing information and you want the next user message to resume at that same
+Agent.
+
+Use it together with `runner.WithAwaitUserReplyRouting(true)`:
+
+```go
+profileAgent := llmagent.New("profile-agent",
+    llmagent.WithAwaitUserReplyTool(true),
+    llmagent.WithInstruction(`
+If you must ask the user for a missing field, call await_user_reply
+immediately before your question.
+`),
+)
+
+r := runner.NewRunner(
+    "crm-app",
+    profileAgent,
+    runner.WithAwaitUserReplyRouting(true),
+)
+```
+
+The route is one-shot: Runner consumes it on the next user turn and then clears
+it automatically.
 
 #### Important Notes
 
@@ -1007,6 +1737,16 @@ These methods are concurrency‑safe and automatically recompute:
 - Aggregated tools (direct tools + ToolSets + knowledge tools + skill tools)
 - User tool tracking (used by the smart filtering logic above)
 
+One important lifecycle detail:
+
+- `AddToolSet` does **not** automatically close a replaced ToolSet.
+- `RemoveToolSet` does **not** automatically close a removed ToolSet.
+- `SetToolSets` does **not** automatically close ToolSets from the
+  previous slice.
+
+If you created those ToolSet instances, you still need to close them
+explicitly at the right time.
+
 **Typical usage pattern:**
 
 ```go
@@ -1037,7 +1777,9 @@ if !removed {
 Runtime ToolSet updates integrate seamlessly with the **tool filtering** logic described earlier:
 
 - Tools coming from `WithTools` or any ToolSet (including dynamically added ones) are treated as **user tools** and are subject to `WithToolFilter` and per‑run filters.
-- Framework tools such as `transfer_to_agent`, `knowledge_search`, and `agentic_knowledge_search` remain **never filtered** and are always available.
+- Framework tools such as `transfer_to_agent`, `knowledge_search`,
+  `agentic_knowledge_search`, and optional `await_user_reply` remain
+  **never filtered** and are always available.
 
 #### Tool Call Arguments Auto Repair
 

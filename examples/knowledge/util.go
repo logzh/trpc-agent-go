@@ -44,6 +44,7 @@ type VectorStoreType string
 const (
 	VectorStoreInMemory      VectorStoreType = "inmemory"
 	VectorStorePGVector      VectorStoreType = "pgvector"
+	VectorStoreSQLiteVec     VectorStoreType = "sqlitevec"
 	VectorStoreTCVector      VectorStoreType = "tcvector"
 	VectorStoreElasticsearch VectorStoreType = "elasticsearch"
 	VectorStoreMilvus        VectorStoreType = "milvus"
@@ -54,6 +55,8 @@ func NewVectorStoreByType(storeType VectorStoreType) (vectorstore.VectorStore, e
 	switch storeType {
 	case VectorStorePGVector:
 		return newPGVectorStore()
+	case VectorStoreSQLiteVec:
+		return newSQLiteVecStore()
 	case VectorStoreTCVector:
 		return newTCVectorStore()
 	case VectorStoreElasticsearch:

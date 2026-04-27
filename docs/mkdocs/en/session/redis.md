@@ -32,6 +32,7 @@ Redis storage is suitable for production environments and distributed applicatio
 | `WithUserStateTTL(ttl time.Duration)` | `time.Duration` | `0` (no expiry) | TTL for user-level state |
 | `WithKeyPrefix(prefix string)` | `string` | `""` | Redis key prefix; all keys will start with `prefix:`. Useful when multiple apps share one Redis instance |
 | `WithCompatMode(mode CompatMode)` | `CompatMode` | `CompatModeLegacy` | Storage compatibility mode. Options: `CompatModeNone`, `CompatModeLegacy`, `CompatModeTransition`. See [Storage Compatibility Mode (CompatMode)](#storage-compatibility-mode-compatmode) |
+| `WithEnableUserSessionIndex(enable bool)` | `bool` | `false` | Enable the per-user session index for HashIdx. See [User Session Index](#user-session-index) |
 
 **Async Persistence:**
 
@@ -55,20 +56,21 @@ Redis storage is suitable for production environments and distributed applicatio
 | --- | --- | --- | --- |
 | `WithEnableTracing(enable bool)` | `bool` | `false` | Enable OpenTelemetry tracing. When enabled, operations such as `CreateSession`, `GetSession`, `AppendEvent`, `DeleteSession`, `AppendTrackEvent`, `CreateSessionSummary`, and `GetSessionSummaryText` automatically create spans |
 
-!!! note "About Root Span"
-    Session operations are executed by the Runner before and after the Agent's `Run()` call. The Agent's root span is created inside `agent.Run()`, so Session spans are not automatically attached under it. To see the full Session span chain in observability platforms like Langfuse, manually create a root span before calling `runner.Run()`:
-
-    ```go
-    import atrace "trpc.group/trpc-go/trpc-agent-go/telemetry/trace"
-
-    // Create a root span before runner.Run(), so that session spans
-    // (create_session, get_session, append_event, etc.) become children
-    // of this root span via context propagation.
-    ctx, span := atrace.Tracer.Start(ctx, "my_request")
-    defer span.End()
-
-    eventChan, err := r.Run(ctx, userID, sessionID, message)
-    ```
+> **About Root Span**
+>
+> Session operations are executed by the Runner before and after the Agent's `Run()` call. The Agent's root span is created inside `agent.Run()`, so Session spans are not automatically attached under it. To see the full Session span chain in observability platforms like Langfuse, manually create a root span before calling `runner.Run()`:
+>
+> ```go
+> import atrace "trpc.group/trpc-go/trpc-agent-go/telemetry/trace"
+>
+> // Create a root span before runner.Run(), so that session spans
+> // (create_session, get_session, append_event, etc.) become children
+> // of this root span via context propagation.
+> ctx, span := atrace.Tracer.Start(ctx, "my_request")
+> defer span.End()
+>
+> eventChan, err := r.Run(ctx, userID, sessionID, message)
+> ```
 
 **Hooks:**
 
@@ -163,18 +165,28 @@ How it works:
 - Async write timeout is 2 seconds (`defaultAsyncPersistTimeout`).
 - Calling `Close()` closes all channels and waits for workers to drain remaining tasks.
 
-!!! warning "Caution"
-    In async persistence mode, events still in the channel may be lost if the process crashes unexpectedly. Evaluate whether to enable this based on your data consistency requirements.
+> **Caution**
+>
+> In async persistence mode, events still in the channel may be lost if the process crashes unexpectedly. Evaluate whether to enable this based on your data consistency requirements.
+
+## User Session Index
+
+`WithEnableUserSessionIndex(true)` is an optional capability for HashIdx storage only. It maintains a user-scoped index that maps `userID` to the session IDs created by that user.
+
+The main purpose of this index is to avoid the SCAN operation currently used by `ListSessions`.
+
+This option is intended for fresh HashIdx writes. If you enable it on an environment that already contains historical HashIdx sessions created before the index was introduced, those older sessions will not automatically appear in the index unless you migrate or rebuild the index separately.
 
 ## Storage Compatibility Mode (CompatMode)
 
 The new version of Redis Session uses a new storage engine (HashIdx) that distributes data across different Redis Cluster slots by user, eliminating the hotspot issue where all data was concentrated in a single slot in the old version. If you have legacy data to migrate, use `WithCompatMode` to configure compatibility mode for a smooth transition.
 
-!!! tip "In most cases, you don't need to worry about compatibility mode"
-    The default `CompatModeLegacy` mode automatically handles read/write compatibility between old and new data — **just upgrade and it works**. You only need to pay attention to compatibility mode configuration in these two cases:
-
-    1. **Heavy use of UserState**: The old and new engines use different Redis keys for UserState. `CreateSession`/`GetSession` only read the new key when merging UserState internally, so legacy UserState data won't automatically carry over to new sessions. If your application relies heavily on UserState, choose the appropriate compatibility mode as described below.
-    2. **Large-scale canary deployment**: When old and new instances run simultaneously, use `CompatModeTransition` to ensure mixed-deployment compatibility.
+> **In most cases, you don't need to worry about compatibility mode**
+>
+> The default `CompatModeLegacy` mode automatically handles read/write compatibility between old and new data — **just upgrade and it works**. You only need to pay attention to compatibility mode configuration in these two cases:
+>
+> 1. **Heavy use of UserState**: The old and new engines use different Redis keys for UserState. `CreateSession`/`GetSession` only read the new key when merging UserState internally, so legacy UserState data won't automatically carry over to new sessions. If your application relies heavily on UserState, choose the appropriate compatibility mode as described below.
+> 2. **Large-scale canary deployment**: When old and new instances run simultaneously, use `CompatModeTransition` to ensure mixed-deployment compatibility.
 
 ### New Deployments (No Legacy Data)
 

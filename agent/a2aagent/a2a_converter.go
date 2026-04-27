@@ -43,6 +43,7 @@ type InvocationA2AConverter interface {
 }
 
 type defaultA2AEventConverter struct {
+	dataPartMappers []A2ADataPartMapper
 }
 
 func (d *defaultA2AEventConverter) ConvertToEvents(
@@ -73,6 +74,23 @@ func (d *defaultA2AEventConverter) ConvertToEvents(
 			if evt := d.buildRespEvent(false, &v.History[i], agentName, invocation); evt != nil {
 				events = append(events, evt)
 			}
+		}
+		if isTaskFailureState(v.Status.State) {
+			statusMsg := convertTaskStatusToMessage(&protocol.TaskStatusUpdateEvent{
+				TaskID:    v.ID,
+				ContextID: v.ContextID,
+				Metadata:  v.Metadata,
+				Status:    v.Status,
+			})
+			if evt := d.buildRespEvent(
+				false,
+				statusMsg,
+				agentName,
+				invocation,
+			); evt != nil {
+				events = append(events, evt)
+			}
+			break
 		}
 		// Artifacts contain the final response
 		for i := range v.Artifacts {
@@ -126,8 +144,11 @@ func (d *defaultA2AEventConverter) ConvertStreamingToEvents(
 	case *protocol.Task:
 		responseMsg = convertTaskToMessage(v)
 	case *protocol.TaskStatusUpdateEvent:
-		// Status updates (submitted/completed) are control signals, not user-facing content.
-		return nil, nil
+		if !isTaskFailureState(v.Status.State) {
+			// submitted/completed updates are control signals.
+			return nil, nil
+		}
+		responseMsg = convertTaskStatusToMessage(v)
 	case *protocol.TaskArtifactUpdateEvent:
 		if v.IsFinal() {
 			// Final artifact chunk is either an aggregated result or a termination signal,
@@ -300,7 +321,7 @@ func (d *defaultA2AEventConverter) buildRespEvent(
 	invocation *agent.Invocation) *event.Event {
 
 	// Parse A2A message parts to extract content and tool information
-	parseResult := parseA2AMessageParts(msg)
+	parseResult := parseA2AMessagePartsWithMappers(msg, d.dataPartMappers)
 
 	// Create event with appropriate response structure
 	return buildEventResponse(isStreaming, msg.MessageID, parseResult, invocation, agentName, msg.Role)
@@ -336,8 +357,17 @@ type parseResult struct {
 	// responseID holds the original LLM Response.ID from A2A message metadata
 	responseID string
 
+	// taskState holds the remote task lifecycle state when present.
+	taskState protocol.TaskState
+
+	// responseError holds structured error fields reconstructed from metadata.
+	responseError *model.ResponseError
+
 	// stateDelta holds structured state updates reconstructed from A2A metadata.
 	stateDelta map[string][]byte
+
+	// extensions holds custom event payloads reconstructed by DataPart mappers.
+	extensions map[string]json.RawMessage
 }
 
 // toolResponseData holds tool response information
@@ -347,26 +377,86 @@ type toolResponseData struct {
 	content string
 }
 
+func newDataPartMappingResult(result *parseResult) *A2ADataPartMappingResult {
+	if result == nil {
+		return &A2ADataPartMappingResult{}
+	}
+	return &A2ADataPartMappingResult{
+		textContent:         result.textContent,
+		reasoningContent:    result.reasoningContent,
+		codeExecution:       result.codeExecution,
+		codeExecutionResult: result.codeExecutionResult,
+		eventExtensions:     cloneA2AExtensions(result.extensions),
+	}
+}
+
+func applyDataPartMappingResult(dst *parseResult, mapped *A2ADataPartMappingResult) {
+	if dst == nil || mapped == nil {
+		return
+	}
+	if mapped.textContentSet {
+		dst.textContent = mapped.textContent
+	}
+	if mapped.reasoningContentSet {
+		dst.reasoningContent = mapped.reasoningContent
+	}
+	if mapped.codeExecutionSet {
+		dst.codeExecution = mapped.codeExecution
+	}
+	if mapped.codeExecutionResultSet {
+		dst.codeExecutionResult = mapped.codeExecutionResult
+	}
+	if len(mapped.eventExtensions) > 0 {
+		if dst.extensions == nil {
+			dst.extensions = make(map[string]json.RawMessage, len(mapped.eventExtensions))
+		}
+		for key, raw := range mapped.eventExtensions {
+			dst.extensions[key] = cloneA2AExtensionRawMessage(raw)
+		}
+	}
+	if len(mapped.toolCalls) > 0 {
+		dst.toolCalls = append(dst.toolCalls, mapped.toolCalls...)
+	}
+	if len(mapped.toolResponses) > 0 {
+		for _, resp := range mapped.toolResponses {
+			dst.toolResponses = append(dst.toolResponses, toolResponseData{
+				id:      resp.ID,
+				name:    resp.Name,
+				content: resp.Content,
+			})
+		}
+	}
+}
+
 // parseA2AMessageParts processes all parts in the A2A message and extracts content and tool information
 func parseA2AMessageParts(msg *protocol.Message) *parseResult {
+	return parseA2AMessagePartsWithMappers(msg, nil)
+}
+
+func parseA2AMessagePartsWithMappers(
+	msg *protocol.Message,
+	mappers []A2ADataPartMapper,
+) *parseResult {
 	parts := msg.Parts
-	var textContent strings.Builder
-	var reasoningContent strings.Builder
 	result := &parseResult{}
+	var textBuilder strings.Builder
+	var reasoningBuilder strings.Builder
 
 	for _, part := range parts {
 		switch part.GetKind() {
 		case protocol.KindText:
 			text, isThought := processTextPart(part)
 			if isThought {
-				reasoningContent.WriteString(text)
+				reasoningBuilder.WriteString(text)
 			} else {
-				textContent.WriteString(text)
+				textBuilder.WriteString(text)
 			}
 		case protocol.KindData:
-			processDataPart(part, result)
+			flushParseResultText(result, &textBuilder, &reasoningBuilder)
+			processDataPartWithMappers(part, result, mappers)
 		}
 	}
+	flushParseResultText(result, &textBuilder, &reasoningBuilder)
 
 	if msg.Metadata != nil {
 		if objectType, ok := msg.Metadata[ia2a.MessageMetadataObjectTypeKey].(string); ok {
@@ -383,15 +473,41 @@ func parseA2AMessageParts(msg *protocol.Message) *parseResult {
 		}
 	}
 
-	result.textContent = textContent.String()
-	result.reasoningContent = reasoningContent.String()
+	result.taskState = taskStateFromMetadata(msg.Metadata)
+	result.responseError = ia2a.ResponseErrorFromMetadata(
+		msg.Metadata,
+		result.textContent,
+		model.ErrorTypeFlowError,
+	)
 	return result
+}
+
+func flushParseResultText(
+	result *parseResult,
+	textBuilder *strings.Builder,
+	reasoningBuilder *strings.Builder,
+) {
+	if result == nil {
+		return
+	}
+	if textBuilder != nil && textBuilder.Len() > 0 {
+		result.textContent += textBuilder.String()
+		textBuilder.Reset()
+	}
+	if reasoningBuilder != nil && reasoningBuilder.Len() > 0 {
+		result.reasoningContent += reasoningBuilder.String()
+		reasoningBuilder.Reset()
+	}
 }
 
 // processTextPart processes a TextPart and returns its content and whether it's a thought
 func processTextPart(part protocol.Part) (text string, isThought bool) {
-	p, ok := part.(*protocol.TextPart)
-	if !ok {
+	var p *protocol.TextPart
+	if textPart, ok := part.(*protocol.TextPart); ok {
+		p = textPart
+	} else if textPart, ok := part.(protocol.TextPart); ok {
+		p = &textPart
+	} else {
 		log.Warnf("unexpected part type: %T", part)
 		return "", false
 	}
@@ -417,37 +533,75 @@ func processTextPart(part protocol.Part) (text string, isThought bool) {
 
 // processDataPart processes a DataPart and updates the parseResult accordingly
 func processDataPart(part protocol.Part, result *parseResult) {
-	d, ok := part.(*protocol.DataPart)
-	if !ok {
+	processDataPartWithMappers(part, result, nil)
+}
+
+func processDataPartWithMappers(
+	part protocol.Part,
+	result *parseResult,
+	mappers []A2ADataPartMapper,
+) {
+	var d *protocol.DataPart
+	if dataPart, ok := part.(*protocol.DataPart); ok {
+		d = dataPart
+	} else if dataPart, ok := part.(protocol.DataPart); ok {
+		d = &dataPart
+	} else {
 		return
 	}
 
 	// Use GetDataPartType to get the type with correct precedence (adk_type first, then type)
 	// GetDataPartType handles nil metadata internally
 	typeStr := ia2a.GetDataPartType(d.Metadata)
-	if typeStr == "" {
+	builtInHandled := false
+	if typeStr != "" {
+		switch typeStr {
+		case ia2a.DataPartMetadataTypeFunctionCall:
+			if toolCall := processFunctionCall(d); toolCall != nil {
+				result.toolCalls = append(result.toolCalls, *toolCall)
+			}
+			builtInHandled = true
+		case ia2a.DataPartMetadataTypeFunctionResp:
+			content, id, name := processFunctionResponse(d)
+			result.toolResponses = append(result.toolResponses, toolResponseData{
+				id:      id,
+				name:    name,
+				content: content,
+			})
+			builtInHandled = true
+		case ia2a.DataPartMetadataTypeExecutableCode:
+			result.codeExecution = processExecutableCode(d)
+			builtInHandled = true
+		case ia2a.DataPartMetadataTypeCodeExecutionResult:
+			result.codeExecutionResult = processCodeExecutionResult(d)
+			builtInHandled = true
+		}
+	}
+
+	if builtInHandled {
 		return
 	}
 
-	switch typeStr {
-	case ia2a.DataPartMetadataTypeFunctionCall:
-		if toolCall := processFunctionCall(d); toolCall != nil {
-			result.toolCalls = append(result.toolCalls, *toolCall)
+	for _, mapper := range mappers {
+		if mapper == nil {
+			continue
 		}
-	case ia2a.DataPartMetadataTypeFunctionResp:
-		content, id, name := processFunctionResponse(d)
-		result.toolResponses = append(result.toolResponses, toolResponseData{
-			id:      id,
-			name:    name,
-			content: content,
-		})
-	case ia2a.DataPartMetadataTypeExecutableCode:
-		result.codeExecution = processExecutableCode(d)
-	case ia2a.DataPartMetadataTypeCodeExecutionResult:
-		result.codeExecutionResult = processCodeExecutionResult(d)
-	default:
-		log.Debugf("unknown DataPart type: %s", typeStr)
+		mappedResult := newDataPartMappingResult(result)
+		matched, err := mapper(d, mappedResult)
+		if err != nil {
+			log.Warnf("A2ADataPartMapper returns error, skip part: %v", err)
+			continue
+		}
+		if matched {
+			applyDataPartMappingResult(result, mappedResult)
+			return
+		}
 	}
+	if typeStr == "" {
+		log.Debugf("unknown DataPart with empty type skipped")
+		return
+	}
+	log.Debugf("unknown DataPart type skipped: %s", typeStr)
 }
 
 // processFunctionCall processes a function call DataPart and returns the ToolCall
@@ -592,6 +746,9 @@ func buildEventResponse(
 	}
 
 	evt := event.New(invocation.InvocationID, agentName, opts...)
+	if len(result.extensions) > 0 {
+		evt.Extensions = cloneA2AExtensions(result.extensions)
+	}
 
 	// Use llm_response_id from metadata when available (preserves original LLM Response.ID),
 	// fall back to messageID (which is ArtifactID in streaming, or Message.MessageID in unary).
@@ -630,6 +787,9 @@ func markGraphCompletionEvent(evt *event.Event, result *parseResult) {
 // - Text content uses Delta for incremental updates
 func buildStreamingResponse(messageID string, result *parseResult, role protocol.MessageRole) *model.Response {
 	now := time.Now()
+	if respErr := taskResponseError(result); respErr != nil {
+		return buildErrorResponse(messageID, respErr, now)
+	}
 
 	// Tool call: use Message (tool calls are complete units, not streamed incrementally)
 	if len(result.toolCalls) > 0 {
@@ -736,6 +896,9 @@ func extractObjectType(result *parseResult) string {
 // In non-streaming mode, all content uses Message (not Delta).
 func buildNonStreamingResponse(messageID string, result *parseResult, role protocol.MessageRole) *model.Response {
 	now := time.Now()
+	if respErr := taskResponseError(result); respErr != nil {
+		return buildErrorResponse(messageID, respErr, now)
+	}
 	var choices []model.Choice
 	// Tool call: assistant requesting tool execution
 	if len(result.toolCalls) > 0 {
@@ -808,6 +971,100 @@ func buildNonStreamingResponse(messageID string, result *parseResult, role proto
 	}
 }
 
+func buildErrorResponse(
+	messageID string,
+	respErr *model.ResponseError,
+	now time.Time,
+) *model.Response {
+	return &model.Response{
+		ID:        messageID,
+		Object:    model.ObjectTypeError,
+		Timestamp: now,
+		Created:   now.Unix(),
+		IsPartial: false,
+		Done:      true,
+		Error:     respErr,
+	}
+}
+
+func taskResponseError(
+	result *parseResult,
+) *model.ResponseError {
+	if result == nil {
+		return nil
+	}
+	if result.responseError != nil {
+		return result.responseError
+	}
+	if !isTaskFailureState(result.taskState) {
+		return nil
+	}
+	message := result.textContent
+	if message == "" {
+		message = taskFailureMessage(result.taskState)
+	}
+	return &model.ResponseError{
+		Type:    model.ErrorTypeFlowError,
+		Message: message,
+	}
+}
+
+func taskFailureMessage(
+	state protocol.TaskState,
+) string {
+	switch state {
+	case protocol.TaskStateCanceled:
+		return "remote task canceled"
+	case protocol.TaskStateRejected:
+		return "remote task rejected"
+	default:
+		return "remote task failed"
+	}
+}
+
+func isTaskFailureState(
+	state protocol.TaskState,
+) bool {
+	switch state {
+	case protocol.TaskStateFailed,
+		protocol.TaskStateRejected,
+		protocol.TaskStateCanceled:
+		return true
+	default:
+		return false
+	}
+}
+
+func taskStateFromMetadata(
+	metadata map[string]any,
+) protocol.TaskState {
+	if metadata == nil {
+		return ""
+	}
+	raw, ok := metadata[ia2a.MessageMetadataTaskStateKey].(string)
+	if !ok {
+		return ""
+	}
+	return protocol.TaskState(raw)
+}
+
+func cloneTaskMetadata(
+	metadata map[string]any,
+	taskState protocol.TaskState,
+) map[string]any {
+	if len(metadata) == 0 && taskState == "" {
+		return nil
+	}
+	cloned := make(map[string]any, len(metadata)+1)
+	for key, value := range metadata {
+		cloned[key] = value
+	}
+	if taskState != "" {
+		cloned[ia2a.MessageMetadataTaskStateKey] = string(taskState)
+	}
+	return cloned
+}
+
 // convertTaskToMessage converts a Task to a Message
 func convertTaskToMessage(task *protocol.Task) *protocol.Message {
 	var (
@@ -827,7 +1084,7 @@ func convertTaskToMessage(task *protocol.Task) *protocol.Message {
 		Parts:     parts,
 		TaskID:    &task.ID,
 		ContextID: &task.ContextID,
-		Metadata:  task.Metadata,
+		Metadata:  cloneTaskMetadata(task.Metadata, task.Status.State),
 	}
 }
 
@@ -838,7 +1095,7 @@ func convertTaskStatusToMessage(event *protocol.TaskStatusUpdateEvent) *protocol
 		Kind:      protocol.KindMessage,
 		TaskID:    &event.TaskID,
 		ContextID: &event.ContextID,
-		Metadata:  event.Metadata,
+		Metadata:  cloneTaskMetadata(event.Metadata, event.Status.State),
 	}
 	if event.Status.Message != nil {
 		msg.Parts = event.Status.Message.Parts
