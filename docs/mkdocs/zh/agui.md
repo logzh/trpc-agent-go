@@ -813,7 +813,7 @@ server, err := agui.New(
 
 为了解决上述问题，框架会先对事件进行聚合，再写入会话。此外，默认每秒定时刷新一次，每次刷新将当前的聚合结果写入会话。无论 run 是正常结束还是被取消，在退出前框架还会再执行一次运行结束后的收尾流程，用于补发仍然打开的协议流结束事件，并将聚合缓存尽量刷入会话存储。这一阶段与日常的定时刷新是分开的。
 
-- `aggregator.WithEnabled(true)` 用于控制是否开启事件聚合，默认为开启状态。开启后，会将连续且具有相同 `messageId` 的 `TEXT_MESSAGE_CONTENT` 与 `REASONING_MESSAGE_CONTENT` 事件进行聚合；关闭时则不对 AG-UI 事件做聚合。
+- `aggregator.WithEnabled(true)` 用于控制是否开启事件聚合，默认为开启状态。开启后，会将连续且具有相同 `messageId` 的 `TEXT_MESSAGE_CONTENT`、`REASONING_MESSAGE_CONTENT` 事件，以及连续且具有相同 `toolCallId` 的 `TOOL_CALL_ARGS` 事件进行聚合；关闭时则不对 AG-UI 事件做聚合。
 - `aguirunner.WithFlushInterval(time.Second)` 用于控制事件聚合结果的定时刷新间隔，默认为 1 秒。设置为 0 时表示不开启定时刷新功能。
 - `agui.WithPostRunFinalizationTimeout(5*time.Second)` 用于限制运行结束后收尾流程的最长执行时间。该阶段同时覆盖协议收尾事件补发与聚合缓存落库，默认值为 `5s`。设置为 `0` 表示不额外设置超时。
 
@@ -846,6 +846,65 @@ server, err := agui.New(
 ```
 
 如果需要更复杂的聚合策略，可以实现 `aggregator.Aggregator` 并通过自定义工厂注入。需要注意的是，虽然每个会话都会单独创建一个聚合器，省去了跨会话的状态维护和并发处理，但聚合方法本身仍有可能被并发调用，因此仍需妥善处理并发。
+
+### 消息快照中的 run 生命周期事件
+
+消息快照路由返回的顶层事件用于描述本次快照请求的生命周期，成功时事件序列为：
+
+`RUN_STARTED → MESSAGES_SNAPSHOT → RUN_FINISHED`
+
+默认情况下，`MESSAGES_SNAPSHOT.messages` 仅包含由历史 AG-UI track 还原出的对话消息和可展示 activity，不包含已持久化的历史 `RUN_STARTED`、`RUN_FINISHED`、`RUN_ERROR`。
+
+若需要在消息快照中保留历史 run 的生命周期状态，可以启用 `agui.WithMessagesSnapshotRunLifecycleEventsEnabled(true)`：
+
+```go
+server, err := agui.New(
+    runner,
+    agui.WithAppName(appName),
+    agui.WithSessionService(sessionService),
+    agui.WithMessagesSnapshotEnabled(true),
+    agui.WithMessagesSnapshotRunLifecycleEventsEnabled(true),
+)
+```
+
+启用后，历史 `RUN_STARTED`、`RUN_FINISHED`、`RUN_ERROR` 会写入 `MESSAGES_SNAPSHOT.messages`，消息的 `role` 为 `activity`。事件语义按所在层级区分：
+
+- `MESSAGES_SNAPSHOT.messages` 中 `role` 为 `activity`、`activityType` 为 `RUN_*` 的消息表示历史会话中已持久化的 run 生命周期事件；
+- 消息快照路由顶层返回的 `RUN_STARTED`、`RUN_FINISHED`、`RUN_ERROR` 表示本次快照请求的生命周期或加载错误。
+
+开启后，`MESSAGES_SNAPSHOT` 中的历史 `RUN_*` 消息形态如下：
+
+```json
+{
+  "type": "MESSAGES_SNAPSHOT",
+  "messages": [
+    {
+      "id": "event-id-1",
+      "role": "activity",
+      "activityType": "RUN_STARTED",
+      "content": {
+        "threadId": "thread-1",
+        "runId": "run-1"
+      }
+    },
+    {
+      "id": "event-id-2",
+      "role": "assistant",
+      "content": "hello"
+    },
+    {
+      "id": "event-id-3",
+      "role": "activity",
+      "activityType": "RUN_ERROR",
+      "content": {
+        "runId": "run-1",
+        "message": "model call failed",
+        "code": "MODEL_ERROR"
+      }
+    }
+  ]
+}
+```
 
 ### 消息快照续传
 
@@ -1078,6 +1137,63 @@ server, err := agui.New(
 ```
 
 完整示例可参考 [examples/agui/server/graph](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/agui/server/graph)，前端渲染与审批交互可参考 [examples/agui/client/tdesign-chat](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/agui/client/tdesign-chat)。
+
+### 流式工具调用参数
+
+默认情况下，AG-UI 服务端会在模型完成一次工具调用后发送完整的 `TOOL_CALL_START → TOOL_CALL_ARGS → TOOL_CALL_END`。也就是说，前端通常只能在工具参数全部生成完成后，才能看到这次工具调用的参数。
+
+如果工具参数本身生成时间较长，或者前端需要在工具执行前实时展示参数生成进度，可以开启工具调用参数流式输出。开启后，AG-UI 服务端会把模型流式产生的工具参数分片转换成多条 `TOOL_CALL_ARGS` 事件，前端可以按 `toolCallId` 累积这些分片并增量展示。
+
+该能力要求底层模型适配层支持并开启 tool call delta 输出。以 OpenAI 适配层为例，可以同时开启模型层和 AG-UI 层开关：
+
+```go
+import (
+	"trpc.group/trpc-go/trpc-agent-go/model/openai"
+	"trpc.group/trpc-go/trpc-agent-go/server/agui"
+)
+
+llm := openai.New(
+	"gpt-5.5",
+	openai.WithShowToolCallDelta(true), // Forward tool_calls chunks.
+)
+
+server, err := agui.New(
+	runner,
+	agui.WithToolCallDeltaStreamingEnabled(true),
+)
+```
+
+完整示例可参考 [examples/agui/server/toolcall_delta](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/agui/server/toolcall_delta)。
+
+这里有两个开关需要同时满足：
+
+- `openai.WithShowToolCallDelta(true)`：OpenAI 适配层不再过滤原始 `tool_calls` 流式分片，并把它们转成框架内部的工具调用增量。
+- `agui.WithToolCallDeltaStreamingEnabled(true)`：AG-UI 服务端将这些分片转换为实时 `TOOL_CALL_ARGS` 事件。
+
+其他模型适配层如果也支持框架内部的工具调用增量，AG-UI 层会按同一逻辑处理。
+
+启用后，同一次工具调用的实时事件流通常会表现为：
+
+```text
+RUN_STARTED
+→ TOOL_CALL_START
+→ TOOL_CALL_ARGS
+→ TOOL_CALL_ARGS
+→ ...
+→ TOOL_CALL_END
+→ TOOL_CALL_RESULT
+→ TEXT_MESSAGE_*
+→ RUN_FINISHED
+```
+
+前端处理时只需要关注两点：
+
+- `TOOL_CALL_ARGS.delta` 是本次新增的参数字符串片段，不一定是完整 JSON；应按 `toolCallId` 累积后再解析。
+- 同一工具调用的 `TOOL_CALL_ARGS` 不保证在事件流中连续；前端状态应按 `toolCallId` 分组维护，而不是依赖相邻事件。
+
+工具调用结束时，AG-UI 服务端会发送 `TOOL_CALL_END`。如果运行被取消或异常结束，服务端也会尽量补齐仍未关闭的协议事件，避免前端停留在未完成状态。
+
+实时对话路由会把每个 `TOOL_CALL_ARGS` 分片发送给前端；如果配置了 `SessionService`，写入会话前会对相邻且相同 `toolCallId` 的 `TOOL_CALL_ARGS` 做聚合。消息快照路由用于恢复累计后的工具调用参数，不保留实时分片的数量和边界。
 
 ### 流式工具执行结果
 

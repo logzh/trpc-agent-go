@@ -135,6 +135,12 @@ func TestWithToolResultInputTranslationEnabled(t *testing.T) {
 	assert.True(t, ro.ToolResultInputTranslationEnabled)
 }
 
+func TestWithToolCallDeltaStreamingEnabled(t *testing.T) {
+	opts := newOptions(WithToolCallDeltaStreamingEnabled(true))
+	ro := aguirunner.NewOptions(opts.aguiRunnerOptions...)
+	assert.True(t, ro.ToolCallDeltaStreamingEnabled)
+}
+
 func TestWithStreamingToolResultActivityEnabled(t *testing.T) {
 	opts := newOptions(WithStreamingToolResultActivityEnabled(true))
 	ro := aguirunner.NewOptions(opts.aguiRunnerOptions...)
@@ -151,6 +157,12 @@ func TestWithMessagesSnapshotFollowMaxDuration(t *testing.T) {
 	opts := newOptions(WithMessagesSnapshotFollowMaxDuration(2 * time.Second))
 	ro := aguirunner.NewOptions(opts.aguiRunnerOptions...)
 	assert.Equal(t, 2*time.Second, ro.MessagesSnapshotFollowMaxDuration)
+}
+
+func TestWithMessagesSnapshotRunLifecycleEventsEnabled(t *testing.T) {
+	opts := newOptions(WithMessagesSnapshotRunLifecycleEventsEnabled(true))
+	ro := aguirunner.NewOptions(opts.aguiRunnerOptions...)
+	assert.True(t, ro.MessagesSnapshotRunLifecycleEventsEnabled)
 }
 
 func TestWithCancelEnabled(t *testing.T) {
