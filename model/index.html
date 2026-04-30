@@ -1756,6 +1756,15 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#5-streaming-tool-call-deltas-showtoolcalldelta" class="md-nav__link">
+    <span class="md-ellipsis">
+      5. Streaming Tool Call Deltas: ShowToolCallDelta
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -3959,6 +3968,15 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#5-streaming-tool-call-deltas-showtoolcalldelta" class="md-nav__link">
+    <span class="md-ellipsis">
+      5. Streaming Tool Call Deltas: ShowToolCallDelta
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -4119,7 +4137,7 @@
 </span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8"></a>
 </span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9"></a><span class="kd">func</span><span class="w"> </span><span class="nx">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
 </span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10"></a><span class="w">    </span><span class="c1">// 1. Create model instance.</span>
-</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11"></a><span class="w">    </span><span class="nx">modelInstance</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11"></a><span class="w">    </span><span class="nx">modelInstance</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
 </span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12"></a><span class="w">        </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithExtraFields</span><span class="p">(</span><span class="kd">map</span><span class="p">[</span><span class="kt">string</span><span class="p">]</span><span class="kd">interface</span><span class="p">{}{</span>
 </span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13"></a><span class="w">            </span><span class="s">&quot;tool_choice&quot;</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;auto&quot;</span><span class="p">,</span><span class="w"> </span><span class="c1">// Automatically select tools.</span>
 </span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14"></a><span class="w">        </span><span class="p">}),</span>
@@ -4167,7 +4185,7 @@
 </span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2"></a><span class="nb">cd</span><span class="w"> </span>examples/runner
 </span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3"></a><span class="nb">export</span><span class="w"> </span><span class="nv">OPENAI_BASE_URL</span><span class="o">=</span><span class="s2">&quot;https://api.deepseek.com/v1&quot;</span>
 </span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4"></a><span class="nb">export</span><span class="w"> </span><span class="nv">OPENAI_API_KEY</span><span class="o">=</span><span class="s2">&quot;your-api-key&quot;</span>
-</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5"></a>go<span class="w"> </span>run<span class="w"> </span>main.go<span class="w"> </span>-model<span class="w"> </span>deepseek-chat
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5"></a>go<span class="w"> </span>run<span class="w"> </span>main.go<span class="w"> </span>-model<span class="w"> </span>deepseek-v4-flash
 </span></code></pre></div></td></tr></table></div>
 <h4 id="platform-integration-configuration">Platform Integration Configuration</h4>
 <p>All platform integration methods follow the same pattern, only requiring configuration of different environment variables or direct setting in code:</p>
@@ -4207,7 +4225,7 @@
 </span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7"></a><span class="nb">export</span><span class="w"> </span><span class="nv">OPENAI_BASE_URL</span><span class="o">=</span><span class="s2">&quot;https://api.deepseek.com/v1&quot;</span>
 </span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8"></a><span class="nb">export</span><span class="w"> </span><span class="nv">OPENAI_API_KEY</span><span class="o">=</span><span class="s2">&quot;your-api-key&quot;</span>
 </span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9"></a><span class="nb">cd</span><span class="w"> </span>examples/runner
-</span><span id="__span-4-10"><a id="__codelineno-4-10" name="__codelineno-4-10"></a>go<span class="w"> </span>run<span class="w"> </span>main.go<span class="w"> </span>-model<span class="w"> </span>deepseek-chat
+</span><span id="__span-4-10"><a id="__codelineno-4-10" name="__codelineno-4-10"></a>go<span class="w"> </span>run<span class="w"> </span>main.go<span class="w"> </span>-model<span class="w"> </span>deepseek-v4-flash
 </span></code></pre></div></td></tr></table></div>
 <p><strong>Code Configuration Method</strong></p>
 <p>Configuration method when directly using Model in your own code:</p>
@@ -4216,7 +4234,7 @@
 <span class="normal"><a href="#__codelineno-5-3">3</a></span>
 <span class="normal"><a href="#__codelineno-5-4">4</a></span>
 <span class="normal"><a href="#__codelineno-5-5">5</a></span>
-<span class="normal"><a href="#__codelineno-5-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="nx">model</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
+<span class="normal"><a href="#__codelineno-5-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="nx">model</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
 </span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithBaseURL</span><span class="p">(</span><span class="s">&quot;https://api.deepseek.com/v1&quot;</span><span class="p">),</span>
 </span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithAPIKey</span><span class="p">(</span><span class="s">&quot;your-api-key&quot;</span><span class="p">),</span>
 </span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4"></a><span class="p">)</span>
@@ -4319,7 +4337,12 @@
 <span class="normal"><a href="#__codelineno-7-45">45</a></span>
 <span class="normal"><a href="#__codelineno-7-46">46</a></span>
 <span class="normal"><a href="#__codelineno-7-47">47</a></span>
-<span class="normal"><a href="#__codelineno-7-48">48</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="c1">// Request represents the request sent to the model.</span>
+<span class="normal"><a href="#__codelineno-7-48">48</a></span>
+<span class="normal"><a href="#__codelineno-7-49">49</a></span>
+<span class="normal"><a href="#__codelineno-7-50">50</a></span>
+<span class="normal"><a href="#__codelineno-7-51">51</a></span>
+<span class="normal"><a href="#__codelineno-7-52">52</a></span>
+<span class="normal"><a href="#__codelineno-7-53">53</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="c1">// Request represents the request sent to the model.</span>
 </span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2"></a><span class="kd">type</span><span class="w"> </span><span class="nx">Request</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
 </span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3"></a><span class="w">    </span><span class="c1">// Message list, containing system instructions, user input and assistant replies.</span>
 </span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4"></a><span class="w">    </span><span class="nx">Messages</span><span class="w"> </span><span class="p">[]</span><span class="nx">Message</span><span class="w"> </span><span class="s">`json:&quot;messages&quot;`</span>
@@ -4356,17 +4379,22 @@
 </span><span id="__span-7-35"><a id="__codelineno-7-35" name="__codelineno-7-35"></a>
 </span><span id="__span-7-36"><a id="__codelineno-7-36" name="__codelineno-7-36"></a><span class="w">    </span><span class="c1">// Reasoning effort level. Accepted values depend on the provider:</span>
 </span><span id="__span-7-37"><a id="__codelineno-7-37" name="__codelineno-7-37"></a><span class="w">    </span><span class="c1">//   - OpenAI o-series: &quot;low&quot;, &quot;medium&quot;, &quot;high&quot;.</span>
-</span><span id="__span-7-38"><a id="__codelineno-7-38" name="__codelineno-7-38"></a><span class="w">    </span><span class="c1">//   - DeepSeek v4 (deepseek-v4-pro / deepseek-v4-flash): &quot;high&quot;, &quot;max&quot;</span>
-</span><span id="__span-7-39"><a id="__codelineno-7-39" name="__codelineno-7-39"></a><span class="w">    </span><span class="c1">//     (server maps &quot;low&quot;/&quot;medium&quot; -&gt; &quot;high&quot; and &quot;xhigh&quot; -&gt; &quot;max&quot; for</span>
-</span><span id="__span-7-40"><a id="__codelineno-7-40" name="__codelineno-7-40"></a><span class="w">    </span><span class="c1">//     backward compatibility).</span>
-</span><span id="__span-7-41"><a id="__codelineno-7-41" name="__codelineno-7-41"></a><span class="w">    </span><span class="nx">ReasoningEffort</span><span class="w"> </span><span class="o">*</span><span class="kt">string</span><span class="w"> </span><span class="s">`json:&quot;reasoning_effort,omitempty&quot;`</span>
-</span><span id="__span-7-42"><a id="__codelineno-7-42" name="__codelineno-7-42"></a>
-</span><span id="__span-7-43"><a id="__codelineno-7-43" name="__codelineno-7-43"></a><span class="w">    </span><span class="c1">// Whether to enable thinking mode.</span>
-</span><span id="__span-7-44"><a id="__codelineno-7-44" name="__codelineno-7-44"></a><span class="w">    </span><span class="nx">ThinkingEnabled</span><span class="w"> </span><span class="o">*</span><span class="kt">bool</span><span class="w"> </span><span class="s">`json:&quot;-&quot;`</span>
-</span><span id="__span-7-45"><a id="__codelineno-7-45" name="__codelineno-7-45"></a>
-</span><span id="__span-7-46"><a id="__codelineno-7-46" name="__codelineno-7-46"></a><span class="w">    </span><span class="c1">// Maximum token count for thinking mode.</span>
-</span><span id="__span-7-47"><a id="__codelineno-7-47" name="__codelineno-7-47"></a><span class="w">    </span><span class="nx">ThinkingTokens</span><span class="w"> </span><span class="o">*</span><span class="kt">int</span><span class="w"> </span><span class="s">`json:&quot;-&quot;`</span>
-</span><span id="__span-7-48"><a id="__codelineno-7-48" name="__codelineno-7-48"></a><span class="p">}</span>
+</span><span id="__span-7-38"><a id="__codelineno-7-38" name="__codelineno-7-38"></a><span class="w">    </span><span class="c1">//   - Anthropic adaptive thinking: &quot;low&quot;, &quot;medium&quot;, &quot;high&quot;, &quot;max&quot;,</span>
+</span><span id="__span-7-39"><a id="__codelineno-7-39" name="__codelineno-7-39"></a><span class="w">    </span><span class="c1">//     and &quot;xhigh&quot; on models that support it.</span>
+</span><span id="__span-7-40"><a id="__codelineno-7-40" name="__codelineno-7-40"></a><span class="w">    </span><span class="c1">//   - DeepSeek v4 (deepseek-v4-pro / deepseek-v4-flash): &quot;high&quot;, &quot;max&quot;</span>
+</span><span id="__span-7-41"><a id="__codelineno-7-41" name="__codelineno-7-41"></a><span class="w">    </span><span class="c1">//     (server maps &quot;low&quot;/&quot;medium&quot; -&gt; &quot;high&quot; and &quot;xhigh&quot; -&gt; &quot;max&quot; for</span>
+</span><span id="__span-7-42"><a id="__codelineno-7-42" name="__codelineno-7-42"></a><span class="w">    </span><span class="c1">//     backward compatibility).</span>
+</span><span id="__span-7-43"><a id="__codelineno-7-43" name="__codelineno-7-43"></a><span class="w">    </span><span class="c1">// OpenAI-compatible providers forward this field to the selected backend</span>
+</span><span id="__span-7-44"><a id="__codelineno-7-44" name="__codelineno-7-44"></a><span class="w">    </span><span class="c1">// model; use values supported by that backend.</span>
+</span><span id="__span-7-45"><a id="__codelineno-7-45" name="__codelineno-7-45"></a><span class="w">    </span><span class="nx">ReasoningEffort</span><span class="w"> </span><span class="o">*</span><span class="kt">string</span><span class="w"> </span><span class="s">`json:&quot;reasoning_effort,omitempty&quot;`</span>
+</span><span id="__span-7-46"><a id="__codelineno-7-46" name="__codelineno-7-46"></a>
+</span><span id="__span-7-47"><a id="__codelineno-7-47" name="__codelineno-7-47"></a><span class="w">    </span><span class="c1">// Whether to enable thinking mode.</span>
+</span><span id="__span-7-48"><a id="__codelineno-7-48" name="__codelineno-7-48"></a><span class="w">    </span><span class="c1">// nil means no thinking-toggle field is emitted, so the provider default applies.</span>
+</span><span id="__span-7-49"><a id="__codelineno-7-49" name="__codelineno-7-49"></a><span class="w">    </span><span class="nx">ThinkingEnabled</span><span class="w"> </span><span class="o">*</span><span class="kt">bool</span><span class="w"> </span><span class="s">`json:&quot;thinking_enabled,omitempty&quot;`</span>
+</span><span id="__span-7-50"><a id="__codelineno-7-50" name="__codelineno-7-50"></a>
+</span><span id="__span-7-51"><a id="__codelineno-7-51" name="__codelineno-7-51"></a><span class="w">    </span><span class="c1">// Maximum token count for thinking mode.</span>
+</span><span id="__span-7-52"><a id="__codelineno-7-52" name="__codelineno-7-52"></a><span class="w">    </span><span class="nx">ThinkingTokens</span><span class="w"> </span><span class="o">*</span><span class="kt">int</span><span class="w"> </span><span class="s">`json:&quot;thinking_tokens,omitempty&quot;`</span>
+</span><span id="__span-7-53"><a id="__codelineno-7-53" name="__codelineno-7-53"></a><span class="p">}</span>
 </span></code></pre></div></td></tr></table></div>
 <p><code>GenerationConfig</code> itself is just a plain struct, and its zero value
 means <code>Stream=false</code>. For <code>LLMAgent</code>, if you omit
@@ -4401,7 +4429,27 @@ explicit defaults.</p>
 <span class="normal"><a href="#__codelineno-8-24">24</a></span>
 <span class="normal"><a href="#__codelineno-8-25">25</a></span>
 <span class="normal"><a href="#__codelineno-8-26">26</a></span>
-<span class="normal"><a href="#__codelineno-8-27">27</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1"></a><span class="c1">// Response represents the response returned by the model.</span>
+<span class="normal"><a href="#__codelineno-8-27">27</a></span>
+<span class="normal"><a href="#__codelineno-8-28">28</a></span>
+<span class="normal"><a href="#__codelineno-8-29">29</a></span>
+<span class="normal"><a href="#__codelineno-8-30">30</a></span>
+<span class="normal"><a href="#__codelineno-8-31">31</a></span>
+<span class="normal"><a href="#__codelineno-8-32">32</a></span>
+<span class="normal"><a href="#__codelineno-8-33">33</a></span>
+<span class="normal"><a href="#__codelineno-8-34">34</a></span>
+<span class="normal"><a href="#__codelineno-8-35">35</a></span>
+<span class="normal"><a href="#__codelineno-8-36">36</a></span>
+<span class="normal"><a href="#__codelineno-8-37">37</a></span>
+<span class="normal"><a href="#__codelineno-8-38">38</a></span>
+<span class="normal"><a href="#__codelineno-8-39">39</a></span>
+<span class="normal"><a href="#__codelineno-8-40">40</a></span>
+<span class="normal"><a href="#__codelineno-8-41">41</a></span>
+<span class="normal"><a href="#__codelineno-8-42">42</a></span>
+<span class="normal"><a href="#__codelineno-8-43">43</a></span>
+<span class="normal"><a href="#__codelineno-8-44">44</a></span>
+<span class="normal"><a href="#__codelineno-8-45">45</a></span>
+<span class="normal"><a href="#__codelineno-8-46">46</a></span>
+<span class="normal"><a href="#__codelineno-8-47">47</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1"></a><span class="c1">// Response represents the response returned by the model.</span>
 </span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2"></a><span class="kd">type</span><span class="w"> </span><span class="nx">Response</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
 </span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3"></a><span class="w">    </span><span class="c1">// OpenAI compatible fields.</span>
 </span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4"></a><span class="w">    </span><span class="nx">ID</span><span class="w">                </span><span class="kt">string</span><span class="w">   </span><span class="s">`json:&quot;id,omitempty&quot;`</span>
@@ -4428,7 +4476,28 @@ explicit defaults.</p>
 </span><span id="__span-8-25"><a id="__codelineno-8-25" name="__codelineno-8-25"></a><span class="w">    </span><span class="nx">Param</span><span class="w">   </span><span class="kt">string</span><span class="w">    </span><span class="s">`json:&quot;param,omitempty&quot;`</span>
 </span><span id="__span-8-26"><a id="__codelineno-8-26" name="__codelineno-8-26"></a><span class="w">    </span><span class="nx">Code</span><span class="w">    </span><span class="kt">string</span><span class="w">    </span><span class="s">`json:&quot;code,omitempty&quot;`</span>
 </span><span id="__span-8-27"><a id="__codelineno-8-27" name="__codelineno-8-27"></a><span class="p">}</span>
+</span><span id="__span-8-28"><a id="__codelineno-8-28" name="__codelineno-8-28"></a>
+</span><span id="__span-8-29"><a id="__codelineno-8-29" name="__codelineno-8-29"></a><span class="c1">// Usage represents token usage information.</span>
+</span><span id="__span-8-30"><a id="__codelineno-8-30" name="__codelineno-8-30"></a><span class="kd">type</span><span class="w"> </span><span class="nx">Usage</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-8-31"><a id="__codelineno-8-31" name="__codelineno-8-31"></a><span class="w">    </span><span class="nx">PromptTokens</span><span class="w">            </span><span class="kt">int</span><span class="w">                     </span><span class="s">`json:&quot;prompt_tokens&quot;`</span>
+</span><span id="__span-8-32"><a id="__codelineno-8-32" name="__codelineno-8-32"></a><span class="w">    </span><span class="nx">CompletionTokens</span><span class="w">        </span><span class="kt">int</span><span class="w">                     </span><span class="s">`json:&quot;completion_tokens&quot;`</span>
+</span><span id="__span-8-33"><a id="__codelineno-8-33" name="__codelineno-8-33"></a><span class="w">    </span><span class="nx">TotalTokens</span><span class="w">             </span><span class="kt">int</span><span class="w">                     </span><span class="s">`json:&quot;total_tokens&quot;`</span>
+</span><span id="__span-8-34"><a id="__codelineno-8-34" name="__codelineno-8-34"></a><span class="w">    </span><span class="nx">PromptTokensDetails</span><span class="w">     </span><span class="nx">PromptTokensDetails</span><span class="w">     </span><span class="s">`json:&quot;prompt_tokens_details&quot;`</span>
+</span><span id="__span-8-35"><a id="__codelineno-8-35" name="__codelineno-8-35"></a><span class="w">    </span><span class="nx">CompletionTokensDetails</span><span class="w"> </span><span class="nx">CompletionTokensDetails</span><span class="w"> </span><span class="s">`json:&quot;completion_tokens_details&quot;`</span>
+</span><span id="__span-8-36"><a id="__codelineno-8-36" name="__codelineno-8-36"></a><span class="w">    </span><span class="nx">TimingInfo</span><span class="w">              </span><span class="o">*</span><span class="nx">TimingInfo</span><span class="w">             </span><span class="s">`json:&quot;timing_info,omitempty&quot;`</span>
+</span><span id="__span-8-37"><a id="__codelineno-8-37" name="__codelineno-8-37"></a><span class="p">}</span>
+</span><span id="__span-8-38"><a id="__codelineno-8-38" name="__codelineno-8-38"></a>
+</span><span id="__span-8-39"><a id="__codelineno-8-39" name="__codelineno-8-39"></a><span class="kd">type</span><span class="w"> </span><span class="nx">PromptTokensDetails</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-8-40"><a id="__codelineno-8-40" name="__codelineno-8-40"></a><span class="w">    </span><span class="nx">CachedTokens</span><span class="w">        </span><span class="kt">int</span><span class="w"> </span><span class="s">`json:&quot;cached_tokens&quot;`</span>
+</span><span id="__span-8-41"><a id="__codelineno-8-41" name="__codelineno-8-41"></a><span class="w">    </span><span class="nx">CacheCreationTokens</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="s">`json:&quot;cache_creation_tokens,omitempty&quot;`</span>
+</span><span id="__span-8-42"><a id="__codelineno-8-42" name="__codelineno-8-42"></a><span class="w">    </span><span class="nx">CacheReadTokens</span><span class="w">     </span><span class="kt">int</span><span class="w"> </span><span class="s">`json:&quot;cache_read_tokens,omitempty&quot;`</span>
+</span><span id="__span-8-43"><a id="__codelineno-8-43" name="__codelineno-8-43"></a><span class="p">}</span>
+</span><span id="__span-8-44"><a id="__codelineno-8-44" name="__codelineno-8-44"></a>
+</span><span id="__span-8-45"><a id="__codelineno-8-45" name="__codelineno-8-45"></a><span class="kd">type</span><span class="w"> </span><span class="nx">CompletionTokensDetails</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-8-46"><a id="__codelineno-8-46" name="__codelineno-8-46"></a><span class="w">    </span><span class="nx">ReasoningTokens</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="s">`json:&quot;reasoning_tokens,omitempty&quot;`</span>
+</span><span id="__span-8-47"><a id="__codelineno-8-47" name="__codelineno-8-47"></a><span class="p">}</span>
 </span></code></pre></div></td></tr></table></div>
+<p>For OpenAI-compatible providers, <code>completion_tokens_details.reasoning_tokens</code> is mapped to <code>Usage.CompletionTokensDetails.ReasoningTokens</code>. The value may be <code>0</code> when the provider does not spend or report reasoning tokens; for reasoning models, set <code>ReasoningEffort</code> and/or <code>ThinkingEnabled</code> when you want to request reasoning behavior.</p>
 <h2 id="openai-model">OpenAI Model</h2>
 <h3 id="model-name-parameter">Model Name Parameter</h3>
 <p>When creating an OpenAI model instance using <code>openai.New(name string, opts ...Option)</code>, the first parameter is the actual model name that gets sent to the OpenAI API, as the <strong>specific model identifier</strong> that tells the API which language model to use.</p>
@@ -4441,8 +4510,10 @@ explicit defaults.</p>
 <p><strong>2. DeepSeek</strong></p>
 <ul>
 <li>Base URL: <code>https://api.deepseek.com</code></li>
-<li>Model Names: <code>deepseek-chat</code>, <code>deepseek-reasoner</code></li>
+<li>Model Names: <code>deepseek-v4-flash</code>, <code>deepseek-v4-pro</code></li>
 </ul>
+<p><code>deepseek-chat</code> and <code>deepseek-reasoner</code> are deprecated compatibility aliases;
+prefer the explicit DeepSeek v4 model names for new code.</p>
 <p><strong>3. Tencent Hunyuan</strong></p>
 <ul>
 <li>Base URL: <code>https://api.hunyuan.cloud.tencent.com/v1</code></li>
@@ -4536,7 +4607,7 @@ explicit defaults.</p>
 </span><span id="__span-11-8"><a id="__codelineno-11-8" name="__codelineno-11-8"></a>
 </span><span id="__span-11-9"><a id="__codelineno-11-9" name="__codelineno-11-9"></a><span class="kd">func</span><span class="w"> </span><span class="nx">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
 </span><span id="__span-11-10"><a id="__codelineno-11-10" name="__codelineno-11-10"></a><span class="w">    </span><span class="c1">// Create model instance.</span>
-</span><span id="__span-11-11"><a id="__codelineno-11-11" name="__codelineno-11-11"></a><span class="w">    </span><span class="nx">llm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">)</span>
+</span><span id="__span-11-11"><a id="__codelineno-11-11" name="__codelineno-11-11"></a><span class="w">    </span><span class="nx">llm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">)</span>
 </span><span id="__span-11-12"><a id="__codelineno-11-12" name="__codelineno-11-12"></a>
 </span><span id="__span-11-13"><a id="__codelineno-11-13" name="__codelineno-11-13"></a><span class="w">    </span><span class="c1">// Build request.</span>
 </span><span id="__span-11-14"><a id="__codelineno-11-14" name="__codelineno-11-14"></a><span class="w">    </span><span class="nx">temperature</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="mf">0.7</span>
@@ -4780,7 +4851,7 @@ explicit defaults.</p>
 <span class="normal"><a href="#__codelineno-15-36">36</a></span>
 <span class="normal"><a href="#__codelineno-15-37">37</a></span>
 <span class="normal"><a href="#__codelineno-15-38">38</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1"></a><span class="c1">// Set pre-request callback function.</span>
-</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2"></a><span class="nx">model</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
+</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2"></a><span class="nx">model</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
 </span><span id="__span-15-3"><a id="__codelineno-15-3" name="__codelineno-15-3"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithChatRequestCallback</span><span class="p">(</span><span class="kd">func</span><span class="p">(</span><span class="nx">ctx</span><span class="w"> </span><span class="nx">context</span><span class="p">.</span><span class="nx">Context</span><span class="p">,</span><span class="w"> </span><span class="nx">req</span><span class="w"> </span><span class="o">*</span><span class="nx">openai</span><span class="p">.</span><span class="nx">ChatCompletionNewParams</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
 </span><span id="__span-15-4"><a id="__codelineno-15-4" name="__codelineno-15-4"></a><span class="w">        </span><span class="c1">// Called before request is sent.</span>
 </span><span id="__span-15-5"><a id="__codelineno-15-5" name="__codelineno-15-5"></a><span class="w">        </span><span class="nx">log</span><span class="p">.</span><span class="nx">Printf</span><span class="p">(</span><span class="s">&quot;Sending request: model=%s, message count=%d&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">Model</span><span class="p">,</span><span class="w"> </span><span class="nb">len</span><span class="p">(</span><span class="nx">req</span><span class="p">.</span><span class="nx">Messages</span><span class="p">))</span>
@@ -4846,7 +4917,7 @@ custom JSON fields:</p>
 </span><span id="__span-16-5"><a id="__codelineno-16-5" name="__codelineno-16-5"></a><span class="w">    </span><span class="nx">oaimodel</span><span class="w"> </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/model/openai&quot;</span>
 </span><span id="__span-16-6"><a id="__codelineno-16-6" name="__codelineno-16-6"></a><span class="p">)</span>
 </span><span id="__span-16-7"><a id="__codelineno-16-7" name="__codelineno-16-7"></a>
-</span><span id="__span-16-8"><a id="__codelineno-16-8" name="__codelineno-16-8"></a><span class="nx">model</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">oaimodel</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
+</span><span id="__span-16-8"><a id="__codelineno-16-8" name="__codelineno-16-8"></a><span class="nx">model</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">oaimodel</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
 </span><span id="__span-16-9"><a id="__codelineno-16-9" name="__codelineno-16-9"></a><span class="w">    </span><span class="nx">oaimodel</span><span class="p">.</span><span class="nx">WithChatRequestCallback</span><span class="p">(</span><span class="kd">func</span><span class="p">(</span><span class="nx">ctx</span><span class="w"> </span><span class="nx">context</span><span class="p">.</span><span class="nx">Context</span><span class="p">,</span><span class="w"> </span><span class="nx">req</span><span class="w"> </span><span class="o">*</span><span class="nx">openai</span><span class="p">.</span><span class="nx">ChatCompletionNewParams</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
 </span><span id="__span-16-10"><a id="__codelineno-16-10" name="__codelineno-16-10"></a><span class="w">        </span><span class="c1">// Dynamically set extra fields based on runtime context.</span>
 </span><span id="__span-16-11"><a id="__codelineno-16-11" name="__codelineno-16-11"></a><span class="w">        </span><span class="nx">userID</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">ctx</span><span class="p">.</span><span class="nx">Value</span><span class="p">(</span><span class="s">&quot;user_id&quot;</span><span class="p">).(</span><span class="kt">string</span><span class="p">)</span>
@@ -4981,7 +5052,7 @@ is the recommended approach.</p>
 </span><span id="__span-19-7"><a id="__codelineno-19-7" name="__codelineno-19-7"></a><span class="c1">// Create multiple model instances.</span>
 </span><span id="__span-19-8"><a id="__codelineno-19-8" name="__codelineno-19-8"></a><span class="nx">gpt4</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;gpt-4o&quot;</span><span class="p">)</span>
 </span><span id="__span-19-9"><a id="__codelineno-19-9" name="__codelineno-19-9"></a><span class="nx">gpt4mini</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;gpt-4o-mini&quot;</span><span class="p">)</span>
-</span><span id="__span-19-10"><a id="__codelineno-19-10" name="__codelineno-19-10"></a><span class="nx">deepseek</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">)</span>
+</span><span id="__span-19-10"><a id="__codelineno-19-10" name="__codelineno-19-10"></a><span class="nx">deepseek</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">)</span>
 </span><span id="__span-19-11"><a id="__codelineno-19-11" name="__codelineno-19-11"></a>
 </span><span id="__span-19-12"><a id="__codelineno-19-12" name="__codelineno-19-12"></a><span class="c1">// Register all models when creating the Agent.</span>
 </span><span id="__span-19-13"><a id="__codelineno-19-13" name="__codelineno-19-13"></a><span class="nx">agent</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">llmagent</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;my-agent&quot;</span><span class="p">,</span>
@@ -5090,7 +5161,7 @@ is the recommended approach.</p>
 </span><span id="__span-22-3"><a id="__codelineno-22-3" name="__codelineno-22-3"></a><span class="w">    </span><span class="nx">llmagent</span><span class="p">.</span><span class="nx">WithModels</span><span class="p">(</span><span class="kd">map</span><span class="p">[</span><span class="kt">string</span><span class="p">]</span><span class="nx">model</span><span class="p">.</span><span class="nx">Model</span><span class="p">{</span>
 </span><span id="__span-22-4"><a id="__codelineno-22-4" name="__codelineno-22-4"></a><span class="w">        </span><span class="s">&quot;smart&quot;</span><span class="p">:</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;gpt-4o&quot;</span><span class="p">),</span>
 </span><span id="__span-22-5"><a id="__codelineno-22-5" name="__codelineno-22-5"></a><span class="w">        </span><span class="s">&quot;fast&quot;</span><span class="p">:</span><span class="w">  </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;gpt-4o-mini&quot;</span><span class="p">),</span>
-</span><span id="__span-22-6"><a id="__codelineno-22-6" name="__codelineno-22-6"></a><span class="w">        </span><span class="s">&quot;cheap&quot;</span><span class="p">:</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">),</span>
+</span><span id="__span-22-6"><a id="__codelineno-22-6" name="__codelineno-22-6"></a><span class="w">        </span><span class="s">&quot;cheap&quot;</span><span class="p">:</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">),</span>
 </span><span id="__span-22-7"><a id="__codelineno-22-7" name="__codelineno-22-7"></a><span class="w">    </span><span class="p">}),</span>
 </span><span id="__span-22-8"><a id="__codelineno-22-8" name="__codelineno-22-8"></a><span class="w">    </span><span class="nx">llmagent</span><span class="p">.</span><span class="nx">WithModel</span><span class="p">(</span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;gpt-4o-mini&quot;</span><span class="p">)),</span><span class="w"> </span><span class="c1">// Default model.</span>
 </span><span id="__span-22-9"><a id="__codelineno-22-9" name="__codelineno-22-9"></a><span class="p">)</span>
@@ -5127,7 +5198,7 @@ is the recommended approach.</p>
 </span><span id="__span-23-8"><a id="__codelineno-23-8" name="__codelineno-23-8"></a>
 </span><span id="__span-23-9"><a id="__codelineno-23-9" name="__codelineno-23-9"></a><span class="c1">// Use specialized reasoning model for reasoning tasks.</span>
 </span><span id="__span-23-10"><a id="__codelineno-23-10" name="__codelineno-23-10"></a><span class="nx">eventChan</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">runner</span><span class="p">.</span><span class="nx">Run</span><span class="p">(</span><span class="nx">ctx</span><span class="p">,</span><span class="w"> </span><span class="nx">userID</span><span class="p">,</span><span class="w"> </span><span class="nx">sessionID</span><span class="p">,</span><span class="w"> </span><span class="nx">reasoningMessage</span><span class="p">,</span>
-</span><span id="__span-23-11"><a id="__codelineno-23-11" name="__codelineno-23-11"></a><span class="w">    </span><span class="nx">agent</span><span class="p">.</span><span class="nx">WithModelName</span><span class="p">(</span><span class="s">&quot;deepseek-reasoner&quot;</span><span class="p">),</span>
+</span><span id="__span-23-11"><a id="__codelineno-23-11" name="__codelineno-23-11"></a><span class="w">    </span><span class="nx">agent</span><span class="p">.</span><span class="nx">WithModelName</span><span class="p">(</span><span class="s">&quot;deepseek-v4-pro&quot;</span><span class="p">),</span>
 </span><span id="__span-23-12"><a id="__codelineno-23-12" name="__codelineno-23-12"></a><span class="p">)</span>
 </span></code></pre></div></td></tr></table></div>
 <h5 id="configuration-details">Configuration Details</h5>
@@ -5700,7 +5771,7 @@ non-streaming, streaming, file upload, and batch APIs.</p>
 <span class="normal"><a href="#__codelineno-37-7">7</a></span>
 <span class="normal"><a href="#__codelineno-37-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-37-1"><a id="__codelineno-37-1" name="__codelineno-37-1"></a><span class="kn">import</span><span class="w"> </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/model/openai&quot;</span>
 </span><span id="__span-37-2"><a id="__codelineno-37-2" name="__codelineno-37-2"></a>
-</span><span id="__span-37-3"><a id="__codelineno-37-3" name="__codelineno-37-3"></a><span class="nx">llm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
+</span><span id="__span-37-3"><a id="__codelineno-37-3" name="__codelineno-37-3"></a><span class="nx">llm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
 </span><span id="__span-37-4"><a id="__codelineno-37-4" name="__codelineno-37-4"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithHeaders</span><span class="p">(</span><span class="kd">map</span><span class="p">[</span><span class="kt">string</span><span class="p">]</span><span class="kt">string</span><span class="p">{</span>
 </span><span id="__span-37-5"><a id="__codelineno-37-5" name="__codelineno-37-5"></a><span class="w">        </span><span class="s">&quot;X-Custom-Header&quot;</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;custom-value&quot;</span><span class="p">,</span>
 </span><span id="__span-37-6"><a id="__codelineno-37-6" name="__codelineno-37-6"></a><span class="w">        </span><span class="s">&quot;X-Request-ID&quot;</span><span class="p">:</span><span class="w">    </span><span class="s">&quot;req-123&quot;</span><span class="p">,</span>
@@ -5729,7 +5800,7 @@ by the underlying OpenAI client.</p>
 </span><span id="__span-38-3"><a id="__codelineno-38-3" name="__codelineno-38-3"></a><span class="w">    </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/model/openai&quot;</span>
 </span><span id="__span-38-4"><a id="__codelineno-38-4" name="__codelineno-38-4"></a><span class="p">)</span>
 </span><span id="__span-38-5"><a id="__codelineno-38-5" name="__codelineno-38-5"></a>
-</span><span id="__span-38-6"><a id="__codelineno-38-6" name="__codelineno-38-6"></a><span class="nx">llm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
+</span><span id="__span-38-6"><a id="__codelineno-38-6" name="__codelineno-38-6"></a><span class="nx">llm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
 </span><span id="__span-38-7"><a id="__codelineno-38-7" name="__codelineno-38-7"></a><span class="w">    </span><span class="c1">// If your provider needs extra headers</span>
 </span><span id="__span-38-8"><a id="__codelineno-38-8" name="__codelineno-38-8"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithOpenAIOptions</span><span class="p">(</span>
 </span><span id="__span-38-9"><a id="__codelineno-38-9" name="__codelineno-38-9"></a><span class="w">        </span><span class="nx">openaiopt</span><span class="p">.</span><span class="nx">WithHeader</span><span class="p">(</span><span class="s">&quot;X-Custom-Header&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;custom-value&quot;</span><span class="p">),</span>
@@ -5759,7 +5830,7 @@ by the underlying OpenAI client.</p>
 <span class="normal"><a href="#__codelineno-39-16">16</a></span>
 <span class="normal"><a href="#__codelineno-39-17">17</a></span>
 <span class="normal"><a href="#__codelineno-39-18">18</a></span>
-<span class="normal"><a href="#__codelineno-39-19">19</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-39-1"><a id="__codelineno-39-1" name="__codelineno-39-1"></a><span class="nx">llm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
+<span class="normal"><a href="#__codelineno-39-19">19</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-39-1"><a id="__codelineno-39-1" name="__codelineno-39-1"></a><span class="nx">llm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
 </span><span id="__span-39-2"><a id="__codelineno-39-2" name="__codelineno-39-2"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithOpenAIOptions</span><span class="p">(</span>
 </span><span id="__span-39-3"><a id="__codelineno-39-3" name="__codelineno-39-3"></a><span class="w">        </span><span class="nx">openaiopt</span><span class="p">.</span><span class="nx">WithMiddleware</span><span class="p">(</span>
 </span><span id="__span-39-4"><a id="__codelineno-39-4" name="__codelineno-39-4"></a><span class="w">            </span><span class="kd">func</span><span class="p">(</span><span class="nx">r</span><span class="w"> </span><span class="o">*</span><span class="nx">http</span><span class="p">.</span><span class="nx">Request</span><span class="p">,</span><span class="w"> </span><span class="nx">next</span><span class="w"> </span><span class="nx">openaiopt</span><span class="p">.</span><span class="nx">MiddlewareNext</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="nx">http</span><span class="p">.</span><span class="nx">Response</span><span class="p">,</span><span class="w"> </span><span class="kt">error</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
@@ -5874,7 +5945,7 @@ consumption.</p>
 </span><span id="__span-40-11"><a id="__codelineno-40-11" name="__codelineno-40-11"></a>
 </span><span id="__span-40-12"><a id="__codelineno-40-12" name="__codelineno-40-12"></a><span class="kd">const</span><span class="w"> </span><span class="nx">streamContentType</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s">&quot;text/event-stream&quot;</span>
 </span><span id="__span-40-13"><a id="__codelineno-40-13" name="__codelineno-40-13"></a>
-</span><span id="__span-40-14"><a id="__codelineno-40-14" name="__codelineno-40-14"></a><span class="nx">llm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
+</span><span id="__span-40-14"><a id="__codelineno-40-14" name="__codelineno-40-14"></a><span class="nx">llm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
 </span><span id="__span-40-15"><a id="__codelineno-40-15" name="__codelineno-40-15"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithOpenAIOptions</span><span class="p">(</span>
 </span><span id="__span-40-16"><a id="__codelineno-40-16" name="__codelineno-40-16"></a><span class="w">        </span><span class="nx">openaiopt</span><span class="p">.</span><span class="nx">WithMiddleware</span><span class="p">(</span>
 </span><span id="__span-40-17"><a id="__codelineno-40-17" name="__codelineno-40-17"></a><span class="w">            </span><span class="kd">func</span><span class="p">(</span>
@@ -5953,7 +6024,7 @@ metrics logic.</p>
 </span><span id="__span-41-7"><a id="__codelineno-41-7" name="__codelineno-41-7"></a><span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">rt</span><span class="p">.</span><span class="nx">base</span><span class="p">.</span><span class="nx">RoundTrip</span><span class="p">(</span><span class="nx">req</span><span class="p">)</span>
 </span><span id="__span-41-8"><a id="__codelineno-41-8" name="__codelineno-41-8"></a><span class="p">}</span>
 </span><span id="__span-41-9"><a id="__codelineno-41-9" name="__codelineno-41-9"></a>
-</span><span id="__span-41-10"><a id="__codelineno-41-10" name="__codelineno-41-10"></a><span class="nx">llm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
+</span><span id="__span-41-10"><a id="__codelineno-41-10" name="__codelineno-41-10"></a><span class="nx">llm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
 </span><span id="__span-41-11"><a id="__codelineno-41-11" name="__codelineno-41-11"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithHTTPClientOptions</span><span class="p">(</span>
 </span><span id="__span-41-12"><a id="__codelineno-41-12" name="__codelineno-41-12"></a><span class="w">        </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithHTTPClientTransport</span><span class="p">(</span><span class="nx">headerRoundTripper</span><span class="p">{</span><span class="nx">base</span><span class="p">:</span><span class="w"> </span><span class="nx">http</span><span class="p">.</span><span class="nx">DefaultTransport</span><span class="p">}),</span>
 </span><span id="__span-41-13"><a id="__codelineno-41-13" name="__codelineno-41-13"></a><span class="w">    </span><span class="p">),</span>
@@ -6168,7 +6239,7 @@ metrics logic.</p>
 </span><span id="__span-43-53"><a id="__codelineno-43-53" name="__codelineno-43-53"></a><span class="p">}</span>
 </span><span id="__span-43-54"><a id="__codelineno-43-54" name="__codelineno-43-54"></a>
 </span><span id="__span-43-55"><a id="__codelineno-43-55" name="__codelineno-43-55"></a><span class="c1">// Use custom counter when creating a model</span>
-</span><span id="__span-43-56"><a id="__codelineno-43-56" name="__codelineno-43-56"></a><span class="nx">llm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
+</span><span id="__span-43-56"><a id="__codelineno-43-56" name="__codelineno-43-56"></a><span class="nx">llm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
 </span><span id="__span-43-57"><a id="__codelineno-43-57" name="__codelineno-43-57"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithTokenCounter</span><span class="p">(</span><span class="o">&amp;</span><span class="nx">MyCustomCounter</span><span class="p">{}),</span>
 </span><span id="__span-43-58"><a id="__codelineno-43-58" name="__codelineno-43-58"></a><span class="p">)</span>
 </span></code></pre></div></td></tr></table></div>
@@ -6225,7 +6296,7 @@ metrics logic.</p>
 </span><span id="__span-45-3"><a id="__codelineno-45-3" name="__codelineno-45-3"></a><span class="p">)</span>
 </span><span id="__span-45-4"><a id="__codelineno-45-4" name="__codelineno-45-4"></a>
 </span><span id="__span-45-5"><a id="__codelineno-45-5" name="__codelineno-45-5"></a><span class="c1">// Enable token tailoring with automatic configuration</span>
-</span><span id="__span-45-6"><a id="__codelineno-45-6" name="__codelineno-45-6"></a><span class="nx">model</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
+</span><span id="__span-45-6"><a id="__codelineno-45-6" name="__codelineno-45-6"></a><span class="nx">model</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
 </span><span id="__span-45-7"><a id="__codelineno-45-7" name="__codelineno-45-7"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithEnableTokenTailoring</span><span class="p">(</span><span class="kc">true</span><span class="p">),</span>
 </span><span id="__span-45-8"><a id="__codelineno-45-8" name="__codelineno-45-8"></a><span class="p">)</span>
 </span></code></pre></div></td></tr></table></div>
@@ -6237,7 +6308,7 @@ metrics logic.</p>
 <span class="normal"><a href="#__codelineno-46-5">5</a></span>
 <span class="normal"><a href="#__codelineno-46-6">6</a></span>
 <span class="normal"><a href="#__codelineno-46-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-46-1"><a id="__codelineno-46-1" name="__codelineno-46-1"></a><span class="c1">// Custom token limit and strategy</span>
-</span><span id="__span-46-2"><a id="__codelineno-46-2" name="__codelineno-46-2"></a><span class="nx">model</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
+</span><span id="__span-46-2"><a id="__codelineno-46-2" name="__codelineno-46-2"></a><span class="nx">model</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
 </span><span id="__span-46-3"><a id="__codelineno-46-3" name="__codelineno-46-3"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithEnableTokenTailoring</span><span class="p">(</span><span class="kc">true</span><span class="p">),</span><span class="w">               </span><span class="c1">// Required: enable token tailoring</span>
 </span><span id="__span-46-4"><a id="__codelineno-46-4" name="__codelineno-46-4"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithMaxInputTokens</span><span class="p">(</span><span class="mi">10000</span><span class="p">),</span><span class="w">                    </span><span class="c1">// Custom token limit</span>
 </span><span id="__span-46-5"><a id="__codelineno-46-5" name="__codelineno-46-5"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithTokenCounter</span><span class="p">(</span><span class="nx">customCounter</span><span class="p">),</span><span class="w">              </span><span class="c1">// Optional: custom counter</span>
@@ -6316,7 +6387,7 @@ metrics logic.</p>
 </span><span id="__span-49-11"><a id="__codelineno-49-11" name="__codelineno-49-11"></a><span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">messages</span><span class="p">,</span><span class="w"> </span><span class="kc">nil</span>
 </span><span id="__span-49-12"><a id="__codelineno-49-12" name="__codelineno-49-12"></a><span class="p">}</span>
 </span><span id="__span-49-13"><a id="__codelineno-49-13" name="__codelineno-49-13"></a>
-</span><span id="__span-49-14"><a id="__codelineno-49-14" name="__codelineno-49-14"></a><span class="nx">model</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
+</span><span id="__span-49-14"><a id="__codelineno-49-14" name="__codelineno-49-14"></a><span class="nx">model</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
 </span><span id="__span-49-15"><a id="__codelineno-49-15" name="__codelineno-49-15"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithEnableTokenTailoring</span><span class="p">(</span><span class="kc">true</span><span class="p">),</span>
 </span><span id="__span-49-16"><a id="__codelineno-49-16" name="__codelineno-49-16"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithTailoringStrategy</span><span class="p">(</span><span class="o">&amp;</span><span class="nx">CustomStrategy</span><span class="p">{}),</span>
 </span><span id="__span-49-17"><a id="__codelineno-49-17" name="__codelineno-49-17"></a><span class="p">)</span>
@@ -6333,7 +6404,7 @@ metrics logic.</p>
 <span class="normal"><a href="#__codelineno-50-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-50-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-50-10">10</a></span>
-<span class="normal"><a href="#__codelineno-50-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-50-1"><a id="__codelineno-50-1" name="__codelineno-50-1"></a><span class="nx">model</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
+<span class="normal"><a href="#__codelineno-50-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-50-1"><a id="__codelineno-50-1" name="__codelineno-50-1"></a><span class="nx">model</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
 </span><span id="__span-50-2"><a id="__codelineno-50-2" name="__codelineno-50-2"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithEnableTokenTailoring</span><span class="p">(</span><span class="kc">true</span><span class="p">),</span>
 </span><span id="__span-50-3"><a id="__codelineno-50-3" name="__codelineno-50-3"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithTokenTailoringConfig</span><span class="p">(</span><span class="o">&amp;</span><span class="nx">model</span><span class="p">.</span><span class="nx">TokenTailoringConfig</span><span class="p">{</span>
 </span><span id="__span-50-4"><a id="__codelineno-50-4" name="__codelineno-50-4"></a><span class="w">        </span><span class="nx">ProtocolOverheadTokens</span><span class="p">:</span><span class="w"> </span><span class="mi">1024</span><span class="p">,</span><span class="w">   </span><span class="c1">// Custom protocol overhead</span>
@@ -6417,7 +6488,7 @@ metrics logic.</p>
 </span><span id="__span-52-8"><a id="__codelineno-52-8" name="__codelineno-52-8"></a><span class="p">)</span>
 </span><span id="__span-52-9"><a id="__codelineno-52-9" name="__codelineno-52-9"></a>
 </span><span id="__span-52-10"><a id="__codelineno-52-10" name="__codelineno-52-10"></a><span class="c1">// Use the DeepSeek platform</span>
-</span><span id="__span-52-11"><a id="__codelineno-52-11" name="__codelineno-52-11"></a><span class="nx">model</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
+</span><span id="__span-52-11"><a id="__codelineno-52-11" name="__codelineno-52-11"></a><span class="nx">model</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
 </span><span id="__span-52-12"><a id="__codelineno-52-12" name="__codelineno-52-12"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithBaseURL</span><span class="p">(</span><span class="s">&quot;https://api.deepseek.com/v1&quot;</span><span class="p">),</span>
 </span><span id="__span-52-13"><a id="__codelineno-52-13" name="__codelineno-52-13"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithAPIKey</span><span class="p">(</span><span class="s">&quot;your-api-key&quot;</span><span class="p">),</span>
 </span><span id="__span-52-14"><a id="__codelineno-52-14" name="__codelineno-52-14"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithVariant</span><span class="p">(</span><span class="nx">openai</span><span class="p">.</span><span class="nx">VariantDeepSeek</span><span class="p">),</span><span class="w"> </span><span class="c1">// Specify the DeepSeek variant</span>
@@ -6469,7 +6540,7 @@ metrics logic.</p>
 <span class="normal"><a href="#__codelineno-55-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-55-1"><a id="__codelineno-55-1" name="__codelineno-55-1"></a><span class="kn">import</span><span class="w"> </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/model&quot;</span>
 </span><span id="__span-55-2"><a id="__codelineno-55-2" name="__codelineno-55-2"></a>
 </span><span id="__span-55-3"><a id="__codelineno-55-3" name="__codelineno-55-3"></a><span class="c1">// DeepSeek</span>
-</span><span id="__span-55-4"><a id="__codelineno-55-4" name="__codelineno-55-4"></a><span class="nx">model</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
+</span><span id="__span-55-4"><a id="__codelineno-55-4" name="__codelineno-55-4"></a><span class="nx">model</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
 </span><span id="__span-55-5"><a id="__codelineno-55-5" name="__codelineno-55-5"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithVariant</span><span class="p">(</span><span class="nx">openai</span><span class="p">.</span><span class="nx">VariantDeepSeek</span><span class="p">),</span><span class="w"> </span><span class="c1">// Automatically reads DEEPSEEK_API_KEY</span>
 </span><span id="__span-55-6"><a id="__codelineno-55-6" name="__codelineno-55-6"></a><span class="p">)</span>
 </span></code></pre></div></td></tr></table></div>
@@ -7368,7 +7439,35 @@ to preserve the default clean text-streaming behavior.</p>
 </span><span id="__span-74-6"><a id="__codelineno-74-6" name="__codelineno-74-6"></a><span class="w">    </span><span class="nx">anthropic</span><span class="p">.</span><span class="nx">WithTailoringStrategy</span><span class="p">(</span><span class="nx">customStrategy</span><span class="p">),</span><span class="w">        </span><span class="c1">// Optional: custom strategy</span>
 </span><span id="__span-74-7"><a id="__codelineno-74-7" name="__codelineno-74-7"></a><span class="p">)</span>
 </span></code></pre></div></td></tr></table></div>
-<p>For detailed explanations of the token calculation formula, tailoring strategy, and custom strategy implementation, please refer to <a href="#3-token-tailoring">Token Tailoring under OpenAI Model</a>.</p>
+<p>For detailed explanations of the token calculation formula, tailoring strategy, and custom strategy implementation, please refer to <a href="#7-token-tailoring">Token Tailoring under OpenAI Model</a>.</p>
+<h4 id="5-streaming-tool-call-deltas-showtoolcalldelta">5. Streaming Tool Call Deltas: ShowToolCallDelta</h4>
+<p>By default, the Anthropic adapter accumulates tool-call arguments internally and returns the complete arguments once the model finishes the tool call, through <code>Response.Choices[0].Message.ToolCalls</code> in the final response.</p>
+<p><code>WithShowToolCallDelta</code> exposes Anthropic <code>input_json_delta</code> chunks during streaming. Enable this option when tool arguments are long, or when the frontend needs to display argument generation progress:</p>
+<div class="language-go highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-75-1">1</a></span>
+<span class="normal"><a href="#__codelineno-75-2">2</a></span>
+<span class="normal"><a href="#__codelineno-75-3">3</a></span>
+<span class="normal"><a href="#__codelineno-75-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-75-1"><a id="__codelineno-75-1" name="__codelineno-75-1"></a><span class="nx">llm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">anthropic</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span>
+</span><span id="__span-75-2"><a id="__codelineno-75-2" name="__codelineno-75-2"></a><span class="w">    </span><span class="s">&quot;claude-sonnet-4-0&quot;</span><span class="p">,</span>
+</span><span id="__span-75-3"><a id="__codelineno-75-3" name="__codelineno-75-3"></a><span class="w">    </span><span class="nx">anthropic</span><span class="p">.</span><span class="nx">WithShowToolCallDelta</span><span class="p">(</span><span class="kc">true</span><span class="p">),</span>
+</span><span id="__span-75-4"><a id="__codelineno-75-4" name="__codelineno-75-4"></a><span class="p">)</span>
+</span></code></pre></div></td></tr></table></div>
+<p>When <code>WithShowToolCallDelta(true)</code> is enabled:</p>
+<ul>
+<li>Streaming responses may include <code>Response.Choices[0].Delta.ToolCalls</code>.</li>
+<li><code>Delta.ToolCalls[*].Function.Arguments</code> is the newly produced argument string fragment, and is usually not complete JSON.</li>
+<li><code>Delta.ToolCalls[*].ID</code> and <code>Index</code> can be used to join fragments for the same tool call.</li>
+<li>The final response still returns the complete tool call in <code>Response.Choices[0].Message.ToolCalls</code>, so existing tool execution logic can continue to use the final response unchanged.</li>
+</ul>
+<p>Typical handling pattern:</p>
+<ol>
+<li>Read <code>Response.Choices[0].Delta.ToolCalls[*].Function.Arguments</code> on each
+   partial response.</li>
+<li>Group chunks by tool call <code>ID</code> or <code>Index</code>, and append the <code>Arguments</code>
+   fragments in order.</li>
+<li>Treat the accumulated value as the tool argument JSON. For progressive
+   rendering, render the string as it grows and unmarshal it only after it
+   becomes valid JSON.</li>
+</ol>
 <h2 id="provider">Provider</h2>
 <p>With the emergence of multiple large model providers, some have defined their own API specifications. Currently, the framework has integrated the APIs of OpenAI and Anthropic, and exposes them as models. Users can access different provider models through <code>openai.New</code> and <code>anthropic.New</code>.</p>
 <p>However, there are differences in instantiation and configuration between providers, which often requires developers to modify a significant amount of code when switching between providers, increasing the cost of switching.</p>
@@ -7421,46 +7520,6 @@ to preserve the default clean text-streaming behavior.</p>
 </tbody>
 </table>
 <h3 id="usage-example_4">Usage Example</h3>
-<div class="language-go highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-75-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-75-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-75-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-75-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-75-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-75-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-75-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-75-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-75-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-75-10">10</a></span>
-<span class="normal"><a href="#__codelineno-75-11">11</a></span>
-<span class="normal"><a href="#__codelineno-75-12">12</a></span>
-<span class="normal"><a href="#__codelineno-75-13">13</a></span>
-<span class="normal"><a href="#__codelineno-75-14">14</a></span>
-<span class="normal"><a href="#__codelineno-75-15">15</a></span>
-<span class="normal"><a href="#__codelineno-75-16">16</a></span>
-<span class="normal"><a href="#__codelineno-75-17">17</a></span>
-<span class="normal"><a href="#__codelineno-75-18">18</a></span>
-<span class="normal"><a href="#__codelineno-75-19">19</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-75-1"><a id="__codelineno-75-1" name="__codelineno-75-1"></a><span class="kn">import</span><span class="w"> </span><span class="p">(</span>
-</span><span id="__span-75-2"><a id="__codelineno-75-2" name="__codelineno-75-2"></a><span class="w">    </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/agent/llmagent&quot;</span>
-</span><span id="__span-75-3"><a id="__codelineno-75-3" name="__codelineno-75-3"></a><span class="w">    </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/model/provider&quot;</span>
-</span><span id="__span-75-4"><a id="__codelineno-75-4" name="__codelineno-75-4"></a><span class="p">)</span>
-</span><span id="__span-75-5"><a id="__codelineno-75-5" name="__codelineno-75-5"></a>
-</span><span id="__span-75-6"><a id="__codelineno-75-6" name="__codelineno-75-6"></a><span class="nx">providerName</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="s">&quot;openai&quot;</span><span class="w">        </span><span class="c1">// provider supports openai and anthropic.</span>
-</span><span id="__span-75-7"><a id="__codelineno-75-7" name="__codelineno-75-7"></a><span class="nx">modelName</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="s">&quot;deepseek-chat&quot;</span>
-</span><span id="__span-75-8"><a id="__codelineno-75-8" name="__codelineno-75-8"></a>
-</span><span id="__span-75-9"><a id="__codelineno-75-9" name="__codelineno-75-9"></a><span class="nx">modelInstance</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">provider</span><span class="p">.</span><span class="nx">Model</span><span class="p">(</span>
-</span><span id="__span-75-10"><a id="__codelineno-75-10" name="__codelineno-75-10"></a><span class="w">    </span><span class="nx">providerName</span><span class="p">,</span>
-</span><span id="__span-75-11"><a id="__codelineno-75-11" name="__codelineno-75-11"></a><span class="w">    </span><span class="nx">modelName</span><span class="p">,</span>
-</span><span id="__span-75-12"><a id="__codelineno-75-12" name="__codelineno-75-12"></a><span class="w">    </span><span class="nx">provider</span><span class="p">.</span><span class="nx">WithAPIKey</span><span class="p">(</span><span class="nx">c</span><span class="p">.</span><span class="nx">apiKey</span><span class="p">),</span>
-</span><span id="__span-75-13"><a id="__codelineno-75-13" name="__codelineno-75-13"></a><span class="w">    </span><span class="nx">provider</span><span class="p">.</span><span class="nx">WithBaseURL</span><span class="p">(</span><span class="nx">c</span><span class="p">.</span><span class="nx">baseURL</span><span class="p">),</span>
-</span><span id="__span-75-14"><a id="__codelineno-75-14" name="__codelineno-75-14"></a><span class="w">    </span><span class="nx">provider</span><span class="p">.</span><span class="nx">WithChannelBufferSize</span><span class="p">(</span><span class="nx">c</span><span class="p">.</span><span class="nx">channelBufferSize</span><span class="p">),</span>
-</span><span id="__span-75-15"><a id="__codelineno-75-15" name="__codelineno-75-15"></a><span class="w">    </span><span class="nx">provider</span><span class="p">.</span><span class="nx">WithEnableTokenTailoring</span><span class="p">(</span><span class="nx">c</span><span class="p">.</span><span class="nx">tokenTailoring</span><span class="p">),</span>
-</span><span id="__span-75-16"><a id="__codelineno-75-16" name="__codelineno-75-16"></a><span class="w">    </span><span class="nx">provider</span><span class="p">.</span><span class="nx">WithMaxInputTokens</span><span class="p">(</span><span class="nx">c</span><span class="p">.</span><span class="nx">maxInputTokens</span><span class="p">),</span>
-</span><span id="__span-75-17"><a id="__codelineno-75-17" name="__codelineno-75-17"></a><span class="p">)</span>
-</span><span id="__span-75-18"><a id="__codelineno-75-18" name="__codelineno-75-18"></a>
-</span><span id="__span-75-19"><a id="__codelineno-75-19" name="__codelineno-75-19"></a><span class="nx">agent</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">llmagent</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;chat-assistant&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">llmagent</span><span class="p">.</span><span class="nx">WithModel</span><span class="p">(</span><span class="nx">modelInstance</span><span class="p">))</span>
-</span></code></pre></div></td></tr></table></div>
-<p><strong>Advanced Configuration with TokenTailoringConfig</strong>:</p>
-<p>For advanced users who need to fine-tune token allocation strategy, you can use <code>WithTokenTailoringConfig</code>:</p>
 <div class="language-go highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-76-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-76-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-76-3"> 3</a></span>
@@ -7480,97 +7539,86 @@ to preserve the default clean text-streaming behavior.</p>
 <span class="normal"><a href="#__codelineno-76-17">17</a></span>
 <span class="normal"><a href="#__codelineno-76-18">18</a></span>
 <span class="normal"><a href="#__codelineno-76-19">19</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-76-1"><a id="__codelineno-76-1" name="__codelineno-76-1"></a><span class="kn">import</span><span class="w"> </span><span class="p">(</span>
-</span><span id="__span-76-2"><a id="__codelineno-76-2" name="__codelineno-76-2"></a><span class="w">    </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/model&quot;</span>
+</span><span id="__span-76-2"><a id="__codelineno-76-2" name="__codelineno-76-2"></a><span class="w">    </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/agent/llmagent&quot;</span>
 </span><span id="__span-76-3"><a id="__codelineno-76-3" name="__codelineno-76-3"></a><span class="w">    </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/model/provider&quot;</span>
 </span><span id="__span-76-4"><a id="__codelineno-76-4" name="__codelineno-76-4"></a><span class="p">)</span>
 </span><span id="__span-76-5"><a id="__codelineno-76-5" name="__codelineno-76-5"></a>
-</span><span id="__span-76-6"><a id="__codelineno-76-6" name="__codelineno-76-6"></a><span class="c1">// Custom token tailoring budget parameters for all providers</span>
-</span><span id="__span-76-7"><a id="__codelineno-76-7" name="__codelineno-76-7"></a><span class="nx">config</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">model</span><span class="p">.</span><span class="nx">TokenTailoringConfig</span><span class="p">{</span>
-</span><span id="__span-76-8"><a id="__codelineno-76-8" name="__codelineno-76-8"></a><span class="w">    </span><span class="nx">ProtocolOverheadTokens</span><span class="p">:</span><span class="w"> </span><span class="mi">1024</span><span class="p">,</span>
-</span><span id="__span-76-9"><a id="__codelineno-76-9" name="__codelineno-76-9"></a><span class="w">    </span><span class="nx">ReserveOutputTokens</span><span class="p">:</span><span class="w">    </span><span class="mi">4096</span><span class="p">,</span>
-</span><span id="__span-76-10"><a id="__codelineno-76-10" name="__codelineno-76-10"></a><span class="w">    </span><span class="nx">SafetyMarginRatio</span><span class="p">:</span><span class="w">      </span><span class="mf">0.15</span><span class="p">,</span>
-</span><span id="__span-76-11"><a id="__codelineno-76-11" name="__codelineno-76-11"></a><span class="p">}</span>
-</span><span id="__span-76-12"><a id="__codelineno-76-12" name="__codelineno-76-12"></a>
-</span><span id="__span-76-13"><a id="__codelineno-76-13" name="__codelineno-76-13"></a><span class="nx">modelInstance</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">provider</span><span class="p">.</span><span class="nx">Model</span><span class="p">(</span>
-</span><span id="__span-76-14"><a id="__codelineno-76-14" name="__codelineno-76-14"></a><span class="w">    </span><span class="s">&quot;openai&quot;</span><span class="p">,</span>
-</span><span id="__span-76-15"><a id="__codelineno-76-15" name="__codelineno-76-15"></a><span class="w">    </span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
-</span><span id="__span-76-16"><a id="__codelineno-76-16" name="__codelineno-76-16"></a><span class="w">    </span><span class="nx">provider</span><span class="p">.</span><span class="nx">WithAPIKey</span><span class="p">(</span><span class="nx">c</span><span class="p">.</span><span class="nx">apiKey</span><span class="p">),</span>
-</span><span id="__span-76-17"><a id="__codelineno-76-17" name="__codelineno-76-17"></a><span class="w">    </span><span class="nx">provider</span><span class="p">.</span><span class="nx">WithEnableTokenTailoring</span><span class="p">(</span><span class="kc">true</span><span class="p">),</span>
-</span><span id="__span-76-18"><a id="__codelineno-76-18" name="__codelineno-76-18"></a><span class="w">    </span><span class="nx">provider</span><span class="p">.</span><span class="nx">WithTokenTailoringConfig</span><span class="p">(</span><span class="nx">config</span><span class="p">),</span>
-</span><span id="__span-76-19"><a id="__codelineno-76-19" name="__codelineno-76-19"></a><span class="p">)</span>
+</span><span id="__span-76-6"><a id="__codelineno-76-6" name="__codelineno-76-6"></a><span class="nx">providerName</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="s">&quot;openai&quot;</span><span class="w">        </span><span class="c1">// provider supports openai and anthropic.</span>
+</span><span id="__span-76-7"><a id="__codelineno-76-7" name="__codelineno-76-7"></a><span class="nx">modelName</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="s">&quot;deepseek-v4-flash&quot;</span>
+</span><span id="__span-76-8"><a id="__codelineno-76-8" name="__codelineno-76-8"></a>
+</span><span id="__span-76-9"><a id="__codelineno-76-9" name="__codelineno-76-9"></a><span class="nx">modelInstance</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">provider</span><span class="p">.</span><span class="nx">Model</span><span class="p">(</span>
+</span><span id="__span-76-10"><a id="__codelineno-76-10" name="__codelineno-76-10"></a><span class="w">    </span><span class="nx">providerName</span><span class="p">,</span>
+</span><span id="__span-76-11"><a id="__codelineno-76-11" name="__codelineno-76-11"></a><span class="w">    </span><span class="nx">modelName</span><span class="p">,</span>
+</span><span id="__span-76-12"><a id="__codelineno-76-12" name="__codelineno-76-12"></a><span class="w">    </span><span class="nx">provider</span><span class="p">.</span><span class="nx">WithAPIKey</span><span class="p">(</span><span class="nx">c</span><span class="p">.</span><span class="nx">apiKey</span><span class="p">),</span>
+</span><span id="__span-76-13"><a id="__codelineno-76-13" name="__codelineno-76-13"></a><span class="w">    </span><span class="nx">provider</span><span class="p">.</span><span class="nx">WithBaseURL</span><span class="p">(</span><span class="nx">c</span><span class="p">.</span><span class="nx">baseURL</span><span class="p">),</span>
+</span><span id="__span-76-14"><a id="__codelineno-76-14" name="__codelineno-76-14"></a><span class="w">    </span><span class="nx">provider</span><span class="p">.</span><span class="nx">WithChannelBufferSize</span><span class="p">(</span><span class="nx">c</span><span class="p">.</span><span class="nx">channelBufferSize</span><span class="p">),</span>
+</span><span id="__span-76-15"><a id="__codelineno-76-15" name="__codelineno-76-15"></a><span class="w">    </span><span class="nx">provider</span><span class="p">.</span><span class="nx">WithEnableTokenTailoring</span><span class="p">(</span><span class="nx">c</span><span class="p">.</span><span class="nx">tokenTailoring</span><span class="p">),</span>
+</span><span id="__span-76-16"><a id="__codelineno-76-16" name="__codelineno-76-16"></a><span class="w">    </span><span class="nx">provider</span><span class="p">.</span><span class="nx">WithMaxInputTokens</span><span class="p">(</span><span class="nx">c</span><span class="p">.</span><span class="nx">maxInputTokens</span><span class="p">),</span>
+</span><span id="__span-76-17"><a id="__codelineno-76-17" name="__codelineno-76-17"></a><span class="p">)</span>
+</span><span id="__span-76-18"><a id="__codelineno-76-18" name="__codelineno-76-18"></a>
+</span><span id="__span-76-19"><a id="__codelineno-76-19" name="__codelineno-76-19"></a><span class="nx">agent</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">llmagent</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;chat-assistant&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">llmagent</span><span class="p">.</span><span class="nx">WithModel</span><span class="p">(</span><span class="nx">modelInstance</span><span class="p">))</span>
+</span></code></pre></div></td></tr></table></div>
+<p><strong>Advanced Configuration with TokenTailoringConfig</strong>:</p>
+<p>For advanced users who need to fine-tune token allocation strategy, you can use <code>WithTokenTailoringConfig</code>:</p>
+<div class="language-go highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-77-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-77-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-77-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-77-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-77-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-77-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-77-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-77-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-77-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-77-10">10</a></span>
+<span class="normal"><a href="#__codelineno-77-11">11</a></span>
+<span class="normal"><a href="#__codelineno-77-12">12</a></span>
+<span class="normal"><a href="#__codelineno-77-13">13</a></span>
+<span class="normal"><a href="#__codelineno-77-14">14</a></span>
+<span class="normal"><a href="#__codelineno-77-15">15</a></span>
+<span class="normal"><a href="#__codelineno-77-16">16</a></span>
+<span class="normal"><a href="#__codelineno-77-17">17</a></span>
+<span class="normal"><a href="#__codelineno-77-18">18</a></span>
+<span class="normal"><a href="#__codelineno-77-19">19</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-77-1"><a id="__codelineno-77-1" name="__codelineno-77-1"></a><span class="kn">import</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-77-2"><a id="__codelineno-77-2" name="__codelineno-77-2"></a><span class="w">    </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/model&quot;</span>
+</span><span id="__span-77-3"><a id="__codelineno-77-3" name="__codelineno-77-3"></a><span class="w">    </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/model/provider&quot;</span>
+</span><span id="__span-77-4"><a id="__codelineno-77-4" name="__codelineno-77-4"></a><span class="p">)</span>
+</span><span id="__span-77-5"><a id="__codelineno-77-5" name="__codelineno-77-5"></a>
+</span><span id="__span-77-6"><a id="__codelineno-77-6" name="__codelineno-77-6"></a><span class="c1">// Custom token tailoring budget parameters for all providers</span>
+</span><span id="__span-77-7"><a id="__codelineno-77-7" name="__codelineno-77-7"></a><span class="nx">config</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">model</span><span class="p">.</span><span class="nx">TokenTailoringConfig</span><span class="p">{</span>
+</span><span id="__span-77-8"><a id="__codelineno-77-8" name="__codelineno-77-8"></a><span class="w">    </span><span class="nx">ProtocolOverheadTokens</span><span class="p">:</span><span class="w"> </span><span class="mi">1024</span><span class="p">,</span>
+</span><span id="__span-77-9"><a id="__codelineno-77-9" name="__codelineno-77-9"></a><span class="w">    </span><span class="nx">ReserveOutputTokens</span><span class="p">:</span><span class="w">    </span><span class="mi">4096</span><span class="p">,</span>
+</span><span id="__span-77-10"><a id="__codelineno-77-10" name="__codelineno-77-10"></a><span class="w">    </span><span class="nx">SafetyMarginRatio</span><span class="p">:</span><span class="w">      </span><span class="mf">0.15</span><span class="p">,</span>
+</span><span id="__span-77-11"><a id="__codelineno-77-11" name="__codelineno-77-11"></a><span class="p">}</span>
+</span><span id="__span-77-12"><a id="__codelineno-77-12" name="__codelineno-77-12"></a>
+</span><span id="__span-77-13"><a id="__codelineno-77-13" name="__codelineno-77-13"></a><span class="nx">modelInstance</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">provider</span><span class="p">.</span><span class="nx">Model</span><span class="p">(</span>
+</span><span id="__span-77-14"><a id="__codelineno-77-14" name="__codelineno-77-14"></a><span class="w">    </span><span class="s">&quot;openai&quot;</span><span class="p">,</span>
+</span><span id="__span-77-15"><a id="__codelineno-77-15" name="__codelineno-77-15"></a><span class="w">    </span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
+</span><span id="__span-77-16"><a id="__codelineno-77-16" name="__codelineno-77-16"></a><span class="w">    </span><span class="nx">provider</span><span class="p">.</span><span class="nx">WithAPIKey</span><span class="p">(</span><span class="nx">c</span><span class="p">.</span><span class="nx">apiKey</span><span class="p">),</span>
+</span><span id="__span-77-17"><a id="__codelineno-77-17" name="__codelineno-77-17"></a><span class="w">    </span><span class="nx">provider</span><span class="p">.</span><span class="nx">WithEnableTokenTailoring</span><span class="p">(</span><span class="kc">true</span><span class="p">),</span>
+</span><span id="__span-77-18"><a id="__codelineno-77-18" name="__codelineno-77-18"></a><span class="w">    </span><span class="nx">provider</span><span class="p">.</span><span class="nx">WithTokenTailoringConfig</span><span class="p">(</span><span class="nx">config</span><span class="p">),</span>
+</span><span id="__span-77-19"><a id="__codelineno-77-19" name="__codelineno-77-19"></a><span class="p">)</span>
 </span></code></pre></div></td></tr></table></div>
 <p>Full code can be found in <a href="https://github.com/trpc-group/trpc-agent-go/tree/main/examples/provider">examples/provider</a>.</p>
 <h3 id="registering-a-custom-provider">Registering a Custom Provider</h3>
 <p>The framework supports registering custom providers to integrate other large model providers or custom model implementations.</p>
 <p>Using <code>provider.Register</code>, you can define a method to create custom model instances based on the options.</p>
-<div class="language-go highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-77-1">1</a></span>
-<span class="normal"><a href="#__codelineno-77-2">2</a></span>
-<span class="normal"><a href="#__codelineno-77-3">3</a></span>
-<span class="normal"><a href="#__codelineno-77-4">4</a></span>
-<span class="normal"><a href="#__codelineno-77-5">5</a></span>
-<span class="normal"><a href="#__codelineno-77-6">6</a></span>
-<span class="normal"><a href="#__codelineno-77-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-77-1"><a id="__codelineno-77-1" name="__codelineno-77-1"></a><span class="kn">import</span><span class="w"> </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/model/provider&quot;</span>
-</span><span id="__span-77-2"><a id="__codelineno-77-2" name="__codelineno-77-2"></a>
-</span><span id="__span-77-3"><a id="__codelineno-77-3" name="__codelineno-77-3"></a><span class="nx">provider</span><span class="p">.</span><span class="nx">Register</span><span class="p">(</span><span class="s">&quot;custom-provider&quot;</span><span class="p">,</span><span class="w"> </span><span class="kd">func</span><span class="p">(</span><span class="nx">opts</span><span class="w"> </span><span class="o">*</span><span class="nx">provider</span><span class="p">.</span><span class="nx">Options</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="nx">model</span><span class="p">.</span><span class="nx">Model</span><span class="p">,</span><span class="w"> </span><span class="kt">error</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-77-4"><a id="__codelineno-77-4" name="__codelineno-77-4"></a><span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">newCustomModel</span><span class="p">(</span><span class="nx">opts</span><span class="p">.</span><span class="nx">ModelName</span><span class="p">,</span><span class="w"> </span><span class="nx">WithAPIKey</span><span class="p">(</span><span class="nx">opts</span><span class="p">.</span><span class="nx">APIKey</span><span class="p">)),</span><span class="w"> </span><span class="kc">nil</span>
-</span><span id="__span-77-5"><a id="__codelineno-77-5" name="__codelineno-77-5"></a><span class="p">})</span>
-</span><span id="__span-77-6"><a id="__codelineno-77-6" name="__codelineno-77-6"></a>
-</span><span id="__span-77-7"><a id="__codelineno-77-7" name="__codelineno-77-7"></a><span class="nx">customModel</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">provider</span><span class="p">.</span><span class="nx">Model</span><span class="p">(</span><span class="s">&quot;custom-provider&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;custom-model&quot;</span><span class="p">)</span>
+<div class="language-go highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-78-1">1</a></span>
+<span class="normal"><a href="#__codelineno-78-2">2</a></span>
+<span class="normal"><a href="#__codelineno-78-3">3</a></span>
+<span class="normal"><a href="#__codelineno-78-4">4</a></span>
+<span class="normal"><a href="#__codelineno-78-5">5</a></span>
+<span class="normal"><a href="#__codelineno-78-6">6</a></span>
+<span class="normal"><a href="#__codelineno-78-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-78-1"><a id="__codelineno-78-1" name="__codelineno-78-1"></a><span class="kn">import</span><span class="w"> </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/model/provider&quot;</span>
+</span><span id="__span-78-2"><a id="__codelineno-78-2" name="__codelineno-78-2"></a>
+</span><span id="__span-78-3"><a id="__codelineno-78-3" name="__codelineno-78-3"></a><span class="nx">provider</span><span class="p">.</span><span class="nx">Register</span><span class="p">(</span><span class="s">&quot;custom-provider&quot;</span><span class="p">,</span><span class="w"> </span><span class="kd">func</span><span class="p">(</span><span class="nx">opts</span><span class="w"> </span><span class="o">*</span><span class="nx">provider</span><span class="p">.</span><span class="nx">Options</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="nx">model</span><span class="p">.</span><span class="nx">Model</span><span class="p">,</span><span class="w"> </span><span class="kt">error</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-78-4"><a id="__codelineno-78-4" name="__codelineno-78-4"></a><span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">newCustomModel</span><span class="p">(</span><span class="nx">opts</span><span class="p">.</span><span class="nx">ModelName</span><span class="p">,</span><span class="w"> </span><span class="nx">WithAPIKey</span><span class="p">(</span><span class="nx">opts</span><span class="p">.</span><span class="nx">APIKey</span><span class="p">)),</span><span class="w"> </span><span class="kc">nil</span>
+</span><span id="__span-78-5"><a id="__codelineno-78-5" name="__codelineno-78-5"></a><span class="p">})</span>
+</span><span id="__span-78-6"><a id="__codelineno-78-6" name="__codelineno-78-6"></a>
+</span><span id="__span-78-7"><a id="__codelineno-78-7" name="__codelineno-78-7"></a><span class="nx">customModel</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">provider</span><span class="p">.</span><span class="nx">Model</span><span class="p">(</span><span class="s">&quot;custom-provider&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;custom-model&quot;</span><span class="p">)</span>
 </span></code></pre></div></td></tr></table></div>
 <h2 id="model-failover">Model Failover</h2>
 <p><code>model/failover</code> provides a priority-ordered fallback wrapper for models. It can compose multiple <code>model.Model</code> instances into a primary/backup chain and automatically switch to the next candidate when the current one is unavailable. This is useful for scenarios such as primary/backup domains, gateways, or model providers.</p>
 <p><strong>Quick Start</strong>:</p>
-<div class="language-go highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-78-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-78-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-78-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-78-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-78-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-78-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-78-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-78-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-78-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-78-10">10</a></span>
-<span class="normal"><a href="#__codelineno-78-11">11</a></span>
-<span class="normal"><a href="#__codelineno-78-12">12</a></span>
-<span class="normal"><a href="#__codelineno-78-13">13</a></span>
-<span class="normal"><a href="#__codelineno-78-14">14</a></span>
-<span class="normal"><a href="#__codelineno-78-15">15</a></span>
-<span class="normal"><a href="#__codelineno-78-16">16</a></span>
-<span class="normal"><a href="#__codelineno-78-17">17</a></span>
-<span class="normal"><a href="#__codelineno-78-18">18</a></span>
-<span class="normal"><a href="#__codelineno-78-19">19</a></span>
-<span class="normal"><a href="#__codelineno-78-20">20</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-78-1"><a id="__codelineno-78-1" name="__codelineno-78-1"></a><span class="kn">import</span><span class="w"> </span><span class="p">(</span>
-</span><span id="__span-78-2"><a id="__codelineno-78-2" name="__codelineno-78-2"></a><span class="w">    </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/model/failover&quot;</span>
-</span><span id="__span-78-3"><a id="__codelineno-78-3" name="__codelineno-78-3"></a><span class="w">    </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/model/openai&quot;</span>
-</span><span id="__span-78-4"><a id="__codelineno-78-4" name="__codelineno-78-4"></a><span class="p">)</span>
-</span><span id="__span-78-5"><a id="__codelineno-78-5" name="__codelineno-78-5"></a>
-</span><span id="__span-78-6"><a id="__codelineno-78-6" name="__codelineno-78-6"></a><span class="nx">primary</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span>
-</span><span id="__span-78-7"><a id="__codelineno-78-7" name="__codelineno-78-7"></a><span class="w">    </span><span class="s">&quot;gpt-4o-mini&quot;</span><span class="p">,</span>
-</span><span id="__span-78-8"><a id="__codelineno-78-8" name="__codelineno-78-8"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithBaseURL</span><span class="p">(</span><span class="s">&quot;https://api.openai.com/v1&quot;</span><span class="p">),</span>
-</span><span id="__span-78-9"><a id="__codelineno-78-9" name="__codelineno-78-9"></a><span class="p">)</span>
-</span><span id="__span-78-10"><a id="__codelineno-78-10" name="__codelineno-78-10"></a><span class="nx">backup</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span>
-</span><span id="__span-78-11"><a id="__codelineno-78-11" name="__codelineno-78-11"></a><span class="w">    </span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
-</span><span id="__span-78-12"><a id="__codelineno-78-12" name="__codelineno-78-12"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithBaseURL</span><span class="p">(</span><span class="s">&quot;https://api.deepseek.com/v1&quot;</span><span class="p">),</span>
-</span><span id="__span-78-13"><a id="__codelineno-78-13" name="__codelineno-78-13"></a><span class="p">)</span>
-</span><span id="__span-78-14"><a id="__codelineno-78-14" name="__codelineno-78-14"></a>
-</span><span id="__span-78-15"><a id="__codelineno-78-15" name="__codelineno-78-15"></a><span class="nx">llm</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">failover</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span>
-</span><span id="__span-78-16"><a id="__codelineno-78-16" name="__codelineno-78-16"></a><span class="w">    </span><span class="nx">failover</span><span class="p">.</span><span class="nx">WithCandidates</span><span class="p">(</span><span class="nx">primary</span><span class="p">,</span><span class="w"> </span><span class="nx">backup</span><span class="p">),</span>
-</span><span id="__span-78-17"><a id="__codelineno-78-17" name="__codelineno-78-17"></a><span class="p">)</span>
-</span><span id="__span-78-18"><a id="__codelineno-78-18" name="__codelineno-78-18"></a><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-78-19"><a id="__codelineno-78-19" name="__codelineno-78-19"></a><span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">err</span>
-</span><span id="__span-78-20"><a id="__codelineno-78-20" name="__codelineno-78-20"></a><span class="p">}</span>
-</span></code></pre></div></td></tr></table></div>
-<p><code>failover.New(...)</code> returns a regular <code>model.Model</code>, so it can be passed directly to places that accept <code>model.Model</code>, such as <code>llmagent.WithModel(...)</code>. For a complete example, see <a href="https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/failover">examples/model/failover</a>.</p>
-<p><strong>Switching Rules</strong>:</p>
-<ul>
-<li>Candidates are tried in the order provided to <code>WithCandidates(...)</code>.</li>
-<li>Switching is allowed only before the first non-error chunk is received.</li>
-<li>If the current candidate returns an <code>error</code> directly before that point, or returns an error response with <code>Response.Error</code>, the wrapper continues with the next candidate.</li>
-<li>Once any non-error chunk has been returned to the caller, later streaming failures are surfaced directly instead of replaying the request on the backup candidate.</li>
-</ul>
-<h2 id="model-hedge">Model Hedge</h2>
-<p><code>model/hedge</code> provides a wrapper for hedging the time to first meaningful response. It starts the primary candidate immediately, then launches later candidates according to the configured hedge delay. If all currently active candidates have already failed, it launches the next candidate early. The first candidate that produces a meaningful response becomes the winner, and the remaining candidates are canceled.</p>
-<p><strong>Quick Start:</strong></p>
 <div class="language-go highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-79-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-79-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-79-3"> 3</a></span>
@@ -7590,9 +7638,8 @@ to preserve the default clean text-streaming behavior.</p>
 <span class="normal"><a href="#__codelineno-79-17">17</a></span>
 <span class="normal"><a href="#__codelineno-79-18">18</a></span>
 <span class="normal"><a href="#__codelineno-79-19">19</a></span>
-<span class="normal"><a href="#__codelineno-79-20">20</a></span>
-<span class="normal"><a href="#__codelineno-79-21">21</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-79-1"><a id="__codelineno-79-1" name="__codelineno-79-1"></a><span class="kn">import</span><span class="w"> </span><span class="p">(</span>
-</span><span id="__span-79-2"><a id="__codelineno-79-2" name="__codelineno-79-2"></a><span class="w">    </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/model/hedge&quot;</span>
+<span class="normal"><a href="#__codelineno-79-20">20</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-79-1"><a id="__codelineno-79-1" name="__codelineno-79-1"></a><span class="kn">import</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-79-2"><a id="__codelineno-79-2" name="__codelineno-79-2"></a><span class="w">    </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/model/failover&quot;</span>
 </span><span id="__span-79-3"><a id="__codelineno-79-3" name="__codelineno-79-3"></a><span class="w">    </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/model/openai&quot;</span>
 </span><span id="__span-79-4"><a id="__codelineno-79-4" name="__codelineno-79-4"></a><span class="p">)</span>
 </span><span id="__span-79-5"><a id="__codelineno-79-5" name="__codelineno-79-5"></a>
@@ -7601,17 +7648,69 @@ to preserve the default clean text-streaming behavior.</p>
 </span><span id="__span-79-8"><a id="__codelineno-79-8" name="__codelineno-79-8"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithBaseURL</span><span class="p">(</span><span class="s">&quot;https://api.openai.com/v1&quot;</span><span class="p">),</span>
 </span><span id="__span-79-9"><a id="__codelineno-79-9" name="__codelineno-79-9"></a><span class="p">)</span>
 </span><span id="__span-79-10"><a id="__codelineno-79-10" name="__codelineno-79-10"></a><span class="nx">backup</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span>
-</span><span id="__span-79-11"><a id="__codelineno-79-11" name="__codelineno-79-11"></a><span class="w">    </span><span class="s">&quot;deepseek-chat&quot;</span><span class="p">,</span>
+</span><span id="__span-79-11"><a id="__codelineno-79-11" name="__codelineno-79-11"></a><span class="w">    </span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
 </span><span id="__span-79-12"><a id="__codelineno-79-12" name="__codelineno-79-12"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithBaseURL</span><span class="p">(</span><span class="s">&quot;https://api.deepseek.com/v1&quot;</span><span class="p">),</span>
 </span><span id="__span-79-13"><a id="__codelineno-79-13" name="__codelineno-79-13"></a><span class="p">)</span>
 </span><span id="__span-79-14"><a id="__codelineno-79-14" name="__codelineno-79-14"></a>
-</span><span id="__span-79-15"><a id="__codelineno-79-15" name="__codelineno-79-15"></a><span class="nx">llm</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span>
-</span><span id="__span-79-16"><a id="__codelineno-79-16" name="__codelineno-79-16"></a><span class="w">    </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">WithName</span><span class="p">(</span><span class="s">&quot;chat-hedge&quot;</span><span class="p">),</span>
-</span><span id="__span-79-17"><a id="__codelineno-79-17" name="__codelineno-79-17"></a><span class="w">    </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">WithCandidates</span><span class="p">(</span><span class="nx">primary</span><span class="p">,</span><span class="w"> </span><span class="nx">backup</span><span class="p">),</span>
-</span><span id="__span-79-18"><a id="__codelineno-79-18" name="__codelineno-79-18"></a><span class="p">)</span>
-</span><span id="__span-79-19"><a id="__codelineno-79-19" name="__codelineno-79-19"></a><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-79-20"><a id="__codelineno-79-20" name="__codelineno-79-20"></a><span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">err</span>
-</span><span id="__span-79-21"><a id="__codelineno-79-21" name="__codelineno-79-21"></a><span class="p">}</span>
+</span><span id="__span-79-15"><a id="__codelineno-79-15" name="__codelineno-79-15"></a><span class="nx">llm</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">failover</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span>
+</span><span id="__span-79-16"><a id="__codelineno-79-16" name="__codelineno-79-16"></a><span class="w">    </span><span class="nx">failover</span><span class="p">.</span><span class="nx">WithCandidates</span><span class="p">(</span><span class="nx">primary</span><span class="p">,</span><span class="w"> </span><span class="nx">backup</span><span class="p">),</span>
+</span><span id="__span-79-17"><a id="__codelineno-79-17" name="__codelineno-79-17"></a><span class="p">)</span>
+</span><span id="__span-79-18"><a id="__codelineno-79-18" name="__codelineno-79-18"></a><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-79-19"><a id="__codelineno-79-19" name="__codelineno-79-19"></a><span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">err</span>
+</span><span id="__span-79-20"><a id="__codelineno-79-20" name="__codelineno-79-20"></a><span class="p">}</span>
+</span></code></pre></div></td></tr></table></div>
+<p><code>failover.New(...)</code> returns a regular <code>model.Model</code>, so it can be passed directly to places that accept <code>model.Model</code>, such as <code>llmagent.WithModel(...)</code>. For a complete example, see <a href="https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/failover">examples/model/failover</a>.</p>
+<p><strong>Switching Rules</strong>:</p>
+<ul>
+<li>Candidates are tried in the order provided to <code>WithCandidates(...)</code>.</li>
+<li>Switching is allowed only before the first non-error chunk is received.</li>
+<li>If the current candidate returns an <code>error</code> directly before that point, or returns an error response with <code>Response.Error</code>, the wrapper continues with the next candidate.</li>
+<li>Once any non-error chunk has been returned to the caller, later streaming failures are surfaced directly instead of replaying the request on the backup candidate.</li>
+</ul>
+<h2 id="model-hedge">Model Hedge</h2>
+<p><code>model/hedge</code> provides a wrapper for hedging the time to first meaningful response. It starts the primary candidate immediately, then launches later candidates according to the configured hedge delay. If all currently active candidates have already failed, it launches the next candidate early. The first candidate that produces a meaningful response becomes the winner, and the remaining candidates are canceled.</p>
+<p><strong>Quick Start:</strong></p>
+<div class="language-go highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-80-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-80-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-80-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-80-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-80-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-80-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-80-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-80-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-80-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-80-10">10</a></span>
+<span class="normal"><a href="#__codelineno-80-11">11</a></span>
+<span class="normal"><a href="#__codelineno-80-12">12</a></span>
+<span class="normal"><a href="#__codelineno-80-13">13</a></span>
+<span class="normal"><a href="#__codelineno-80-14">14</a></span>
+<span class="normal"><a href="#__codelineno-80-15">15</a></span>
+<span class="normal"><a href="#__codelineno-80-16">16</a></span>
+<span class="normal"><a href="#__codelineno-80-17">17</a></span>
+<span class="normal"><a href="#__codelineno-80-18">18</a></span>
+<span class="normal"><a href="#__codelineno-80-19">19</a></span>
+<span class="normal"><a href="#__codelineno-80-20">20</a></span>
+<span class="normal"><a href="#__codelineno-80-21">21</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-80-1"><a id="__codelineno-80-1" name="__codelineno-80-1"></a><span class="kn">import</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-80-2"><a id="__codelineno-80-2" name="__codelineno-80-2"></a><span class="w">    </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/model/hedge&quot;</span>
+</span><span id="__span-80-3"><a id="__codelineno-80-3" name="__codelineno-80-3"></a><span class="w">    </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/model/openai&quot;</span>
+</span><span id="__span-80-4"><a id="__codelineno-80-4" name="__codelineno-80-4"></a><span class="p">)</span>
+</span><span id="__span-80-5"><a id="__codelineno-80-5" name="__codelineno-80-5"></a>
+</span><span id="__span-80-6"><a id="__codelineno-80-6" name="__codelineno-80-6"></a><span class="nx">primary</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span>
+</span><span id="__span-80-7"><a id="__codelineno-80-7" name="__codelineno-80-7"></a><span class="w">    </span><span class="s">&quot;gpt-4o-mini&quot;</span><span class="p">,</span>
+</span><span id="__span-80-8"><a id="__codelineno-80-8" name="__codelineno-80-8"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithBaseURL</span><span class="p">(</span><span class="s">&quot;https://api.openai.com/v1&quot;</span><span class="p">),</span>
+</span><span id="__span-80-9"><a id="__codelineno-80-9" name="__codelineno-80-9"></a><span class="p">)</span>
+</span><span id="__span-80-10"><a id="__codelineno-80-10" name="__codelineno-80-10"></a><span class="nx">backup</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">openai</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span>
+</span><span id="__span-80-11"><a id="__codelineno-80-11" name="__codelineno-80-11"></a><span class="w">    </span><span class="s">&quot;deepseek-v4-flash&quot;</span><span class="p">,</span>
+</span><span id="__span-80-12"><a id="__codelineno-80-12" name="__codelineno-80-12"></a><span class="w">    </span><span class="nx">openai</span><span class="p">.</span><span class="nx">WithBaseURL</span><span class="p">(</span><span class="s">&quot;https://api.deepseek.com/v1&quot;</span><span class="p">),</span>
+</span><span id="__span-80-13"><a id="__codelineno-80-13" name="__codelineno-80-13"></a><span class="p">)</span>
+</span><span id="__span-80-14"><a id="__codelineno-80-14" name="__codelineno-80-14"></a>
+</span><span id="__span-80-15"><a id="__codelineno-80-15" name="__codelineno-80-15"></a><span class="nx">llm</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span>
+</span><span id="__span-80-16"><a id="__codelineno-80-16" name="__codelineno-80-16"></a><span class="w">    </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">WithName</span><span class="p">(</span><span class="s">&quot;chat-hedge&quot;</span><span class="p">),</span>
+</span><span id="__span-80-17"><a id="__codelineno-80-17" name="__codelineno-80-17"></a><span class="w">    </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">WithCandidates</span><span class="p">(</span><span class="nx">primary</span><span class="p">,</span><span class="w"> </span><span class="nx">backup</span><span class="p">),</span>
+</span><span id="__span-80-18"><a id="__codelineno-80-18" name="__codelineno-80-18"></a><span class="p">)</span>
+</span><span id="__span-80-19"><a id="__codelineno-80-19" name="__codelineno-80-19"></a><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-80-20"><a id="__codelineno-80-20" name="__codelineno-80-20"></a><span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">err</span>
+</span><span id="__span-80-21"><a id="__codelineno-80-21" name="__codelineno-80-21"></a><span class="p">}</span>
 </span></code></pre></div></td></tr></table></div>
 <p><code>hedge.New(...)</code> also returns a regular <code>model.Model</code>, so it can be passed directly to places that accept <code>model.Model</code>, such as <code>llmagent.WithModel(...)</code>. This quick start uses the package default delay. Use <code>WithDelay(...)</code> or <code>WithDelays(...)</code> when you need explicit launch scheduling. For a complete example, see <a href="https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/hedge">examples/model/hedge</a>.</p>
 <p><strong>Scheduling And Commit Rules</strong>:</p>
@@ -7624,13 +7723,13 @@ to preserve the default clean text-streaming behavior.</p>
 </ul>
 <p><strong>Configuration Examples</strong>:</p>
 <p>The following snippets show only the scheduling differences.</p>
-<div class="language-go highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-80-1">1</a></span>
-<span class="normal"><a href="#__codelineno-80-2">2</a></span>
-<span class="normal"><a href="#__codelineno-80-3">3</a></span>
-<span class="normal"><a href="#__codelineno-80-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-80-1"><a id="__codelineno-80-1" name="__codelineno-80-1"></a><span class="nx">llm</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span>
-</span><span id="__span-80-2"><a id="__codelineno-80-2" name="__codelineno-80-2"></a><span class="w">    </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">WithCandidates</span><span class="p">(</span><span class="nx">primary</span><span class="p">,</span><span class="w"> </span><span class="nx">backupA</span><span class="p">,</span><span class="w"> </span><span class="nx">backupB</span><span class="p">),</span>
-</span><span id="__span-80-3"><a id="__codelineno-80-3" name="__codelineno-80-3"></a><span class="w">    </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">WithDelay</span><span class="p">(</span><span class="mi">100</span><span class="o">*</span><span class="nx">time</span><span class="p">.</span><span class="nx">Millisecond</span><span class="p">),</span>
-</span><span id="__span-80-4"><a id="__codelineno-80-4" name="__codelineno-80-4"></a><span class="p">)</span>
+<div class="language-go highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-81-1">1</a></span>
+<span class="normal"><a href="#__codelineno-81-2">2</a></span>
+<span class="normal"><a href="#__codelineno-81-3">3</a></span>
+<span class="normal"><a href="#__codelineno-81-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-81-1"><a id="__codelineno-81-1" name="__codelineno-81-1"></a><span class="nx">llm</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span>
+</span><span id="__span-81-2"><a id="__codelineno-81-2" name="__codelineno-81-2"></a><span class="w">    </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">WithCandidates</span><span class="p">(</span><span class="nx">primary</span><span class="p">,</span><span class="w"> </span><span class="nx">backupA</span><span class="p">,</span><span class="w"> </span><span class="nx">backupB</span><span class="p">),</span>
+</span><span id="__span-81-3"><a id="__codelineno-81-3" name="__codelineno-81-3"></a><span class="w">    </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">WithDelay</span><span class="p">(</span><span class="mi">100</span><span class="o">*</span><span class="nx">time</span><span class="p">.</span><span class="nx">Millisecond</span><span class="p">),</span>
+</span><span id="__span-81-4"><a id="__codelineno-81-4" name="__codelineno-81-4"></a><span class="p">)</span>
 </span></code></pre></div></td></tr></table></div>
 <p>This configuration means:</p>
 <ul>
@@ -7638,13 +7737,13 @@ to preserve the default clean text-streaming behavior.</p>
 <li><code>candidate[1]</code> starts at <code>100ms</code>.</li>
 <li><code>candidate[2]</code> starts at <code>200ms</code>.</li>
 </ul>
-<div class="language-go highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-81-1">1</a></span>
-<span class="normal"><a href="#__codelineno-81-2">2</a></span>
-<span class="normal"><a href="#__codelineno-81-3">3</a></span>
-<span class="normal"><a href="#__codelineno-81-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-81-1"><a id="__codelineno-81-1" name="__codelineno-81-1"></a><span class="nx">llm</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span>
-</span><span id="__span-81-2"><a id="__codelineno-81-2" name="__codelineno-81-2"></a><span class="w">    </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">WithCandidates</span><span class="p">(</span><span class="nx">primary</span><span class="p">,</span><span class="w"> </span><span class="nx">backupA</span><span class="p">,</span><span class="w"> </span><span class="nx">backupB</span><span class="p">),</span>
-</span><span id="__span-81-3"><a id="__codelineno-81-3" name="__codelineno-81-3"></a><span class="w">    </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">WithDelays</span><span class="p">(</span><span class="mi">80</span><span class="o">*</span><span class="nx">time</span><span class="p">.</span><span class="nx">Millisecond</span><span class="p">,</span><span class="w"> </span><span class="mi">250</span><span class="o">*</span><span class="nx">time</span><span class="p">.</span><span class="nx">Millisecond</span><span class="p">),</span>
-</span><span id="__span-81-4"><a id="__codelineno-81-4" name="__codelineno-81-4"></a><span class="p">)</span>
+<div class="language-go highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-82-1">1</a></span>
+<span class="normal"><a href="#__codelineno-82-2">2</a></span>
+<span class="normal"><a href="#__codelineno-82-3">3</a></span>
+<span class="normal"><a href="#__codelineno-82-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-82-1"><a id="__codelineno-82-1" name="__codelineno-82-1"></a><span class="nx">llm</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span>
+</span><span id="__span-82-2"><a id="__codelineno-82-2" name="__codelineno-82-2"></a><span class="w">    </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">WithCandidates</span><span class="p">(</span><span class="nx">primary</span><span class="p">,</span><span class="w"> </span><span class="nx">backupA</span><span class="p">,</span><span class="w"> </span><span class="nx">backupB</span><span class="p">),</span>
+</span><span id="__span-82-3"><a id="__codelineno-82-3" name="__codelineno-82-3"></a><span class="w">    </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">WithDelays</span><span class="p">(</span><span class="mi">80</span><span class="o">*</span><span class="nx">time</span><span class="p">.</span><span class="nx">Millisecond</span><span class="p">,</span><span class="w"> </span><span class="mi">250</span><span class="o">*</span><span class="nx">time</span><span class="p">.</span><span class="nx">Millisecond</span><span class="p">),</span>
+</span><span id="__span-82-4"><a id="__codelineno-82-4" name="__codelineno-82-4"></a><span class="p">)</span>
 </span></code></pre></div></td></tr></table></div>
 <p>This configuration means:</p>
 <ul>
@@ -7653,13 +7752,13 @@ to preserve the default clean text-streaming behavior.</p>
 <li><code>candidate[2]</code> starts at <code>250ms</code>.</li>
 </ul>
 <p><code>WithDelays(...)</code> uses absolute launch offsets from request start, not incremental gaps relative to the previous candidate.</p>
-<div class="language-go highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-82-1">1</a></span>
-<span class="normal"><a href="#__codelineno-82-2">2</a></span>
-<span class="normal"><a href="#__codelineno-82-3">3</a></span>
-<span class="normal"><a href="#__codelineno-82-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-82-1"><a id="__codelineno-82-1" name="__codelineno-82-1"></a><span class="nx">llm</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span>
-</span><span id="__span-82-2"><a id="__codelineno-82-2" name="__codelineno-82-2"></a><span class="w">    </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">WithCandidates</span><span class="p">(</span><span class="nx">primary</span><span class="p">,</span><span class="w"> </span><span class="nx">backupA</span><span class="p">,</span><span class="w"> </span><span class="nx">backupB</span><span class="p">),</span>
-</span><span id="__span-82-3"><a id="__codelineno-82-3" name="__codelineno-82-3"></a><span class="w">    </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">WithDelays</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">),</span>
-</span><span id="__span-82-4"><a id="__codelineno-82-4" name="__codelineno-82-4"></a><span class="p">)</span>
+<div class="language-go highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-83-1">1</a></span>
+<span class="normal"><a href="#__codelineno-83-2">2</a></span>
+<span class="normal"><a href="#__codelineno-83-3">3</a></span>
+<span class="normal"><a href="#__codelineno-83-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-83-1"><a id="__codelineno-83-1" name="__codelineno-83-1"></a><span class="nx">llm</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span>
+</span><span id="__span-83-2"><a id="__codelineno-83-2" name="__codelineno-83-2"></a><span class="w">    </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">WithCandidates</span><span class="p">(</span><span class="nx">primary</span><span class="p">,</span><span class="w"> </span><span class="nx">backupA</span><span class="p">,</span><span class="w"> </span><span class="nx">backupB</span><span class="p">),</span>
+</span><span id="__span-83-3"><a id="__codelineno-83-3" name="__codelineno-83-3"></a><span class="w">    </span><span class="nx">hedge</span><span class="p">.</span><span class="nx">WithDelays</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">),</span>
+</span><span id="__span-83-4"><a id="__codelineno-83-4" name="__codelineno-83-4"></a><span class="p">)</span>
 </span></code></pre></div></td></tr></table></div>
 <p>This configuration means:</p>
 <ul>
@@ -7690,7 +7789,7 @@ to preserve the default clean text-streaming behavior.</p>
     <span class="md-icon" title="Last update">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 13.1c-.1 0-.3.1-.4.2l-1 1 2.1 2.1 1-1c.2-.2.2-.6 0-.8l-1.3-1.3c-.1-.1-.2-.2-.4-.2m-1.9 1.8-6.1 6V23h2.1l6.1-6.1zM12.5 7v5.2l4 2.4-1 1L11 13V7zM11 21.9c-5.1-.5-9-4.8-9-9.9C2 6.5 6.5 2 12 2c5.3 0 9.6 4.1 10 9.3-.3-.1-.6-.2-1-.2s-.7.1-1 .2C19.6 7.2 16.2 4 12 4c-4.4 0-8 3.6-8 8 0 4.1 3.1 7.5 7.1 7.9l-.1.2z"/></svg>
     </span>
-    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-iso_datetime" title="April 27, 2026 07:48:47 UTC">2026-04-27 07:48:47</span>
+    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-iso_datetime" title="April 30, 2026 08:40:00 UTC">2026-04-30 08:40:00</span>
   </span>
 
     
