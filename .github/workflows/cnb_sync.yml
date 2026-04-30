@@ -8,11 +8,13 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    env:
+      GIT_LFS_SKIP_SMUDGE: "1"
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # 建议设为 0，拉取所有分支和历史，避免同步不全
-          lfs: true # 关键点：开启 LFS 文件的拉取
+          lfs: false # 不拉取 LFS 对象，避免 GitHub LFS 预算/历史缺失对象阻断同步
           
       - name: get repo name
         id: repo-name
@@ -20,15 +22,18 @@ jobs:
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
           echo "name=$REPO_NAME" >> $GITHUB_OUTPUT
 
-      # 在同步之前，确保 LFS 对象在本地路径中
-      - name: Ensure LFS objects are present
-        run: git lfs pull
+      - name: Allow sync without historical LFS objects
+        run: git config --local lfs.allowincompletepush true
   
       - name: Sync to CNB Repository
         run: |
           docker run --rm \
             -v ${{ github.workspace }}:${{ github.workspace }} \
             -w ${{ github.workspace }} \
+            -e GIT_CONFIG_COUNT="1" \
+            -e GIT_CONFIG_KEY_0="lfs.allowincompletepush" \
+            -e GIT_CONFIG_VALUE_0="true" \
+            -e GIT_LFS_SKIP_SMUDGE="1" \
             -e PLUGIN_TARGET_URL="https://cnb.cool/spencezhang/${{ steps.repo-name.outputs.name }}.git" \
             -e PLUGIN_AUTH_TYPE="https" \
             -e PLUGIN_USERNAME="cnb" \
