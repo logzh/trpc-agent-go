@@ -470,6 +470,67 @@ func TestModel_GenerateContentIter_Streaming(t *testing.T) {
 	require.True(t, sawHello)
 }
 
+func TestModel_StreamingSkipsProviderSpecificNonJSONEvents(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		chunks := []string{
+			`: keep-alive`,
+			`data: : OPENROUTER PROCESSING`,
+			"event: ping\n" + `data: provider progress`,
+			`data: {"id":"provider-events","object":"chat.completion.chunk","created":1699200000,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}`,
+			`data: : keep-alive`,
+			`data: {"id":"provider-events","object":"chat.completion.chunk","created":1699200000,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}`,
+			`data: {"id":"provider-events","object":"chat.completion.chunk","created":1699200000,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			`data: [DONE]`,
+		}
+		for _, chunk := range chunks {
+			fmt.Fprintf(w, "%s\n\n", chunk)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	}))
+	defer server.Close()
+
+	m := New("gpt-3.5-turbo",
+		WithBaseURL(server.URL),
+		WithAPIKey("test-key"),
+	)
+
+	req := &model.Request{
+		Messages: []model.Message{
+			model.NewUserMessage("hi"),
+		},
+		GenerationConfig: model.GenerationConfig{
+			Stream: true,
+		},
+	}
+
+	responseChan, err := m.GenerateContent(context.Background(), req)
+	require.NoError(t, err)
+
+	var final *model.Response
+	for resp := range responseChan {
+		require.Nil(t, resp.Error)
+		if resp.Done {
+			final = resp
+			continue
+		}
+	}
+
+	require.NotNil(t, final)
+	require.True(t, final.Done)
+	require.NotEmpty(t, final.Choices)
+	require.Equal(t, "hello world", final.Choices[0].Message.Content)
+}
+
 func TestModel_GenerateContentIter_StreamingContextCancellationRunsCallback(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
@@ -801,6 +862,133 @@ func TestModel_convertMessages_ReasoningContent(t *testing.T) {
 				"reasoning_content should stay absent when backfill "+
 					"is disabled",
 			)
+		})
+
+	t.Run("deepseek backfills assistant tool call by default",
+		func(t *testing.T) {
+			msgs := []model.Message{
+				{
+					Role:    model.RoleAssistant,
+					Content: "Calling a tool.",
+					ToolCalls: []model.ToolCall{
+						{
+							ID:   "call-deepseek-default",
+							Type: "function",
+							Function: model.FunctionDefinitionParam{
+								Name:      "calculator",
+								Arguments: []byte(`{"expression":"2+2"}`),
+							},
+						},
+					},
+				},
+			}
+
+			converted := New(
+				"deepseek-v4-pro",
+				WithVariant(VariantDeepSeek),
+			).convertMessages(msgs)
+			require.Len(t, converted, 1)
+			require.NotNil(t, converted[0].OfAssistant)
+
+			data, err := json.Marshal(converted[0].OfAssistant)
+			require.NoError(t, err)
+
+			var parsed map[string]any
+			err = json.Unmarshal(data, &parsed)
+			require.NoError(t, err)
+
+			reasoningValue, ok := parsed[model.ReasoningContentKey]
+			require.True(
+				t,
+				ok,
+				"DeepSeek should backfill reasoning_content by default",
+			)
+			assert.Equal(t, "", reasoningValue)
+		})
+
+	t.Run("deepseek backfill can be explicitly disabled",
+		func(t *testing.T) {
+			msgs := []model.Message{
+				{
+					Role:    model.RoleAssistant,
+					Content: "Calling a tool.",
+					ToolCalls: []model.ToolCall{
+						{
+							ID:   "call-deepseek-disabled",
+							Type: "function",
+							Function: model.FunctionDefinitionParam{
+								Name:      "calculator",
+								Arguments: []byte(`{"expression":"2+2"}`),
+							},
+						},
+					},
+				},
+			}
+
+			converted := New(
+				"deepseek-v4-pro",
+				WithVariant(VariantDeepSeek),
+				WithReasoningContentBackfill(false),
+			).convertMessages(msgs)
+			require.Len(t, converted, 1)
+			require.NotNil(t, converted[0].OfAssistant)
+
+			data, err := json.Marshal(converted[0].OfAssistant)
+			require.NoError(t, err)
+
+			var parsed map[string]any
+			err = json.Unmarshal(data, &parsed)
+			require.NoError(t, err)
+
+			_, ok := parsed[model.ReasoningContentKey]
+			assert.False(
+				t,
+				ok,
+				"explicit false should disable DeepSeek reasoning_content backfill",
+			)
+		})
+
+	t.Run("deepseek inferred from base URL backfills by default",
+		func(t *testing.T) {
+			msgs := []model.Message{
+				{
+					Role:    model.RoleAssistant,
+					Content: "Calling a tool.",
+					ToolCalls: []model.ToolCall{
+						{
+							ID:   "call-deepseek-inferred",
+							Type: "function",
+							Function: model.FunctionDefinitionParam{
+								Name:      "calculator",
+								Arguments: []byte(`{"expression":"2+2"}`),
+							},
+						},
+					},
+				},
+			}
+
+			converted := New(
+				"deepseek-v4-pro",
+				WithBaseURL(defaultDeepSeekBaseURL),
+			).convertMessages(msgs)
+			require.Len(t, converted, 1)
+			require.NotNil(t, converted[0].OfAssistant)
+
+			data, err := json.Marshal(converted[0].OfAssistant)
+			require.NoError(t, err)
+
+			var parsed map[string]any
+			err = json.Unmarshal(data, &parsed)
+			require.NoError(t, err)
+
+			reasoningValue, ok := parsed[model.ReasoningContentKey]
+			require.True(
+				t,
+				ok,
+				"DeepSeek inferred from base URL should backfill "+
+					"reasoning_content by default",
+			)
+			assert.Equal(t, "", reasoningValue)
 		})
 
 	t.Run("assistant message without tool calls backfills empty reasoning_content",
